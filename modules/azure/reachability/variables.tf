@@ -35,3 +35,8 @@ variable "tags" {
   default     = {}
 }
 
+variable "resource_suffix" {
+  description = "Optional suffix appended to connectivity test names."
+  type        = string
+  default     = ""
+}

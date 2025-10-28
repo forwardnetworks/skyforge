@@ -45,3 +45,9 @@ variable "tags" {
   type        = map(string)
   default     = {}
 }
+
+variable "resource_suffix" {
+  description = "Optional suffix appended to TGW peering resource names."
+  type        = string
+  default     = ""
+}

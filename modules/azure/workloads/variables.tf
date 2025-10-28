@@ -19,6 +19,12 @@ variable "default_tags" {
   default     = {}
 }
 
+variable "resource_suffix" {
+  description = "Optional suffix appended to workload resource names."
+  type        = string
+  default     = ""
+}
+
 variable "config" {
   description = "Workload configuration for AKS/App Gateway/App Service/SQL."
   type        = any

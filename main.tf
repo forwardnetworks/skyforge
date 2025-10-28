@@ -1,4 +1,22 @@
 locals {
+  deployment_identifier_raw        = trimspace(var.deployment_identifier)
+  deployment_identifier_normalized = lower(replace(replace(local.deployment_identifier_raw, "_", "-"), "[^0-9A-Za-z-]", "-"))
+  deployment_identifier_collapsed  = replace(local.deployment_identifier_normalized, "-{2,}", "-")
+  deployment_identifier_clean      = trim(local.deployment_identifier_collapsed, "-")
+  deployment_identifier_supplied   = local.deployment_identifier_clean != ""
+}
+
+resource "time_static" "deployment" {
+  count = local.deployment_identifier_supplied ? 0 : 1
+}
+
+locals {
+  deployment_identifier_effective = local.deployment_identifier_supplied ? local.deployment_identifier_clean : formatdate("YYYYMMDDHHmmss", time_static.deployment[0].rfc3339)
+  deployment_tag_value            = "skyforge-${local.deployment_identifier_effective}"
+  resource_name_suffix            = local.deployment_identifier_effective
+  default_tags_with_timestamp = merge(var.default_tags, {
+    SkyforgeDeployment = local.deployment_tag_value
+  })
   aws_region_configs = {
     "us-east-1"      = lookup(var.aws_regions, "us-east-1", null)
     "eu-central-1"   = lookup(var.aws_regions, "eu-central-1", null)
@@ -14,6 +32,8 @@ locals {
   }
 
   azure_resource_group_settings = var.azure_global_resource_group != null ? merge({
+    name              = null
+    location          = null
     create_if_missing = false
     tags              = {}
     }, var.azure_global_resource_group) : (
@@ -53,13 +73,14 @@ locals {
 }
 
 module "aws_us_east_1" {
-  count         = local.aws_region_configs["us-east-1"] == null ? 0 : 1
-  source        = "./modules/aws"
-  region_key    = "us-east-1"
-  region_config = local.aws_region_configs["us-east-1"]
-  default_tags  = var.default_tags
-  vnf_links     = lookup(local.aws_vnf_links_by_region, "us-east-1", [])
-  vnf_sites     = var.vnf_endpoints
+  count           = local.aws_region_configs["us-east-1"] == null ? 0 : 1
+  source          = "./modules/aws"
+  region_key      = "us-east-1"
+  region_config   = local.aws_region_configs["us-east-1"]
+  default_tags    = local.default_tags_with_timestamp
+  vnf_links       = lookup(local.aws_vnf_links_by_region, "us-east-1", [])
+  vnf_sites       = var.vnf_endpoints
+  resource_suffix = local.resource_name_suffix
 
   providers = {
     aws = aws.us-east-1
@@ -67,13 +88,14 @@ module "aws_us_east_1" {
 }
 
 module "aws_eu_central_1" {
-  count         = local.aws_region_configs["eu-central-1"] == null ? 0 : 1
-  source        = "./modules/aws"
-  region_key    = "eu-central-1"
-  region_config = local.aws_region_configs["eu-central-1"]
-  default_tags  = var.default_tags
-  vnf_links     = lookup(local.aws_vnf_links_by_region, "eu-central-1", [])
-  vnf_sites     = var.vnf_endpoints
+  count           = local.aws_region_configs["eu-central-1"] == null ? 0 : 1
+  source          = "./modules/aws"
+  region_key      = "eu-central-1"
+  region_config   = local.aws_region_configs["eu-central-1"]
+  default_tags    = local.default_tags_with_timestamp
+  vnf_links       = lookup(local.aws_vnf_links_by_region, "eu-central-1", [])
+  vnf_sites       = var.vnf_endpoints
+  resource_suffix = local.resource_name_suffix
 
   providers = {
     aws = aws.eu-central-1
@@ -81,13 +103,14 @@ module "aws_eu_central_1" {
 }
 
 module "aws_ap_northeast_1" {
-  count         = local.aws_region_configs["ap-northeast-1"] == null ? 0 : 1
-  source        = "./modules/aws"
-  region_key    = "ap-northeast-1"
-  region_config = local.aws_region_configs["ap-northeast-1"]
-  default_tags  = var.default_tags
-  vnf_links     = lookup(local.aws_vnf_links_by_region, "ap-northeast-1", [])
-  vnf_sites     = var.vnf_endpoints
+  count           = local.aws_region_configs["ap-northeast-1"] == null ? 0 : 1
+  source          = "./modules/aws"
+  region_key      = "ap-northeast-1"
+  region_config   = local.aws_region_configs["ap-northeast-1"]
+  default_tags    = local.default_tags_with_timestamp
+  vnf_links       = lookup(local.aws_vnf_links_by_region, "ap-northeast-1", [])
+  vnf_sites       = var.vnf_endpoints
+  resource_suffix = local.resource_name_suffix
 
   providers = {
     aws = aws.ap-northeast-1
@@ -95,13 +118,14 @@ module "aws_ap_northeast_1" {
 }
 
 module "aws_me_south_1" {
-  count         = local.aws_region_configs["me-south-1"] == null ? 0 : 1
-  source        = "./modules/aws"
-  region_key    = "me-south-1"
-  region_config = local.aws_region_configs["me-south-1"]
-  default_tags  = var.default_tags
-  vnf_links     = lookup(local.aws_vnf_links_by_region, "me-south-1", [])
-  vnf_sites     = var.vnf_endpoints
+  count           = local.aws_region_configs["me-south-1"] == null ? 0 : 1
+  source          = "./modules/aws"
+  region_key      = "me-south-1"
+  region_config   = local.aws_region_configs["me-south-1"]
+  default_tags    = local.default_tags_with_timestamp
+  vnf_links       = lookup(local.aws_vnf_links_by_region, "me-south-1", [])
+  vnf_sites       = var.vnf_endpoints
+  resource_suffix = local.resource_name_suffix
 
   providers = {
     aws = aws.me-south-1
@@ -113,11 +137,12 @@ module "aws_network_manager" {
 
   source = "./modules/aws/network_manager"
 
-  global_name = try(var.aws_network_manager.global_name, "skyforge-global-network")
-  description = try(var.aws_network_manager.description, null)
-  sites       = local.aws_network_manager_sites
-  devices     = local.aws_network_manager_devices
-  tags        = var.default_tags
+  global_name     = try(var.aws_network_manager.global_name, "skyforge-global-network")
+  description     = try(var.aws_network_manager.description, null)
+  sites           = local.aws_network_manager_sites
+  devices         = local.aws_network_manager_devices
+  tags            = local.default_tags_with_timestamp
+  resource_suffix = local.resource_name_suffix
 
   providers = {
     aws = aws.us-east-1
@@ -132,7 +157,8 @@ module "aws_reachability_us_east_1" {
   region_key                  = "us-east-1"
   paths                       = try(var.aws_reachability["us-east-1"].paths, [])
   transit_gateway_attachments = lookup(local.aws_transit_gateway_attachment_map, "us-east-1", {})
-  tags                        = var.default_tags
+  tags                        = local.default_tags_with_timestamp
+  resource_suffix             = local.resource_name_suffix
 
   providers = {
     aws = aws.us-east-1
@@ -147,7 +173,8 @@ module "aws_reachability_eu_central_1" {
   region_key                  = "eu-central-1"
   paths                       = try(var.aws_reachability["eu-central-1"].paths, [])
   transit_gateway_attachments = lookup(local.aws_transit_gateway_attachment_map, "eu-central-1", {})
-  tags                        = var.default_tags
+  tags                        = local.default_tags_with_timestamp
+  resource_suffix             = local.resource_name_suffix
 
   providers = {
     aws = aws.eu-central-1
@@ -162,7 +189,8 @@ module "aws_reachability_ap_northeast_1" {
   region_key                  = "ap-northeast-1"
   paths                       = try(var.aws_reachability["ap-northeast-1"].paths, [])
   transit_gateway_attachments = lookup(local.aws_transit_gateway_attachment_map, "ap-northeast-1", {})
-  tags                        = var.default_tags
+  tags                        = local.default_tags_with_timestamp
+  resource_suffix             = local.resource_name_suffix
 
   providers = {
     aws = aws.ap-northeast-1
@@ -177,7 +205,8 @@ module "aws_reachability_me_south_1" {
   region_key                  = "me-south-1"
   paths                       = try(var.aws_reachability["me-south-1"].paths, [])
   transit_gateway_attachments = lookup(local.aws_transit_gateway_attachment_map, "me-south-1", {})
-  tags                        = var.default_tags
+  tags                        = local.default_tags_with_timestamp
+  resource_suffix             = local.resource_name_suffix
 
   providers = {
     aws = aws.me-south-1
@@ -192,7 +221,7 @@ module "azure_resource_group" {
   name              = local.azure_resource_group_settings.name
   location          = try(local.azure_resource_group_settings.location, null)
   create_if_missing = try(local.azure_resource_group_settings.create_if_missing, false)
-  tags              = merge(var.default_tags, try(local.azure_resource_group_settings.tags, {}))
+  tags              = merge(local.default_tags_with_timestamp, try(local.azure_resource_group_settings.tags, {}))
 }
 
 locals {
@@ -209,10 +238,11 @@ module "azure_regions" {
   source              = "./modules/azure"
   region_key          = each.key
   region_config       = each.value
-  default_tags        = var.default_tags
+  default_tags        = local.default_tags_with_timestamp
   vnf_links           = lookup(local.azure_vnf_links_by_region, each.key, [])
   vnf_sites           = var.vnf_endpoints
   resource_group_name = local.azure_resource_group_name_effective
+  resource_suffix     = local.resource_name_suffix
 
   providers = {
     azurerm = azurerm
@@ -232,18 +262,20 @@ module "azure_reachability" {
   location           = module.azure_regions[each.key].location
   network_watcher_id = local.azure_network_watcher_map[each.key]
   tests              = coalesce(each.value.tests, [])
-  tags               = var.default_tags
+  tags               = local.default_tags_with_timestamp
+  resource_suffix    = local.resource_name_suffix
 }
 
 
 module "gcp_us_central1" {
-  count         = local.gcp_region_configs["us-central1"] == null ? 0 : 1
-  source        = "./modules/gcp"
-  region_key    = "us-central1"
-  region_config = local.gcp_region_configs["us-central1"]
-  default_tags  = var.default_tags
-  vnf_links     = lookup(local.gcp_vnf_links_by_region, "us-central1", [])
-  vnf_sites     = var.vnf_endpoints
+  count           = local.gcp_region_configs["us-central1"] == null ? 0 : 1
+  source          = "./modules/gcp"
+  region_key      = "us-central1"
+  region_config   = local.gcp_region_configs["us-central1"]
+  default_tags    = local.default_tags_with_timestamp
+  vnf_links       = lookup(local.gcp_vnf_links_by_region, "us-central1", [])
+  vnf_sites       = var.vnf_endpoints
+  resource_suffix = local.resource_name_suffix
 
   providers = {
     google      = google.us_central1
@@ -252,13 +284,14 @@ module "gcp_us_central1" {
 }
 
 module "gcp_europe_west1" {
-  count         = local.gcp_region_configs["europe-west1"] == null ? 0 : 1
-  source        = "./modules/gcp"
-  region_key    = "europe-west1"
-  region_config = local.gcp_region_configs["europe-west1"]
-  default_tags  = var.default_tags
-  vnf_links     = lookup(local.gcp_vnf_links_by_region, "europe-west1", [])
-  vnf_sites     = var.vnf_endpoints
+  count           = local.gcp_region_configs["europe-west1"] == null ? 0 : 1
+  source          = "./modules/gcp"
+  region_key      = "europe-west1"
+  region_config   = local.gcp_region_configs["europe-west1"]
+  default_tags    = local.default_tags_with_timestamp
+  vnf_links       = lookup(local.gcp_vnf_links_by_region, "europe-west1", [])
+  vnf_sites       = var.vnf_endpoints
+  resource_suffix = local.resource_name_suffix
 
   providers = {
     google      = google.europe_west1
@@ -267,13 +300,14 @@ module "gcp_europe_west1" {
 }
 
 module "gcp_asia_southeast1" {
-  count         = local.gcp_region_configs["asia-southeast1"] == null ? 0 : 1
-  source        = "./modules/gcp"
-  region_key    = "asia-southeast1"
-  region_config = local.gcp_region_configs["asia-southeast1"]
-  default_tags  = var.default_tags
-  vnf_links     = lookup(local.gcp_vnf_links_by_region, "asia-southeast1", [])
-  vnf_sites     = var.vnf_endpoints
+  count           = local.gcp_region_configs["asia-southeast1"] == null ? 0 : 1
+  source          = "./modules/gcp"
+  region_key      = "asia-southeast1"
+  region_config   = local.gcp_region_configs["asia-southeast1"]
+  default_tags    = local.default_tags_with_timestamp
+  vnf_links       = lookup(local.gcp_vnf_links_by_region, "asia-southeast1", [])
+  vnf_sites       = var.vnf_endpoints
+  resource_suffix = local.resource_name_suffix
 
   providers = {
     google      = google.asia_southeast1
@@ -282,13 +316,14 @@ module "gcp_asia_southeast1" {
 }
 
 module "gcp_me_west1" {
-  count         = local.gcp_region_configs["me-west1"] == null ? 0 : 1
-  source        = "./modules/gcp"
-  region_key    = "me-west1"
-  region_config = local.gcp_region_configs["me-west1"]
-  default_tags  = var.default_tags
-  vnf_links     = lookup(local.gcp_vnf_links_by_region, "me-west1", [])
-  vnf_sites     = var.vnf_endpoints
+  count           = local.gcp_region_configs["me-west1"] == null ? 0 : 1
+  source          = "./modules/gcp"
+  region_key      = "me-west1"
+  region_config   = local.gcp_region_configs["me-west1"]
+  default_tags    = local.default_tags_with_timestamp
+  vnf_links       = lookup(local.gcp_vnf_links_by_region, "me-west1", [])
+  vnf_sites       = var.vnf_endpoints
+  resource_suffix = local.resource_name_suffix
 
   providers = {
     google      = google.me_west1
@@ -305,10 +340,11 @@ module "gcp_reachability" {
 
   source = "./modules/gcp/reachability"
 
-  region_key = each.key
-  project_id = coalesce(try(each.value.project_id, null), try(local.gcp_project_map[each.key], null))
-  tests      = coalesce(each.value.tests, [])
-  labels     = var.default_tags
+  region_key      = each.key
+  project_id      = coalesce(try(each.value.project_id, null), try(local.gcp_project_map[each.key], null))
+  tests           = coalesce(each.value.tests, [])
+  labels          = local.default_tags_with_timestamp
+  resource_suffix = local.resource_name_suffix
 }
 
 
@@ -321,7 +357,7 @@ module "dns" {
   comment          = try(var.dns.comment, "Skyforge DNS zone")
   private_zone     = try(var.dns.private_zone, false)
   vpc_associations = try(var.dns.vpc_associations, [])
-  tags             = merge(var.default_tags, try(var.dns.tags, {}))
+  tags             = merge(local.default_tags_with_timestamp, try(var.dns.tags, {}))
   records          = try(var.dns.records, {})
 }
 
@@ -715,6 +751,7 @@ module "vnfs" {
   source          = "./modules/shared/vnfs"
   sites           = var.vnf_endpoints
   cloud_manifests = local.cloud_vpn_manifests
+  resource_suffix = local.resource_name_suffix
 }
 
 module "aws_tgw_mesh_us_east_1__eu_central_1" {
@@ -732,9 +769,10 @@ module "aws_tgw_mesh_us_east_1__eu_central_1" {
   peer_route_table_id    = local.aws_transit_gateway_route_table_map["eu-central-1"]
   peer_destination_cidrs = compact([lookup(local.aws_region_cidr_blocks, "us-east-1", null)])
 
-  tags = merge(var.default_tags, {
+  tags = merge(local.default_tags_with_timestamp, {
     SkyforgeRole = "tgw-mesh"
   })
+  resource_suffix = local.resource_name_suffix
 
   providers = {
     aws.requester = aws.us-east-1
@@ -757,9 +795,10 @@ module "aws_tgw_mesh_us_east_1__ap_northeast_1" {
   peer_route_table_id    = local.aws_transit_gateway_route_table_map["ap-northeast-1"]
   peer_destination_cidrs = compact([lookup(local.aws_region_cidr_blocks, "us-east-1", null)])
 
-  tags = merge(var.default_tags, {
+  tags = merge(local.default_tags_with_timestamp, {
     SkyforgeRole = "tgw-mesh"
   })
+  resource_suffix = local.resource_name_suffix
 
   providers = {
     aws.requester = aws.us-east-1
@@ -782,9 +821,10 @@ module "aws_tgw_mesh_us_east_1__me_south_1" {
   peer_route_table_id    = local.aws_transit_gateway_route_table_map["me-south-1"]
   peer_destination_cidrs = compact([lookup(local.aws_region_cidr_blocks, "us-east-1", null)])
 
-  tags = merge(var.default_tags, {
+  tags = merge(local.default_tags_with_timestamp, {
     SkyforgeRole = "tgw-mesh"
   })
+  resource_suffix = local.resource_name_suffix
 
   providers = {
     aws.requester = aws.us-east-1
@@ -807,9 +847,10 @@ module "aws_tgw_mesh_eu_central_1__ap_northeast_1" {
   peer_route_table_id    = local.aws_transit_gateway_route_table_map["ap-northeast-1"]
   peer_destination_cidrs = compact([lookup(local.aws_region_cidr_blocks, "eu-central-1", null)])
 
-  tags = merge(var.default_tags, {
+  tags = merge(local.default_tags_with_timestamp, {
     SkyforgeRole = "tgw-mesh"
   })
+  resource_suffix = local.resource_name_suffix
 
   providers = {
     aws.requester = aws.eu-central-1
@@ -832,9 +873,10 @@ module "aws_tgw_mesh_eu_central_1__me_south_1" {
   peer_route_table_id    = local.aws_transit_gateway_route_table_map["me-south-1"]
   peer_destination_cidrs = compact([lookup(local.aws_region_cidr_blocks, "eu-central-1", null)])
 
-  tags = merge(var.default_tags, {
+  tags = merge(local.default_tags_with_timestamp, {
     SkyforgeRole = "tgw-mesh"
   })
+  resource_suffix = local.resource_name_suffix
 
   providers = {
     aws.requester = aws.eu-central-1
@@ -857,9 +899,10 @@ module "aws_tgw_mesh_ap_northeast_1__me_south_1" {
   peer_route_table_id    = local.aws_transit_gateway_route_table_map["me-south-1"]
   peer_destination_cidrs = compact([lookup(local.aws_region_cidr_blocks, "ap-northeast-1", null)])
 
-  tags = merge(var.default_tags, {
+  tags = merge(local.default_tags_with_timestamp, {
     SkyforgeRole = "tgw-mesh"
   })
+  resource_suffix = local.resource_name_suffix
 
   providers = {
     aws.requester = aws.ap-northeast-1
@@ -902,7 +945,7 @@ resource "aws_globalaccelerator_accelerator" "global_app" {
   enabled         = true
   ip_address_type = "IPV4"
 
-  tags = merge(var.default_tags, {
+  tags = merge(local.default_tags_with_timestamp, {
     Name = "skyforge-global-app"
   })
 }
@@ -1032,7 +1075,7 @@ resource "aws_customer_gateway" "cloud_links_us_east_1" {
   ip_address = local.cloud_link_target_ip_map[each.key][0]
   type       = "ipsec.1"
 
-  tags = merge(var.default_tags, {
+  tags = merge(local.default_tags_with_timestamp, {
     Name         = "skyforge-${each.value.source.region}-${each.value.target.cloud}-${each.key}-cgw"
     SkyforgeRole = "cloud-mesh"
   })
@@ -1051,7 +1094,7 @@ resource "aws_customer_gateway" "cloud_links_eu_central_1" {
   ip_address = local.cloud_link_target_ip_map[each.key][0]
   type       = "ipsec.1"
 
-  tags = merge(var.default_tags, {
+  tags = merge(local.default_tags_with_timestamp, {
     Name         = "skyforge-${each.value.source.region}-${each.value.target.cloud}-${each.key}-cgw"
     SkyforgeRole = "cloud-mesh"
   })
@@ -1070,7 +1113,7 @@ resource "aws_customer_gateway" "cloud_links_ap_northeast_1" {
   ip_address = local.cloud_link_target_ip_map[each.key][0]
   type       = "ipsec.1"
 
-  tags = merge(var.default_tags, {
+  tags = merge(local.default_tags_with_timestamp, {
     Name         = "skyforge-${each.value.source.region}-${each.value.target.cloud}-${each.key}-cgw"
     SkyforgeRole = "cloud-mesh"
   })
@@ -1089,7 +1132,7 @@ resource "aws_customer_gateway" "cloud_links_me_south_1" {
   ip_address = local.cloud_link_target_ip_map[each.key][0]
   type       = "ipsec.1"
 
-  tags = merge(var.default_tags, {
+  tags = merge(local.default_tags_with_timestamp, {
     Name         = "skyforge-${each.value.source.region}-${each.value.target.cloud}-${each.key}-cgw"
     SkyforgeRole = "cloud-mesh"
   })
@@ -1112,7 +1155,7 @@ resource "aws_vpn_connection" "cloud_links_us_east_1" {
   tunnel1_preshared_key = format("A%s", random_password.cloud_link_tunnel1_psk[each.key].result)
   tunnel2_preshared_key = format("A%s", random_password.cloud_link_tunnel2_psk[each.key].result)
 
-  tags = merge(var.default_tags, {
+  tags = merge(local.default_tags_with_timestamp, {
     Name         = "skyforge-${each.value.source.region}-${each.value.target.cloud}-${each.key}-vpn"
     SkyforgeRole = "cloud-mesh"
   })
@@ -1135,7 +1178,7 @@ resource "aws_vpn_connection" "cloud_links_eu_central_1" {
   tunnel1_preshared_key = format("A%s", random_password.cloud_link_tunnel1_psk[each.key].result)
   tunnel2_preshared_key = format("A%s", random_password.cloud_link_tunnel2_psk[each.key].result)
 
-  tags = merge(var.default_tags, {
+  tags = merge(local.default_tags_with_timestamp, {
     Name         = "skyforge-${each.value.source.region}-${each.value.target.cloud}-${each.key}-vpn"
     SkyforgeRole = "cloud-mesh"
   })
@@ -1158,7 +1201,7 @@ resource "aws_vpn_connection" "cloud_links_ap_northeast_1" {
   tunnel1_preshared_key = format("A%s", random_password.cloud_link_tunnel1_psk[each.key].result)
   tunnel2_preshared_key = format("A%s", random_password.cloud_link_tunnel2_psk[each.key].result)
 
-  tags = merge(var.default_tags, {
+  tags = merge(local.default_tags_with_timestamp, {
     Name         = "skyforge-${each.value.source.region}-${each.value.target.cloud}-${each.key}-vpn"
     SkyforgeRole = "cloud-mesh"
   })
@@ -1181,7 +1224,7 @@ resource "aws_vpn_connection" "cloud_links_me_south_1" {
   tunnel1_preshared_key = format("A%s", random_password.cloud_link_tunnel1_psk[each.key].result)
   tunnel2_preshared_key = format("A%s", random_password.cloud_link_tunnel2_psk[each.key].result)
 
-  tags = merge(var.default_tags, {
+  tags = merge(local.default_tags_with_timestamp, {
     Name         = "skyforge-${each.value.source.region}-${each.value.target.cloud}-${each.key}-vpn"
     SkyforgeRole = "cloud-mesh"
   })
@@ -1310,7 +1353,7 @@ resource "azurerm_vpn_site" "cloud_links" {
     }
   }
 
-  tags = merge(var.default_tags, {
+  tags = merge(local.default_tags_with_timestamp, {
     Name         = "vpnsite-skyforge-${each.value.source.region}-to-${each.value.target.region}"
     SkyforgeRole = "cloud-mesh"
   })

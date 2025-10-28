@@ -9,8 +9,10 @@
 data "google_client_config" "current" {}
 
 locals {
-  project_id = coalesce(try(var.region_config.project_id, null), data.google_client_config.current.project)
-  cfg        = try(var.region_config.workloads, {})
+  project_id          = coalesce(try(var.region_config.project_id, null), data.google_client_config.current.project)
+  cfg                 = try(var.region_config.workloads, {})
+  name_prefix         = var.resource_suffix == "" ? "skyforge" : "skyforge-${var.resource_suffix}"
+  name_prefix_compact = var.resource_suffix == "" ? "skyforge" : format("skyforge%s", var.resource_suffix)
 
   gke_cfg       = try(local.cfg.gke, null)
   armor_cfg     = try(local.cfg.cloud_armor, null)
@@ -53,7 +55,7 @@ locals {
 resource "google_container_cluster" "this" {
   count    = local.gke_enabled ? 1 : 0
   project  = local.project_id
-  name     = "skyforge-${var.region_key}-gke"
+  name     = "${local.name_prefix}-${var.region_key}-gke"
   location = var.region_config.region
 
   network    = local.gke_network_id
@@ -82,7 +84,7 @@ resource "google_container_cluster" "this" {
 resource "google_container_node_pool" "this" {
   count      = local.gke_enabled ? 1 : 0
   project    = local.project_id
-  name       = "skyforge-${var.region_key}-pool"
+  name       = "${local.name_prefix}-${var.region_key}-pool"
   location   = var.region_config.region
   cluster    = google_container_cluster.this[0].name
   node_count = try(local.gke_cfg.node_count, 2)
@@ -103,7 +105,7 @@ resource "google_container_node_pool" "this" {
 resource "google_compute_security_policy" "this" {
   count       = local.armor_enabled ? 1 : 0
   project     = local.project_id
-  name        = "skyforge-${var.region_key}-armor"
+  name        = "${local.name_prefix}-${var.region_key}-armor"
   description = "Skyforge baseline Cloud Armor policy"
 
   rule {
@@ -129,7 +131,7 @@ resource "random_id" "bucket_suffix" {
 
 resource "google_storage_bucket" "this" {
   count         = local.storage_enabled ? 1 : 0
-  name          = lower("skyforge-${var.region_key}-${random_id.bucket_suffix[0].hex}")
+  name          = lower(format("%s-%s-%s", local.name_prefix, var.region_key, random_id.bucket_suffix[0].hex))
   project       = local.project_id
   location      = try(local.storage_cfg.location, "US")
   force_destroy = true
@@ -144,7 +146,7 @@ resource "google_cloud_run_service" "this" {
   provider                   = google-beta
   count                      = local.run_enabled ? 1 : 0
   project                    = local.project_id
-  name                       = coalesce(try(local.run_cfg.service_name, null), "skyforge-${var.region_key}-run")
+  name                       = coalesce(try(local.run_cfg.service_name, null), format("%s-%s-run", local.name_prefix, var.region_key))
   location                   = var.region_config.region
   autogenerate_revision_name = true
 
@@ -236,7 +238,7 @@ resource "random_password" "sql" {
 resource "google_sql_database_instance" "this" {
   count            = local.sql_enabled ? 1 : 0
   project          = local.project_id
-  name             = "skyforge-${var.region_key}-sql"
+  name             = "${local.name_prefix}-${var.region_key}-sql"
   region           = try(local.sql_cfg.region, var.region_config.region)
   database_version = try(local.sql_cfg.database_version, "POSTGRES_15")
 
@@ -273,7 +275,7 @@ resource "google_sql_user" "this" {
 resource "google_compute_region_network_endpoint_group" "cloud_run" {
   count                 = local.global_lb_backend_can_cloud_run ? 1 : 0
   project               = local.project_id
-  name                  = "neg-skyforge-${var.region_key}"
+  name                  = "neg-${local.name_prefix}-${var.region_key}"
   region                = var.region_config.region
   network_endpoint_type = "SERVERLESS"
 
@@ -287,7 +289,7 @@ resource "google_compute_region_network_endpoint_group" "cloud_run" {
 resource "google_compute_backend_service" "global" {
   count                 = local.global_lb_backend_can_cloud_run ? 1 : 0
   project               = local.project_id
-  name                  = "skyforge-${var.region_key}-backend"
+  name                  = "${local.name_prefix}-${var.region_key}-backend"
   protocol              = "HTTP"
   port_name             = "http"
   load_balancing_scheme = "EXTERNAL_MANAGED"
@@ -304,7 +306,7 @@ resource "google_compute_backend_service" "global" {
 resource "google_compute_backend_bucket" "global" {
   count       = local.global_lb_backend_can_storage ? 1 : 0
   project     = local.project_id
-  name        = "skyforge-${var.region_key}-backend"
+  name        = "${local.name_prefix}-${var.region_key}-backend"
   bucket_name = google_storage_bucket.this[0].name
   enable_cdn  = try(local.global_lb_cfg.enable_cdn, false)
 }
@@ -312,7 +314,7 @@ resource "google_compute_backend_bucket" "global" {
 resource "google_compute_url_map" "global" {
   count       = local.global_lb_ready ? 1 : 0
   project     = local.project_id
-  name        = "skyforge-${var.region_key}-urlmap"
+  name        = "${local.name_prefix}-${var.region_key}-urlmap"
   description = try(local.global_lb_cfg.description, null)
 
   default_service = local.global_lb_backend_can_cloud_run ? google_compute_backend_service.global[0].self_link : google_compute_backend_bucket.global[0].self_link
@@ -321,21 +323,21 @@ resource "google_compute_url_map" "global" {
 resource "google_compute_target_http_proxy" "global" {
   count   = local.global_lb_ready ? 1 : 0
   project = local.project_id
-  name    = "skyforge-${var.region_key}-http-proxy"
+  name    = "${local.name_prefix}-${var.region_key}-http-proxy"
   url_map = google_compute_url_map.global[0].self_link
 }
 
 resource "google_compute_global_address" "global" {
   count      = local.global_lb_ready ? 1 : 0
   project    = local.project_id
-  name       = "skyforge-${var.region_key}-glb"
+  name       = "${local.name_prefix}-${var.region_key}-glb"
   ip_version = "IPV4"
 }
 
 resource "google_compute_global_forwarding_rule" "global" {
   count                 = local.global_lb_ready ? 1 : 0
   project               = local.project_id
-  name                  = "skyforge-${var.region_key}-http-fr"
+  name                  = "${local.name_prefix}-${var.region_key}-http-fr"
   load_balancing_scheme = "EXTERNAL_MANAGED"
   port_range            = "80"
   target                = google_compute_target_http_proxy.global[0].self_link

@@ -1,6 +1,8 @@
 locals {
-  vpc_map         = var.region_config.vpcs
-  default_vpc_key = contains(keys(var.region_config.vpcs), "shared-services") ? "shared-services" : sort(keys(var.region_config.vpcs))[0]
+  name_prefix         = var.resource_suffix == "" ? "skyforge" : "skyforge-${var.resource_suffix}"
+  name_prefix_compact = var.resource_suffix == "" ? "skyforge" : format("skyforge%s", var.resource_suffix)
+  vpc_map             = var.region_config.vpcs
+  default_vpc_key     = contains(keys(var.region_config.vpcs), "shared-services") ? "shared-services" : sort(keys(var.region_config.vpcs))[0]
 
   subnet_blueprints = flatten([
     for vpc_name, vpc in local.vpc_map : [
@@ -21,7 +23,7 @@ locals {
 
 resource "google_compute_network" "this" {
   for_each                = local.vpc_map
-  name                    = "skyforge-${var.region_key}-${each.key}"
+  name                    = "${local.name_prefix}-${var.region_key}-${each.key}"
   auto_create_subnetworks = false
   routing_mode            = each.value.routing_mode
 }
@@ -68,7 +70,7 @@ locals {
 resource "google_compute_firewall" "tier_allow" {
   for_each = { for vpc_name, vpc in local.vpc_map : vpc_name => vpc if vpc.create_firewall }
 
-  name    = "fw-${var.region_key}-${each.key}-allow"
+  name    = format("fw-%s-%s-%s-allow", local.name_prefix, var.region_key, each.key)
   network = google_compute_network.this[each.key].name
 
   allow {
@@ -77,13 +79,13 @@ resource "google_compute_firewall" "tier_allow" {
   }
 
   source_ranges = [var.region_config.cidr_block]
-  target_tags   = ["skyforge-${each.key}"]
+  target_tags   = [format("%s-%s", local.name_prefix, each.key)]
 }
 
 resource "google_compute_router" "this" {
   for_each = local.vpc_map
 
-  name    = "cr-${var.region_key}-${each.key}"
+  name    = "cr-${local.name_prefix}-${var.region_key}-${each.key}"
   network = google_compute_network.this[each.key].self_link
   region  = var.region_config.region
 
@@ -95,7 +97,7 @@ resource "google_compute_router" "this" {
 resource "google_compute_router_nat" "this" {
   for_each = var.region_config.enable_cloud_natt ? { for router_name in keys(local.vpc_map) : router_name => router_name } : {}
 
-  name   = "nat-${var.region_key}-${each.key}"
+  name   = "nat-${local.name_prefix}-${var.region_key}-${each.key}"
   router = google_compute_router.this[each.key].name
   region = var.region_config.region
 
@@ -105,7 +107,7 @@ resource "google_compute_router_nat" "this" {
 
 resource "google_compute_ha_vpn_gateway" "this" {
   count   = var.region_config.enable_ha_vpn ? 1 : 0
-  name    = "ha-vpn-skyforge-${var.region_key}"
+  name    = "ha-vpn-${local.name_prefix}-${var.region_key}"
   network = google_compute_network.this[local.default_vpc_key].self_link
   region  = var.region_config.region
 }
@@ -136,11 +138,12 @@ module "workloads" {
     google-beta = google-beta
   }
 
-  region_key     = var.region_key
-  region_config  = var.region_config
-  default_tags   = var.default_tags
-  subnet_id_map  = local.subnet_id_map
-  network_id_map = local.network_id_map
+  region_key      = var.region_key
+  region_config   = var.region_config
+  default_tags    = var.default_tags
+  subnet_id_map   = local.subnet_id_map
+  network_id_map  = local.network_id_map
+  resource_suffix = var.resource_suffix
 
   // ensure networks/subnets exist before creating workload resources
   depends_on = [
@@ -166,7 +169,7 @@ resource "random_password" "checkpoint_admin" {
 resource "google_compute_external_vpn_gateway" "vnf" {
   for_each = local.gcp_vnf_link_map
 
-  name            = "ext-gw-skyforge-${var.region_key}-${each.key}"
+  name            = format("ext-gw-%s-%s-%s", local.name_prefix, var.region_key, each.key)
   redundancy_type = "SINGLE_IP_INTERNALLY_REDUNDANT"
   description     = "Skyforge external VNF gateway for ${each.key}"
 
@@ -184,7 +187,7 @@ resource "google_compute_external_vpn_gateway" "vnf" {
 resource "google_compute_vpn_tunnel" "vnf" {
   for_each = local.gcp_vnf_link_map
 
-  name                            = "vpn-skyforge-${var.region_key}-${each.key}"
+  name                            = format("vpn-%s-%s-%s", local.name_prefix, var.region_key, each.key)
   region                          = var.region_config.region
   vpn_gateway                     = google_compute_ha_vpn_gateway.this[0].id
   vpn_gateway_interface           = 0
@@ -203,7 +206,7 @@ resource "google_compute_vpn_tunnel" "vnf" {
 resource "google_compute_router_interface" "vnf" {
   for_each = local.gcp_vnf_link_map
 
-  name       = "if-skyforge-${var.region_key}-${each.key}"
+  name       = format("if-%s-%s-%s", local.name_prefix, var.region_key, each.key)
   router     = google_compute_router.this[local.default_vpc_key].name
   region     = var.region_config.region
   vpn_tunnel = google_compute_vpn_tunnel.vnf[each.key].name
@@ -213,7 +216,7 @@ resource "google_compute_router_interface" "vnf" {
 resource "google_compute_router_peer" "vnf" {
   for_each = local.gcp_vnf_link_map
 
-  name            = "peer-skyforge-${var.region_key}-${each.key}"
+  name            = format("peer-%s-%s-%s", local.name_prefix, var.region_key, each.key)
   router          = google_compute_router.this[local.default_vpc_key].name
   region          = var.region_config.region
   interface       = google_compute_router_interface.vnf[each.key].name
@@ -257,7 +260,7 @@ resource "google_compute_instance" "checkpoint" {
     } : {}
   )
 
-  tags = concat(["skyforge-checkpoint", format("skyforge-%s", var.region_key)], try(local.checkpoint_config.tags, []))
+  tags = concat([format("%s-checkpoint", local.name_prefix), format("%s-%s", local.name_prefix, var.region_key)], try(local.checkpoint_config.tags, []))
 
   dynamic "service_account" {
     for_each = compact([try(local.checkpoint_config.service_account, null)])

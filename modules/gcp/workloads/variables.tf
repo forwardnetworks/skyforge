@@ -23,3 +23,9 @@ variable "network_id_map" {
   description = "Map of VPC name to network ID."
   type        = map(string)
 }
+
+variable "resource_suffix" {
+  description = "Optional suffix appended to workload resource names."
+  type        = string
+  default     = ""
+}

@@ -39,3 +39,9 @@ variable "resource_group_name" {
   type        = string
   default     = null
 }
+
+variable "resource_suffix" {
+  description = "Optional suffix appended to Azure resource names to avoid collisions."
+  type        = string
+  default     = ""
+}

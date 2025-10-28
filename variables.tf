@@ -1131,5 +1131,12 @@ variable "default_tags" {
   default = {
     Project     = "skyforge"
     Environment = "demo"
+    Skyforge    = "true"
   }
+}
+
+variable "deployment_identifier" {
+  description = "Optional identifier (e.g., username, ticket) appended to resource names and tags. When omitted, Skyforge falls back to a timestamp."
+  type        = string
+  default     = ""
 }

@@ -30,6 +30,16 @@ skyforge/
 
 > Copy `.env.local.sample` to `.env.local`, populate cloud credentials, then `source .env.local` before running any Terraform commands.
 
+### Choose a Deployment Identifier
+
+Set a short identifier so every resource name/tag is clearly mapped to your run (helpful in shared sandboxes):
+
+```bash
+export TF_VAR_deployment_identifier="$(whoami)-skyforge"
+```
+
+Only lowercase letters, numbers, and hyphens are preserved; everything else is converted or trimmed. If you skip this variable, Skyforge falls back to a timestamp-based suffix.
+
 ## Deployment Workflow
 
 1. **Initialise Terraform**
@@ -90,16 +100,47 @@ skyforge/
    ```
 
 6. **Destroy after every demo**
-   ```bash
-   terraform destroy \
+  ```bash
+  terraform destroy \
      -var-file="environments/aws/demo.auto.tfvars.json" \
      -var-file="environments/azure/demo.auto.tfvars.json" \
      -var-file="environments/gcp/demo.auto.tfvars.json" \
      -var-file="environments/vnfs/demo.auto.tfvars.json" \
      -var-file="environments/network/demo.mesh.auto.tfvars.json" \
      -var-file="environments/dns/demo.auto.tfvars.json"
-   ```
-   Azure Virtual WAN hubs can take 10–15 minutes to delete; watch `az network vhub show` if destroy is slow.
+  ```
+  Azure Virtual WAN hubs can take 10–15 minutes to delete; watch `az network vhub show` if destroy is slow.
+
+### Running a Single Cloud Slice
+
+Skyforge defaults to launching all three hyperscalers. To stand up only one cloud, override the unused region maps with empty objects and omit unrelated tfvars files. Examples:
+
+- **AWS only**
+  ```bash
+  terraform apply \
+    -var='azure_regions={}' \
+    -var='gcp_regions={}' \
+    -var-file="environments/aws/demo.auto.tfvars.json"
+  ```
+  Destroy with the same `-var` overrides. Mesh/VNF modules reference Azure/GCP endpoints, so leave those tfvars out when they are disabled.
+
+- **Azure only**
+  ```bash
+  terraform apply \
+    -var='aws_regions={}' \
+    -var='gcp_regions={}' \
+    -var-file="environments/azure/demo.auto.tfvars.json"
+  ```
+
+- **GCP only**
+  ```bash
+  terraform apply \
+    -var='aws_regions={}' \
+    -var='azure_regions={}' \
+    -var-file="environments/gcp/demo.auto.tfvars.json"
+  ```
+
+If you need to mix two clouds (for example AWS + Azure), pass both tfvars files and only clear the third cloud's map. The shared VNFs, DNS, and cross-cloud mesh modules assume all three clouds are present—add those components only when the corresponding providers are enabled.
 
 ## Feature Highlights
 

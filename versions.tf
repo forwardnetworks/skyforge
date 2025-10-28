@@ -30,5 +30,9 @@ terraform {
       source  = "hashicorp/local"
       version = "~> 2.5"
     }
+    time = {
+      source  = "hashicorp/time"
+      version = "~> 0.11"
+    }
   }
 }

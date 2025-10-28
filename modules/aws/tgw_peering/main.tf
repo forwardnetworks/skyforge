@@ -1,5 +1,6 @@
 locals {
-  link_name = "tgw-peering-${var.requester_region}-to-${var.peer_region}"
+  name_prefix = var.resource_suffix == "" ? "skyforge" : "skyforge-${var.resource_suffix}"
+  link_name   = "${local.name_prefix}-tgw-peering-${var.requester_region}-to-${var.peer_region}"
 }
 
 resource "aws_ec2_transit_gateway_peering_attachment" "this" {

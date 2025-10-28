@@ -45,3 +45,9 @@ variable "cloud_manifests" {
     }
   }
 }
+
+variable "resource_suffix" {
+  description = "Optional suffix for generated manifest filenames."
+  type        = string
+  default     = ""
+}

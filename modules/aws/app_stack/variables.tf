@@ -13,6 +13,12 @@ variable "default_tags" {
   type        = map(string)
 }
 
+variable "resource_suffix" {
+  description = "Optional timestamp suffix appended to names."
+  type        = string
+  default     = ""
+}
+
 variable "frontend_vpc_id" {
   type        = string
   description = "VPC hosting the frontend/ingress resources."

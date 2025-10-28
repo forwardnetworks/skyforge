@@ -29,3 +29,9 @@ variable "tags" {
   type        = map(string)
   default     = {}
 }
+
+variable "resource_suffix" {
+  description = "Optional suffix appended to reachability Analyzer resource names."
+  type        = string
+  default     = ""
+}

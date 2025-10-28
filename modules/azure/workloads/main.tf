@@ -94,6 +94,8 @@ locals {
     SkyforgeRegion = var.region_key
     SkyforgeRole   = "application"
   })
+  name_prefix         = var.resource_suffix == "" ? "skyforge" : "skyforge-${var.resource_suffix}"
+  name_prefix_compact = var.resource_suffix == "" ? "skyforge" : format("skyforge%s", var.resource_suffix)
 
   aks_subnet_id = local.aks_enabled ? lookup(
     var.subnet_id_map,
@@ -119,7 +121,7 @@ resource "random_string" "storage" {
 resource "azurerm_storage_account" "this" {
   count = local.storage_enabled ? 1 : 0
 
-  name                     = lower(substr(format("skyforge%s%s", var.region_key, random_string.storage[0].result), 0, 24))
+  name                     = lower(substr(format("%s%s%s", local.name_prefix_compact, var.region_key, random_string.storage[0].result), 0, 24))
   resource_group_name      = var.resource_group_name
   location                 = var.location
   account_tier             = split("_", try(local.storage_cfg.sku, "Standard_LRS"))[0]
@@ -127,17 +129,17 @@ resource "azurerm_storage_account" "this" {
   account_kind             = try(local.storage_cfg.kind, "StorageV2")
 
   tags = merge(local.base_tags, {
-    Name = format("skyforge-%s-storage", var.region_key)
+    Name = format("%s-%s-storage", local.name_prefix, var.region_key)
   })
 }
 
 resource "azurerm_kubernetes_cluster" "this" {
   count = local.aks_enabled ? 1 : 0
 
-  name                = format("skyforge-%s-aks", var.region_key)
+  name                = format("%s-%s-aks", local.name_prefix, var.region_key)
   location            = var.location
   resource_group_name = var.resource_group_name
-  dns_prefix          = format("skyforge-%s", var.region_key)
+  dns_prefix          = format("%s-%s", local.name_prefix, var.region_key)
   kubernetes_version  = try(local.aks_cfg.kubernetes_version, null)
 
   default_node_pool {
@@ -164,28 +166,28 @@ resource "azurerm_kubernetes_cluster" "this" {
   }
 
   tags = merge(local.base_tags, {
-    Name = format("skyforge-%s-aks", var.region_key)
+    Name = format("%s-%s-aks", local.name_prefix, var.region_key)
   })
 }
 
 resource "azurerm_public_ip" "app_gateway" {
   count = local.app_gw_enabled ? 1 : 0
 
-  name                = format("pip-skyforge-%s-appgw", var.region_key)
+  name                = format("pip-%s-%s-appgw", local.name_prefix, var.region_key)
   resource_group_name = var.resource_group_name
   location            = var.location
   allocation_method   = "Static"
   sku                 = "Standard"
 
   tags = merge(local.base_tags, {
-    Name = format("pip-skyforge-%s-appgw", var.region_key)
+    Name = format("pip-%s-%s-appgw", local.name_prefix, var.region_key)
   })
 }
 
 resource "azurerm_application_gateway" "this" {
   count = local.app_gw_enabled ? 1 : 0
 
-  name                = format("agw-skyforge-%s", var.region_key)
+  name                = format("agw-%s-%s", local.name_prefix, var.region_key)
   resource_group_name = var.resource_group_name
   location            = var.location
 
@@ -256,28 +258,28 @@ resource "azurerm_application_gateway" "this" {
   }
 
   tags = merge(local.base_tags, {
-    Name = format("agw-skyforge-%s", var.region_key)
+    Name = format("agw-%s-%s", local.name_prefix, var.region_key)
   })
 }
 
 resource "azurerm_public_ip" "load_balancer" {
   count = local.load_balancer_enabled && local.load_balancer_is_public ? 1 : 0
 
-  name                = format("pip-skyforge-%s-lb", var.region_key)
+  name                = format("pip-%s-%s-lb", local.name_prefix, var.region_key)
   resource_group_name = var.resource_group_name
   location            = var.location
   allocation_method   = "Static"
   sku                 = local.load_balancer_sku
 
   tags = merge(local.base_tags, {
-    Name         = format("pip-skyforge-%s-lb", var.region_key)
+    Name         = format("pip-%s-%s-lb", local.name_prefix, var.region_key)
     SkyforgeRole = "load-balancer"
   })
 }
 
 resource "azurerm_lb" "standard" {
   count               = local.load_balancer_enabled ? 1 : 0
-  name                = format("lb-skyforge-%s", var.region_key)
+  name                = format("lb-%s-%s", local.name_prefix, var.region_key)
   resource_group_name = var.resource_group_name
   location            = var.location
   sku                 = local.load_balancer_sku
@@ -301,7 +303,7 @@ resource "azurerm_lb" "standard" {
   }
 
   tags = merge(local.base_tags, {
-    Name = format("lb-skyforge-%s", var.region_key)
+    Name = format("lb-%s-%s", local.name_prefix, var.region_key)
   })
 
   lifecycle {
@@ -375,21 +377,21 @@ resource "azurerm_lb_rule" "standard" {
 resource "azurerm_service_plan" "this" {
   count = local.app_service_enabled ? 1 : 0
 
-  name                = format("asp-skyforge-%s", var.region_key)
+  name                = format("asp-%s-%s", local.name_prefix, var.region_key)
   resource_group_name = var.resource_group_name
   location            = var.location
   os_type             = try(local.app_service_cfg.linux_runtime, true) ? "Linux" : "Windows"
   sku_name            = try(local.app_service_cfg.sku_name, "P1v3")
 
   tags = merge(local.base_tags, {
-    Name = format("asp-skyforge-%s", var.region_key)
+    Name = format("asp-%s-%s", local.name_prefix, var.region_key)
   })
 }
 
 resource "azurerm_linux_web_app" "this" {
   count = local.app_service_enabled && try(local.app_service_cfg.linux_runtime, true) ? 1 : 0
 
-  name                = format("app-skyforge-%s", var.region_key)
+  name                = format("app-%s-%s", local.name_prefix, var.region_key)
   resource_group_name = var.resource_group_name
   location            = var.location
   service_plan_id     = azurerm_service_plan.this[0].id
@@ -403,14 +405,14 @@ resource "azurerm_linux_web_app" "this" {
   }
 
   tags = merge(local.base_tags, {
-    Name = format("app-skyforge-%s", var.region_key)
+    Name = format("app-%s-%s", local.name_prefix, var.region_key)
   })
 }
 
 resource "azurerm_windows_web_app" "this" {
   count = local.app_service_enabled && !try(local.app_service_cfg.linux_runtime, true) ? 1 : 0
 
-  name                = format("app-skyforge-%s", var.region_key)
+  name                = format("app-%s-%s", local.name_prefix, var.region_key)
   resource_group_name = var.resource_group_name
   location            = var.location
   service_plan_id     = azurerm_service_plan.this[0].id
@@ -420,7 +422,7 @@ resource "azurerm_windows_web_app" "this" {
   }
 
   tags = merge(local.base_tags, {
-    Name = format("app-skyforge-%s", var.region_key)
+    Name = format("app-%s-%s", local.name_prefix, var.region_key)
   })
 }
 
@@ -441,7 +443,7 @@ locals {
 resource "azurerm_mssql_server" "this" {
   count = local.sql_enabled ? 1 : 0
 
-  name                         = lower(format("sql-skyforge-%s", var.region_key))
+  name                         = lower(format("sql-%s-%s", local.name_prefix_compact, var.region_key))
   resource_group_name          = var.resource_group_name
   location                     = var.location
   version                      = "12.0"
@@ -460,21 +462,21 @@ resource "azurerm_mssql_server" "this" {
   }
 
   tags = merge(local.base_tags, {
-    Name = format("sql-skyforge-%s", var.region_key)
+    Name = format("sql-%s-%s", local.name_prefix, var.region_key)
   })
 }
 
 resource "azurerm_mssql_database" "this" {
   count = local.sql_enabled ? 1 : 0
 
-  name           = format("sqldb-skyforge-%s", var.region_key)
+  name           = format("sqldb-%s-%s", local.name_prefix, var.region_key)
   server_id      = azurerm_mssql_server.this[0].id
   sku_name       = try(local.sql_cfg.sku_name, "GP_Gen5_2")
   max_size_gb    = try(local.sql_cfg.max_size_gb, 32)
   zone_redundant = false
 
   tags = merge(local.base_tags, {
-    Name = format("sqldb-skyforge-%s", var.region_key)
+    Name = format("sqldb-%s-%s", local.name_prefix, var.region_key)
   })
 }
 
@@ -485,18 +487,18 @@ resource "azurerm_mssql_database" "this" {
 resource "azurerm_cdn_frontdoor_profile" "this" {
   count = local.front_door_enabled ? 1 : 0
 
-  name                = lower(coalesce(try(local.front_door_cfg.profile_name, null), format("fdp-skyforge-%s", var.region_key)))
+  name                = lower(coalesce(try(local.front_door_cfg.profile_name, null), format("fdp-%s-%s", local.name_prefix_compact, var.region_key)))
   resource_group_name = var.resource_group_name
   sku_name            = try(local.front_door_cfg.sku_name, "Standard_AzureFrontDoor")
 
   tags = merge(local.base_tags, {
-    Name = format("fdp-skyforge-%s", var.region_key)
+    Name = format("fdp-%s-%s", local.name_prefix, var.region_key)
   })
 }
 
 resource "azurerm_cdn_frontdoor_endpoint" "this" {
   count                    = local.front_door_enabled ? 1 : 0
-  name                     = lower(coalesce(try(local.front_door_cfg.endpoint_name, null), format("fde-skyforge-%s", var.region_key)))
+  name                     = lower(coalesce(try(local.front_door_cfg.endpoint_name, null), format("fde-%s-%s", local.name_prefix_compact, var.region_key)))
   cdn_frontdoor_profile_id = azurerm_cdn_frontdoor_profile.this[0].id
   enabled                  = true
 }

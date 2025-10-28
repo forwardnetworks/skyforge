@@ -1,5 +1,6 @@
 locals {
-  resource_group_name = coalesce(var.resource_group_name, "rg-skyforge-${var.region_key}")
+  name_prefix         = var.resource_suffix == "" ? "skyforge" : "skyforge-${var.resource_suffix}"
+  resource_group_name = coalesce(var.resource_group_name, "rg-${local.name_prefix}-${var.region_key}")
 }
 
 resource "azurerm_resource_group" "region" {
@@ -20,12 +21,12 @@ locals {
 resource "azurerm_network_watcher" "this" {
   count = local.network_watcher_enabled ? 1 : 0
 
-  name                = "nw-skyforge-${var.region_key}"
+  name                = "nw-${local.name_prefix}-${var.region_key}"
   location            = var.region_config.location
   resource_group_name = local.resource_group_name
 
   tags = merge(var.default_tags, {
-    Name           = "nw-skyforge-${var.region_key}"
+    Name           = "nw-${local.name_prefix}-${var.region_key}"
     SkyforgeRegion = var.region_key
   })
 }
@@ -150,14 +151,14 @@ resource "azurerm_subnet" "this" {
 resource "azurerm_public_ip" "nat" {
   for_each = local.nat_gateway_map
 
-  name                = format("pip-skyforge-%s-%s-nat", var.region_key, each.key)
+  name                = format("pip-%s-%s-%s-nat", local.name_prefix, var.region_key, each.key)
   location            = var.region_config.location
   resource_group_name = local.resource_group_name
   allocation_method   = "Static"
   sku                 = "Standard"
 
   tags = merge(var.default_tags, {
-    Name           = format("pip-skyforge-%s-%s-nat", var.region_key, each.key)
+    Name           = format("pip-%s-%s-%s-nat", local.name_prefix, var.region_key, each.key)
     SkyforgeRegion = var.region_key
     SkyforgeRole   = "nat-gateway"
   })
@@ -166,14 +167,14 @@ resource "azurerm_public_ip" "nat" {
 resource "azurerm_nat_gateway" "this" {
   for_each = local.nat_gateway_map
 
-  name                    = format("nat-skyforge-%s-%s", var.region_key, each.key)
+  name                    = format("nat-%s-%s-%s", local.name_prefix, var.region_key, each.key)
   location                = var.region_config.location
   resource_group_name     = local.resource_group_name
   sku_name                = "Standard"
   idle_timeout_in_minutes = 10
 
   tags = merge(var.default_tags, {
-    Name           = format("nat-skyforge-%s-%s", var.region_key, each.key)
+    Name           = format("nat-%s-%s-%s", local.name_prefix, var.region_key, each.key)
     SkyforgeRegion = var.region_key
     SkyforgeRole   = "nat-gateway"
   })
@@ -198,33 +199,33 @@ resource "azurerm_subnet_nat_gateway_association" "this" {
 
 resource "azurerm_public_ip" "firewall" {
   count               = var.region_config.enable_firewall ? 1 : 0
-  name                = "pip-skyforge-${var.region_key}-azfw"
+  name                = "pip-${local.name_prefix}-${var.region_key}-azfw"
   location            = var.region_config.location
   resource_group_name = local.resource_group_name
   allocation_method   = "Static"
   sku                 = "Standard"
 
   tags = merge(var.default_tags, {
-    Name = "pip-skyforge-${var.region_key}-azfw"
+    Name = "pip-${local.name_prefix}-${var.region_key}-azfw"
   })
 }
 
 resource "azurerm_virtual_wan" "this" {
   count = var.region_config.enable_virtual_wan ? 1 : 0
 
-  name                = "vwan-skyforge-${var.region_key}"
+  name                = "vwan-${local.name_prefix}-${var.region_key}"
   resource_group_name = local.resource_group_name
   location            = var.region_config.location
 
   tags = merge(var.default_tags, {
-    Name = "vwan-skyforge-${var.region_key}"
+    Name = "vwan-${local.name_prefix}-${var.region_key}"
   })
 }
 
 resource "azurerm_virtual_hub" "this" {
   count = var.region_config.enable_virtual_wan ? 1 : 0
 
-  name                = "vhub-skyforge-${var.region_key}"
+  name                = "vhub-${local.name_prefix}-${var.region_key}"
   resource_group_name = local.resource_group_name
   location            = var.region_config.location
   address_prefix      = coalesce(try(var.region_config.virtual_hub_address_prefix, null), cidrsubnet(var.region_config.cidr_block, 4, 15))
@@ -235,7 +236,7 @@ resource "azurerm_virtual_hub" "this" {
 resource "azurerm_vpn_gateway" "this" {
   count = var.region_config.enable_virtual_wan ? 1 : 0
 
-  name                = "vpngw-skyforge-${var.region_key}"
+  name                = "vpngw-${local.name_prefix}-${var.region_key}"
   location            = var.region_config.location
   resource_group_name = local.resource_group_name
   virtual_hub_id      = azurerm_virtual_hub.this[0].id
@@ -247,14 +248,14 @@ resource "azurerm_vpn_gateway" "this" {
   }
 
   tags = merge(var.default_tags, {
-    Name = "vpngw-skyforge-${var.region_key}"
+    Name = "vpngw-${local.name_prefix}-${var.region_key}"
   })
 }
 
 resource "azurerm_virtual_hub_connection" "this" {
   for_each = var.region_config.enable_virtual_wan ? azurerm_virtual_network.this : {}
 
-  name                      = "vhc-skyforge-${var.region_key}-${each.key}"
+  name                      = "vhc-${local.name_prefix}-${var.region_key}-${each.key}"
   virtual_hub_id            = azurerm_virtual_hub.this[0].id
   remote_virtual_network_id = each.value.id
   internet_security_enabled = false
@@ -270,12 +271,12 @@ resource "azurerm_virtual_hub_connection" "this" {
 
 resource "azurerm_firewall_policy" "this" {
   count               = var.region_config.enable_firewall ? 1 : 0
-  name                = "fp-skyforge-${var.region_key}"
+  name                = "fp-${local.name_prefix}-${var.region_key}"
   location            = var.region_config.location
   resource_group_name = local.resource_group_name
   sku                 = "Standard"
   tags = merge(var.default_tags, {
-    Name = "fp-skyforge-${var.region_key}"
+    Name = "fp-${local.name_prefix}-${var.region_key}"
   })
 }
 
@@ -305,7 +306,7 @@ locals {
   ]
 
   firewall_default_network_collection = {
-    name     = "skyforge-net-allow"
+    name     = "${local.name_prefix}-net-allow"
     priority = 200
     action   = "Allow"
     rules = [
@@ -375,7 +376,7 @@ locals {
 
 resource "azurerm_firewall_policy_rule_collection_group" "this" {
   count              = var.region_config.enable_firewall ? 1 : 0
-  name               = "rcg-skyforge-${var.region_key}"
+  name               = "rcg-${local.name_prefix}-${var.region_key}"
   priority           = 100
   firewall_policy_id = azurerm_firewall_policy.this[0].id
 
@@ -469,14 +470,14 @@ resource "random_password" "asa_admin" {
 resource "azurerm_public_ip" "asa" {
   count = local.asa_enabled ? 1 : 0
 
-  name                = format("pip-skyforge-%s-asa", var.region_key)
+  name                = format("pip-%s-%s-asa", local.name_prefix, var.region_key)
   location            = var.region_config.location
   resource_group_name = local.resource_group_name
   allocation_method   = "Static"
   sku                 = "Standard"
 
   tags = merge(var.default_tags, {
-    Name           = format("pip-skyforge-%s-asa", var.region_key)
+    Name           = format("pip-%s-%s-asa", local.name_prefix, var.region_key)
     SkyforgeRegion = var.region_key
     SkyforgeRole   = "nva"
   })
@@ -485,7 +486,7 @@ resource "azurerm_public_ip" "asa" {
 resource "azurerm_network_interface" "asa" {
   count = local.asa_enabled ? 1 : 0
 
-  name                = format("nic-skyforge-%s-asa", var.region_key)
+  name                = format("nic-%s-%s-asa", local.name_prefix, var.region_key)
   location            = var.region_config.location
   resource_group_name = local.resource_group_name
 
@@ -497,7 +498,7 @@ resource "azurerm_network_interface" "asa" {
   }
 
   tags = merge(var.default_tags, {
-    Name           = format("nic-skyforge-%s-asa", var.region_key)
+    Name           = format("nic-%s-%s-asa", local.name_prefix, var.region_key)
     SkyforgeRegion = var.region_key
     SkyforgeRole   = "nva"
   })
@@ -513,7 +514,7 @@ resource "azurerm_network_interface" "asa" {
 resource "azurerm_linux_virtual_machine" "asa" {
   count = local.asa_enabled ? 1 : 0
 
-  name                = format("vm-skyforge-%s-asa", var.region_key)
+  name                = format("vm-%s-%s-asa", local.name_prefix, var.region_key)
   location            = var.region_config.location
   resource_group_name = local.resource_group_name
   size                = coalesce(try(local.asa_config.vm_size, null), "Standard_D4s_v5")
@@ -533,7 +534,7 @@ resource "azurerm_linux_virtual_machine" "asa" {
   }
 
   os_disk {
-    name                 = format("osdisk-skyforge-%s-asa", var.region_key)
+    name                 = format("osdisk-%s-%s-asa", local.name_prefix, var.region_key)
     caching              = "ReadWrite"
     storage_account_type = "Standard_LRS"
   }
@@ -545,7 +546,7 @@ resource "azurerm_linux_virtual_machine" "asa" {
   )
 
   tags = merge(var.default_tags, {
-    Name           = format("vm-skyforge-%s-asa", var.region_key)
+    Name           = format("vm-%s-%s-asa", local.name_prefix, var.region_key)
     SkyforgeRegion = var.region_key
     SkyforgeRole   = "nva"
     Vendor         = "Cisco"
@@ -589,7 +590,7 @@ resource "azurerm_private_endpoint" "this" {
     name => cfg if lookup(local.private_endpoint_subnets, name, null) != null
   }
 
-  name                = format("pep-skyforge-%s-%s", var.region_key, each.key)
+  name                = format("pep-%s-%s-%s", local.name_prefix, var.region_key, each.key)
   location            = var.region_config.location
   resource_group_name = local.resource_group_name
   subnet_id           = local.private_endpoint_subnets[each.key]
@@ -613,7 +614,7 @@ resource "azurerm_private_endpoint" "this" {
   }
 
   tags = merge(var.default_tags, {
-    Name           = format("pep-skyforge-%s-%s", var.region_key, each.key)
+    Name           = format("pep-%s-%s-%s", local.name_prefix, var.region_key, each.key)
     SkyforgeRegion = var.region_key
     SkyforgeRole   = "private-endpoint"
   })
@@ -621,7 +622,7 @@ resource "azurerm_private_endpoint" "this" {
 
 resource "azurerm_firewall" "this" {
   count               = var.region_config.enable_firewall ? 1 : 0
-  name                = "azfw-skyforge-${var.region_key}"
+  name                = "azfw-${local.name_prefix}-${var.region_key}"
   location            = var.region_config.location
   resource_group_name = local.resource_group_name
   sku_name            = "AZFW_VNet"
@@ -636,7 +637,7 @@ resource "azurerm_firewall" "this" {
   }
 
   tags = merge(var.default_tags, {
-    Name = "azfw-skyforge-${var.region_key}"
+    Name = "azfw-${local.name_prefix}-${var.region_key}"
   })
 }
 
@@ -663,6 +664,7 @@ module "workloads" {
   subnet_id_map       = local.subnet_id_map
   vnet_id_map         = local.vnet_id_map
   firewall_private_ip = length(azurerm_firewall.this) > 0 ? azurerm_firewall.this[0].ip_configuration[0].private_ip_address : null
+  resource_suffix     = var.resource_suffix
 
   providers = {
     azurerm = azurerm
@@ -722,12 +724,12 @@ locals {
 resource "azurerm_route_table" "nva" {
   for_each = local.nva_chain_enabled ? local.nva_route_collections_enriched : {}
 
-  name                = "rt-skyforge-${var.region_key}-${each.key}-nva"
+  name                = "rt-${local.name_prefix}-${var.region_key}-${each.key}-nva"
   location            = var.region_config.location
   resource_group_name = local.resource_group_name
 
   tags = merge(var.default_tags, {
-    Name           = "rt-skyforge-${var.region_key}-${each.key}-nva"
+    Name           = "rt-${local.name_prefix}-${var.region_key}-${each.key}-nva"
     SkyforgeRegion = var.region_key
     SkyforgeVNet   = each.key
   })
@@ -823,7 +825,7 @@ resource "random_password" "vnf_link_psk" {
 resource "azurerm_vpn_site" "vnf" {
   for_each = local.azure_vnf_link_map
 
-  name                = "vpnsite-skyforge-${var.region_key}-${each.key}"
+  name                = "vpnsite-${local.name_prefix}-${var.region_key}-${each.key}"
   location            = var.region_config.location
   resource_group_name = local.resource_group_name
   virtual_wan_id      = azurerm_virtual_wan.this[0].id
@@ -844,7 +846,7 @@ resource "azurerm_vpn_site" "vnf" {
   }
 
   tags = merge(var.default_tags, {
-    Name         = "vpnsite-skyforge-${var.region_key}-${each.key}"
+    Name         = "vpnsite-${local.name_prefix}-${var.region_key}-${each.key}"
     SkyforgeSite = each.key
   })
 }
@@ -852,7 +854,7 @@ resource "azurerm_vpn_site" "vnf" {
 resource "azurerm_vpn_gateway_connection" "vnf" {
   for_each = local.azure_vnf_link_map
 
-  name                      = "vpnconn-skyforge-${var.region_key}-${each.key}"
+  name                      = "vpnconn-${local.name_prefix}-${var.region_key}-${each.key}"
   vpn_gateway_id            = azurerm_vpn_gateway.this[0].id
   remote_vpn_site_id        = azurerm_vpn_site.vnf[each.key].id
   internet_security_enabled = false

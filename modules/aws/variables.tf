@@ -33,3 +33,9 @@ variable "vnf_sites" {
   type        = map(any)
   default     = {}
 }
+
+variable "resource_suffix" {
+  description = "Optional suffix appended to all nameable AWS resources."
+  type        = string
+  default     = ""
+}

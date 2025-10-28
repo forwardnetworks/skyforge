@@ -3,19 +3,20 @@ locals {
     for test in var.tests :
     test.name => test
   }
+  name_prefix = var.resource_suffix == "" ? "skyforge" : "skyforge-${var.resource_suffix}"
 }
 
 resource "azurerm_network_connection_monitor" "this" {
   for_each = local.test_map
 
-  name               = "ncm-${var.region_key}-${replace(each.key, "[^A-Za-z0-9]", "")}"
+  name               = format("ncm-%s-%s", local.name_prefix, replace(each.key, "[^A-Za-z0-9]", ""))
   location           = var.location
   network_watcher_id = var.network_watcher_id
   notes              = try(each.value.description, null)
 
   tags = {
     for k, v in merge(var.tags, {
-      Name           = "skyforge-${var.region_key}-${each.key}-connmon"
+      Name           = format("%s-%s-%s-connmon", local.name_prefix, var.region_key, each.key)
       SkyforgeRegion = var.region_key
     }) :
     k => v if v != null

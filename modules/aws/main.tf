@@ -38,6 +38,7 @@ locals {
 
   fortinet_enabled   = local.inspection_vpc_name != null && local.fortinet_config != null && try(local.fortinet_config.enable, false) && try(local.fortinet_config.ami_id, null) != null
   checkpoint_enabled = local.inspection_vpc_name != null && local.checkpoint_config != null && try(local.checkpoint_config.enable, false) && try(local.checkpoint_config.ami_id, null) != null
+  name_prefix        = var.resource_suffix == "" ? "skyforge" : "skyforge-${var.resource_suffix}"
 }
 
 data "aws_ami" "paloalto_gwlb" {
@@ -74,7 +75,7 @@ resource "aws_vpc" "this" {
   enable_dns_hostnames             = true
 
   tags = merge(var.default_tags, {
-    Name           = "skyforge-${var.region_key}-${each.key}-vpc"
+    Name           = "${local.name_prefix}-${var.region_key}-${each.key}-vpc"
     SkyforgeVPC    = each.key
     SkyforgeRegion = var.region_key
   })
@@ -89,7 +90,7 @@ resource "aws_subnet" "this" {
   map_public_ip_on_launch = contains(["ingress", "public", "frontend"], each.value.tier)
 
   tags = merge(var.default_tags, {
-    Name             = "skyforge-${var.region_key}-${each.value.vpc_name}-${each.value.tier}-${each.value.az}"
+    Name             = "${local.name_prefix}-${var.region_key}-${each.value.vpc_name}-${each.value.tier}-${each.value.az}"
     Tier             = each.value.tier
     AvailabilityZone = each.value.az
     SkyforgeRegion   = var.region_key
@@ -103,7 +104,7 @@ resource "aws_internet_gateway" "this" {
   vpc_id = aws_vpc.this[each.key].id
 
   tags = merge(var.default_tags, {
-    Name = "skyforge-${var.region_key}-${each.key}-igw"
+    Name = "${local.name_prefix}-${var.region_key}-${each.key}-igw"
   })
 }
 
@@ -118,7 +119,7 @@ resource "aws_ec2_transit_gateway" "this" {
   vpn_ecmp_support                = "enable"
 
   tags = merge(var.default_tags, {
-    Name = "skyforge-${var.region_key}-tgw"
+    Name = "${local.name_prefix}-${var.region_key}-tgw"
   })
 }
 
@@ -134,7 +135,7 @@ resource "aws_ec2_transit_gateway_vpc_attachment" "this" {
   vpc_id             = aws_vpc.this[each.key].id
 
   tags = merge(var.default_tags, {
-    Name = "skyforge-${var.region_key}-${each.key}-tgw-attachment"
+    Name = "${local.name_prefix}-${var.region_key}-${each.key}-tgw-attachment"
   })
 
   depends_on = [aws_subnet.this]
@@ -148,7 +149,7 @@ resource "aws_ec2_transit_gateway_connect" "this" {
   protocol                = lower(try(local.transit_gateway_connect_config.protocol, "gre"))
 
   tags = merge(var.default_tags, {
-    Name = "skyforge-${var.region_key}-tgw-connect"
+    Name = "${local.name_prefix}-${var.region_key}-tgw-connect"
   })
 }
 
@@ -162,7 +163,7 @@ resource "aws_ec2_transit_gateway_connect_peer" "this" {
   transit_gateway_address       = local.transit_gateway_connect_tgw_ip
 
   tags = merge(var.default_tags, {
-    Name = "skyforge-${var.region_key}-tgw-connect-peer"
+    Name = "${local.name_prefix}-${var.region_key}-tgw-connect-peer"
   })
 }
 
@@ -184,7 +185,7 @@ module "paloalto_gwlb" {
   iam_instance_profile = try(local.gwlb_config.iam_instance_profile, null)
   user_data            = try(local.gwlb_config.user_data, null)
   bootstrap            = try(local.gwlb_config.bootstrap, null)
-  name_prefix          = try(local.gwlb_config.name_prefix, "skyforge-palo")
+  name_prefix          = try(local.gwlb_config.name_prefix, "${local.name_prefix}-palo")
   allowed_principals   = try(local.gwlb_config.allowed_principals, [])
 }
 
@@ -204,7 +205,7 @@ module "transit_gateway_connect_connector" {
     SkyforgeRegion = var.region_key
     SkyforgeRole   = "tgw-connect"
   }
-  name_prefix          = try(local.transit_gateway_connect_connector_config.name_prefix, "skyforge-${var.region_key}-fortinet")
+  name_prefix          = try(local.transit_gateway_connect_connector_config.name_prefix, "${local.name_prefix}-${var.region_key}-fortinet")
   ami_id               = try(local.transit_gateway_connect_connector_config.ami_id, null)
   ami_product_code     = try(local.transit_gateway_connect_connector_config.ami_product_code, "cyxc6cynd1msb41uz9fou0byi")
   instance_type        = try(local.transit_gateway_connect_connector_config.instance_type, "c5.xlarge")
@@ -360,7 +361,7 @@ resource "aws_ec2_transit_gateway_route_table" "inspection" {
   transit_gateway_id = aws_ec2_transit_gateway.this[0].id
 
   tags = merge(var.default_tags, {
-    Name           = "skyforge-${var.region_key}-tgw-inspection"
+    Name           = "${local.name_prefix}-${var.region_key}-tgw-inspection"
     SkyforgeRegion = var.region_key
     SkyforgeRole   = "tgw-route-table"
   })
@@ -372,7 +373,7 @@ resource "aws_ec2_transit_gateway_route_table" "appliance" {
   transit_gateway_id = aws_ec2_transit_gateway.this[0].id
 
   tags = merge(var.default_tags, {
-    Name           = "skyforge-${var.region_key}-tgw-appliance"
+    Name           = "${local.name_prefix}-${var.region_key}-tgw-appliance"
     SkyforgeRegion = var.region_key
     SkyforgeRole   = "tgw-route-table"
   })
@@ -506,7 +507,7 @@ resource "aws_networkfirewall_rule_group" "stateful" {
   count = local.network_firewall_enabled ? 1 : 0
 
   capacity = 100
-  name     = "skyforge-${var.region_key}-stateful"
+  name     = "${local.name_prefix}-${var.region_key}-stateful"
   type     = "STATEFUL"
 
   rule_group {
@@ -520,7 +521,7 @@ resource "aws_networkfirewall_rule_group" "stateless" {
   count = local.network_firewall_enabled ? 1 : 0
 
   capacity = 100
-  name     = "skyforge-${var.region_key}-stateless"
+  name     = "${local.name_prefix}-${var.region_key}-stateless"
   type     = "STATELESS"
 
   rule_group {
@@ -578,7 +579,7 @@ resource "aws_networkfirewall_rule_group" "stateless" {
 resource "aws_networkfirewall_firewall_policy" "this" {
   count = local.network_firewall_enabled ? 1 : 0
 
-  name = "skyforge-${var.region_key}-firewall-policy"
+  name = "${local.name_prefix}-${var.region_key}-firewall-policy"
 
   firewall_policy {
     stateful_engine_options {
@@ -602,7 +603,7 @@ resource "aws_networkfirewall_firewall_policy" "this" {
 resource "aws_networkfirewall_firewall" "this" {
   count = local.network_firewall_enabled ? 1 : 0
 
-  name                = "skyforge-${var.region_key}-firewall"
+  name                = "${local.name_prefix}-${var.region_key}-firewall"
   firewall_policy_arn = aws_networkfirewall_firewall_policy.this[0].arn
   vpc_id              = aws_vpc.this[local.network_firewall_inspection_vpc].id
 
@@ -614,18 +615,18 @@ resource "aws_networkfirewall_firewall" "this" {
   }
 
   tags = merge(var.default_tags, {
-    Name = "skyforge-${var.region_key}-network-firewall"
+    Name = "${local.name_prefix}-${var.region_key}-network-firewall"
   })
 }
 
 resource "aws_cloudwatch_log_group" "network_firewall" {
   count = local.network_firewall_enabled ? 1 : 0
 
-  name              = "/aws/network-firewall/skyforge-${var.region_key}"
+  name              = "/aws/network-firewall/${local.name_prefix}-${var.region_key}"
   retention_in_days = 14
 
   tags = merge(var.default_tags, {
-    Name = "skyforge-${var.region_key}-network-firewall"
+    Name = "${local.name_prefix}-${var.region_key}-network-firewall"
   })
 }
 
@@ -656,7 +657,7 @@ resource "aws_networkfirewall_logging_configuration" "this" {
 resource "aws_security_group" "extra" {
   for_each = local.extra_security_group_map
 
-  name        = "skyforge-${var.region_key}-${each.key}-sg"
+  name        = "${local.name_prefix}-${var.region_key}-${each.key}-sg"
   description = trimspace(coalesce(try(each.value.description, null), "Skyforge ${each.key} security group"))
   vpc_id      = aws_vpc.this[each.value.vpc].id
 
@@ -685,7 +686,7 @@ resource "aws_security_group" "extra" {
   }
 
   tags = merge(var.default_tags, {
-    Name           = "skyforge-${var.region_key}-${each.key}-sg"
+    Name           = "${local.name_prefix}-${var.region_key}-${each.key}-sg"
     SkyforgeRegion = var.region_key
     SkyforgeRole   = "security"
   })
@@ -694,7 +695,7 @@ resource "aws_security_group" "extra" {
 resource "aws_security_group" "interface_endpoints" {
   for_each = local.interface_endpoint_map
 
-  name        = "skyforge-${var.region_key}-${each.key}-vpce-sg"
+  name        = "${local.name_prefix}-${var.region_key}-${each.key}-vpce-sg"
   description = "Security group for VPC interface endpoint ${each.key}"
   vpc_id      = aws_vpc.this[each.value.vpc].id
 
@@ -714,7 +715,7 @@ resource "aws_security_group" "interface_endpoints" {
   }
 
   tags = merge(var.default_tags, {
-    Name           = "skyforge-${var.region_key}-${each.key}-vpce-sg"
+    Name           = "${local.name_prefix}-${var.region_key}-${each.key}-vpce-sg"
     SkyforgeRegion = var.region_key
     SkyforgeRole   = "vpc-endpoint"
   })
@@ -731,7 +732,7 @@ resource "aws_vpc_endpoint" "interface" {
   private_dns_enabled = try(each.value.private_dns_enabled, true)
 
   tags = merge(var.default_tags, {
-    Name           = "skyforge-${var.region_key}-${each.key}-vpce"
+    Name           = "${local.name_prefix}-${var.region_key}-${each.key}-vpce"
     SkyforgeRegion = var.region_key
     SkyforgeRole   = "vpc-endpoint"
   })
@@ -752,7 +753,7 @@ resource "aws_eip" "nat" {
   domain = "vpc"
 
   tags = merge(var.default_tags, {
-    Name           = "skyforge-${var.region_key}-${each.key}-nat-eip"
+    Name           = "${local.name_prefix}-${var.region_key}-${each.key}-nat-eip"
     SkyforgeRegion = var.region_key
     SkyforgeRole   = "nat-gateway"
   })
@@ -765,7 +766,7 @@ resource "aws_nat_gateway" "this" {
   subnet_id     = local.nat_gateway_public_subnet_map[each.key][0]
 
   tags = merge(var.default_tags, {
-    Name           = "skyforge-${var.region_key}-${each.key}-nat"
+    Name           = "${local.name_prefix}-${var.region_key}-${each.key}-nat"
     SkyforgeRegion = var.region_key
     SkyforgeRole   = "nat-gateway"
   })
@@ -786,7 +787,7 @@ resource "aws_route_table" "nat_private" {
   vpc_id = aws_vpc.this[local.nat_gateway_definition_map[each.value.nat_name].vpc].id
 
   tags = merge(var.default_tags, {
-    Name           = "skyforge-${var.region_key}-${each.key}-rt"
+    Name           = "${local.name_prefix}-${var.region_key}-${each.key}-rt"
     SkyforgeRegion = var.region_key
     SkyforgeRole   = "nat-route"
   })
@@ -815,7 +816,7 @@ resource "aws_vpc_peering_connection" "this" {
   auto_accept = true
   peer_region = try(each.value.peer_region, null)
   tags = merge(var.default_tags, {
-    Name           = "skyforge-${var.region_key}-${each.key}-peering"
+    Name           = "${local.name_prefix}-${var.region_key}-${each.key}-peering"
     SkyforgeRegion = var.region_key
     SkyforgeRole   = "vpc-peering"
   })
@@ -840,7 +841,7 @@ resource "aws_route" "vpc_peering_b" {
 resource "aws_ec2_managed_prefix_list" "this" {
   for_each = local.managed_prefix_list_map
 
-  name           = "skyforge-${var.region_key}-${each.key}-pl"
+  name           = "${local.name_prefix}-${var.region_key}-${each.key}-pl"
   address_family = "IPv4"
   max_entries    = try(each.value.max_entries, length(each.value.entries))
 
@@ -853,7 +854,7 @@ resource "aws_ec2_managed_prefix_list" "this" {
   }
 
   tags = merge(var.default_tags, {
-    Name           = "skyforge-${var.region_key}-${each.key}-pl"
+    Name           = "${local.name_prefix}-${var.region_key}-${each.key}-pl"
     SkyforgeRegion = var.region_key
     SkyforgeRole   = "managed-prefix-list"
   })
@@ -865,7 +866,7 @@ resource "aws_network_acl" "extra" {
   vpc_id = aws_vpc.this[each.value.vpc].id
 
   tags = merge(var.default_tags, {
-    Name           = "skyforge-${var.region_key}-${each.key}-acl"
+    Name           = "${local.name_prefix}-${var.region_key}-${each.key}-acl"
     SkyforgeRegion = var.region_key
     SkyforgeRole   = "security"
   })
@@ -963,6 +964,7 @@ module "app_stack" {
   frontend_subnet_ids = local.app_frontend_subnets
   app_subnet_ids      = local.app_app_subnets
   data_subnet_ids     = local.app_data_subnets
+  resource_suffix     = var.resource_suffix
 }
 
 module "fortinet_firewalls" {
@@ -974,7 +976,7 @@ module "fortinet_firewalls" {
     aws = aws
   }
 
-  name_prefix          = format("%s-%s", try(local.fortinet_config.name_prefix, "skyforge-fortinet"), var.region_key)
+  name_prefix          = format("%s-%s", try(local.fortinet_config.name_prefix, "${local.name_prefix}-fortinet"), var.region_key)
   vpc_id               = aws_vpc.this[local.inspection_vpc_name].id
   subnet_ids           = local.inspection_subnet_ids
   ami_id               = try(local.fortinet_config.ami_id, "")
@@ -997,7 +999,7 @@ module "checkpoint_firewalls" {
     aws = aws
   }
 
-  name_prefix          = format("%s-%s", try(local.checkpoint_config.name_prefix, "skyforge-checkpoint"), var.region_key)
+  name_prefix          = format("%s-%s", try(local.checkpoint_config.name_prefix, "${local.name_prefix}-checkpoint"), var.region_key)
   vpc_id               = aws_vpc.this[local.inspection_vpc_name].id
   subnet_ids           = local.inspection_subnet_ids
   ami_id               = try(local.checkpoint_config.ami_id, "")
@@ -1063,7 +1065,7 @@ resource "aws_customer_gateway" "vnf" {
   type       = "ipsec.1"
 
   tags = merge(var.default_tags, {
-    Name         = "skyforge-${var.region_key}-${each.key}-cgw"
+    Name         = "${local.name_prefix}-${var.region_key}-${each.key}-cgw"
     SkyforgeSite = each.key
     SkyforgeRole = "vpn-hub"
   })
@@ -1081,7 +1083,7 @@ resource "aws_vpn_connection" "vnf" {
   tunnel2_preshared_key = random_password.vnf_tunnel2_psk[each.key].result
 
   tags = merge(var.default_tags, {
-    Name         = "skyforge-${var.region_key}-${each.key}-vpn"
+    Name         = "${local.name_prefix}-${var.region_key}-${each.key}-vpn"
     SkyforgeSite = each.key
     SkyforgeRole = "vpn-hub"
   })

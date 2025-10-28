@@ -40,3 +40,9 @@ variable "devices" {
   }))
   default = []
 }
+
+variable "resource_suffix" {
+  description = "Optional suffix to keep global network resource names unique."
+  type        = string
+  default     = ""
+}

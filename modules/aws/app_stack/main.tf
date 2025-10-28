@@ -1,12 +1,13 @@
 locals {
-  create_eks     = try(var.config.create_eks, true)
-  create_alb     = try(var.config.create_alb, true)
-  create_rds     = try(var.config.create_rds, true)
-  create_app_asg = try(var.config.create_app_asg, true)
-  create_ga      = local.create_alb && try(var.config.create_global_accelerator, false)
+  name_prefix_base = var.resource_suffix == "" ? "skyforge" : "skyforge-${var.resource_suffix}"
+  create_eks       = try(var.config.create_eks, true)
+  create_alb       = try(var.config.create_alb, true)
+  create_rds       = try(var.config.create_rds, true)
+  create_app_asg   = try(var.config.create_app_asg, true)
+  create_ga        = local.create_alb && try(var.config.create_global_accelerator, false)
 
   eks_defaults = {
-    name_prefix        = format("skyforge-%s", var.region_key)
+    name_prefix        = format("%s-%s", local.name_prefix_base, var.region_key)
     version            = "1.29"
     node_instance_type = "t3.medium"
     desired_capacity   = 2
@@ -37,6 +38,7 @@ locals {
     SkyforgeRegion = var.region_key
     SkyforgeRole   = "application"
   })
+  name_prefix = local.name_prefix_base
 }
 
 
@@ -46,7 +48,7 @@ locals {
 resource "aws_security_group" "alb" {
   count = local.create_alb ? 1 : 0
 
-  name        = "skyforge-${var.region_key}-alb-sg"
+  name        = "${local.name_prefix}-${var.region_key}-alb-sg"
   description = "ALB security group"
   vpc_id      = var.frontend_vpc_id
 
@@ -74,27 +76,27 @@ resource "aws_security_group" "alb" {
   }
 
   tags = merge(local.base_tags, {
-    Name = "skyforge-${var.region_key}-alb-sg"
+    Name = "${local.name_prefix}-${var.region_key}-alb-sg"
   })
 }
 
 resource "aws_lb" "app" {
   count = local.create_alb ? 1 : 0
 
-  name               = "skyforge-${var.region_key}-alb"
+  name               = "${local.name_prefix}-${var.region_key}-alb"
   load_balancer_type = "application"
   security_groups    = aws_security_group.alb.*.id
   subnets            = var.frontend_subnet_ids
 
   tags = merge(local.base_tags, {
-    Name = "skyforge-${var.region_key}-alb"
+    Name = "${local.name_prefix}-${var.region_key}-alb"
   })
 }
 
 resource "aws_lb_target_group" "app" {
   count = local.create_alb ? 1 : 0
 
-  name     = "skyforge-${var.region_key}-tg"
+  name     = "${local.name_prefix}-${var.region_key}-tg"
   port     = 80
   protocol = "HTTP"
   vpc_id   = var.app_vpc_id
@@ -108,7 +110,7 @@ resource "aws_lb_target_group" "app" {
   }
 
   tags = merge(local.base_tags, {
-    Name = "skyforge-${var.region_key}-tg"
+    Name = "${local.name_prefix}-${var.region_key}-tg"
   })
 }
 
@@ -131,12 +133,12 @@ resource "aws_lb_listener" "app_http" {
 resource "aws_globalaccelerator_accelerator" "app" {
   count = local.create_ga ? 1 : 0
 
-  name            = "skyforge-${var.region_key}-ga"
+  name            = "${local.name_prefix}-${var.region_key}-ga"
   enabled         = true
   ip_address_type = "IPV4"
 
   tags = merge(local.base_tags, {
-    Name = "skyforge-${var.region_key}-ga"
+    Name = "${local.name_prefix}-${var.region_key}-ga"
   })
 }
 
@@ -169,7 +171,7 @@ resource "aws_globalaccelerator_endpoint_group" "app" {
 resource "aws_security_group" "app" {
   count = local.create_app_asg ? 1 : 0
 
-  name        = "skyforge-${var.region_key}-app-sg"
+  name        = "${local.name_prefix}-${var.region_key}-app-sg"
   description = "Application tier security group"
   vpc_id      = var.app_vpc_id
 
@@ -189,14 +191,14 @@ resource "aws_security_group" "app" {
   }
 
   tags = merge(local.base_tags, {
-    Name = "skyforge-${var.region_key}-app-sg"
+    Name = "${local.name_prefix}-${var.region_key}-app-sg"
   })
 }
 
 resource "aws_iam_role" "app_instance" {
   count = local.create_app_asg ? 1 : 0
 
-  name = "skyforge-${var.region_key}-app-instance-role"
+  name = "${local.name_prefix}-${var.region_key}-app-instance-role"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -211,7 +213,7 @@ resource "aws_iam_role" "app_instance" {
 resource "aws_iam_instance_profile" "app_instance" {
   count = local.create_app_asg ? 1 : 0
 
-  name = "skyforge-${var.region_key}-app-profile"
+  name = "${local.name_prefix}-${var.region_key}-app-profile"
   role = aws_iam_role.app_instance[0].name
 }
 
@@ -224,7 +226,7 @@ data "aws_ssm_parameter" "amazon_linux_2" {
 resource "aws_launch_template" "app" {
   count = local.create_app_asg ? 1 : 0
 
-  name_prefix   = "skyforge-${var.region_key}-app-lt"
+  name_prefix   = "${local.name_prefix}-${var.region_key}-app-lt"
   image_id      = data.aws_ssm_parameter.amazon_linux_2[0].value
   instance_type = local.asg_config.instance_type
   iam_instance_profile {
@@ -244,7 +246,7 @@ resource "aws_launch_template" "app" {
   tag_specifications {
     resource_type = "instance"
     tags = merge(local.base_tags, {
-      Name = "skyforge-${var.region_key}-app"
+      Name = "${local.name_prefix}-${var.region_key}-app"
     })
   }
 }
@@ -252,7 +254,7 @@ resource "aws_launch_template" "app" {
 resource "aws_autoscaling_group" "app" {
   count = local.create_app_asg ? 1 : 0
 
-  name                = "skyforge-${var.region_key}-app-asg"
+  name                = "${local.name_prefix}-${var.region_key}-app-asg"
   desired_capacity    = local.asg_config.desired_capacity
   max_size            = local.asg_config.max_size
   min_size            = local.asg_config.min_size
@@ -264,7 +266,7 @@ resource "aws_autoscaling_group" "app" {
   }
   tag {
     key                 = "Name"
-    value               = "skyforge-${var.region_key}-app"
+    value               = "${local.name_prefix}-${var.region_key}-app"
     propagate_at_launch = true
   }
 }
@@ -282,7 +284,7 @@ resource "aws_autoscaling_attachment" "app" {
 resource "aws_security_group" "rds" {
   count = local.create_rds ? 1 : 0
 
-  name        = "skyforge-${var.region_key}-rds-sg"
+  name        = "${local.name_prefix}-${var.region_key}-rds-sg"
   description = "Database security group"
   vpc_id      = var.data_vpc_id
 
@@ -302,18 +304,18 @@ resource "aws_security_group" "rds" {
   }
 
   tags = merge(local.base_tags, {
-    Name = "skyforge-${var.region_key}-rds-sg"
+    Name = "${local.name_prefix}-${var.region_key}-rds-sg"
   })
 }
 
 resource "aws_db_subnet_group" "this" {
   count = local.create_rds ? 1 : 0
 
-  name       = "skyforge-${var.region_key}-rds-subnet"
+  name       = "${local.name_prefix}-${var.region_key}-rds-subnet"
   subnet_ids = var.data_subnet_ids
 
   tags = merge(local.base_tags, {
-    Name = "skyforge-${var.region_key}-rds-subnet"
+    Name = "${local.name_prefix}-${var.region_key}-rds-subnet"
   })
 }
 
@@ -327,7 +329,7 @@ resource "random_password" "rds" {
 resource "aws_db_instance" "this" {
   count = local.create_rds ? 1 : 0
 
-  identifier             = "skyforge-${var.region_key}-rds"
+  identifier             = "${local.name_prefix}-${var.region_key}-rds"
   allocated_storage      = local.rds_config.allocated_storage
   db_subnet_group_name   = aws_db_subnet_group.this[0].name
   engine                 = local.rds_config.engine
@@ -351,7 +353,7 @@ resource "aws_db_instance" "this" {
 resource "aws_security_group" "eks_cluster" {
   count = local.create_eks ? 1 : 0
 
-  name        = "skyforge-${var.region_key}-eks-cluster-sg"
+  name        = "${local.name_prefix}-${var.region_key}-eks-cluster-sg"
   description = "EKS cluster communication"
   vpc_id      = var.app_vpc_id
 
@@ -363,14 +365,14 @@ resource "aws_security_group" "eks_cluster" {
   }
 
   tags = merge(local.base_tags, {
-    Name = "skyforge-${var.region_key}-eks-cluster-sg"
+    Name = "${local.name_prefix}-${var.region_key}-eks-cluster-sg"
   })
 }
 
 resource "aws_security_group" "eks_nodes" {
   count = local.create_eks ? 1 : 0
 
-  name        = "skyforge-${var.region_key}-eks-nodes-sg"
+  name        = "${local.name_prefix}-${var.region_key}-eks-nodes-sg"
   description = "EKS worker nodes"
   vpc_id      = var.app_vpc_id
 
@@ -390,7 +392,7 @@ resource "aws_security_group" "eks_nodes" {
   }
 
   tags = merge(local.base_tags, {
-    Name = "skyforge-${var.region_key}-eks-nodes-sg"
+    Name = "${local.name_prefix}-${var.region_key}-eks-nodes-sg"
   })
 }
 
@@ -419,7 +421,7 @@ resource "aws_security_group_rule" "eks_nodes_self" {
 resource "aws_iam_role" "eks_cluster" {
   count = local.create_eks ? 1 : 0
 
-  name = "skyforge-${var.region_key}-eks-cluster-role"
+  name = "${local.name_prefix}-${var.region_key}-eks-cluster-role"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -441,7 +443,7 @@ resource "aws_iam_role_policy_attachment" "eks_cluster" {
 resource "aws_iam_role" "eks_node" {
   count = local.create_eks ? 1 : 0
 
-  name = "skyforge-${var.region_key}-eks-node-role"
+  name = "${local.name_prefix}-${var.region_key}-eks-node-role"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -477,7 +479,7 @@ resource "aws_iam_role_policy_attachment" "eks_node_registry" {
 resource "aws_eks_cluster" "this" {
   count = local.create_eks ? 1 : 0
 
-  name     = coalesce(try(local.eks_config.name_prefix, null), format("skyforge-%s", var.region_key))
+  name     = coalesce(try(local.eks_config.name_prefix, null), format("${local.name_prefix}-%s", var.region_key))
   role_arn = aws_iam_role.eks_cluster[0].arn
   version  = local.eks_config.version
 
@@ -489,7 +491,7 @@ resource "aws_eks_cluster" "this" {
   depends_on = [aws_iam_role_policy_attachment.eks_cluster]
 
   tags = merge(local.base_tags, {
-    Name = "skyforge-${var.region_key}-eks"
+    Name = "${local.name_prefix}-${var.region_key}-eks"
   })
 }
 
@@ -497,7 +499,7 @@ resource "aws_eks_node_group" "this" {
   count = local.create_eks ? 1 : 0
 
   cluster_name    = aws_eks_cluster.this[0].name
-  node_group_name = "skyforge-${var.region_key}-eks-default"
+  node_group_name = "${local.name_prefix}-${var.region_key}-eks-default"
   node_role_arn   = aws_iam_role.eks_node[0].arn
   subnet_ids      = var.app_subnet_ids
 
@@ -521,7 +523,7 @@ resource "aws_eks_node_group" "this" {
   ]
 
   tags = merge(local.base_tags, {
-    Name = "skyforge-${var.region_key}-eks-node-group"
+    Name = "${local.name_prefix}-${var.region_key}-eks-node-group"
   })
 }
 

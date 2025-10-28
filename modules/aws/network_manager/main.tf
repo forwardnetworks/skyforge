@@ -1,13 +1,14 @@
 locals {
-  site_map   = { for site in var.sites : site.name => site }
-  device_map = { for device in var.devices : device.name => device }
+  site_map    = { for site in var.sites : site.name => site }
+  device_map  = { for device in var.devices : device.name => device }
+  name_prefix = var.resource_suffix == "" ? "skyforge" : "skyforge-${var.resource_suffix}"
 }
 
 resource "aws_networkmanager_global_network" "this" {
   description = var.description
 
   tags = merge(var.tags, {
-    Name = var.global_name
+    Name = "${local.name_prefix}-${var.global_name}"
   })
 }
 
@@ -30,7 +31,7 @@ resource "aws_networkmanager_site" "this" {
 
   tags = {
     for k, v in merge(var.tags, {
-      Name           = each.value.name
+      Name           = "${local.name_prefix}-${each.value.name}"
       SkyforgeRegion = try(each.value.region, null)
     }) :
     k => v if v != null
@@ -49,7 +50,7 @@ resource "aws_networkmanager_device" "this" {
 
   tags = {
     for k, v in merge(var.tags, {
-      Name         = each.value.name
+      Name         = "${local.name_prefix}-${each.value.name}"
       SkyforgeSite = each.value.site_name
     }) :
     k => v if v != null

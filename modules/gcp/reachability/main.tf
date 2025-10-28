@@ -5,12 +5,13 @@ locals {
     test.name => test
     if try(test.enabled, true)
   }
+  name_prefix = var.resource_suffix == "" ? "skyforge" : "skyforge-${var.resource_suffix}"
 }
 
 resource "google_network_management_connectivity_test" "this" {
   for_each = local.test_map
 
-  name        = "ct-${var.region_key}-${replace(each.key, "[^A-Za-z0-9]", "")}"
+  name        = format("ct-%s-%s", local.name_prefix, replace(each.key, "[^A-Za-z0-9]", ""))
   project     = local.project_id
   protocol    = upper(try(each.value.protocol, "TCP"))
   description = try(each.value.description, null)
