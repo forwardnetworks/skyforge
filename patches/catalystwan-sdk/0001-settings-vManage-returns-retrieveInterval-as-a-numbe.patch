@@ -1,0 +1,46 @@
+settings: vManage returns retrieveInterval as a NUMBER, and the model refuses it
+
+The enterprise-CA onboarding step dies READING vManage's current certificate
+settings, not writing them:
+
+  TASK [Switch certificate signing to the enterprise CA]
+  fatal: [vmanage -> localhost]: FAILED! => {"changed": false,
+    "msg": "Task failed: Module failed: 1 validation error for Certificate
+            retrieveInterval
+              Input should be a valid string
+              [type=string_type, input_value=1, input_type=int]"}
+
+The module sends a payload of one field -- Certificate(certificate_signing=...)
+-- and never passes retrieve_interval at all (administration_settings.py:354).
+The failure is on the NEXT call, get_certificates, whose response the SDK
+validates into this same model. vManage 20.18.4 serialises retrieveInterval as a
+JSON number; the model declares Optional[str]; pydantic refuses it.
+
+So the appliance is not misbehaving and neither is our task. The SDK's model is
+stricter than the API it models, and nothing on our side can pass a value that
+avoids it, because the offending value is the DEVICE'S.
+
+coerce_numbers_to_str is pydantic's own answer to exactly this. It is set on the
+model rather than the field, so validity_period gets the same tolerance -- it is
+declared Optional[str] beside retrieve_interval and there is no reason to think
+a device that returns one as a number will not return the other. Only
+retrieveInterval is MEASURED; the widening is deliberate and named here.
+
+Applied to the pip-installed SDK (catalystwan==0.41.5.dev2) rather than fixed at
+source, because the SDK is a dependency and not a vendored fork. The pin stays:
+stable 0.41.x dropped the Enterprise Root CA implementation this lane depends on
+(docs/COMPATIBILITY.md).
+
+NOTE ON FORMAT: no "-- / 2.51.0" git trailer. This series is applied with
+patch(1) rather than `git apply`, because its target is a pip package in
+dist-packages and not a git work tree. patch(1) treats the trailer as a
+malformed hunk and refuses the whole file.
+
+--- a/catalystwan/endpoints/configuration_settings.py
++++ b/catalystwan/endpoints/configuration_settings.py
+@@ -50,4 +50,4 @@
+ class Certificate(BaseModel):
+-    model_config = ConfigDict(populate_by_name=True)
++    model_config = ConfigDict(populate_by_name=True, coerce_numbers_to_str=True)
+     certificate_signing: str = Field(serialization_alias="certificateSigning", validation_alias="certificateSigning")
+     validity_period: Optional[str] = Field(

@@ -1,0 +1,113 @@
+From 9223aeb61508e8330d6bc42add7176d473367e7e Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sun, 19 Jul 2026 12:45:05 -0500
+Subject: [PATCH 9/9] skyforge(firewall): permit data-plane fabric control
+ traffic on cEOS interfaces
+
+The EOS control-plane firewall (INPUT policy DROP, empty EOS_INPUT) that patch
+0002 opens for the management return-CIDRs also silently drops the DATA-plane
+control traffic that arrives on the fabric links: OSPF/BGP hellos and inter-device
+ICMP land on the p2p interfaces (eth1, eth2, ...) sourced from the routed fabric
+subnets, which are NOT in the mgmt permit list -> they fall through to the default
+DROP. The fabric then boots config-clean but forms ZERO OSPF adjacencies even
+though hellos cross the wire both ways. Proven live on changedemo-fleet40
+(2026-07-19): every device had correct interface/OSPF config, hellos were captured
+arriving at each peer, yet the OSPF neighbor table was empty fleet-wide and the
+INPUT default-DROP counter climbed on the fabric hellos; a temporary
+'iptables -I INPUT -s 10.0.0.0/8 -j ACCEPT' on br1/core/dc immediately brought
+core<->dc and br1<->core to FULL and populated the DC-service routes.
+
+Fabric links are the modeled topology's own trusted p2p wires, so restore normal
+router behavior: permit all inbound on every data interface (eth1+), enumerated
+from the pod netns each pass and re-asserted in the existing retry loop (meshnet
+may wire interfaces in just after PostStart, and EOS reprograms its chains during
+boot). eth0 (Management0) stays under the source-scoped mgmt permits only.
+
+---
+ controllers/ceoslabdevice_controller.go       | 32 +++++++++++++++++++
+ .../ceoslabdevice_controller_unit_test.go     | 14 ++++++++
+ 2 files changed, 46 insertions(+)
+
+diff --git a/controllers/ceoslabdevice_controller.go b/controllers/ceoslabdevice_controller.go
+index a585a04..d3239cf 100644
+--- a/controllers/ceoslabdevice_controller.go
++++ b/controllers/ceoslabdevice_controller.go
+@@ -1054,13 +1054,45 @@ apply_permits() {
+   done
+   IFS="${old_ifs}"
+ }
++# The same INPUT-policy-DROP firewall that blocks unpermitted management sources
++# also blocks the DATA-plane control traffic that arrives on the fabric links:
++# OSPF/BGP hellos (multicast + unicast) and inter-device ICMP land on the p2p
++# interfaces (eth1, eth2, ...) sourced from the routed fabric subnets, which are
++# NOT in the management return-CIDR permit list, so they fall through EOS_INPUT
++# (empty) to the default DROP. The result is a fabric that boots config-clean but
++# forms ZERO OSPF adjacencies (no neighbor, no routes) even though hellos cross
++# the wire in both directions — proven on fleet40 (2026-07-19): every device had
++# correct interface/OSPF config yet the OSPF neighbor table was empty fleet-wide,
++# and the INPUT chain default-DROP counter climbed on the fabric hellos.
++#
++# The fabric links are trusted (they are the modeled topology's own p2p wires),
++# so restore normal router behavior: permit all inbound on every data interface.
++# eth0 is the Kubernetes/EOS management interface (Management0) and is left under
++# the source-scoped management permits above — only the mgmt return-CIDRs may
++# reach the control plane over eth0. Data interfaces are enumerated from the pod's
++# own netns each pass (not a fixed count): meshnet may wire them in slightly after
++# PostStart, and the retry loop below re-asserts as they appear and as EOS
++# reprograms its firewall chains during boot. Delete-then-insert keeps exactly one
++# ACCEPT per interface, ordered ahead of the default DROP.
++apply_dataplane_permits() {
++  for _ifpath in /sys/class/net/eth*; do
++    [ -e "${_ifpath}" ] || continue
++    intf="${_ifpath##*/}"
++    [ "${intf}" = "eth0" ] && continue
++    case "${intf}" in eth[0-9]*) ;; *) continue ;; esac
++    iptables -D INPUT -i "${intf}" -j ACCEPT 2>/dev/null || true
++    iptables -I INPUT 1 -i "${intf}" -j ACCEPT || true
++  done
++}
+ apply_permits
++apply_dataplane_permits
+ (
+   i=0
+   max="${SKYFORGE_MGMT_RETURN_ROUTE_RETRIES:-60}"
+   interval="${SKYFORGE_MGMT_RETURN_ROUTE_INTERVAL:-5}"
+   while [ "${i}" -lt "${max}" ]; do
+     apply_permits
++    apply_dataplane_permits
+     i=$((i + 1))
+     sleep "${interval}"
+   done
+diff --git a/controllers/ceoslabdevice_controller_unit_test.go b/controllers/ceoslabdevice_controller_unit_test.go
+index 850603b..565908f 100644
+--- a/controllers/ceoslabdevice_controller_unit_test.go
++++ b/controllers/ceoslabdevice_controller_unit_test.go
+@@ -179,11 +179,25 @@ func TestGetPodAddsManagementReturnRouteLifecycle(t *testing.T) {
+ 		"iptables -I INPUT 1 -s",
+ 		"SKYFORGE_MGMT_RETURN_ROUTE_RETRIES",
+ 		"/tmp/skyforge-mgmt-permits.log",
++		// The same firewall drops DATA-plane control traffic (OSPF/BGP/ICMP) on
++		// the fabric links, which arrives on the non-mgmt data interfaces from
++		// the routed fabric subnets. Restore router behavior by permitting all
++		// inbound on every data interface (eth1+), enumerated from the pod netns,
++		// re-asserted in the retry loop; eth0 (Management0) stays source-scoped.
++		"apply_dataplane_permits",
++		"/sys/class/net/eth*",
++		"iptables -I INPUT 1 -i",
+ 	} {
+ 		if !strings.Contains(script, want) {
+ 			t.Fatalf("lifecycle script missing %q: %s", want, script)
+ 		}
+ 	}
++	// eth0 is the management interface and must NOT get a blanket interface
++	// permit — only the source-scoped management return-CIDRs may reach the
++	// control plane over eth0.
++	if !strings.Contains(script, `[ "${intf}" = "eth0" ] && continue`) {
++		t.Fatalf("lifecycle script does not exclude eth0 from data-plane permits: %s", script)
++	}
+ 	// The return-PATH must NOT be kernel-managed here anymore: when eth0 is a
+ 	// claimed management interface, EOS owns address+routes end to end via the
+ 	// startup-config runtime block (config-as-truth). The old gateway-discovery
+-- 
+2.55.0
+

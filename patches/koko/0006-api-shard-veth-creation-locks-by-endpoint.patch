@@ -1,0 +1,293 @@
+From 2e69791484caf2ee354d40fe76ced086500371ca Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Thu, 23 Jul 2026 18:59:11 -0500
+Subject: [PATCH 6/6] api: shard veth creation locks by endpoint
+
+Lock both canonical (netns, ifname) endpoint slots for each wire instead of sharing the VXLAN-wide lock. Opposite wire directions and malformed overlapping wires still serialize, while disjoint wires can create concurrently. Keep the full observe/delete/create/adopt/configure transaction inside the lock and retain the bounded external-race reinspection.
+---
+ api/koko_veth_ensure.go      | 139 +++++++++++++++++++++++++++++++----
+ api/koko_veth_ensure_test.go |  74 +++++++++++++++++++
+ 2 files changed, 199 insertions(+), 14 deletions(-)
+
+diff --git a/api/koko_veth_ensure.go b/api/koko_veth_ensure.go
+index fb22055..9b75274 100644
+--- a/api/koko_veth_ensure.go
++++ b/api/koko_veth_ensure.go
+@@ -4,17 +4,22 @@ Idempotent point-to-point veth wire realization.
+ EnsureVethWire generalizes the vxlan owner-alias concept to veth wires so
+ that two racing creators (typically the CNI ADDs of the two pods on a link,
+ or a daemon-side reconciler) converge on one correct wire instead of failing
+-with "file exists" rename collisions. All koko wire creators on a node
+-serialize behind the same wire-create lock, which makes inspect-then-act
+-atomic among koko actors; a bounded re-inspect loop absorbs races with
+-anything else.
++with "file exists" rename collisions. Koko creators lock both endpoint slots
++for a wire, which makes inspect-then-act atomic among actors that can touch
++either slot while allowing disjoint wires to progress concurrently; a bounded
++re-inspect loop absorbs races with anything outside that lock domain.
+ */
+ package api
+ 
+ import (
++	"crypto/sha256"
+ 	"errors"
+ 	"fmt"
++	"os"
++	"path/filepath"
++	"sort"
+ 	"strings"
++	"sync"
+ 	"syscall"
+ 	"time"
+ 
+@@ -247,8 +252,8 @@ func setAliasInNS(end VEth, alias string) error {
+ }
+ 
+ // makeVethTagged creates the pair and tags both ends with the wire alias.
+-// It runs under the wire-create lock, so the momentary unaliased window is
+-// invisible to other koko actors.
++// It runs under both endpoint locks, so the momentary unaliased window is
++// invisible to other koko actors that could touch either endpoint.
+ func makeVethTagged(local, peer VEth, alias string) error {
+ 	if err := MakeVeth(local, peer); err != nil {
+ 		return err
+@@ -262,12 +267,118 @@ func makeVethTagged(local, peer VEth, alias string) error {
+ 	return nil
+ }
+ 
+-// acquireWireCreateLock serializes ALL koko wire creation on this node —
+-// veth and vxlan alike — behind the same in-process mutex and shared file
+-// lock used by MakeVxLan, so every CNI plugin invocation and daemon on the
+-// node forms a single lock domain.
+-func acquireWireCreateLock() func() {
+-	return acquireVXLANCreateLock()
++type vethProcessLock struct {
++	mu   sync.Mutex
++	refs int
++}
++
++var vethProcessLocks = struct {
++	sync.Mutex
++	byEndpoint map[string]*vethProcessLock
++}{
++	byEndpoint: map[string]*vethProcessLock{},
++}
++
++func vethEndpointLockKey(end VEth) string {
++	return end.NsName + "\x00" + end.LinkName
++}
++
++// vethEndpointLockKeys returns the unique endpoint keys in canonical order.
++// Acquiring every wire's endpoint locks in this order prevents deadlock while
++// making opposite directions of the same wire, and even malformed wires that
++// overlap at only one endpoint, share the required critical section.
++func vethEndpointLockKeys(local, peer VEth) []string {
++	keys := []string{vethEndpointLockKey(local), vethEndpointLockKey(peer)}
++	sort.Strings(keys)
++	if keys[0] == keys[1] {
++		return keys[:1]
++	}
++	return keys
++}
++
++func acquireVethProcessLock(key string) func() {
++	vethProcessLocks.Lock()
++	entry := vethProcessLocks.byEndpoint[key]
++	if entry == nil {
++		entry = &vethProcessLock{}
++		vethProcessLocks.byEndpoint[key] = entry
++	}
++	entry.refs++
++	vethProcessLocks.Unlock()
++
++	entry.mu.Lock()
++	return func() {
++		entry.mu.Unlock()
++		vethProcessLocks.Lock()
++		entry.refs--
++		if entry.refs == 0 && vethProcessLocks.byEndpoint[key] == entry {
++			delete(vethProcessLocks.byEndpoint, key)
++		}
++		vethProcessLocks.Unlock()
++	}
++}
++
++func vethLockDirs() []string {
++	if dir := strings.TrimSpace(os.Getenv("KOKO_VETH_LOCK_DIR")); dir != "" {
++		return []string{dir}
++	}
++	// /opt/cni/bin is shared by meshnetd and the host CNI invocation. Keep the
++	// same fallbacks as the historical global VXLAN lock for deployments with
++	// a different mount layout.
++	return []string{"/opt/cni/bin", "/var/run/netns", "/run"}
++}
++
++func acquireVethFileLock(key string) (*os.File, error) {
++	digest := sha256.Sum256([]byte(key))
++	name := fmt.Sprintf(".koko-veth-create-%x.lock", digest[:16])
++	var lastErr error
++	for _, dir := range vethLockDirs() {
++		lockFile, err := os.OpenFile(filepath.Join(dir, name), os.O_CREATE|os.O_RDWR, 0600)
++		if err != nil {
++			lastErr = err
++			continue
++		}
++		if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
++			lastErr = err
++			_ = lockFile.Close()
++			continue
++		}
++		return lockFile, nil
++	}
++	return nil, lastErr
++}
++
++type heldVethEndpointLock struct {
++	file          *os.File
++	unlockProcess func()
++}
++
++// acquireVethWireCreateLock locks both endpoint slots, in canonical order,
++// across goroutines and CNI processes. The invariant is slot ownership:
++// observe -> delete stale state -> create/adopt -> configure remains atomic
++// for every actor that can touch either (netns, ifname). Disjoint wires share
++// no endpoint lock and can therefore progress concurrently.
++func acquireVethWireCreateLock(local, peer VEth) func() {
++	keys := vethEndpointLockKeys(local, peer)
++	held := make([]heldVethEndpointLock, 0, len(keys))
++	for _, key := range keys {
++		h := heldVethEndpointLock{unlockProcess: acquireVethProcessLock(key)}
++		var err error
++		h.file, err = acquireVethFileLock(key)
++		if err != nil {
++			logger.Warnf("koko: continuing without cross-process veth endpoint lock: %+v", err)
++		}
++		held = append(held, h)
++	}
++	return func() {
++		for i := len(held) - 1; i >= 0; i-- {
++			if held[i].file != nil {
++				_ = syscall.Flock(int(held[i].file.Fd()), syscall.LOCK_UN)
++				_ = held[i].file.Close()
++			}
++			held[i].unlockProcess()
++		}
++	}
+ }
+ 
+ func isEExistErr(err error) bool {
+@@ -287,7 +398,7 @@ func isEExistErr(err error) bool {
+ //     links claiming one ifname is a configuration error.
+ //
+ // Both directions of a link may call this concurrently; correctness comes
+-// from the node-wide wire-create lock plus the symmetric alias.
++// from locking both endpoint slots plus the symmetric alias.
+ func EnsureVethWire(local, peer VEth, alias string) error {
+ 	if isProtectedIfName(local.LinkName) || isProtectedIfName(peer.LinkName) {
+ 		return fmt.Errorf("EnsureVethWire: refusing to manage protected interface %q/%q",
+@@ -303,7 +414,7 @@ func EnsureVethWire(local, peer VEth, alias string) error {
+ 		return err
+ 	}
+ 
+-	unlock := acquireWireCreateLock()
++	unlock := acquireVethWireCreateLock(local, peer)
+ 	defer unlock()
+ 
+ 	var lastErr error
+diff --git a/api/koko_veth_ensure_test.go b/api/koko_veth_ensure_test.go
+index 6960746..2dd702c 100644
+--- a/api/koko_veth_ensure_test.go
++++ b/api/koko_veth_ensure_test.go
+@@ -2,8 +2,10 @@ package api
+ 
+ import (
+ 	"errors"
++	"reflect"
+ 	"strings"
+ 	"testing"
++	"time"
+ )
+ 
+ func obs(exists, isVeth bool, alias string) wireEndObservation {
+@@ -68,6 +70,78 @@ func TestVethWireAliasCanonicalAndUnique(t *testing.T) {
+ 	}
+ }
+ 
++func TestVethEndpointLockKeysAreSymmetricAndOverlapSafe(t *testing.T) {
++	a := VEth{NsName: "/var/run/netns/a", LinkName: "eth1"}
++	b := VEth{NsName: "/var/run/netns/b", LinkName: "eth2"}
++	c := VEth{NsName: "/var/run/netns/c", LinkName: "eth3"}
++
++	forward := vethEndpointLockKeys(a, b)
++	reverse := vethEndpointLockKeys(b, a)
++	if !reflect.DeepEqual(forward, reverse) {
++		t.Fatalf("opposite wire directions lock different keys: %q vs %q", forward, reverse)
++	}
++
++	overlap := vethEndpointLockKeys(a, c)
++	shared := false
++	for _, left := range forward {
++		for _, right := range overlap {
++			if left == right {
++				shared = true
++			}
++		}
++	}
++	if !shared {
++		t.Fatalf("wires sharing endpoint %v do not share a lock: %q vs %q", a, forward, overlap)
++	}
++}
++
++func TestVethWireCreateLockSerializesOverlapOnly(t *testing.T) {
++	t.Setenv("KOKO_VETH_LOCK_DIR", t.TempDir())
++	a := VEth{NsName: "/var/run/netns/a", LinkName: "eth1"}
++	b := VEth{NsName: "/var/run/netns/b", LinkName: "eth2"}
++	c := VEth{NsName: "/var/run/netns/c", LinkName: "eth3"}
++	d := VEth{NsName: "/var/run/netns/d", LinkName: "eth4"}
++
++	unlockFirst := acquireVethWireCreateLock(a, b)
++	firstHeld := true
++	defer func() {
++		if firstHeld {
++			unlockFirst()
++		}
++	}()
++	acquiredOverlap := make(chan struct{})
++	go func() {
++		unlock := acquireVethWireCreateLock(b, c)
++		unlock()
++		close(acquiredOverlap)
++	}()
++	acquiredDisjoint := make(chan struct{})
++	go func() {
++		unlock := acquireVethWireCreateLock(c, d)
++		unlock()
++		close(acquiredDisjoint)
++	}()
++
++	select {
++	case <-acquiredDisjoint:
++	case <-time.After(time.Second):
++		t.Fatal("disjoint wire was blocked by another wire's endpoint locks")
++	}
++	select {
++	case <-acquiredOverlap:
++		t.Fatal("overlapping wire acquired while the shared endpoint was locked")
++	case <-time.After(100 * time.Millisecond):
++	}
++
++	unlockFirst()
++	firstHeld = false
++	select {
++	case <-acquiredOverlap:
++	case <-time.After(time.Second):
++		t.Fatal("overlapping wire did not acquire after the shared endpoint was unlocked")
++	}
++}
++
+ func TestIsProtectedIfName(t *testing.T) {
+ 	for _, name := range []string{"", "   ", "eth0", "lo"} {
+ 		if !isProtectedIfName(name) {
+-- 
+2.55.0
+

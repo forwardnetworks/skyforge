@@ -1,0 +1,504 @@
+From 0883b1e5ea82c9872b5abed6249c2b0dfa66bd4b Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sat, 18 Jul 2026 08:18:23 -0500
+Subject: [PATCH 7/9] plugin,daemon: KubeVirt secondary-interface (NAD) support
+
+KubeVirt topology nodes attach meshnet links as Multus
+NetworkAttachmentDefinitions with kubevirtSecondary=true instead of via the
+default chained conflist. That changes the CNI contract per invocation:
+one requested interface, launcher pod names that differ from topology
+names, and peers that may not exist yet at attach time.
+
+plugin:
+- netconf gains kubevirtSecondary and secondaryWaitSeconds.
+- Secondary ADD/DEL operate on exactly the requested interface
+  (linksForCNIRequest fails closed when it matches no topology link); the
+  default chained path is unchanged.
+- Secondary ADD waits (poll 2s, default 240s, ADD budget stretched to
+  cover it) for the peer pod's topology/alive metadata instead of failing.
+- The launcher's eth0 delegate call is recognized (virt-launcher- prefix)
+  and passed through untouched: meshnet must never manage the primary CNI
+  interface of a launcher pod.
+- Secondary results are aligned to the requested interface name
+  (alignResultInterfaceName) so Multus accepts them.
+- Secondary DEL cleans only the requested link, preserves the pod's alive
+  status, and sets the usual skip-reverse flag.
+
+daemon:
+- getPod falls back from the queried pod name to the topology CR via the
+  kne/topologyNode, vm.kubevirt.io/name and vmi.kubevirt.io/id labels, so
+  launcher pods resolve to their topology node; Get now returns the
+  resolved CR name so skip bookkeeping is consistent.
+- isPodAlive replaces open-coded SrcIp/NetNs checks on the ADD path.
+
+Upstreamable as an optional feature.
+---
+ daemon/meshnet/handler.go |  29 +++++-
+ plugin/meshnet.go         | 209 ++++++++++++++++++++++++++++++++++++--
+ plugin/meshnet_test.go    | 106 +++++++++++++++++++
+ 3 files changed, 336 insertions(+), 8 deletions(-)
+ create mode 100644 plugin/meshnet_test.go
+
+diff --git a/daemon/meshnet/handler.go b/daemon/meshnet/handler.go
+index 8eeb72b..9e6295e 100644
+--- a/daemon/meshnet/handler.go
++++ b/daemon/meshnet/handler.go
+@@ -12,6 +12,7 @@ import (
+ 	"github.com/networkop/meshnet-cni/daemon/vxlan"
+ 
+ 	log "github.com/sirupsen/logrus"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+ 	"k8s.io/apimachinery/pkg/runtime"
+@@ -75,7 +76,31 @@ func nodeSource(nodeIP, nodeIntf string) (string, string) {
+ 
+ func (m *Meshnet) getPod(ctx context.Context, name, ns string) (*unstructured.Unstructured, error) {
+ 	mnetdLogger.Infof("Reading pod %s from K8s", name)
+-	return m.tClient.Topology(ns).Unstructured(ctx, name, metav1.GetOptions{})
++	result, err := m.tClient.Topology(ns).Unstructured(ctx, name, metav1.GetOptions{})
++	if err == nil || !apierrors.IsNotFound(err) {
++		return result, err
++	}
++	if m.kClient == nil {
++		return nil, err
++	}
++
++	kpod, podErr := m.kClient.CoreV1().Pods(ns).Get(ctx, name, metav1.GetOptions{})
++	if podErr != nil {
++		return nil, err
++	}
++	for _, label := range []string{"kne/topologyNode", "vm.kubevirt.io/name", "vmi.kubevirt.io/id"} {
++		topologyName := kpod.Labels[label]
++		if topologyName == "" || topologyName == name {
++			continue
++		}
++		mnetdLogger.Infof("Resolved Kubernetes pod %s to meshnet topology %s via label %s", name, topologyName, label)
++		result, aliasErr := m.tClient.Topology(ns).Unstructured(ctx, topologyName, metav1.GetOptions{})
++		if aliasErr == nil || !apierrors.IsNotFound(aliasErr) {
++			return result, aliasErr
++		}
++	}
++
++	return nil, err
+ }
+ 
+ func (m *Meshnet) updateStatus(ctx context.Context, obj *unstructured.Unstructured, ns string) error {
+@@ -124,7 +149,7 @@ func (m *Meshnet) Get(ctx context.Context, pod *mpb.PodQuery) (*mpb.Pod, error)
+ 	nodeIP, nodeIntf = nodeSource(nodeIP, nodeIntf)
+ 
+ 	return &mpb.Pod{
+-		Name:        pod.Name,
++		Name:        result.GetName(),
+ 		SrcIp:       srcIP,
+ 		NetNs:       netNs,
+ 		KubeNs:      pod.KubeNs,
+diff --git a/plugin/meshnet.go b/plugin/meshnet.go
+index 7878d0c..47a7c34 100644
+--- a/plugin/meshnet.go
++++ b/plugin/meshnet.go
+@@ -53,7 +53,9 @@ var interNodeLinkType = wireutil.INTER_NODE_LINK_VXLAN
+ 
+ type netConf struct {
+ 	types.NetConf
+-	Delegate map[string]interface{} `json:"delegate"`
++	Delegate             map[string]interface{} `json:"delegate"`
++	KubeVirtSecondary    bool                   `json:"kubevirtSecondary,omitempty"`
++	SecondaryWaitSeconds int                    `json:"secondaryWaitSeconds,omitempty"`
+ }
+ 
+ type k8sArgs struct {
+@@ -219,6 +221,71 @@ func makeVxlan(srcIntf string, peerIP string, vni int) *koko.VxLan {
+ 	}
+ }
+ 
++func linksForCNIRequest(links []*mpb.Link, ifName string, requireMatch bool) ([]*mpb.Link, error) {
++	ifName = strings.TrimSpace(ifName)
++	if ifName == "" {
++		if requireMatch {
++			return nil, fmt.Errorf("requested CNI interface is required for kubevirt secondary meshnet ADD/DEL")
++		}
++		return links, nil
++	}
++	filtered := make([]*mpb.Link, 0, 1)
++	for _, link := range links {
++		if link != nil && strings.TrimSpace(link.LocalIntf) == ifName {
++			filtered = append(filtered, link)
++		}
++	}
++	if len(filtered) == 0 {
++		if requireMatch {
++			return nil, fmt.Errorf("requested CNI interface %q does not match any meshnet topology link", ifName)
++		}
++		return links, nil
++	}
++	return filtered, nil
++}
++
++func kubeVirtSecondaryWaitDuration(seconds int) time.Duration {
++	if seconds <= 0 {
++		seconds = 240
++	}
++	return time.Duration(seconds) * time.Second
++}
++
++func isPodAlive(pod *mpb.Pod) bool {
++	return pod != nil && strings.TrimSpace(pod.SrcIp) != "" && strings.TrimSpace(pod.NetNs) != ""
++}
++
++func waitForPeerPodAlive(ctx context.Context, meshnetClient mpb.LocalClient, podName, ns, localPodName, localIntf string, wait time.Duration) (*mpb.Pod, error) {
++	if wait <= 0 {
++		wait = kubeVirtSecondaryWaitDuration(0)
++	}
++	deadline := time.Now().Add(wait)
++	var lastErr error
++	for {
++		peerPod, err := meshnetClient.Get(ctx, &mpb.PodQuery{
++			Name:   podName,
++			KubeNs: ns,
++		})
++		if err == nil && isPodAlive(peerPod) {
++			return peerPod, nil
++		}
++		if err != nil {
++			lastErr = err
++		}
++		if time.Now().After(deadline) {
++			if lastErr != nil {
++				return nil, fmt.Errorf("kubevirt secondary interface %s on pod %s timed out waiting %.0fs for peer pod %s topology/alive metadata: %w", localIntf, localPodName, wait.Seconds(), podName, lastErr)
++			}
++			return nil, fmt.Errorf("kubevirt secondary interface %s on pod %s timed out waiting %.0fs for peer pod %s to become alive", localIntf, localPodName, wait.Seconds(), podName)
++		}
++		select {
++		case <-ctx.Done():
++			return nil, ctx.Err()
++		case <-time.After(2 * time.Second):
++		}
++	}
++}
++
+ // perRPCTimeout is a grpc unary interceptor that bounds every RPC with
+ // rpcTimeout while still honouring the caller's overall command budget
+ // carried by the parent context.
+@@ -244,6 +311,48 @@ func dialGRPC(ctx context.Context, target string) (*grpc.ClientConn, error) {
+ 	return conn, nil
+ }
+ 
++func requestedIfName(args *skel.CmdArgs) string {
++	if args == nil {
++		return ""
++	}
++	if ifName := strings.TrimSpace(args.IfName); ifName != "" {
++		return ifName
++	}
++	return strings.TrimSpace(os.Getenv("CNI_IFNAME"))
++}
++
++func alignResultInterfaceName(result *current.Result, ifName string) {
++	if result == nil {
++		return
++	}
++	ifName = strings.TrimSpace(ifName)
++	if ifName == "" {
++		return
++	}
++	if len(result.Interfaces) == 0 {
++		result.Interfaces = []*current.Interface{{Name: ifName}}
++		return
++	}
++	result.Interfaces[len(result.Interfaces)-1].Name = ifName
++}
++
++func printKubeVirtSecondaryResult(result *current.Result, version, ifName string) error {
++	alignResultInterfaceName(result, ifName)
++	return types.PrintResult(result, version)
++}
++
++func isKubeVirtLauncherDefaultCNI(podName, ifName string, kubeVirtSecondary bool) bool {
++	if kubeVirtSecondary {
++		return false
++	}
++	podName = strings.TrimSpace(podName)
++	ifName = strings.TrimSpace(ifName)
++	if ifName != "" && ifName != "eth0" {
++		return false
++	}
++	return strings.HasPrefix(podName, "virt-launcher-")
++}
++
+ // -------------------------------------------------------------------------------------------------
+ // Adds interfaces to a POD. the POD name and the POD Namespace is passed as arguments.
+ func cmdAdd(args *skel.CmdArgs) (retErr error) {
+@@ -261,11 +370,19 @@ func cmdAdd(args *skel.CmdArgs) (retErr error) {
+ 
+ 	// Overall ADD budget: fail crisply instead of letting a wedged daemon or
+ 	// API server stall kubelet's CNI ADD (and containerd's CRI workers).
+-	ctx, cancel := context.WithTimeout(context.Background(), addBudget)
++	budget := addBudget
++	if n.KubeVirtSecondary {
++		// kubevirt secondary interfaces deliberately wait for their peer pod
++		// to come alive; give the budget room for that wait plus one RPC.
++		if w := kubeVirtSecondaryWaitDuration(n.SecondaryWaitSeconds) + rpcTimeout; w > budget {
++			budget = w
++		}
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), budget)
+ 	defer cancel()
+ 	defer func() {
+ 		if retErr != nil && ctx.Err() == context.DeadlineExceeded {
+-			retErr = fmt.Errorf("meshnet CNI ADD for pod %s/%s exceeded its %v budget: %w", string(cniArgs.K8S_POD_NAMESPACE), string(cniArgs.K8S_POD_NAME), addBudget, retErr)
++			retErr = fmt.Errorf("meshnet CNI ADD for pod %s/%s exceeded its %v budget: %w", string(cniArgs.K8S_POD_NAMESPACE), string(cniArgs.K8S_POD_NAME), budget, retErr)
+ 		}
+ 	}()
+ 
+@@ -291,6 +408,14 @@ func cmdAdd(args *skel.CmdArgs) (retErr error) {
+ 		log.Errorf("Add: Pod %s:%s was not a topology pod returning", string(cniArgs.K8S_POD_NAMESPACE), string(cniArgs.K8S_POD_NAME))
+ 		return types.PrintResult(result, n.CNIVersion)
+ 	}
++	requestedIntf := requestedIfName(args)
++	if isKubeVirtLauncherDefaultCNI(string(cniArgs.K8S_POD_NAME), requestedIntf, n.KubeVirtSecondary) {
++		log.Infof("Add[%s]: KubeVirt launcher default interface %q is owned by the primary CNI; meshnet links are handled by kubevirtSecondary NADs", string(cniArgs.K8S_POD_NAME), requestedIntf)
++		return types.PrintResult(result, n.CNIVersion)
++	}
++	if n.KubeVirtSecondary {
++		log.Infof("Add[%s]: kubevirt secondary CNI creating requested meshnet interface %q", string(cniArgs.K8S_POD_NAME), requestedIntf)
++	}
+ 
+ 	// Finding the source IP and interface for VXLAN VTEP
+ 	srcIP, srcIntf, err := getVxlanSource(localPod.NodeIp, localPod.NodeIntf)
+@@ -310,8 +435,13 @@ func cmdAdd(args *skel.CmdArgs) (retErr error) {
+ 		return err
+ 	}
+ 
+-	log.Infof("Add[%s]: Starting to traverse all links", string(cniArgs.K8S_POD_NAME))
+-	for _, link := range localPod.Links { // Iterate over each link of the local pod
++	links, err := linksForCNIRequest(localPod.Links, requestedIntf, n.KubeVirtSecondary)
++	if err != nil {
++		log.Errorf("Add[%s]: %v", string(cniArgs.K8S_POD_NAME), err)
++		return err
++	}
++	log.Infof("Add[%s]: Starting to traverse %d of %d links for CNI interface %q", string(cniArgs.K8S_POD_NAME), len(links), len(localPod.Links), requestedIntf)
++	for _, link := range links { // Iterate over each link of the local pod
+ 		// Build koko's veth struct for local intf
+ 		myVeth, err := makeVeth(args.Netns, link.LocalIntf, link.LocalIp)
+ 		if err != nil {
+@@ -339,12 +469,23 @@ func cmdAdd(args *skel.CmdArgs) (retErr error) {
+ 			Name:   link.PeerPod,
+ 			KubeNs: string(cniArgs.K8S_POD_NAMESPACE),
+ 		})
++		if n.KubeVirtSecondary && (err != nil || !isPodAlive(peerPod)) {
++			// kubevirt secondary interfaces deliberately wait for their peer
++			// pod: the NAD attach happens while the topology peer may still
++			// be scheduling.
++			if err != nil {
++				log.Warnf("Add[%s]: kubevirt secondary interface %s could not read peer pod %s yet; waiting for topology/alive metadata", string(cniArgs.K8S_POD_NAME), link.LocalIntf, link.PeerPod)
++			} else {
++				log.Infof("Add[%s]: kubevirt secondary interface %s waiting for peer pod %s to become alive", string(cniArgs.K8S_POD_NAME), link.LocalIntf, peerPod.Name)
++			}
++			peerPod, err = waitForPeerPodAlive(ctx, meshnetClient, link.PeerPod, string(cniArgs.K8S_POD_NAMESPACE), localPod.Name, link.LocalIntf, kubeVirtSecondaryWaitDuration(n.SecondaryWaitSeconds))
++		}
+ 		if err != nil {
+ 			log.Errorf("Add[%s]: Failed to retrieve peer pod %s:%s topology", string(cniArgs.K8S_POD_NAME), string(cniArgs.K8S_POD_NAMESPACE), link.PeerPod)
+ 			return err
+ 		}
+ 
+-		isAlive := peerPod.SrcIp != "" && peerPod.NetNs != ""
++		isAlive := isPodAlive(peerPod)
+ 		log.Infof("Add[%s]: Is peer pod %s alive?: %t", string(cniArgs.K8S_POD_NAME), peerPod.Name, isAlive)
+ 
+ 		if isAlive { // This means we're coming up AFTER our peer so things are pretty easy
+@@ -491,11 +632,59 @@ func cmdAdd(args *skel.CmdArgs) (retErr error) {
+ 		}
+ 	}
+ 
++	if n.KubeVirtSecondary {
++		return printKubeVirtSecondaryResult(result, n.CNIVersion, requestedIntf)
++	}
+ 	return types.PrintResult(result, n.CNIVersion)
+ }
+ 
+ // -------------------------------------------------------------------------------------------------
+ // Deletes interfaces from a POD
++func cleanupKubeVirtSecondaryInterface(ctx context.Context, meshnetClient mpb.LocalClient, args *skel.CmdArgs, cniArgs *k8sArgs, localPod *mpb.Pod, requestedIntf string) error {
++	links, err := linksForCNIRequest(localPod.Links, requestedIntf, true)
++	if err != nil {
++		return err
++	}
++	log.Infof("Del[%s]: kubevirt secondary cleanup for interface %q (%d of %d links); preserving pod alive status", string(cniArgs.K8S_POD_NAME), requestedIntf, len(links), len(localPod.Links))
++	for _, link := range links {
++		linkType := "veth"
++		log.Infof("Del[%s]: kubevirt secondary cleanup retrieving peer pod %s for local interface %s", string(cniArgs.K8S_POD_NAME), link.PeerPod, link.LocalIntf)
++		peerPod, _ := meshnetClient.Get(ctx, &mpb.PodQuery{
++			Name:   link.PeerPod,
++			KubeNs: string(cniArgs.K8S_POD_NAMESPACE),
++		})
++		if peerPod != nil && peerPod.SrcIp != localPod.SrcIp {
++			if interNodeLinkType == wireutil.INTER_NODE_LINK_GRPC {
++				if err := MakeGRPCChanDown(link, localPod, peerPod, ctx); err != nil {
++					log.Errorf("Del[%s]: failed to remove secondary grpc wire for interface %s: %v", string(cniArgs.K8S_POD_NAME), link.LocalIntf, err)
++				}
++				linkType = "grpc"
++			} else {
++				linkType = "vxlan"
++			}
++		}
++
++		myVeth, err := makeVeth(args.Netns, link.LocalIntf, link.LocalIp)
++		if err != nil {
++			log.Errorf("Del[%s]: failed to construct secondary Veth %s in netns %s; continuing best-effort cleanup: %v", string(cniArgs.K8S_POD_NAME), link.LocalIntf, args.Netns, err)
++		} else if err = myVeth.RemoveVethLink(); err != nil {
++			log.Errorf("Del[%s]: error removing secondary link %s (%s) on pod %s: %v", string(cniArgs.K8S_POD_NAME), link.LocalIntf, linkType, localPod.Name, err)
++		}
++
++		ok, err := meshnetClient.SkipReverse(ctx, &mpb.SkipQuery{
++			Pod:    localPod.Name,
++			Peer:   link.PeerPod,
++			LinkId: link.Uid,
++			KubeNs: string(cniArgs.K8S_POD_NAMESPACE),
++		})
++		if err != nil || !ok.Response {
++			log.Errorf("Del[%s]: failed to set secondary skip-reverse flag on peer %s", string(cniArgs.K8S_POD_NAME), link.PeerPod)
++			return err
++		}
++	}
++	return nil
++}
++
+ func cmdDel(args *skel.CmdArgs) (retErr error) {
+ 	cniArgs := k8sArgs{}
+ 	if err := types.LoadArgs(args.Args, &cniArgs); err != nil {
+@@ -544,11 +733,19 @@ func cmdDel(args *skel.CmdArgs) (retErr error) {
+ 		log.Infof("Del: Pod %s:%s is not in topology returning. err:%v", string(cniArgs.K8S_POD_NAMESPACE), string(cniArgs.K8S_POD_NAME), err)
+ 		return types.PrintResult(result, n.CNIVersion)
+ 	}
++	requestedIntf := requestedIfName(args)
++	if isKubeVirtLauncherDefaultCNI(string(cniArgs.K8S_POD_NAME), requestedIntf, n.KubeVirtSecondary) {
++		log.Infof("Del[%s]: KubeVirt launcher default interface %q is owned by the primary CNI; skipping meshnet cleanup", string(cniArgs.K8S_POD_NAME), requestedIntf)
++		return types.PrintResult(result, n.CNIVersion)
++	}
+ 	// if the current containerID is not the topo's current containerID, exit here b/c this is a duplicated DEL call.
+ 	if localPod.ContainerId != args.ContainerID {
+ 		log.Infof("Del: Pod %s:%s is a duplicate; skipping", string(cniArgs.K8S_POD_NAMESPACE), string(cniArgs.K8S_POD_NAME))
+ 		return nil
+ 	}
++	if n.KubeVirtSecondary {
++		return cleanupKubeVirtSecondaryInterface(ctx, meshnetClient, args, &cniArgs, localPod, requestedIntf)
++	}
+ 
+ 	/* Tell daemon to close the grpc tunnel for this pod netns (if any) */
+ 	log.Infof("Del: Retrieving pod's metadata from meshnet daemon")
+diff --git a/plugin/meshnet_test.go b/plugin/meshnet_test.go
+new file mode 100644
+index 0000000..a149d43
+--- /dev/null
++++ b/plugin/meshnet_test.go
+@@ -0,0 +1,106 @@
++package main
++
++import (
++	"testing"
++	"time"
++
++	"github.com/containernetworking/cni/pkg/types/current"
++	mpb "github.com/networkop/meshnet-cni/daemon/proto/meshnet/v1beta1"
++)
++
++func TestLinksForCNIRequestMatchesRequestedInterface(t *testing.T) {
++	links := []*mpb.Link{{LocalIntf: "eth1"}, {LocalIntf: "eth2"}}
++	got, err := linksForCNIRequest(links, "eth2", true)
++	if err != nil {
++		t.Fatalf("linksForCNIRequest() returned error: %v", err)
++	}
++	if len(got) != 1 || got[0].LocalIntf != "eth2" {
++		t.Fatalf("linksForCNIRequest() = %#v, want only eth2", got)
++	}
++}
++
++func TestLinksForCNIRequestFailsClosedForUnknownRequestedInterface(t *testing.T) {
++	links := []*mpb.Link{{LocalIntf: "eth1"}, {LocalIntf: "eth2"}}
++	if _, err := linksForCNIRequest(links, "eth9", true); err == nil {
++		t.Fatal("expected unknown requested interface to fail closed")
++	}
++}
++
++func TestLinksForCNIRequestRequiresInterfaceForSecondary(t *testing.T) {
++	links := []*mpb.Link{{LocalIntf: "eth1"}}
++	if _, err := linksForCNIRequest(links, "", true); err == nil {
++		t.Fatal("expected missing requested interface to fail closed for kubevirt secondary")
++	}
++}
++
++func TestLinksForCNIRequestFallsBackForDefaultTopologyAdd(t *testing.T) {
++	links := []*mpb.Link{{LocalIntf: "eth1"}, {LocalIntf: "eth2"}}
++	got, err := linksForCNIRequest(links, "eth0", false)
++	if err != nil {
++		t.Fatalf("linksForCNIRequest() returned error: %v", err)
++	}
++	if len(got) != len(links) {
++		t.Fatalf("default topology ADD got %d links, want %d", len(got), len(links))
++	}
++}
++
++func TestKubeVirtSecondaryWaitDurationDefaultAndOverride(t *testing.T) {
++	if got := kubeVirtSecondaryWaitDuration(0); got != 240*time.Second {
++		t.Fatalf("kubeVirtSecondaryWaitDuration(0) = %s, want 240s", got)
++	}
++	if got := kubeVirtSecondaryWaitDuration(17); got != 17*time.Second {
++		t.Fatalf("kubeVirtSecondaryWaitDuration(17) = %s, want 17s", got)
++	}
++}
++
++func TestIsPodAliveRequiresSourceAndNetNS(t *testing.T) {
++	if isPodAlive(nil) {
++		t.Fatal("nil pod must not be alive")
++	}
++	if isPodAlive(&mpb.Pod{SrcIp: "192.0.2.1"}) {
++		t.Fatal("pod without netns must not be alive")
++	}
++	if isPodAlive(&mpb.Pod{NetNs: "/proc/1/ns/net"}) {
++		t.Fatal("pod without source IP must not be alive")
++	}
++	if !isPodAlive(&mpb.Pod{SrcIp: "192.0.2.1", NetNs: "/proc/1/ns/net"}) {
++		t.Fatal("pod with source IP and netns must be alive")
++	}
++}
++
++func TestAlignResultInterfaceNameUsesRequestedInterface(t *testing.T) {
++	result := &current.Result{Interfaces: []*current.Interface{{Name: "meshnet"}}}
++	alignResultInterfaceName(result, "pod123")
++	if len(result.Interfaces) != 1 || result.Interfaces[0].Name != "pod123" {
++		t.Fatalf("alignResultInterfaceName() = %#v, want pod123", result.Interfaces)
++	}
++}
++
++func TestAlignResultInterfaceNameAddsMissingInterface(t *testing.T) {
++	result := &current.Result{}
++	alignResultInterfaceName(result, "pod123")
++	if len(result.Interfaces) != 1 || result.Interfaces[0].Name != "pod123" {
++		t.Fatalf("alignResultInterfaceName() = %#v, want new pod123 interface", result.Interfaces)
++	}
++}
++
++func TestKubeVirtLauncherDefaultCNIIsSkipped(t *testing.T) {
++	if !isKubeVirtLauncherDefaultCNI("virt-launcher-router1-abcd", "eth0", false) {
++		t.Fatal("expected default launcher eth0 CNI call to be skipped")
++	}
++	if !isKubeVirtLauncherDefaultCNI("virt-launcher-router1-abcd", "", false) {
++		t.Fatal("expected default launcher CNI call without explicit ifName to be skipped")
++	}
++}
++
++func TestKubeVirtLauncherSecondaryCNIIsNotSkipped(t *testing.T) {
++	if isKubeVirtLauncherDefaultCNI("virt-launcher-router1-abcd", "eth1", true) {
++		t.Fatal("kubevirtSecondary NAD call must not be skipped")
++	}
++	if isKubeVirtLauncherDefaultCNI("virt-launcher-router1-abcd", "eth1", false) {
++		t.Fatal("non-default launcher interface must not be skipped")
++	}
++	if isKubeVirtLauncherDefaultCNI("container-ceos1", "eth0", false) {
++		t.Fatal("container topology pod default CNI call must not be skipped")
++	}
++}
+-- 
+2.55.0
+

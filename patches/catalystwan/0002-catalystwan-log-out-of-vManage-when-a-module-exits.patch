@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Wed, 3 Sep 2026 13:00:00 -0500
+Subject: [PATCH] catalystwan: log out of vManage when a module exits
+
+MEASURED on a live vManage 20.7.1. Upstream never logs out: every module
+invocation opens a ManagerSession and exits through exit_json/fail_json without
+closing it, so each call LEAKS a server-side session until vManage's idle
+timeout.
+
+vManage caps concurrent sessions per user, and once the cap is hit it answers
+every new login with
+
+    429 Client Error: Too Many Requests for url: .../dataservice/client/server
+
+which persisted for more than an hour after the calls stopped. A readiness loop
+of ~100 module calls locked the whole lane out of the very appliance it was
+waiting for -- and the symptom (429 on login) looks like a credential or
+rate-limit problem rather than a leak, which is what made it expensive to find.
+
+The SDK's own close() docstring says to use the session as a context manager;
+this is the equivalent for a module that exits through exit_json/fail_json.
+close() logs out first (ManagerSession.close -> logout -> super().close()).
+
+Best-effort by construction: a failure to log out must never mask the module's
+real result, so the close is wrapped and its exception swallowed. _session is
+cleared before closing so a double exit cannot double-close.
+
+UPSTREAM ASK: FILE. Session leakage affects every consumer of this collection,
+not just us.
+
+---
+diff --git a/plugins/module_utils/vmanage_module.py b/plugins/module_utils/vmanage_module.py
+index c2f1d66..0185ef9 100644
+--- a/plugins/module_utils/vmanage_module.py
++++ b/plugins/module_utils/vmanage_module.py
+@@ -91,10 +91,37 @@ class AnsibleCatalystwanModule:
+ 
+         self._session = None
+ 
++    def _close_session(self) -> None:
++        # SKYFORGE FIX (2026-09-02, measured on vManage 20.7.1). Upstream never
++        # logs out: every module invocation opens a ManagerSession and exits
++        # without closing it, so each call LEAKS a server-side session until
++        # vManage's idle timeout. vManage caps concurrent sessions per user and,
++        # once the cap is hit, answers every new login with
++        #
++        #   429 Client Error: Too Many Requests for url: .../dataservice/client/server
++        #
++        # which persisted for more than an hour after the calls stopped -- a
++        # readiness loop of ~100 module calls locked the whole lane out of the
++        # appliance it was waiting for. The SDK's own docstring on close() says
++        # to use the session as a context manager; this is the equivalent for a
++        # module that exits through exit_json/fail_json. close() logs out first
++        # (ManagerSession.close -> logout -> super().close()). Best-effort: a
++        # failure to log out must never mask the module's real result.
++        session = self._session
++        self._session = None
++        if session is None:
++            return
++        try:
++            session.close()
++        except Exception:  # noqa: BLE001 - logout is best-effort by design
++            pass
++
+     def exit_json(self, **kwargs):
++        self._close_session()
+         self.module.exit_json(**kwargs)
+ 
+     def fail_json(self, msg: str, **kwargs):
++        self._close_session()
+         self.module.fail_json(msg, **kwargs)
+ 
+     @property
+
+-- 
+2.51.0

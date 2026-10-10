@@ -1,0 +1,109 @@
+From cdfa0c5fa26109b74670f6acde4e0bb045443a4d Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Fri, 17 Jul 2026 18:27:12 -0500
+Subject: [PATCH 2/6] skyforge(mgmt): return-routes + EOS control-plane
+ firewall permits
+
+getLifecycleAPI PostStart hook: when SKYFORGE_MGMT_RETURN_CIDRS is set, add
+return routes for the management source CIDRs AND insert explicit iptables
+ACCEPT permits ahead of the cEOS control-plane default-DROP INPUT policy, on a
+bounded retry loop. Fixes the cEOS-on-Talos regression where the analysis system
+collector could not reach devices (SSH/gNMI SYNs and ICMP silently dropped).
+---
+ controllers/ceoslabdevice_controller.go | 69 +++++++++++++++++++++++++
+ 1 file changed, 69 insertions(+)
+
+diff --git a/controllers/ceoslabdevice_controller.go b/controllers/ceoslabdevice_controller.go
+index 352ed0c..69f05c7 100644
+--- a/controllers/ceoslabdevice_controller.go
++++ b/controllers/ceoslabdevice_controller.go
+@@ -871,6 +871,7 @@ func getPod(pod *corev1.Pod, device *ceoslabv1alpha1.CEosLabDevice, secretsAndCo
+ 	args := getArgs(device, envVarsMap)
+ 	image := getImage(device)
+ 	initImage := getInitContainerImage(device)
++	lifecycle := getLifecycleAPI(envVarsMap)
+ 	resourceMap, err := getResourceMap(device)
+ 	if err != nil {
+ 		return err
+@@ -905,6 +906,7 @@ func getPod(pod *corev1.Pod, device *ceoslabv1alpha1.CEosLabDevice, secretsAndCo
+ 			VolumeMounts:    volumeMounts,
+ 			// Run container in privileged mode
+ 			SecurityContext: &corev1.SecurityContext{Privileged: pointer.Bool(true)},
++			Lifecycle:       lifecycle,
+ 			// Check if agents are warm
+ 			StartupProbe: startupProbe,
+ 		}},
+@@ -914,6 +916,73 @@ func getPod(pod *corev1.Pod, device *ceoslabv1alpha1.CEosLabDevice, secretsAndCo
+ 	return nil
+ }
+ 
++func getLifecycleAPI(envVarsMap map[string]string) *corev1.Lifecycle {
++	if strings.TrimSpace(envVarsMap["SKYFORGE_MGMT_RETURN_CIDRS"]) == "" {
++		return nil
++	}
++	return &corev1.Lifecycle{
++		PostStart: &corev1.LifecycleHandler{
++			Exec: &corev1.ExecAction{
++				Command: []string{"/bin/sh", "-ceu", strings.TrimSpace(`
++cidrs="${SKYFORGE_MGMT_RETURN_CIDRS:-}"
++[ -n "${cidrs}" ] || exit 0
++apply_routes() {
++  gw="$(ip -4 route show dev eth0 scope link | awk '{print $1; exit}')"
++  if [ -z "${gw}" ]; then
++    gw="$(ip -4 route show default dev eth0 | awk '{print $3; exit}')"
++  fi
++  [ -n "${gw}" ] || return 0
++  mtu="${SKYFORGE_MGMT_RETURN_MTU:-1370}"
++  old_ifs="${IFS}"
++  IFS=","
++  for cidr in ${cidrs}; do
++    cidr="$(printf '%s' "${cidr}" | tr -d '[:space:]')"
++    [ -n "${cidr}" ] || continue
++    ip route replace "${cidr}" via "${gw}" dev eth0 mtu "${mtu}" || true
++  done
++  IFS="${old_ifs}"
++}
++# cEOS enforces an EOS control-plane firewall: the iptables INPUT policy is DROP
++# and the EOS_INPUT chain starts empty, so every inbound management packet from
++# the Kubernetes pod / Service network (where the analysis system collector pod and the
++# per-device Services it dials both live) is dropped before EOS processes it. The
++# return routes above only correct the reply *path*; they do not lift this
++# ingress filter (a route to the source CIDR does not create a permit). Without
++# an explicit permit the collector's SSH/gNMI SYNs — and even ICMP echo replies —
++# are silently dropped, which is the cEOS-on-Talos "collector cannot reach the
++# device" regression. Permit each management source CIDR explicitly. The
++# delete-then-insert keeps exactly one ACCEPT per CIDR across the retry loop,
++# ordered ahead of the default DROP.
++apply_permits() {
++  old_ifs="${IFS}"
++  IFS=","
++  for cidr in ${cidrs}; do
++    cidr="$(printf '%s' "${cidr}" | tr -d '[:space:]')"
++    [ -n "${cidr}" ] || continue
++    iptables -D INPUT -s "${cidr}" -j ACCEPT 2>/dev/null || true
++    iptables -I INPUT 1 -s "${cidr}" -j ACCEPT || true
++  done
++  IFS="${old_ifs}"
++}
++apply_routes
++apply_permits
++(
++  i=0
++  max="${SKYFORGE_MGMT_RETURN_ROUTE_RETRIES:-60}"
++  interval="${SKYFORGE_MGMT_RETURN_ROUTE_INTERVAL:-5}"
++  while [ "${i}" -lt "${max}" ]; do
++    apply_routes
++    apply_permits
++    i=$((i + 1))
++    sleep "${interval}"
++  done
++) >/tmp/skyforge-mgmt-return-routes.log 2>&1 &
++`)},
++			},
++		},
++	}
++}
++
+ func getEnvVarsMap(device *ceoslabv1alpha1.CEosLabDevice) map[string]string {
+ 	envVars := map[string]string{}
+ 	for k, v := range defaultEnvVars {

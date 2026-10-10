@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Fri, 5 Sep 2026 12:00:00 -0500
+Subject: [PATCH] gnmi: snapshot the dict keys before mutating the dict during
+ iteration
+
+`_dictToList` walks `aDict.keys()` and, inside the loop, inserts the renamed
+key (`___foo` -> `foo`) and `del`s the original. Mutating a dict while
+iterating its live keys view raises `RuntimeError` on Python 3 ("dictionary
+keys changed during iteration" on 3.8+, "dictionary changed size during
+iteration" when the two operations do not net out), so a gNMI reply that
+carries a `___`-prefixed key -- the encoding this plugin itself uses for
+lists -- crashes the connection plugin instead of being decoded. Iterating
+over `list(aDict.keys())`, a snapshot, is the idiomatic fix and changes
+nothing else.
+
+This is the in-place edit that lived in the vendored nokia.grpc 1.0.2 tree
+under components/server (server commit 764fb8bb, 2026-06-18) with no patch
+series and no register row, now carried the way every other fork delta is:
+the vendored tree is restored to the Galaxy artifact byte for byte (sha256
+e891eee6... per its own FILES.json) and this patch is applied at image build.
+
+Upstream: github.com/nokia/ansible-networking-collections, grpc/plugins/
+connection/gnmi.py. Generic, one line, offerable as-is.
+---
+ plugins/connection/gnmi.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/plugins/connection/gnmi.py b/plugins/connection/gnmi.py
+--- a/plugins/connection/gnmi.py
++++ b/plugins/connection/gnmi.py
+@@ -497,7 +497,7 @@ class Connection(NetworkConnectionBase):
+             raise AnsibleConnectionFailure("Ansible gNMI plugin does not support encoding for value: %s" % json.dumps(val))
+
+     def _dictToList(self, aDict):
+-        for key in aDict.keys():
++        for key in list(aDict.keys()):  # list() snapshot avoids RuntimeError when del modifies dict during iteration
+             if key.startswith('___'):
+                 aDict[key[3:]] = [self._dictToList(val) if isinstance(val, dict) else val for val in aDict[key].values()]
+                 del aDict[key]

@@ -1,0 +1,233 @@
+From 7a908ace4531d81a804c58a7cfa59efd503fccfc Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Mon, 21 Sep 2026 10:14:40 -0500
+Subject: [PATCH] reconcile: resolve the KubeVirt-renamed slot before
+ inspecting a same-node veth wire
+
+koko.InspectVethWire has no notion of virt-launcher's bridge-binding
+rename, so a same-node wire on a KubeVirt pod was always inspected under
+the bare pod<id> name -- which after binding is occupied only by a DOWN
+dummy placeholder. That correctly-broken verdict was then discarded by
+classifyWire's RenamedFormPresent skip, exactly like the cross-node vxlan
+case before 0020, leaving the wire permanently unverified.
+
+Adds resolveVethSlot (mirrors daemon/vxlan.resolveSlot) and uses it only
+for inspection, not repair: koko.EnsureVethWire is not KubeVirt-bridge-
+aware, so a genuinely broken resolved wire still does not auto-repair.
+
+Measured live on example-lab-shared 2026-09-21: siteC-dc-fw01 had two same-node
+KubeVirt links sitting in this skip bucket that were, in fact, up and
+correctly bridge-enslaved the whole time.
+---
+ daemon/meshnet/kubevirt_veth_slot.go | 68 ++++++++++++++++++++++++++++
+ daemon/meshnet/reconcile.go          | 19 +++++++-
+ daemon/meshnet/reconcile_test.go     | 60 ++++++++++++++++++++++++
+ 3 files changed, 146 insertions(+), 1 deletion(-)
+ create mode 100644 daemon/meshnet/kubevirt_veth_slot.go
+
+diff --git a/daemon/meshnet/kubevirt_veth_slot.go b/daemon/meshnet/kubevirt_veth_slot.go
+new file mode 100644
+index 0000000..7ec78d4
+--- /dev/null
++++ b/daemon/meshnet/kubevirt_veth_slot.go
+@@ -0,0 +1,68 @@
++package meshnet
++
++import (
++	"strings"
++
++	"github.com/containernetworking/plugins/pkg/ns"
++	"github.com/vishvananda/netlink"
++)
++
++// resolveVethSlot returns the link name a same-node veth wire's end actually
++// lives under inside nsName, resolving virt-launcher's KubeVirt
++// bridge-binding rename the same way daemon/vxlan.resolveSlot already does
++// for cross-node wires (0020).
++//
++// Without this, koko.InspectVethWire is handed the bare "podXXXX" name on
++// every call, same-node or not. On a plain container that is correct. On a
++// KubeVirt VM pod whose binding has already run, "podXXXX" is occupied by
++// nothing but virt-launcher's DOWN dummy placeholder and the real wire sits
++// under "XXXX-nic" inside "k6t-XXXX" -- so InspectVethWire correctly reports
++// the bare name as broken (an end that is not a veth), and classifyWire, on
++// seeing RenamedFormPresent, discards that verdict as unverifiable and skips
++// forever. Measured live 2026-09-21 (example-lab-shared siteC-dc-fw01): both of its
++// same-node KubeVirt links were, in fact, UP and correctly bridge-enslaved
++// under their "-nic" names the whole time -- the reconciler just never asked
++// the right question. This is the koko-side half of the same gap 0020 closed
++// for vxlan.
++//
++// Returns linkName UNCHANGED (the caller inspects under the original name,
++// same as before this fix) when: the namespace can't be entered, the name is
++// not KubeVirt-shaped, the renamed form isn't present, or a same-named
++// bridge isn't there to explain it. An unresolved case is a plain container,
++// or a VM pod whose binding has not run yet -- never guess past that.
++func resolveVethSlot(nsName, linkName string) string {
++	renamed := kubevirtRenamedName(linkName)
++	if renamed == "" || !netNSUsable(nsName) {
++		return linkName
++	}
++	netNS, err := ns.GetNS(nsName)
++	if err != nil {
++		return linkName
++	}
++	defer netNS.Close()
++
++	bridgeName := "k6t-" + strings.TrimPrefix(linkName, "pod")
++	resolved := linkName
++	_ = netNS.Do(func(_ ns.NetNS) error {
++		nic, err := netlink.LinkByName(renamed)
++		if err != nil {
++			// The renamed form is not there: binding has not run, or this
++			// was never a KubeVirt pod. Keep inspecting the original name.
++			return nil
++		}
++		br, err := netlink.LinkByName(bridgeName)
++		if err != nil || br.Type() != "bridge" {
++			// Something named "<id>-nic" exists but no matching KubeVirt
++			// bridge does -- do not guess this is the same mechanism.
++			return nil
++		}
++		if nic.Attrs().MasterIndex != br.Attrs().Index {
++			// A "-nic"-named link exists but is not actually enslaved to
++			// the bridge we expect it under. Not the pattern this resolves.
++			return nil
++		}
++		resolved = renamed
++		return nil
++	})
++	return resolved
++}
+diff --git a/daemon/meshnet/reconcile.go b/daemon/meshnet/reconcile.go
+index a8d52df..2d22854 100644
+--- a/daemon/meshnet/reconcile.go
++++ b/daemon/meshnet/reconcile.go
+@@ -302,6 +302,7 @@ func (s passStats) summary() string {
+ type reconcileDeps struct {
+ 	netNSUsable    func(nsName string) bool
+ 	renamedPresent func(nsName, linkName string) bool
++	resolveSlot    func(nsName, linkName string) string
+ 	inspectVeth    func(local, peer koko.VEth, alias string) (koko.WireHealth, string, error)
+ 	inspectVxlan   func(nsName, linkName string, vni int, peerVTEP net.IP) (vxlan.Health, string)
+ 	repairVeth     func(local, peer koko.VEth, alias string) error
+@@ -312,6 +313,7 @@ func productionDeps() reconcileDeps {
+ 	return reconcileDeps{
+ 		netNSUsable:    netNSUsable,
+ 		renamedPresent: kubevirtRenamedFormPresent,
++		resolveSlot:    resolveVethSlot,
+ 		inspectVeth:    koko.InspectVethWire,
+ 		inspectVxlan:   vxlan.Inspect,
+ 		repairVeth:     koko.EnsureVethWire,
+@@ -556,7 +558,22 @@ func (w wireRepair) inspect(d reconcileDeps) (wireHealth, string, error) {
+ 		return healthUnknown, "wire could not be derived from the Topology CR", w.buildErr
+ 	}
+ 	if w.sameNode {
+-		h, reason, err := d.inspectVeth(w.local, w.peer, w.alias)
++		// Inspect under the slot the wire actually lives in, not necessarily
++		// the bare name meshnet gave it: virt-launcher's KubeVirt bridge
++		// binding can have moved it to "<id>-nic" already (see
++		// kubevirt_veth_slot.go). koko has no notion of this rename, so
++		// resolving here -- for INSPECTION only -- is what makes Health
++		// honest for a same-node wire the same way vxlan.Inspect already is
++		// for a cross-node one. apply()/repairVeth deliberately keeps using
++		// w.local/w.peer UNRESOLVED: koko.EnsureVethWire is not
++		// KubeVirt-bridge-aware, and recreating a plain veth under the
++		// "-nic" name (or worse, beside it) would not restore a wire
++		// KubeVirt's own binding put there -- that is a distinct, still-open
++		// gap, not something to paper over with an unsafe auto-repair.
++		local, peer := w.local, w.peer
++		local.LinkName = d.resolveSlot(w.local.NsName, w.local.LinkName)
++		peer.LinkName = d.resolveSlot(w.peer.NsName, w.peer.LinkName)
++		h, reason, err := d.inspectVeth(local, peer, w.alias)
+ 		switch h {
+ 		case koko.WireHealthOK:
+ 			return healthOK, reason, err
+diff --git a/daemon/meshnet/reconcile_test.go b/daemon/meshnet/reconcile_test.go
+index 21d4aaa..67cb9ef 100644
+--- a/daemon/meshnet/reconcile_test.go
++++ b/daemon/meshnet/reconcile_test.go
+@@ -234,6 +234,10 @@ type fakeDeps struct {
+ 	vethHealth map[string]koko.WireHealth
+ 	vxlanState map[string]vxlan.Health
+ 	renamed    map[string]bool
++	// resolved maps "nsName/linkName" -> the slot inspection should resolve
++	// to. Absent keys resolve to the identity (unchanged name), matching
++	// every test that predates the KubeVirt same-node veth slot resolution.
++	resolved map[string]string
+ 
+ 	vethRepairs  []string
+ 	vxlanRepairs []string
+@@ -246,6 +250,12 @@ func (f *fakeDeps) deps() reconcileDeps {
+ 		renamedPresent: func(nsName, linkName string) bool {
+ 			return f.renamed[nsName+"/"+linkName]
+ 		},
++		resolveSlot: func(nsName, linkName string) string {
++			if resolved, ok := f.resolved[nsName+"/"+linkName]; ok {
++				return resolved
++			}
++			return linkName
++		},
+ 		inspectVeth: func(local, peer koko.VEth, alias string) (koko.WireHealth, string, error) {
+ 			h, ok := f.vethHealth[local.NsName+"/"+local.LinkName]
+ 			if !ok {
+@@ -421,6 +431,56 @@ func TestReconcileSkipsAWireWhoseNameKubeVirtRenamed(t *testing.T) {
+ 	}
+ }
+ 
++func TestReconcileFindsAHealthySameNodeWireUnderItsKubeVirtRenamedSlot(t *testing.T) {
++	// koko-side counterpart of TestReconcileRepairsACrossNodeWireDespiteThe...
++	// below: inspecting under the resolved "-nic" slot (kubevirt_veth_slot.go)
++	// finds the wire genuinely healthy -- exactly what was measured live on
++	// example-lab-shared 2026-09-21 (siteC-dc-fw01's two same-node KubeVirt links
++	// were UP and correctly bridge-enslaved the whole time; the reconciler
++	// just never asked under the right name and left them permanently
++	// "skipped" instead of confirming health).
++	f := &fakeDeps{
++		usableNS:   map[string]bool{nsLocal: true, nsPeer: true},
++		vethHealth: map[string]koko.WireHealth{nsLocal + "/980816f36b7-nic": koko.WireHealthOK},
++		renamed:    map[string]bool{nsLocal + "/pod980816f36b7": true},
++		resolved:   map[string]string{nsLocal + "/pod980816f36b7": "980816f36b7-nic"},
++	}
++	local := topo("virt-launcher-siteC-dc-fw01", "example-lab", "10.0.0.1", nsLocal, "c1",
++		topologyv1.Link{LocalIntf: "pod980816f36b7", PeerIntf: "eth3", PeerPod: "siteC-dc-leaf01", UID: 21})
++	peer := topo("siteC-dc-leaf01", "example-lab", "10.0.0.1", nsPeer, "c2")
++
++	_, stats := runPod(t, f, 1, local, peer)
++	if stats.Healthy != 1 || stats.Repaired != 0 || len(f.vethRepairs) != 0 {
++		t.Fatalf("a healthy same-node KubeVirt wire was not recognized via its resolved slot: %s %v", stats.summary(), f.vethRepairs)
++	}
++	if n := stats.Skipped["a-link-exists-under-the-KubeVirt-renamed-form-of-this-name"]; n != 0 {
++		t.Fatalf("healthy resolved same-node wire was still bucketed as an unverifiable skip: %s", stats.summary())
++	}
++}
++
++func TestReconcileNeverAutoRepairsAGenuinelyBrokenSameNodeKubeVirtWire(t *testing.T) {
++	// Resolution can also confirm the wire IS broken even under its correct
++	// slot. That must still not become verdictRepair: koko.EnsureVethWire has
++	// no notion of the KubeVirt bridge, and recreating a plain veth under (or
++	// beside) the "-nic" name would not restore what virt-launcher's own
++	// binding put there. This stays a skip -- deliberately -- until a
++	// bridge-aware same-node repair exists.
++	f := &fakeDeps{
++		usableNS:   map[string]bool{nsLocal: true, nsPeer: true},
++		vethHealth: map[string]koko.WireHealth{nsLocal + "/980816f36b7-nic": koko.WireHealthBroken},
++		renamed:    map[string]bool{nsLocal + "/pod980816f36b7": true},
++		resolved:   map[string]string{nsLocal + "/pod980816f36b7": "980816f36b7-nic"},
++	}
++	local := topo("virt-launcher-siteC-dc-fw01", "example-lab", "10.0.0.1", nsLocal, "c1",
++		topologyv1.Link{LocalIntf: "pod980816f36b7", PeerIntf: "eth3", PeerPod: "siteC-dc-leaf01", UID: 21})
++	peer := topo("siteC-dc-leaf01", "example-lab", "10.0.0.1", nsPeer, "c2")
++
++	_, stats := runPod(t, f, 1, local, peer)
++	if stats.Repaired != 0 || len(f.vethRepairs) != 0 {
++		t.Fatalf("a genuinely-broken same-node KubeVirt wire was auto-repaired via plain EnsureVethWire: %s %v", stats.summary(), f.vethRepairs)
++	}
++}
++
+ func TestReconcileRepairsACrossNodeWireDespiteTheKubeVirtRenamedForm(t *testing.T) {
+ 	// Cross-node counterpart of the test above. vxlan.Inspect already looks
+ 	// through the KubeVirt rename and compared the renamed link's VNI and
+-- 
+2.55.0
+

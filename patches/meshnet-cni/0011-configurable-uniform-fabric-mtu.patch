@@ -1,0 +1,370 @@
+From a9460d5b389760805abf26a6f10e8dca0b0ae8fa Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sat, 25 Jul 2026 19:05:51 -0500
+Subject: [PATCH] meshnet: declare one fabric MTU
+
+---
+ daemon/cni/cni.go              | 25 +++++++++++++++++++++----
+ daemon/cni/cni_mtu_test.go     | 18 ++++++++++++++++++
+ daemon/vxlan/vxlan.go          | 20 ++++++++++++++++++++
+ daemon/vxlan/vxlan_mtu_test.go | 14 ++++++++++++++
+ plugin/grpcwires-plugin.go     |  7 ++++---
+ plugin/meshnet.go              | 29 +++++++++++++++++++----------
+ plugin/meshnet_test.go         | 20 ++++++++++++++++++++
+ 7 files changed, 116 insertions(+), 17 deletions(-)
+ create mode 100644 daemon/cni/cni_mtu_test.go
+ create mode 100644 daemon/vxlan/vxlan_mtu_test.go
+
+diff --git a/daemon/cni/cni.go b/daemon/cni/cni.go
+index 79b3645..a022269 100644
+--- a/daemon/cni/cni.go
++++ b/daemon/cni/cni.go
+@@ -8,11 +8,11 @@ import (
+ 	"os"
+ 	"path/filepath"
+ 	"sort"
++	"strconv"
+ 	"strings"
+ 	"time"
+ 
+ 	"github.com/containernetworking/cni/libcni"
+-	"github.com/containernetworking/cni/pkg/types"
+ 	log "github.com/sirupsen/logrus"
+ )
+ 
+@@ -120,9 +120,14 @@ func Init() error {
+ 	// We can safely access and type-cast since all of the checks have already been done in the `loadConfList()`
+ 	plugins := conf["plugins"].([]interface{})
+ 
+-	plugins = append(plugins, &types.NetConf{
+-		Type: defaultPluginName,
+-		Name: defaultPluginName,
++	fabricMTU, err := fabricMTUFromEnv()
++	if err != nil {
++		return err
++	}
++	plugins = append(plugins, map[string]interface{}{
++		"type":      defaultPluginName,
++		"name":      defaultPluginName,
++		"fabricMTU": fabricMTU,
+ 	})
+ 
+ 	conf["cniVersion"] = "0.3.0"
+@@ -136,6 +141,18 @@ func Init() error {
+ 	return saveConfList(conf)
+ }
+ 
++func fabricMTUFromEnv() (int, error) {
++	raw := strings.TrimSpace(os.Getenv("MESHNET_FABRIC_MTU"))
++	if raw == "" {
++		return 1450, nil
++	}
++	mtu, err := strconv.Atoi(raw)
++	if err != nil || mtu < 1280 || mtu > 65535 {
++		return 0, fmt.Errorf("MESHNET_FABRIC_MTU must be an integer in [1280,65535], got %q", raw)
++	}
++	return mtu, nil
++}
++
+ // InitOrWaitForBaseConfig installs the meshnet CNI configuration, waiting for
+ // a base (non-meshnet) CNI config to show up in /etc/cni/net.d first. At node
+ // boot meshnetd races the primary CNI's conflist write; failing hard here
+diff --git a/daemon/cni/cni_mtu_test.go b/daemon/cni/cni_mtu_test.go
+new file mode 100644
+index 0000000..8854242
+--- /dev/null
++++ b/daemon/cni/cni_mtu_test.go
+@@ -0,0 +1,18 @@
++package cni
++
++import "testing"
++
++func TestFabricMTUFromEnv(t *testing.T) {
++	t.Setenv("MESHNET_FABRIC_MTU", "")
++	if got, err := fabricMTUFromEnv(); err != nil || got != 1450 {
++		t.Fatalf("default = %d,%v, want 1450,nil", got, err)
++	}
++	t.Setenv("MESHNET_FABRIC_MTU", "8950")
++	if got, err := fabricMTUFromEnv(); err != nil || got != 8950 {
++		t.Fatalf("jumbo = %d,%v, want 8950,nil", got, err)
++	}
++	t.Setenv("MESHNET_FABRIC_MTU", "invalid")
++	if _, err := fabricMTUFromEnv(); err == nil {
++		t.Fatal("invalid MTU accepted")
++	}
++}
+diff --git a/daemon/vxlan/vxlan.go b/daemon/vxlan/vxlan.go
+index 20756b3..fffd6d3 100644
+--- a/daemon/vxlan/vxlan.go
++++ b/daemon/vxlan/vxlan.go
+@@ -3,7 +3,9 @@ package vxlan
+ import (
+ 	"fmt"
+ 	"net"
++	"os"
+ 	"strconv"
++	"strings"
+ 
+ 	"github.com/containernetworking/plugins/pkg/ns"
+ 	"github.com/redhat-nfvpe/koko/api"
+@@ -32,10 +34,15 @@ func CreateOrUpdate(v *mpb.RemotePod) error {
+ 		}
+ 	}
+ 
++	mtu, err := fabricMTUFromEnv()
++	if err != nil {
++		return err
++	}
+ 	// Creating koko Veth struct
+ 	veth := api.VEth{
+ 		NsName:   v.NetNs,
+ 		LinkName: v.IntfName,
++		MTU:      mtu,
+ 	}
+ 
+ 	// Link IP is optional, only set it when it's provided
+@@ -56,6 +63,7 @@ func CreateOrUpdate(v *mpb.RemotePod) error {
+ 		ParentIF: srcIntf,
+ 		IPAddr:   net.ParseIP(v.PeerVtep),
+ 		ID:       int(v.Vni),
++		MTU:      mtu,
+ 	}
+ 	vxLanOvrlyLogger.Infof("Created koko vxlan struct %+v", vxlan)
+ 
+@@ -103,6 +111,18 @@ func CreateOrUpdate(v *mpb.RemotePod) error {
+ 	return nil
+ }
+ 
++func fabricMTUFromEnv() (int, error) {
++	raw := strings.TrimSpace(os.Getenv("MESHNET_FABRIC_MTU"))
++	if raw == "" {
++		return 1450, nil
++	}
++	mtu, err := strconv.Atoi(raw)
++	if err != nil || mtu < 1280 || mtu > 65535 {
++		return 0, fmt.Errorf("MESHNET_FABRIC_MTU must be an integer in [1280,65535], got %q", raw)
++	}
++	return mtu, nil
++}
++
+ // getLinkFromNS retrieves netlink.Link from NetNS
+ func getLinkFromNS(nsName string, linkName string) netlink.Link {
+ 	// If namespace doesn't exist, do nothing and return empty result
+diff --git a/daemon/vxlan/vxlan_mtu_test.go b/daemon/vxlan/vxlan_mtu_test.go
+new file mode 100644
+index 0000000..6160ace
+--- /dev/null
++++ b/daemon/vxlan/vxlan_mtu_test.go
+@@ -0,0 +1,14 @@
++package vxlan
++
++import "testing"
++
++func TestFabricMTUFromEnv(t *testing.T) {
++	t.Setenv("MESHNET_FABRIC_MTU", "")
++	if got, err := fabricMTUFromEnv(); err != nil || got != 1450 {
++		t.Fatalf("default = %d,%v, want 1450,nil", got, err)
++	}
++	t.Setenv("MESHNET_FABRIC_MTU", "8950")
++	if got, err := fabricMTUFromEnv(); err != nil || got != 8950 {
++		t.Fatalf("jumbo = %d,%v, want 8950,nil", got, err)
++	}
++}
+diff --git a/plugin/grpcwires-plugin.go b/plugin/grpcwires-plugin.go
+index 4df7b16..b503980 100644
+--- a/plugin/grpcwires-plugin.go
++++ b/plugin/grpcwires-plugin.go
+@@ -21,7 +21,7 @@ const (
+ )
+ 
+ // --------------------------------------------------------------------------------------------------------
+-func CreatGRPCChan(link *mpb.Link, localPod *mpb.Pod, peerPod *mpb.Pod, localClient mpb.LocalClient, cniArgs *k8sArgs, ctx context.Context) error {
++func CreatGRPCChan(link *mpb.Link, localPod *mpb.Pod, peerPod *mpb.Pod, localClient mpb.LocalClient, cniArgs *k8sArgs, ctx context.Context, fabricMTU int) error {
+ 	// At this point pods attached to both end of this link are both up. They have got the management IP already.
+ 
+ 	if link == nil {
+@@ -126,7 +126,7 @@ func CreatGRPCChan(link *mpb.Link, localPod *mpb.Pod, peerPod *mpb.Pod, localCli
+ 
+ 	// Build koko's veth struct for the intf to be placed inside the pod
+ 	inConIntfNm := link.LocalIntf
+-	inContainerVeth, err := makeVeth(localPod.NetNs, inConIntfNm, link.LocalIp)
++	inContainerVeth, err := makeVeth(localPod.NetNs, inConIntfNm, link.LocalIp, fabricMTU)
+ 	if err != nil {
+ 		log.Errorf("Add-GRPC[%s]: Could not create vEth for local pod %s:%s, peer pod %s, err %v", localPod.Name, localPod.Name, inConIntfNm, peerPod.Name, err)
+ 		return err
+@@ -139,7 +139,8 @@ func CreatGRPCChan(link *mpb.Link, localPod *mpb.Pod, peerPod *mpb.Pod, localCli
+ 
+ 	hostEndVeth := &koko.VEth{
+ 		LinkName: respIntfName.NodeIntfName,
+-		NsName:   currNs.Path()}
++		NsName:   currNs.Path(),
++		MTU:      fabricMTU}
+ 
+ 	if err = koko.MakeVeth(*inContainerVeth, *hostEndVeth); err != nil {
+ 		return fmt.Errorf("Add-GRPC[%s]: creating GRPC wire: failed to create vEth-pair inside pod (%s:%s) and on host (%s). err:%s",
+diff --git a/plugin/meshnet.go b/plugin/meshnet.go
+index 1cbc083..9fc4601 100644
+--- a/plugin/meshnet.go
++++ b/plugin/meshnet.go
+@@ -56,6 +56,7 @@ type netConf struct {
+ 	Delegate             map[string]interface{} `json:"delegate"`
+ 	KubeVirtSecondary    bool                   `json:"kubevirtSecondary,omitempty"`
+ 	SecondaryWaitSeconds int                    `json:"secondaryWaitSeconds,omitempty"`
++	FabricMTU            int                    `json:"fabricMTU,omitempty"`
+ }
+ 
+ type k8sArgs struct {
+@@ -80,6 +81,12 @@ func loadConf(bytes []byte) (*netConf, *current.Result, error) {
+ 	if err := json.Unmarshal(bytes, n); err != nil {
+ 		return nil, nil, fmt.Errorf("failed to load netconf: %v", err)
+ 	}
++	if n.FabricMTU == 0 {
++		n.FabricMTU = 1450
++	}
++	if n.FabricMTU < 1280 || n.FabricMTU > 65535 {
++		return nil, nil, fmt.Errorf("fabricMTU must be in [1280,65535], got %d", n.FabricMTU)
++	}
+ 
+ 	// Parse previous result.
+ 	if n.RawPrevResult == nil {
+@@ -180,11 +187,12 @@ func getVxlanSource(nodeIP string, nodeIntf string) (string, string, error) {
+ 
+ // -------------------------------------------------------------------------------------------------
+ // makeVeth creates koko.Veth from NetNS and LinkName
+-func makeVeth(netNS, linkName string, ip string) (*koko.VEth, error) {
++func makeVeth(netNS, linkName string, ip string, mtu int) (*koko.VEth, error) {
+ 	log.Infof("Creating Veth struct with NetNS:%s and intfName: %s, IP:%s", netNS, linkName, ip)
+ 	veth := koko.VEth{}
+ 	veth.NsName = netNS
+ 	veth.LinkName = linkName
++	veth.MTU = mtu
+ 	if ip != "" {
+ 		ipAddr, ipSubnet, err := net.ParseCIDR(ip)
+ 		if err != nil {
+@@ -213,11 +221,12 @@ func makeVxlanID(namespace string, idx int64) int {
+ }
+ 
+ // Creates koko.Vxlan from ParentIF, destination IP and VNI
+-func makeVxlan(srcIntf string, peerIP string, vni int) *koko.VxLan {
++func makeVxlan(srcIntf string, peerIP string, vni int, mtu int) *koko.VxLan {
+ 	return &koko.VxLan{
+ 		ParentIF: srcIntf,
+ 		IPAddr:   net.ParseIP(peerIP),
+ 		ID:       vni,
++		MTU:      mtu,
+ 	}
+ }
+ 
+@@ -498,7 +507,7 @@ func cmdAdd(args *skel.CmdArgs) (retErr error) {
+ 	var linkErrs []error
+ 	for _, link := range links { // Iterate over each link of the local pod
+ 		// Build koko's veth struct for local intf
+-		myVeth, err := makeVeth(args.Netns, link.LocalIntf, link.LocalIp)
++		myVeth, err := makeVeth(args.Netns, link.LocalIntf, link.LocalIp, n.FabricMTU)
+ 		if err != nil {
+ 			return err
+ 		}
+@@ -549,7 +558,7 @@ func cmdAdd(args *skel.CmdArgs) (retErr error) {
+ 			if peerPod.SrcIp == localPod.SrcIp { // This means we're on the same host
+ 				log.Infof("Add[%s]: %s and %s are on the same host", string(cniArgs.K8S_POD_NAME), localPod.Name, peerPod.Name)
+ 				// Creating koko's Veth struct for peer intf
+-				peerVeth, err := makeVeth(peerPod.NetNs, link.PeerIntf, link.PeerIp)
++				peerVeth, err := makeVeth(peerPod.NetNs, link.PeerIntf, link.PeerIp, n.FabricMTU)
+ 				if err != nil {
+ 					log.Errorf("Add[%s]: Failed to build koko Veth struct", string(cniArgs.K8S_POD_NAME))
+ 					return err
+@@ -608,7 +617,7 @@ func cmdAdd(args *skel.CmdArgs) (retErr error) {
+ 			} else { // This means we're on different hosts
+ 				log.Infof("Add[%s]: %s@%s and %s@%s are on different hosts", string(cniArgs.K8S_POD_NAME), localPod.Name, localPod.SrcIp, peerPod.Name, peerPod.SrcIp)
+ 				if interNodeLinkType == wireutil.INTER_NODE_LINK_GRPC {
+-					err = CreatGRPCChan(link, localPod, peerPod, meshnetClient, &cniArgs, ctx)
++					err = CreatGRPCChan(link, localPod, peerPod, meshnetClient, &cniArgs, ctx, n.FabricMTU)
+ 					if err != nil {
+ 						log.Errorf("Add[%s]: !! Failed to create grpc wire. err: %v", string(cniArgs.K8S_POD_NAME), err)
+ 						return err
+@@ -617,7 +626,7 @@ func cmdAdd(args *skel.CmdArgs) (retErr error) {
+ 				}
+ 				vni := makeVxlanID(string(cniArgs.K8S_POD_NAMESPACE), link.Uid)
+ 				// Creating koko's Vxlan struct
+-				vxlan := makeVxlan(srcIntf, peerPod.SrcIp, vni)
++				vxlan := makeVxlan(srcIntf, peerPod.SrcIp, vni, n.FabricMTU)
+ 				if err = koko.MakeVxLan(*myVeth, *vxlan); err != nil {
+ 					log.Infof("Add[%s]: Error when creating a Vxlan interface with koko: %s", string(cniArgs.K8S_POD_NAME), err)
+ 					return err
+@@ -682,7 +691,7 @@ func cmdAdd(args *skel.CmdArgs) (retErr error) {
+ 
+ // -------------------------------------------------------------------------------------------------
+ // Deletes interfaces from a POD
+-func cleanupKubeVirtSecondaryInterface(ctx context.Context, meshnetClient mpb.LocalClient, args *skel.CmdArgs, cniArgs *k8sArgs, localPod *mpb.Pod, requestedIntf string) error {
++func cleanupKubeVirtSecondaryInterface(ctx context.Context, meshnetClient mpb.LocalClient, args *skel.CmdArgs, cniArgs *k8sArgs, localPod *mpb.Pod, requestedIntf string, fabricMTU int) error {
+ 	links, err := linksForCNIRequest(localPod.Links, requestedIntf, true)
+ 	if err != nil {
+ 		return err
+@@ -706,7 +715,7 @@ func cleanupKubeVirtSecondaryInterface(ctx context.Context, meshnetClient mpb.Lo
+ 			}
+ 		}
+ 
+-		myVeth, err := makeVeth(args.Netns, link.LocalIntf, link.LocalIp)
++		myVeth, err := makeVeth(args.Netns, link.LocalIntf, link.LocalIp, fabricMTU)
+ 		if err != nil {
+ 			log.Errorf("Del[%s]: failed to construct secondary Veth %s in netns %s; continuing best-effort cleanup: %v", string(cniArgs.K8S_POD_NAME), link.LocalIntf, args.Netns, err)
+ 		} else if err = myVeth.RemoveVethLink(); err != nil {
+@@ -786,7 +795,7 @@ func cmdDel(args *skel.CmdArgs) (retErr error) {
+ 		return nil
+ 	}
+ 	if n.KubeVirtSecondary {
+-		return cleanupKubeVirtSecondaryInterface(ctx, meshnetClient, args, &cniArgs, localPod, requestedIntf)
++		return cleanupKubeVirtSecondaryInterface(ctx, meshnetClient, args, &cniArgs, localPod, requestedIntf, n.FabricMTU)
+ 	}
+ 
+ 	/* Tell daemon to close the grpc tunnel for this pod netns (if any) */
+@@ -842,7 +851,7 @@ func cmdDel(args *skel.CmdArgs) (retErr error) {
+ 			continue
+ 		}
+ 		// Creating koko's Veth struct for local intf
+-		myVeth, err := makeVeth(args.Netns, link.LocalIntf, link.LocalIp)
++		myVeth, err := makeVeth(args.Netns, link.LocalIntf, link.LocalIp, n.FabricMTU)
+ 		if err != nil {
+ 			log.Infof("Del: Failed to construct koko Veth struct")
+ 			return err
+diff --git a/plugin/meshnet_test.go b/plugin/meshnet_test.go
+index a149d43..dd87714 100644
+--- a/plugin/meshnet_test.go
++++ b/plugin/meshnet_test.go
+@@ -1,6 +1,7 @@
+ package main
+ 
+ import (
++	"encoding/json"
+ 	"testing"
+ 	"time"
+ 
+@@ -8,6 +9,25 @@ import (
+ 	mpb "github.com/networkop/meshnet-cni/daemon/proto/meshnet/v1beta1"
+ )
+ 
++func TestLoadConfFabricMTUDefaultAndJumbo(t *testing.T) {
++	base := map[string]interface{}{"cniVersion": "0.3.0", "name": "meshnet", "type": "meshnet"}
++	data, _ := json.Marshal(base)
++	conf, _, err := loadConf(data)
++	if err != nil || conf.FabricMTU != 1450 {
++		t.Fatalf("default fabric MTU = %d,%v, want 1450,nil", conf.FabricMTU, err)
++	}
++	base["fabricMTU"] = 8950
++	data, _ = json.Marshal(base)
++	conf, _, err = loadConf(data)
++	if err != nil || conf.FabricMTU != 8950 {
++		t.Fatalf("jumbo fabric MTU = %d,%v, want 8950,nil", conf.FabricMTU, err)
++	}
++	vxlan := makeVxlan("bond0", "192.0.2.1", 4096, conf.FabricMTU)
++	if vxlan.MTU != 8950 {
++		t.Fatalf("VXLAN MTU = %d, want 8950", vxlan.MTU)
++	}
++}
++
+ func TestLinksForCNIRequestMatchesRequestedInterface(t *testing.T) {
+ 	links := []*mpb.Link{{LocalIntf: "eth1"}, {LocalIntf: "eth2"}}
+ 	got, err := linksForCNIRequest(links, "eth2", true)
+-- 
+2.55.0
+

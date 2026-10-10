@@ -1,0 +1,144 @@
+From 6bb08b24645e7931a0a6ac906b1ebb9fda6d4326 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sat, 18 Jul 2026 08:12:54 -0500
+Subject: [PATCH 1/9] build: toolchain refresh and vendored koko via _localdeps
+
+- Build images on golang:1.23 (pinned protoc-gen-go v1.28.1 /
+  protoc-gen-go-grpc v1.2.0 so generated code stays reproducible) with
+  BUILDPLATFORM-aware proto stage; runtime base ubuntu:24.04.
+- Vendor the forked koko into the module graph via a go.mod replace to
+  ./_localdeps/koko; the image build COPYies _localdeps/koko in before
+  'go mod download'. Build tooling materializes that directory from the
+  pinned koko checkout plus its patch series.
+- Harden the installer entrypoint: atomic temp-file install of the plugin
+  binary and CNI conf with mode setting and sha256 verification, and exec
+  the daemon so PID 1 signal handling works.
+
+Fork-only (build plumbing), not intended for upstream.
+---
+ docker/Dockerfile        | 11 ++++----
+ docker/new-entrypoint.sh | 54 ++++++++++++++++++++++++++++++++++------
+ go.mod                   |  2 ++
+ 3 files changed, 54 insertions(+), 13 deletions(-)
+
+diff --git a/docker/Dockerfile b/docker/Dockerfile
+index 2534271..60fc2fe 100644
+--- a/docker/Dockerfile
++++ b/docker/Dockerfile
+@@ -1,10 +1,10 @@
+ # GRPC generation
+-FROM golang:1.18.2 AS proto_base
++FROM --platform=${BUILDPLATFORM:-linux/amd64} golang:1.23 AS proto_base
+ 
+ WORKDIR /src
+ 
+-RUN go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+-RUN go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
++RUN go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.28.1
++RUN go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.2.0
+ RUN go install github.com/bufbuild/buf/cmd/buf@v1.13.1
+ 
+ COPY daemon/proto .
+@@ -16,13 +16,14 @@ RUN buf lint && buf generate -v
+ #---------------------------------------------- Stage 2: Build Base : Build mesnet binraries (Plugin & daemon) - ---------------------------------
+ # Building the binaries
+ #FROM golang:1.17.2 AS build_base
+-FROM golang:1.18.2 AS build_base
++FROM golang:1.23 AS build_base
+ 
+ 
+ WORKDIR /go/src/github.com/networkop/meshnet-cni
+ ENV CGO_ENABLED=0
+ COPY go.mod .
+ COPY go.sum .
++COPY _localdeps/koko/ _localdeps/koko/
+ RUN go mod download; \
+     apt-get update -y; \
+     apt-get install -y libpcap-dev; \
+@@ -54,7 +55,7 @@ RUN GOOS=${TARGETOS} CGO_ENABLED=1 GOARCH=${TARGETARCH} go build -ldflags="-s -w
+ # RUN apk update; \
+ #     apk add --no-cache jq
+ 
+-FROM ubuntu:20.04
++FROM ubuntu:24.04
+ RUN apt-get update; \ 
+     apt-get install -y jq; \
+     apt-get install -y libpcap-dev
+diff --git a/docker/new-entrypoint.sh b/docker/new-entrypoint.sh
+index 3f3179d..fd52bf0 100644
+--- a/docker/new-entrypoint.sh
++++ b/docker/new-entrypoint.sh
+@@ -1,14 +1,52 @@
+ #!/bin/bash
++set -euo pipefail
+ 
+-echo "Distributing files"
+-if [ -d "/opt/cni/bin/" ] && [ -f "./meshnet" ]; then
+-  cp ./meshnet /opt/cni/bin/
+-fi
++install_file() {
++  local src="$1"
++  local dst="$2"
++  local mode="$3"
++  local dir
++  local tmp
++  local src_sum
++  local dst_sum
+ 
+-if [ -d "/etc/cni/net.d/" ] && [ -f "./meshnet.conf" ]; then
+-  cp ./meshnet.conf /etc/cni/net.d/
+-fi
++  if [[ ! -f "$src" ]]; then
++    echo "ERROR: source file not found: $src" >&2
++    exit 1
++  fi
++
++  dir="$(dirname "$dst")"
++  if [[ ! -d "$dir" ]]; then
++    echo "ERROR: destination directory not found: $dir" >&2
++    exit 1
++  fi
++
++  tmp="${dir}/.$(basename "$dst").$$.tmp"
++  rm -f "$tmp"
++  cp "$src" "$tmp"
++  chmod "$mode" "$tmp"
++  mv -f "$tmp" "$dst"
+ 
++  src_sum="$(sha256sum "$src" | awk '{print $1}')"
++  dst_sum="$(sha256sum "$dst" | awk '{print $1}')"
++  if [[ "$src_sum" != "$dst_sum" ]]; then
++    echo "ERROR: installed $dst checksum mismatch: got $dst_sum expected $src_sum" >&2
++    exit 1
++  fi
++}
++
++cleanup_tmp() {
++  rm -f /opt/cni/bin/.meshnet.$$.tmp /etc/cni/net.d/.meshnet.conf.$$.tmp 2>/dev/null || true
++}
++trap cleanup_tmp EXIT
++
++echo "Installing meshnet CNI plugin"
++install_file ./meshnet /opt/cni/bin/meshnet 0755
++
++if [[ -f ./meshnet.conf ]]; then
++  echo "Installing meshnet CNI config"
++  install_file ./meshnet.conf /etc/cni/net.d/meshnet.conf 0644
++fi
+ 
+ echo "Starting meshnetd daemon"
+-/meshnetd
++exec /meshnetd
+diff --git a/go.mod b/go.mod
+index aee7cff..effd163 100644
+--- a/go.mod
++++ b/go.mod
+@@ -78,3 +78,5 @@ require (
+ )
+ 
+ replace github.com/networkop/meshnet-cni => ./
++
++replace github.com/redhat-nfvpe/koko => ./_localdeps/koko
+-- 
+2.55.0
+

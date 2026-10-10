@@ -1,0 +1,377 @@
+From 28d0ab69bfbb6ef3fe162b5897d7e53e4f1ac244 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Wed, 5 Aug 2026 19:48:04 -0500
+Subject: [PATCH] perf(controller): parallelize bounded cEOS admission
+
+---
+ controllers/ceoslabdevice_controller.go       | 175 ++++++++++++++----
+ .../ceoslabdevice_controller_unit_test.go     |  64 +++++++
+ 2 files changed, 207 insertions(+), 32 deletions(-)
+
+diff --git a/controllers/ceoslabdevice_controller.go b/controllers/ceoslabdevice_controller.go
+index 9e75aa7..cf989a4 100644
+--- a/controllers/ceoslabdevice_controller.go
++++ b/controllers/ceoslabdevice_controller.go
+@@ -76,6 +76,7 @@ const (
+ 	// when the node is visibly backing up on sandbox creation — so a deploy of any size
+ 	// succeeds AND small/medium deploys aren't throttled.
+ 	defaultMaxConcurrentBringup = 16               // high ceiling / catastrophe backstop; tunable via SKYFORGE_MAX_CONCURRENT_BRINGUP
++	maxSafeConcurrentBringup    = 48               // burst-validated safety boundary; configuration may lower but never exceed it
+ 	bringupSandboxDeadline      = 45 * time.Second // a cEOS pod Pending this long with no sandbox/init started => CNI is backing up
+ 	bringupRequeueAfter         = 10 * time.Second // how soon to retry a deferred device
+ 
+@@ -106,12 +107,16 @@ var (
+ 	ethIntfRe  = regexp.MustCompile(`^Ethernet\d+(?:/\d+)?(?:/\d+)?$`)
+ 	mgmtIntfRe = regexp.MustCompile(`^Management\d+(?:/\d+)?$`)
+ 
+-	// The throttle decision and pod creation form one admission transaction.
+-	// Without this lock, concurrent reconciles can all observe inflight below
+-	// the ceiling and collectively overshoot it before any pod is visible.
+-	bringupAdmissionMu sync.Mutex
++	// API observations may lag a successful pod create. Reservations bridge that
++	// visibility window without serializing independent reconciles or pod creates.
++	bringupAdmissions = bringupAdmissionReservations{pods: map[types.NamespacedName]struct{}{}}
+ )
+ 
++type bringupAdmissionReservations struct {
++	mu   sync.Mutex
++	pods map[types.NamespacedName]struct{}
++}
++
+ // CEosLabDeviceReconciler reconciles a CEosLabDevice object
+ type CEosLabDeviceReconciler struct {
+ 	client.Client
+@@ -315,19 +320,11 @@ func (r *CEosLabDeviceReconciler) Reconcile(ctx context.Context, req ctrl.Reques
+ 	// EOS ssdinit, stalling Sysdb past the startup-probe budget (task #77).
+ 	startupPersistenceEnabled := startupConfigResourceVersion != nil
+ 
+-	// Adaptive bringup pacing: serialize only the admission decision plus pod
+-	// create, not pod startup. This makes the count-and-create transaction
+-	// atomic while admitted pods still initialize concurrently.
+-	bringupAdmissionMu.Lock()
+-	admissionHeld := true
+-	releaseBringupAdmission := func() {
+-		if admissionHeld {
+-			bringupAdmissionMu.Unlock()
+-			admissionHeld = false
+-		}
+-	}
+-	defer releaseBringupAdmission()
+-	if throttled, reason, err := r.bringupThrottled(ctx, device); err != nil {
++	// Adaptive bringup pacing: observe the namespace concurrently, then reserve
++	// the short API-visibility gap atomically. The 48-pod Multus safety boundary
++	// remains enforced without holding a global mutex across API reads/creates.
++	reserved, throttled, reason, err := r.reserveBringup(ctx, device)
++	if err != nil {
+ 		return noRequeue, err
+ 	} else if throttled {
+ 		r.updateDeviceReconciling(ctx, device, reason)
+@@ -352,10 +349,12 @@ func (r *CEosLabDeviceReconciler) Reconcile(ctx context.Context, req ctrl.Reques
+ 		}
+ 		err := r.getOrCreateObject(ctx, device, podName, createPodObject, devicePod)
+ 		if err != nil {
++			if reserved {
++				bringupAdmissions.release(types.NamespacedName{Name: device.Name, Namespace: device.Namespace})
++			}
+ 			return noRequeue, err
+ 		}
+ 	}
+-	releaseBringupAdmission()
+ 
+ 	// Services
+ 
+@@ -743,12 +742,55 @@ func (r *CEosLabDeviceReconciler) getOrCreateObject(ctx context.Context, device
+ func maxConcurrentBringup() int {
+ 	if v := strings.TrimSpace(os.Getenv("SKYFORGE_MAX_CONCURRENT_BRINGUP")); v != "" {
+ 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+-			return n
++			if n < maxSafeConcurrentBringup {
++				return n
++			}
++			return maxSafeConcurrentBringup
+ 		}
+ 	}
+ 	return defaultMaxConcurrentBringup
+ }
+ 
++type bringupObservation struct {
++	podExists   bool
++	inflight    int
++	stuck       int
++	visiblePods map[string]struct{}
++}
++
++func (a *bringupAdmissionReservations) release(key types.NamespacedName) {
++	a.mu.Lock()
++	defer a.mu.Unlock()
++	delete(a.pods, key)
++}
++
++func (a *bringupAdmissionReservations) reserve(key types.NamespacedName, observation bringupObservation, ceiling int) (bool, int) {
++	a.mu.Lock()
++	defer a.mu.Unlock()
++	for reserved := range a.pods {
++		if reserved.Namespace == key.Namespace {
++			if _, visible := observation.visiblePods[reserved.Name]; visible {
++				delete(a.pods, reserved)
++			}
++		}
++	}
++	if observation.podExists {
++		return false, observation.inflight
++	}
++	reserved := 0
++	for candidate := range a.pods {
++		if candidate.Namespace == key.Namespace {
++			reserved++
++		}
++	}
++	effective := observation.inflight + reserved
++	if effective >= ceiling {
++		return false, effective
++	}
++	a.pods[key] = struct{}{}
++	return true, effective
++}
++
+ // maxConcurrentReconciles keeps the upstream CPU-derived worker count but
+ // floors it at the configured adaptive bringup ceiling. By default, a
+ // controller scheduled on a small node can therefore keep all 16 safe
+@@ -807,7 +849,8 @@ func ownedByCEosLabDevice(p *corev1.Pod) bool {
+ // and boot underway), so the gate is readiness-driven, not timer-driven — there is no
+ // stale timeout because there is no host-pod miscount left to deadlock on. Returns a
+ // human-readable reason when throttling.
+-func (r *CEosLabDeviceReconciler) bringupThrottled(ctx context.Context, device *ceoslabv1alpha1.CEosLabDevice) (bool, string, error) {
++func (r *CEosLabDeviceReconciler) observeBringup(ctx context.Context, device *ceoslabv1alpha1.CEosLabDevice) (bringupObservation, error) {
++	observation := bringupObservation{visiblePods: map[string]struct{}{}}
+ 	reader := r.APIReader
+ 	if reader == nil {
+ 		// Unit tests and embedders that do not provide an uncached reader keep
+@@ -818,36 +861,67 @@ func (r *CEosLabDeviceReconciler) bringupThrottled(ctx context.Context, device *
+ 	existing := &corev1.Pod{}
+ 	err := reader.Get(ctx, types.NamespacedName{Name: device.Name, Namespace: device.Namespace}, existing)
+ 	if err == nil {
+-		return false, "", nil // pod already exists; never throttle
++		observation.podExists = true
+ 	}
+-	if !errors.IsNotFound(err) {
+-		return false, "", err
++	if err != nil && !errors.IsNotFound(err) {
++		return observation, err
+ 	}
+ 	podList := &corev1.PodList{}
+ 	if err := reader.List(ctx, podList, client.InNamespace(device.Namespace)); err != nil {
+-		return false, "", err
++		return observation, err
+ 	}
+-	inflight, stuckCreating := 0, 0
+ 	for i := range podList.Items {
+ 		p := &podList.Items[i]
+ 		if !ownedByCEosLabDevice(p) {
+ 			continue // only pace the cEOS pods we own; never count the host pods gated on us
+ 		}
++		observation.visiblePods[p.Name] = struct{}{}
+ 		if p.Status.Phase != corev1.PodPending {
+ 			continue // a cEOS pod that has left Pending has cleared the sandbox/init window
+ 		}
+-		inflight++
++		observation.inflight++
+ 		if time.Since(p.CreationTimestamp.Time) > bringupSandboxDeadline && !podSandboxStarted(p) {
+-			stuckCreating++ // still in the CNI/sandbox window past the deadline => backpressure
++			observation.stuck++ // still in the CNI/sandbox window past the deadline => backpressure
+ 		}
+ 	}
+-	if stuckCreating > 0 {
+-		return true, fmt.Sprintf("node is backing up on sandbox creation (%d cEOS pod(s) stuck in ContainerCreating in namespace %s); deferring pod creation", stuckCreating, device.Namespace), nil
++	return observation, nil
++}
++
++func bringupThrottleReason(observation bringupObservation, effectiveInflight int, namespace string) (bool, string) {
++	if observation.podExists {
++		return false, ""
+ 	}
+-	if inflight >= maxConcurrentBringup() {
+-		return true, fmt.Sprintf("bringup ceiling reached (%d cEOS pods still initializing in namespace %s); deferring pod creation", inflight, device.Namespace), nil
++	if observation.stuck > 0 {
++		return true, fmt.Sprintf("node is backing up on sandbox creation (%d cEOS pod(s) stuck in ContainerCreating in namespace %s); deferring pod creation", observation.stuck, namespace)
+ 	}
+-	return false, "", nil
++	if effectiveInflight >= maxConcurrentBringup() {
++		return true, fmt.Sprintf("bringup ceiling reached (%d cEOS pods still initializing or admission-reserved in namespace %s); deferring pod creation", effectiveInflight, namespace)
++	}
++	return false, ""
++}
++
++func (r *CEosLabDeviceReconciler) bringupThrottled(ctx context.Context, device *ceoslabv1alpha1.CEosLabDevice) (bool, string, error) {
++	observation, err := r.observeBringup(ctx, device)
++	if err != nil {
++		return false, "", err
++	}
++	throttled, reason := bringupThrottleReason(observation, observation.inflight, device.Namespace)
++	return throttled, reason, nil
++}
++
++func (r *CEosLabDeviceReconciler) reserveBringup(ctx context.Context, device *ceoslabv1alpha1.CEosLabDevice) (bool, bool, string, error) {
++	observation, err := r.observeBringup(ctx, device)
++	if err != nil {
++		return false, false, "", err
++	}
++	if observation.stuck > 0 || observation.podExists {
++		throttled, reason := bringupThrottleReason(observation, observation.inflight, device.Namespace)
++		return false, throttled, reason, nil
++	}
++	key := types.NamespacedName{Name: device.Name, Namespace: device.Namespace}
++	reserved, effective := bringupAdmissions.reserve(key, observation, maxConcurrentBringup())
++	throttled, reason := bringupThrottleReason(observation, effective, device.Namespace)
++	return reserved, throttled, reason, nil
+ }
+ 
+ func (r *CEosLabDeviceReconciler) ensureCEosConfigMap(ctx context.Context, device *ceoslabv1alpha1.CEosLabDevice, name string, data string, configMap *corev1.ConfigMap) error {
+@@ -1018,11 +1092,45 @@ func getCEosConfigData(env map[string]string) string {
+ 	return strings.Join(lines, "\n") + "\n"
+ }
+ 
++func getSkyforgePlacement(env map[string]string) (map[string]string, []corev1.Toleration, string, error) {
++	selector := map[string]string{}
++	if raw := strings.TrimSpace(env["SKYFORGE_KNE_NODE_SELECTOR_JSON"]); raw != "" {
++		if err := json.Unmarshal([]byte(raw), &selector); err != nil {
++			return nil, nil, "", fmt.Errorf("invalid SKYFORGE_KNE_NODE_SELECTOR_JSON: %w", err)
++		}
++	}
++	if hostname := strings.TrimSpace(env["KNE_NODE_SELECTOR_HOSTNAME"]); hostname != "" {
++		selector["kubernetes.io/hostname"] = hostname
++	}
++	var tolerations []corev1.Toleration
++	allowTainted, _ := strconv.ParseBool(strings.TrimSpace(env["SKYFORGE_KNE_ALLOW_TAINTED_NODES"]))
++	if allowTainted {
++		key := strings.TrimSpace(env["SKYFORGE_KNE_TAINT_KEY"])
++		if key == "" {
++			key = "skyforge.example.com/release-track"
++		}
++		value := strings.TrimSpace(env["SKYFORGE_KNE_TAINT_VALUE"])
++		if value == "" {
++			value = "stable-release"
++		}
++		effect := corev1.TaintEffect(strings.TrimSpace(env["SKYFORGE_KNE_TAINT_EFFECT"]))
++		if effect == "" {
++			effect = corev1.TaintEffectNoSchedule
++		}
++		tolerations = []corev1.Toleration{{Key: key, Operator: corev1.TolerationOpEqual, Value: value, Effect: effect}}
++	}
++	return selector, tolerations, strings.TrimSpace(env["SKYFORGE_KNE_PRIORITY_CLASS_NAME"]), nil
++}
++
+ // Pods
+ 
+ func getPod(pod *corev1.Pod, device *ceoslabv1alpha1.CEosLabDevice, secretsAndConfigMaps map[string]client.Object, useStartupPersistence bool) error {
+ 	labels := getLabels(device)
+ 	envVarsMap := getEnvVarsMap(device)
++	nodeSelector, tolerations, priorityClassName, err := getSkyforgePlacement(envVarsMap)
++	if err != nil {
++		return err
++	}
+ 	env := getEnvVarsAPI(device, envVarsMap)
+ 	command := getCommand(device)
+ 	args := getArgs(device, envVarsMap)
+@@ -1072,6 +1180,9 @@ func getPod(pod *corev1.Pod, device *ceoslabv1alpha1.CEosLabDevice, secretsAndCo
+ 			ReadinessProbe: readinessProbe,
+ 		}},
+ 		TerminationGracePeriodSeconds: pointer.Int64(0),
++		NodeSelector:                  nodeSelector,
++		Tolerations:                   tolerations,
++		PriorityClassName:             priorityClassName,
+ 		Volumes:                       volumes,
+ 	}
+ 	return nil
+diff --git a/controllers/ceoslabdevice_controller_unit_test.go b/controllers/ceoslabdevice_controller_unit_test.go
+index eddaf8a..767477b 100644
+--- a/controllers/ceoslabdevice_controller_unit_test.go
++++ b/controllers/ceoslabdevice_controller_unit_test.go
+@@ -15,6 +15,7 @@ import (
+ 	corev1 "k8s.io/api/core/v1"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/types"
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
+ 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+ )
+@@ -74,6 +75,30 @@ func TestGetPodStartupPersistence(t *testing.T) {
+ 	}
+ }
+ 
++func TestGetPodSkyforgePlacement(t *testing.T) {
++	device := &ceoslabv1alpha1.CEosLabDevice{
++		Spec: ceoslabv1alpha1.CEosLabDeviceSpec{EnvVar: map[string]string{
++			"SKYFORGE_KNE_NODE_SELECTOR_JSON":  `{"skyforge.example.com/meshnet-fabric-mtu":"8950"}`,
++			"KNE_NODE_SELECTOR_HOSTNAME":       "worker-a",
++			"SKYFORGE_KNE_ALLOW_TAINTED_NODES": "true",
++			"SKYFORGE_KNE_PRIORITY_CLASS_NAME": "skyforge-lab",
++		}},
++	}
++	pod := &corev1.Pod{}
++	if err := getPod(pod, device, nil, false); err != nil {
++		t.Fatalf("getPod() failed: %v", err)
++	}
++	if pod.Spec.NodeSelector["kubernetes.io/hostname"] != "worker-a" || pod.Spec.NodeSelector["skyforge.example.com/meshnet-fabric-mtu"] != "8950" {
++		t.Fatalf("node selector = %#v", pod.Spec.NodeSelector)
++	}
++	if pod.Spec.PriorityClassName != "skyforge-lab" {
++		t.Fatalf("priority class = %q", pod.Spec.PriorityClassName)
++	}
++	if len(pod.Spec.Tolerations) != 1 || pod.Spec.Tolerations[0].Key != "skyforge.example.com/release-track" || pod.Spec.Tolerations[0].Operator != corev1.TolerationOpEqual {
++		t.Fatalf("tolerations = %#v", pod.Spec.Tolerations)
++	}
++}
++
+ func TestGetPodWithoutStartupPersistence(t *testing.T) {
+ 	device := &ceoslabv1alpha1.CEosLabDevice{
+ 		ObjectMeta: metav1.ObjectMeta{
+@@ -760,6 +785,45 @@ func TestMaxConcurrentReconcilesFeedsBringupCeiling(t *testing.T) {
+ 	}
+ }
+ 
++func TestMaxConcurrentBringupClampsUnsafeOverride(t *testing.T) {
++	t.Setenv("SKYFORGE_MAX_CONCURRENT_BRINGUP", "500")
++	if got := maxConcurrentBringup(); got != maxSafeConcurrentBringup {
++		t.Fatalf("maxConcurrentBringup() = %d, want safety ceiling %d", got, maxSafeConcurrentBringup)
++	}
++}
++
++func TestBringupReservationsBoundParallelAdmission(t *testing.T) {
++	reservations := bringupAdmissionReservations{pods: map[types.NamespacedName]struct{}{}}
++	observation := bringupObservation{visiblePods: map[string]struct{}{}}
++	for index := 0; index < maxSafeConcurrentBringup; index++ {
++		key := types.NamespacedName{Namespace: "lab", Name: fmt.Sprintf("ceos-%d", index)}
++		reserved, effective := reservations.reserve(key, observation, maxSafeConcurrentBringup)
++		if !reserved || effective != index {
++			t.Fatalf("reservation %d = (%v, %d), want (true, %d)", index, reserved, effective, index)
++		}
++	}
++	reserved, effective := reservations.reserve(
++		types.NamespacedName{Namespace: "lab", Name: "one-too-many"},
++		observation,
++		maxSafeConcurrentBringup,
++	)
++	if reserved || effective != maxSafeConcurrentBringup {
++		t.Fatalf("overflow reservation = (%v, %d), want (false, %d)", reserved, effective, maxSafeConcurrentBringup)
++	}
++
++	// Once an admitted pod is visible, its reservation is replaced by the live
++	// observation instead of double-counted.
++	visible := bringupObservation{inflight: 1, visiblePods: map[string]struct{}{"ceos-0": {}}}
++	reserved, effective = reservations.reserve(
++		types.NamespacedName{Namespace: "lab", Name: "replacement"},
++		visible,
++		maxSafeConcurrentBringup,
++	)
++	if reserved || effective != maxSafeConcurrentBringup {
++		t.Fatalf("visible replacement = (%v, %d), want bounded effective count %d", reserved, effective, maxSafeConcurrentBringup)
++	}
++}
++
+ // getJsonIntfMapping must be a faithful 1:1 translator of the kernel-device -> EOS
+ // interface map carried in the CR. The eth0 -> Management0 mapping is now authored at
+ // the netlab source-of-truth layer, so the operator must translate what it is given and
+-- 
+2.55.0
+

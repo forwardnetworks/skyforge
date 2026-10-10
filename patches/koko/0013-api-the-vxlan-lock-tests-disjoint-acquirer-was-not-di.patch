@@ -1,0 +1,76 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sat, 5 Sep 2026 13:00:00 -0500
+Subject: api: the vxlan lock test's "disjoint" acquirer was not disjoint
+
+0012 fixed the leak, the message and the timeout, and the test still failed
+4 of 10 batches of 20 runs. The timeout was never the problem: the acquirer
+is genuinely BLOCKED, not slow, so 3s -> 30s only made each failure cost ten
+times as much.
+
+The FIXTURE is the bug. `disjoint` and `sameTarget` both used VNI 9999, so
+they shared the HOST lock key. Keys are acquired in sorted order and the host
+key sorts before the target key, so sameTarget takes host(9999) FIRST and
+then blocks on the held target slot -- holding host(9999) the whole time.
+This "disjoint" acquirer needs host(9999) too, so the two RACE for it, and
+whenever the disjoint one loses it cannot proceed until release(), which the
+test only reaches after that select. It was disjoint from `held` and
+contending with a sibling the test introduced itself.
+
+That is also why the rate looked mysterious: it is a goroutine race, so it
+tracks scheduling. Isolated, the disjoint acquirer never waits more than 4ms
+over 400 iterations; the full three-contender shape reproduces the block on
+the first iteration.
+
+Giving the disjoint acquirer a VNI no other contender uses restores the
+property the test claims to check.
+
+MEASURED, same tree, same command, 200 runs each:
+
+  before   4 of 10 batches FAILED
+  after    0 of 10 batches failed
+
+POSITIVE CONTROL, and it needed a second attempt worth recording. Collapsing
+vxlanCreateLockKeys to ONE literal panics on keys[1] in the dedup, so the
+test goes red without reaching the assertion -- a red for the wrong reason is
+as useless as a green that asserted nothing. Setting BOTH keys to the same
+constant is the real pre-0010 global lock, and under it the test fails on the
+disjoint assertion at 30s, then passes again when restored.
+
+The implementation is UNTOUCHED and was never at fault: shardLockTable
+releases its map mutex before blocking, the keys are sorted so there is no
+ordering cycle, and disjoint keys hash to different files.
+
+---
+ api/koko_vxlan_lock_test.go | 15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/api/koko_vxlan_lock_test.go b/api/koko_vxlan_lock_test.go
+--- a/api/koko_vxlan_lock_test.go
++++ b/api/koko_vxlan_lock_test.go
+@@ -118,9 +118,22 @@
+ 		return done
+ 	}
+ 
+-	// Disjoint: a different pod, a different interface, a different VNI.
+-	// Under the old global lock this could not proceed.
+-	disjoint := acquireAsync(VEth{NsName: "/var/run/netns/cni-b", LinkName: "eth3"}, vxlanFor(9999, "bond0"))
++	// Disjoint: a different pod, a different interface, and a VNI SHARED WITH NO
++	// OTHER CONTENDER IN THIS TEST. That last clause is the whole fixture.
++	//
++	// It used to be 9999 -- the same VNI sameTarget uses. Keys are acquired in
++	// sorted order and the host key sorts before the target key, so sameTarget
++	// takes host(9999) FIRST and then blocks forever on the held target slot,
++	// holding host(9999) the entire time. This "disjoint" acquirer also needs
++	// host(9999), so the two raced for it, and whenever the disjoint one lost it
++	// could not proceed until release() -- which the test only reaches after
++	// this select. It was not disjoint at all; it was disjoint from `held` and
++	// contending with a sibling the test itself introduced.
++	//
++	// Measured on the pre-fix fixture: 4 of 10 batches of 20 runs failed. The
++	// implementation was never at fault, which is why raising the timeout did
++	// not help -- the acquirer is genuinely blocked, not slow.
++	disjoint := acquireAsync(VEth{NsName: "/var/run/netns/cni-b", LinkName: "eth3"}, vxlanFor(7777, "bond0"))
+ 	// Overlapping on the TARGET slot only (same netns+ifname, different VNI).
+ 	sameTarget := acquireAsync(held, vxlanFor(9999, "bond0"))
+ 	// Overlapping on the HOST tuple only (different slot, same VNI+parent).

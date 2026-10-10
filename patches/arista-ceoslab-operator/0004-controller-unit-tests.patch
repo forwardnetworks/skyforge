@@ -1,0 +1,374 @@
+From 11a31a0318f6dfc8da55853a37b502f87a0a955a Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Fri, 17 Jul 2026 18:27:12 -0500
+Subject: [PATCH 4/9] skyforge(test): controller unit tests for KNE-runtime,
+ mgmt firewall, bringup
+
+Pure-unit coverage (no envtest) for startup-config persistence, ceos-config
+identity, the management return-route + firewall-permit lifecycle, env-var
+defaults/overrides, podSandboxStarted and the adaptive bringupThrottled gate.
+---
+ .../ceoslabdevice_controller_unit_test.go     | 351 ++++++++++++++++++
+ 1 file changed, 351 insertions(+)
+ create mode 100644 controllers/ceoslabdevice_controller_unit_test.go
+
+diff --git a/controllers/ceoslabdevice_controller_unit_test.go b/controllers/ceoslabdevice_controller_unit_test.go
+new file mode 100644
+index 0000000..791faf3
+--- /dev/null
++++ b/controllers/ceoslabdevice_controller_unit_test.go
+@@ -0,0 +1,351 @@
++package controllers
++
++import (
++	"context"
++	"fmt"
++	"strings"
++	"testing"
++	"time"
++
++	ceoslabv1alpha1 "github.com/aristanetworks/arista-ceoslab-operator/v2/api/v1alpha1"
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/runtime"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++	"sigs.k8s.io/controller-runtime/pkg/client/fake"
++)
++
++func TestGetPodStartupPersistence(t *testing.T) {
++	device := &ceoslabv1alpha1.CEosLabDevice{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      "leaf1",
++			Namespace: "demo",
++		},
++		Spec: ceoslabv1alpha1.CEosLabDeviceSpec{
++			NumInterfaces: 2,
++		},
++	}
++	secretsAndConfigMaps := map[string]client.Object{
++		startupConfigName(device.Name): &corev1.ConfigMap{
++			ObjectMeta: metav1.ObjectMeta{Name: startupConfigName(device.Name)},
++			Data:       map[string]string{"startup-config": "hostname leaf1\n"},
++		},
++		"configmap-rceos-leaf1": &corev1.ConfigMap{
++			ObjectMeta: metav1.ObjectMeta{Name: "configmap-rceos-leaf1"},
++			BinaryData: map[string][]byte{"rc.eos": []byte("#!/bin/bash\n")},
++		},
++	}
++	pod := &corev1.Pod{}
++	if err := getPod(pod, device, secretsAndConfigMaps, true); err != nil {
++		t.Fatalf("getPod() failed: %v", err)
++	}
++	if len(pod.Spec.InitContainers) != 2 {
++		t.Fatalf("getPod() initContainers len = %d, want 2", len(pod.Spec.InitContainers))
++	}
++	if pod.Spec.InitContainers[1].Name != "startup-config-seed" {
++		t.Fatalf("getPod() second init container = %q, want startup-config-seed", pod.Spec.InitContainers[1].Name)
++	}
++	foundFlashMount := false
++	foundRCMount := false
++	foundDirectStartupMount := false
++	for _, mount := range pod.Spec.Containers[0].VolumeMounts {
++		if mount.Name == startupPersistenceVolumeName && mount.MountPath == "/mnt/flash" {
++			foundFlashMount = true
++		}
++		if mount.MountPath == "/mnt/flash/rc.eos" {
++			foundRCMount = true
++		}
++		if mount.Name == volumeName(startupConfigName(device.Name)) && mount.MountPath == "/mnt/flash/startup-config" {
++			foundDirectStartupMount = true
++		}
++	}
++	if !foundFlashMount {
++		t.Fatalf("getPod() did not mount persistent flash volume: %#v", pod.Spec.Containers[0].VolumeMounts)
++	}
++	if !foundRCMount {
++		t.Fatalf("getPod() dropped rc.eos mount: %#v", pod.Spec.Containers[0].VolumeMounts)
++	}
++	if foundDirectStartupMount {
++		t.Fatalf("getPod() still mounted startup-config directly into the main container")
++	}
++}
++
++func TestGetPodWithoutStartupPersistence(t *testing.T) {
++	device := &ceoslabv1alpha1.CEosLabDevice{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      "leaf1",
++			Namespace: "demo",
++		},
++	}
++	secretsAndConfigMaps := map[string]client.Object{
++		startupConfigName(device.Name): &corev1.ConfigMap{
++			ObjectMeta: metav1.ObjectMeta{Name: startupConfigName(device.Name)},
++			Data:       map[string]string{"startup-config": "hostname leaf1\n"},
++		},
++	}
++	pod := &corev1.Pod{}
++	if err := getPod(pod, device, secretsAndConfigMaps, false); err != nil {
++		t.Fatalf("getPod() failed: %v", err)
++	}
++	if len(pod.Spec.InitContainers) != 1 {
++		t.Fatalf("getPod() initContainers len = %d, want 1", len(pod.Spec.InitContainers))
++	}
++	foundDirectStartupMount := false
++	for _, mount := range pod.Spec.Containers[0].VolumeMounts {
++		if mount.Name == volumeName(startupConfigName(device.Name)) && mount.MountPath == "/mnt/flash/startup-config" {
++			foundDirectStartupMount = true
++		}
++		if mount.Name == startupPersistenceVolumeName {
++			t.Fatalf("getPod() unexpectedly mounted persistence volume")
++		}
++	}
++	if !foundDirectStartupMount {
++		t.Fatalf("getPod() did not retain direct startup-config mount")
++	}
++}
++
++func TestGetPodMountsCEosConfig(t *testing.T) {
++	device := &ceoslabv1alpha1.CEosLabDevice{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      "leaf1",
++			Namespace: "demo",
++		},
++		Spec: ceoslabv1alpha1.CEosLabDeviceSpec{
++			EnvVar: map[string]string{
++				"SERIALNUMBER":  "0123456789ABCDEF0123456789ABCDEF",
++				"SYSTEMMACADDR": "0200.1111.2222",
++			},
++		},
++	}
++	secretsAndConfigMaps := map[string]client.Object{
++		"configmap-ceos-config-leaf1": &corev1.ConfigMap{
++			ObjectMeta: metav1.ObjectMeta{Name: "configmap-ceos-config-leaf1"},
++			Data: map[string]string{
++				"ceos-config": "SERIALNUMBER=0123456789ABCDEF0123456789ABCDEF\nSYSTEMMACADDR=0200.1111.2222\n",
++			},
++		},
++	}
++	pod := &corev1.Pod{}
++	if err := getPod(pod, device, secretsAndConfigMaps, false); err != nil {
++		t.Fatalf("getPod() failed: %v", err)
++	}
++	foundCEosConfig := false
++	for _, mount := range pod.Spec.Containers[0].VolumeMounts {
++		if mount.Name == volumeName("configmap-ceos-config-leaf1") && mount.MountPath == "/mnt/flash/ceos-config" && mount.SubPath == "ceos-config" {
++			foundCEosConfig = true
++		}
++	}
++	if !foundCEosConfig {
++		t.Fatalf("getPod() did not mount ceos-config: %#v", pod.Spec.Containers[0].VolumeMounts)
++	}
++}
++
++func TestGetPodAddsManagementReturnRouteLifecycle(t *testing.T) {
++	device := &ceoslabv1alpha1.CEosLabDevice{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      "leaf1",
++			Namespace: "demo",
++		},
++		Spec: ceoslabv1alpha1.CEosLabDeviceSpec{
++			EnvVar: map[string]string{
++				"SKYFORGE_MGMT_RETURN_CIDRS": "100.64.0.0/10,198.18.0.0/15",
++				"SKYFORGE_MGMT_RETURN_MTU":   "1370",
++			},
++		},
++	}
++	pod := &corev1.Pod{}
++	if err := getPod(pod, device, nil, false); err != nil {
++		t.Fatalf("getPod() failed: %v", err)
++	}
++	lifecycle := pod.Spec.Containers[0].Lifecycle
++	if lifecycle == nil || lifecycle.PostStart == nil || lifecycle.PostStart.Exec == nil {
++		t.Fatalf("getPod() did not add management return-route lifecycle: %#v", pod.Spec.Containers[0])
++	}
++	command := lifecycle.PostStart.Exec.Command
++	if len(command) != 3 || command[0] != "/bin/sh" || command[1] != "-ceu" {
++		t.Fatalf("unexpected lifecycle command: %#v", command)
++	}
++	script := command[2]
++	for _, want := range []string{
++		"SKYFORGE_MGMT_RETURN_CIDRS",
++		"ip -4 route show dev eth0 scope link",
++		"ip route replace",
++		// The EOS control-plane firewall drops inbound management traffic
++		// unless each source CIDR is explicitly permitted (see getLifecycleAPI).
++		"apply_permits",
++		"iptables -D INPUT -s",
++		"iptables -I INPUT 1 -s",
++		"SKYFORGE_MGMT_RETURN_MTU",
++		"SKYFORGE_MGMT_RETURN_ROUTE_RETRIES",
++		"/tmp/skyforge-mgmt-return-routes.log",
++	} {
++		if !strings.Contains(script, want) {
++			t.Fatalf("lifecycle script missing %q: %s", want, script)
++		}
++	}
++}
++
++func TestGetPodSkipsManagementReturnRouteLifecycleWithoutContract(t *testing.T) {
++	device := &ceoslabv1alpha1.CEosLabDevice{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      "leaf1",
++			Namespace: "demo",
++		},
++	}
++	pod := &corev1.Pod{}
++	if err := getPod(pod, device, nil, false); err != nil {
++		t.Fatalf("getPod() failed: %v", err)
++	}
++	if pod.Spec.Containers[0].Lifecycle != nil {
++		t.Fatalf("getPod() unexpectedly added lifecycle: %#v", pod.Spec.Containers[0].Lifecycle)
++	}
++}
++
++func TestGetEnvVarsMapIncludesCEosLabInterfaceDefaults(t *testing.T) {
++	device := &ceoslabv1alpha1.CEosLabDevice{}
++
++	got := getEnvVarsMap(device)
++	want := map[string]string{
++		"CEOS":         "1",
++		"EOS_PLATFORM": "ceoslab",
++		"ETBA":         "1",
++		"INTFTYPE":     "eth",
++		"MAPETH0":      "1",
++		"MGMT_INTF":    "eth0",
++	}
++	for k, v := range want {
++		if got[k] != v {
++			t.Fatalf("getEnvVarsMap()[%q] = %q, want %q; got %#v", k, got[k], v, got)
++		}
++	}
++}
++
++func TestGetEnvVarsMapAllowsSpecOverrides(t *testing.T) {
++	device := &ceoslabv1alpha1.CEosLabDevice{
++		Spec: ceoslabv1alpha1.CEosLabDeviceSpec{
++			EnvVar: map[string]string{
++				"INTFTYPE":    "et",
++				"CUSTOM_FLAG": "1",
++			},
++		},
++	}
++
++	got := getEnvVarsMap(device)
++	if got["INTFTYPE"] != "et" {
++		t.Fatalf("getEnvVarsMap() did not allow INTFTYPE override: %#v", got)
++	}
++	if got["CUSTOM_FLAG"] != "1" {
++		t.Fatalf("getEnvVarsMap() did not allow custom env var: %#v", got)
++	}
++}
++
++func TestGetCEosConfigDataUsesIdentityEnv(t *testing.T) {
++	got := getCEosConfigData(map[string]string{
++		"SERIALNUMBER":  " 0123456789ABCDEF0123456789ABCDEF ",
++		"SYSTEMMACADDR": " 0200.1111.2222 ",
++	})
++	want := "SERIALNUMBER=0123456789ABCDEF0123456789ABCDEF\nSYSTEMMACADDR=0200.1111.2222\n"
++	if got != want {
++		t.Fatalf("getCEosConfigData() = %q, want %q", got, want)
++	}
++}
++
++func TestPodSandboxStarted(t *testing.T) {
++	// No container statuses => sandbox not started (still ContainerCreating).
++	if podSandboxStarted(&corev1.Pod{Status: corev1.PodStatus{Phase: corev1.PodPending}}) {
++		t.Fatal("expected not-started with no container statuses")
++	}
++	// An init container running => sandbox exists (a cEOS init-wait blocking is normal).
++	if !podSandboxStarted(&corev1.Pod{Status: corev1.PodStatus{InitContainerStatuses: []corev1.ContainerStatus{
++		{State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}}}}}) {
++		t.Fatal("expected started when an init container is running")
++	}
++	// A main container terminated => sandbox existed.
++	if !podSandboxStarted(&corev1.Pod{Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{
++		{State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{}}}}}}) {
++		t.Fatal("expected started when a container is terminated")
++	}
++}
++
++func TestBringupThrottledAdaptive(t *testing.T) {
++	scheme := runtime.NewScheme()
++	if err := corev1.AddToScheme(scheme); err != nil {
++		t.Fatal(err)
++	}
++	if err := ceoslabv1alpha1.AddToScheme(scheme); err != nil {
++		t.Fatal(err)
++	}
++	device := &ceoslabv1alpha1.CEosLabDevice{ObjectMeta: metav1.ObjectMeta{Name: "newdev", Namespace: "demo"}}
++	ctx := context.Background()
++
++	// pendingPod models a cEOS pod the operator PACES: it carries the CEosLabDevice owner
++	// ref SetControllerReference stamps, so bringupThrottled counts it.
++	pendingPod := func(name string, ageSecs int, sandboxStarted bool) *corev1.Pod {
++		p := &corev1.Pod{
++			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "demo",
++				OwnerReferences:   []metav1.OwnerReference{{Kind: ceosLabDeviceKind, Name: name}},
++				CreationTimestamp: metav1.NewTime(time.Now().Add(-time.Duration(ageSecs) * time.Second))},
++			Status: corev1.PodStatus{Phase: corev1.PodPending},
++		}
++		if sandboxStarted {
++			p.Status.InitContainerStatuses = []corev1.ContainerStatus{
++				{Name: "init", State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}}}
++		}
++		return p
++	}
++	// hostPod models a meshnet-gated linux host pod (brNhN / app): NO CEosLabDevice owner
++	// ref. It is Pending (Init:0/N) because its cEOS peer does not exist yet. The throttle
++	// must NOT count these — counting them is the deadlock this fix removes (task#79).
++	hostPod := func(name string, ageSecs int) *corev1.Pod {
++		return &corev1.Pod{
++			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "demo",
++				CreationTimestamp: metav1.NewTime(time.Now().Add(-time.Duration(ageSecs) * time.Second))},
++			Status: corev1.PodStatus{Phase: corev1.PodPending},
++		}
++	}
++	mk := func(objs ...client.Object) *CEosLabDeviceReconciler {
++		return &CEosLabDeviceReconciler{
++			Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build(),
++			Scheme: scheme,
++		}
++	}
++	assert := func(t *testing.T, r *CEosLabDeviceReconciler, wantThrottle bool, wantReason string) {
++		t.Helper()
++		th, reason, err := r.bringupThrottled(ctx, device)
++		if err != nil {
++			t.Fatalf("unexpected error: %v", err)
++		}
++		if th != wantThrottle {
++			t.Fatalf("throttled=%v, want %v (reason=%q)", th, wantThrottle, reason)
++		}
++		if wantReason != "" && !strings.Contains(reason, wantReason) {
++			t.Fatalf("reason %q does not contain %q", reason, wantReason)
++		}
++	}
++
++	// A couple of young Pending cEOS pods: high ceiling, no backpressure -> allow.
++	assert(t, mk(pendingPod("a", 5, false), pendingPod("b", 5, false)), false, "")
++	// A cEOS pod stuck in sandbox creation (old, no container started) -> back off.
++	assert(t, mk(pendingPod("a", 5, false), pendingPod("stuck", 60, false)), true, "backing up")
++	// Old, but its sandbox has started (init running) -> not backpressure, allow.
++	assert(t, mk(pendingPod("a", 5, false), pendingPod("initrun", 60, true)), false, "")
++	// REGRESSION (task#79): meshnet-gated host pods are Pending because their cEOS peers
++	// don't exist yet. They must NOT count — a swarm of them, even old ones with no sandbox,
++	// must never throttle cEOS creation (that miscount was the deadlock).
++	hosts := make([]client.Object, 0, defaultMaxConcurrentBringup*3)
++	for i := 0; i < defaultMaxConcurrentBringup*3; i++ {
++		hosts = append(hosts, hostPod(fmt.Sprintf("br%dh1", i), 90))
++	}
++	assert(t, mk(hosts...), false, "")
++	// The device's own pod already exists -> never throttle, even amid backpressure.
++	devPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: device.Name, Namespace: device.Namespace},
++		Status: corev1.PodStatus{Phase: corev1.PodPending}}
++	assert(t, mk(devPod, pendingPod("stuck", 60, false)), false, "")
++	// Ceiling backstop: defaultMaxConcurrentBringup young cEOS pods -> throttle on the count.
++	// Interleaved host pods must not shift the count.
++	many := make([]client.Object, 0, defaultMaxConcurrentBringup*2)
++	for i := 0; i < defaultMaxConcurrentBringup; i++ {
++		many = append(many, pendingPod(fmt.Sprintf("y%d", i), 5, false), hostPod(fmt.Sprintf("y%dh1", i), 5))
++	}
++	assert(t, mk(many...), true, "ceiling")
++}
+-- 
+2.55.0
+

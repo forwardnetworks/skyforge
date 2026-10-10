@@ -1,0 +1,392 @@
+From b4d787a124a89f48b9da088066f42280c0db1de8 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Fri, 14 Aug 2026 20:44:32 -0500
+Subject: [PATCH] =?UTF-8?q?fix(ceos):=20give=20cEOS=20an=20empty=20block-d?=
+ =?UTF-8?q?evice=20view=20=E2=80=94=20host=20disks=20decided=20whether=20a?=
+ =?UTF-8?q?=20lab=20could=20boot?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Sibling to 0013. Together they are one contract: a NOS may not CORRUPT host state
+it does not own (0013, the sysctl leak), and it may not DEPEND on host state it
+does not own (this).
+
+The cEOS container runs privileged, so it inherits the NODE's block devices:
+/sys/block and /dev are the host's. EOS boot walks that view unconditionally —
+ssdinit.service -> ssdinit.sh -> mount_all_block_dev() enumerates every
+/sys/block entry (whole disks AND partitions) and runs
+`/sbin/initblockdev <dev> add --mountssd` for each; every one of those calls
+shells out to a BARE `/sbin/blkid` (no device argument — a full probe of every
+block device on the node) purely to read one LABEL.
+
+So a single device that does not answer stalls the entire serial walk.
+EOS.target never starts, Sysdb and ConfigAgent never come up, /usr/bin/Cli never
+appears, and kubelet kills the container at the startup-probe budget
+(48 x 5s = 240s) — forever, because every restart replays the same walk. The
+container stays alive and exec-able throughout, which is why this reads as "the
+NOS is not answering" rather than as a boot failure.
+
+MEASURED 2026-08-15. The three bare-metal Supermicro workers each expose an
+"ATEN Virtual CDROM" — the BMC/iKVM virtual-media device — as a USB sr0. SCSI
+TEST UNIT READY to it never completes:
+
+  blkid, D state:
+    blk_execute_rq / scsi_execute_cmd / scsi_test_unit_ready
+    / sr_drive_status / sr_block_ioctl   fd 6 -> /dev/sr0
+
+  full `blkid`                sm-node-b 332s (>400s on another run) | worker-a 0.046s
+  `blkid /dev/sr0`            sm-node-b 140s
+  4KiB read under timeout 15  sm-node-b returned at 3m13s (D state cannot be
+                              signalled) | worker-a "No medium found" in 0.018s
+
+With 6 non-loop /sys/block entries that is ~33 MINUTES of serial scanning against
+a 240s budget: cEOS could never boot on 3 of 5 nodes. A cEOS pod on sm-node-b was
+still inside the walk 326s in, having advanced only from sda4 to sda3.
+
+worker-a is NOT special because it has fewer devices — it has MORE (36
+whole disks vs 1). It works because its sr0 answers instantly. The failure is not
+device COUNT, it is whether any one device answers: an unownable property of the
+host that lab placement must not depend on.
+
+Second occurrence of this class. Backing /mnt/flash with a longhorn PVC created
+one host /dev/sd* per device and stalled Sysdb the same way (task #77); that was
+worked around by making /mnt/flash an emptyDir — by REDUCING the device count,
+not by removing the dependency. The dependency is what is removed here.
+
+FIX: mount an empty emptyDir over /sys/block. mount_all_block_dev() then
+enumerates zero devices, initblockdev is never invoked, blkid is never run, and
+EOS.target starts immediately — identically on every node. ssdinit.service still
+RUNS and still SUCCEEDS (it simply finds nothing), so archive-init.service's
+Requires= on it stays satisfied — which is why emptying its input was chosen over
+masking the unit (systemd.mask=ssdinit.service was tested and works, but removes
+only one consumer and breaks that dependency edge). Nothing in
+cEOS-on-Kubernetes consumes the result: /mnt/flash is a Kubernetes volume,
+ssdinit's SSD_DRIVE (/mnt/drive) does not exist in the image, and a booted cEOS
+on worker-a has nothing mounted from the scan. /sys/class/net — the interface view
+meshnet and the firewall permit hooks depend on — is a sibling of /sys/block and
+is untouched, and so is /etc/sysctl.d, which carries 0013's guard.
+
+VERIFIED with a probe-free cEOS pod (so kubelet could not mask the stall by
+killing it) on a bare-metal worker AND on worker-a, same image, same args:
+
+  sm-node-b, unmasked (negative control)  blkid wedged in D state; still in the
+                                          walk at 326s; wfw -t 5 ConfigAgent
+                                          Sysdb -> exit 1 "timed out"
+  sm-node-b, masked                       Sysdb + ConfigAgent at 63s;
+                                          wfw -> exit 0; Cli -p 15 answers
+  worker-a,     masked (control)             Sysdb + ConfigAgent at 59s;
+                                          wfw -> exit 0
+
+Per-device kill switch, no CRD schema change, matching the
+SKYFORGE_MGMT_RUNTIME_CONFIG precedent: spec.envvars
+SKYFORGE_EOS_HOST_BLOCK_MASK=off. It does not disable 0013's guard, which stays
+unconditional.
+
+TestGetPodMasksHostBlockDevices and TestGetPodComposesBlockMaskWithSysctlGuard
+both FAIL against a tree carrying 0013 but not this patch, and pass after;
+0013's own TestSysctlGuardSuppressesHostGlobalLeak passes in both directions.
+---
+ controllers/ceoslabdevice_controller.go       |  94 ++++++++++-
+ .../ceoslabdevice_controller_unit_test.go     | 155 ++++++++++++++++++
+ 2 files changed, 245 insertions(+), 4 deletions(-)
+
+diff --git a/controllers/ceoslabdevice_controller.go b/controllers/ceoslabdevice_controller.go
+index 5180902..d16bbab 100644
+--- a/controllers/ceoslabdevice_controller.go
++++ b/controllers/ceoslabdevice_controller.go
+@@ -76,6 +76,68 @@ const (
+ 	sysctlGuardFile       = "99-zzskyforge-no-global-sysctl-leak.conf"
+ 	sysctlGuardMountPath  = "/etc/sysctl.d/" + sysctlGuardFile
+ 
++	// The cEOS container runs privileged, so it inherits the HOST's block-device
++	// view: /sys/block and /dev are the node's, not the pod's. EOS boot walks that
++	// view unconditionally — ssdinit.service -> ssdinit.sh -> mount_all_block_dev()
++	// enumerates every /sys/block entry (whole disks AND partitions) and runs
++	// /sbin/initblockdev <dev> add --mountssd for each, and EVERY one of those calls
++	// shells out to a bare `/sbin/blkid` (no device argument: a full probe of every
++	// block device on the node) just to read one LABEL. A single device that does not
++	// answer therefore stalls the whole serial walk, EOS.target never starts, Sysdb
++	// and ConfigAgent never come up, /usr/bin/Cli never appears, and kubelet kills the
++	// container at the startup-probe budget (48 x 5s = 240s) — forever, because every
++	// restart replays the same walk. The container stays alive and exec-able the whole
++	// time, which is why this reads as "the NOS is not answering" rather than as a
++	// boot failure.
++	//
++	// This is a SIBLING defect to the sysctl guard above, and the pair describes the
++	// whole contract: a NOS may not CORRUPT host state it does not own (the sysctl
++	// leak), and it may not DEPEND on host state it does not own (this). It has now
++	// bitten twice:
++	//
++	//  1. Backing /mnt/flash with a longhorn PVC created one host /dev/sd* per device;
++	//     the serial scan stalled Sysdb past the budget -> exit137 crashloop (task #77).
++	//     That was worked around by making /mnt/flash an emptyDir (see getVolumes) —
++	//     i.e. by REDUCING the device count, not by removing the dependency.
++	//  2. The three bare-metal Supermicro workers (sm-node-b/c/d) each expose an
++	//     "ATEN Virtual CDROM" — the BMC/iKVM virtual-media device — as a USB sr0.
++	//     SCSI TEST UNIT READY to it never completes: `blkid` parks in D state in
++	//     scsi_test_unit_ready/sr_drive_status. Measured 2026-08-15 on sm-node-b: a
++	//     full `blkid` took 332s (and did not return in >400s on another run), and a
++	//     single 4KiB read of /dev/sr0 under `timeout 15` returned only after 3m13s
++	//     because a D-state task cannot be signalled. With 6 non-loop /sys/block
++	//     entries that is ~33 MINUTES of serial scanning against a 240s budget, so
++	//     cEOS could never boot on 3 of 5 nodes — the platform's most common NOS,
++	//     unusable on the majority of the fleet.
++	//
++	// worker-a is NOT special because it has fewer devices — it has MORE (36
++	// whole disks vs 1). It works because its sr0 is a hypervisor "Linux Virtual CD/DVD"
++	// that answers instantly: a full `blkid` there completes in 0.046s and a read
++	// returns "No medium found" in 0.018s. So the failure is not device COUNT, it is
++	// whether any one device answers — an unownable property of the host that lab
++	// placement must not depend on.
++	//
++	// The fix is to stop the pod having a host block-device view at all: mount an empty
++	// emptyDir over /sys/block. mount_all_block_dev() then enumerates zero devices,
++	// initblockdev is never invoked, blkid is never run, and EOS.target starts
++	// immediately — identically on every node. ssdinit.service still RUNS and still
++	// SUCCEEDS (it simply finds nothing), so archive-init.service's Requires= on it
++	// stays satisfied; this is why masking the unit was rejected in favour of emptying
++	// its input. Nothing in cEOS-on-Kubernetes uses the result: /mnt/flash is a
++	// Kubernetes volume, ssdinit's SSD_DRIVE (/mnt/drive) does not exist in the image,
++	// and a booted cEOS on worker-a has nothing mounted from the scan. Verified on both a
++	// bare-metal sm-node and on worker-a: Sysdb + ConfigAgent warm at ~60s,
++	// `wfw -t 5 ConfigAgent Sysdb` exit 0, `Cli -p 15 'show version'` answers.
++	//
++	// /sys/class/net (the interface view meshnet and the firewall hooks depend on) is a
++	// SIBLING of /sys/block and is untouched by this mount. So is /etc/sysctl.d, which
++	// carries the sysctl guard above — the two mounts do not overlap.
++	//
++	// Per-device escape hatch, matching the SKYFORGE_MGMT_RUNTIME_CONFIG precedent and
++	// requiring no CRD schema change: spec.envvars SKYFORGE_EOS_HOST_BLOCK_MASK=off.
++	hostBlockMaskVolumeName = "eos-host-block-mask"
++	hostBlockMaskMountPath  = "/sys/block"
++
+ 	// Bringup pacing (ADAPTIVE): a large topology otherwise creates every CEosLab pod
+ 	// at once; the burst of per-pod meshnet CNI-ADD + veth wiring overwhelms containerd's
+ 	// sandbox creation (FailedCreatePodSandBox / DeadlineExceeded -> the CRI wedges and
+@@ -1149,8 +1211,8 @@ func getPod(pod *corev1.Pod, device *ceoslabv1alpha1.CEosLabDevice, secretsAndCo
+ 	if err != nil {
+ 		return err
+ 	}
+-	volumes := getVolumes(secretsAndConfigMaps, useStartupPersistence, device.Name)
+-	volumeMounts := getVolumeMounts(secretsAndConfigMaps, useStartupPersistence, device.Name)
++	volumes := getVolumes(secretsAndConfigMaps, useStartupPersistence, device.Name, envVarsMap)
++	volumeMounts := getVolumeMounts(secretsAndConfigMaps, useStartupPersistence, device.Name, envVarsMap)
+ 	resources := getResourcesAPI(resourceMap)
+ 	startupProbe := getStartupProbeAPI(device)
+ 	readinessProbe := getReadinessProbeAPI(device, envVarsMap, useStartupPersistence)
+@@ -1463,7 +1525,17 @@ func startupConfigName(deviceName string) string {
+ 	return fmt.Sprintf("%s-config", deviceName)
+ }
+ 
+-func getVolumes(secretsAndConfigMaps map[string]client.Object, useStartupPersistence bool, deviceName string) []corev1.Volume {
++// hostBlockMaskEnabled reports whether the cEOS container should be given an
++// empty block-device view instead of the node's. Default ON: a lab must boot the
++// same way on every node, and the alternative is a 240s crashloop whose only
++// symptom is "the NOS is not answering". Per-device kill switch via spec.envvars
++// SKYFORGE_EOS_HOST_BLOCK_MASK=off (no CRD schema change). See the
++// hostBlockMaskVolumeName comment for the measurements behind this.
++func hostBlockMaskEnabled(envVarsMap map[string]string) bool {
++	return !strings.EqualFold(strings.TrimSpace(envVarsMap["SKYFORGE_EOS_HOST_BLOCK_MASK"]), "off")
++}
++
++func getVolumes(secretsAndConfigMaps map[string]client.Object, useStartupPersistence bool, deviceName string, envVarsMap map[string]string) []corev1.Volume {
+ 	volumeNames := []string{}
+ 	for name := range secretsAndConfigMaps {
+ 		volumeNames = append(volumeNames, name)
+@@ -1534,10 +1606,18 @@ func getVolumes(secretsAndConfigMaps map[string]client.Object, useStartupPersist
+ 			EmptyDir: &corev1.EmptyDirVolumeSource{},
+ 		},
+ 	})
++	if hostBlockMaskEnabled(envVarsMap) {
++		volumes = append(volumes, corev1.Volume{
++			Name: hostBlockMaskVolumeName,
++			VolumeSource: corev1.VolumeSource{
++				EmptyDir: &corev1.EmptyDirVolumeSource{},
++			},
++		})
++	}
+ 	return volumes
+ }
+ 
+-func getVolumeMounts(secretsAndConfigMaps map[string]client.Object, useStartupPersistence bool, deviceName string) []corev1.VolumeMount {
++func getVolumeMounts(secretsAndConfigMaps map[string]client.Object, useStartupPersistence bool, deviceName string, envVarsMap map[string]string) []corev1.VolumeMount {
+ 	volumeNames := []string{}
+ 	for name := range secretsAndConfigMaps {
+ 		volumeNames = append(volumeNames, name)
+@@ -1592,6 +1672,12 @@ func getVolumeMounts(secretsAndConfigMaps map[string]client.Object, useStartupPe
+ 		SubPath:   sysctlGuardFile,
+ 		ReadOnly:  true,
+ 	})
++	if hostBlockMaskEnabled(envVarsMap) {
++		mounts = append(mounts, corev1.VolumeMount{
++			Name:      hostBlockMaskVolumeName,
++			MountPath: hostBlockMaskMountPath,
++		})
++	}
+ 	return mounts
+ }
+ 
+diff --git a/controllers/ceoslabdevice_controller_unit_test.go b/controllers/ceoslabdevice_controller_unit_test.go
+index 39b8397..edce06f 100644
+--- a/controllers/ceoslabdevice_controller_unit_test.go
++++ b/controllers/ceoslabdevice_controller_unit_test.go
+@@ -991,3 +991,158 @@ func TestSysctlGuardSuppressesHostGlobalLeak(t *testing.T) {
+ 		}
+ 	}
+ }
++
++// The cEOS container runs privileged and therefore inherits the NODE's block
++// devices. EOS boot walks them all (ssdinit -> initblockdev -> a bare `blkid`
++// per device), so one device that does not answer stalls Sysdb past the 240s
++// startup-probe budget and crashloops the pod forever — which is how cEOS became
++// unbootable on the three bare-metal workers whose BMC exposes a wedged "ATEN
++// Virtual CDROM" as sr0. Masking /sys/block with an empty emptyDir gives every
++// pod the same (empty) block-device view on every node.
++//
++// This test fails against a tree that has the sysctl guard but NOT this change:
++// it names the eos-host-block-mask volume specifically rather than asserting
++// that "some emptyDir exists", so the sysctl guard cannot satisfy it.
++func TestGetPodMasksHostBlockDevices(t *testing.T) {
++	for _, useStartupPersistence := range []bool{true, false} {
++		device := &ceoslabv1alpha1.CEosLabDevice{
++			ObjectMeta: metav1.ObjectMeta{Name: "leaf1", Namespace: "demo"},
++		}
++		pod := &corev1.Pod{}
++		if err := getPod(pod, device, map[string]client.Object{}, useStartupPersistence); err != nil {
++			t.Fatalf("persistence=%v: getPod() failed: %v", useStartupPersistence, err)
++		}
++
++		foundVolume := false
++		for _, volume := range pod.Spec.Volumes {
++			if volume.Name != hostBlockMaskVolumeName {
++				continue
++			}
++			foundVolume = true
++			if volume.EmptyDir == nil {
++				t.Fatalf("persistence=%v: %s volume is not an emptyDir: %+v",
++					useStartupPersistence, hostBlockMaskVolumeName, volume.VolumeSource)
++			}
++		}
++		if !foundVolume {
++			t.Fatalf("persistence=%v: getPod() did not declare the %s volume",
++				useStartupPersistence, hostBlockMaskVolumeName)
++		}
++
++		foundMount := false
++		for _, mount := range pod.Spec.Containers[0].VolumeMounts {
++			if mount.Name == hostBlockMaskVolumeName {
++				foundMount = true
++				if mount.MountPath != hostBlockMaskMountPath {
++					t.Fatalf("persistence=%v: %s mounted at %q, want %q",
++						useStartupPersistence, hostBlockMaskVolumeName, mount.MountPath, hostBlockMaskMountPath)
++				}
++				if mount.SubPath != "" {
++					t.Fatalf("persistence=%v: %s must mask the whole directory, got subPath %q",
++						useStartupPersistence, hostBlockMaskVolumeName, mount.SubPath)
++				}
++			}
++			// /sys/class/net is a sibling of /sys/block and carries the interface view
++			// meshnet and the firewall permit hooks depend on. Masking it would break
++			// the data plane, so assert we never mount anything else under /sys.
++			if strings.HasPrefix(mount.MountPath, "/sys/") && mount.MountPath != hostBlockMaskMountPath {
++				t.Fatalf("persistence=%v: getPod() mounted an unexpected path under /sys: %q",
++					useStartupPersistence, mount.MountPath)
++			}
++		}
++		if !foundMount {
++			t.Fatalf("persistence=%v: getPod() did not mask %s", useStartupPersistence, hostBlockMaskMountPath)
++		}
++	}
++}
++
++// The block mask and the sysctl guard are SIBLING halves of one contract — a NOS
++// may not depend on host state it does not own, and may not corrupt it either —
++// and they are built in the same two functions. They must COMPOSE: a pod carries
++// both volumes and both mounts, the sysctl guard keeps its SubPath (it lands as
++// one file inside /etc/sysctl.d, it does not replace the directory), and the
++// block mask keeps its whole-directory form. This is the test that fails if a
++// future edit to getVolumes/getVolumeMounts drops either one.
++func TestGetPodComposesBlockMaskWithSysctlGuard(t *testing.T) {
++	device := &ceoslabv1alpha1.CEosLabDevice{
++		ObjectMeta: metav1.ObjectMeta{Name: "leaf1", Namespace: "demo"},
++	}
++	pod := &corev1.Pod{}
++	if err := getPod(pod, device, map[string]client.Object{}, true); err != nil {
++		t.Fatalf("getPod() failed: %v", err)
++	}
++
++	volumes := map[string]corev1.Volume{}
++	for _, volume := range pod.Spec.Volumes {
++		volumes[volume.Name] = volume
++	}
++	for _, name := range []string{hostBlockMaskVolumeName, sysctlGuardVolumeName} {
++		volume, ok := volumes[name]
++		if !ok {
++			t.Fatalf("getPod() volumes = %v, want both %s and %s",
++				volumes, hostBlockMaskVolumeName, sysctlGuardVolumeName)
++		}
++		if volume.EmptyDir == nil {
++			t.Fatalf("getPod() %s is not an emptyDir: %+v", name, volume.VolumeSource)
++		}
++	}
++
++	mounts := map[string]corev1.VolumeMount{}
++	for _, mount := range pod.Spec.Containers[0].VolumeMounts {
++		mounts[mount.Name] = mount
++	}
++	blockMask, ok := mounts[hostBlockMaskVolumeName]
++	if !ok {
++		t.Fatalf("getPod() mounts = %v, want %s", mounts, hostBlockMaskVolumeName)
++	}
++	guard, ok := mounts[sysctlGuardVolumeName]
++	if !ok {
++		t.Fatalf("getPod() mounts = %v, want %s", mounts, sysctlGuardVolumeName)
++	}
++	if blockMask.MountPath != hostBlockMaskMountPath || blockMask.SubPath != "" {
++		t.Fatalf("block mask must cover the whole directory: path=%q subPath=%q",
++			blockMask.MountPath, blockMask.SubPath)
++	}
++	if guard.MountPath != sysctlGuardMountPath || guard.SubPath != sysctlGuardFile {
++		t.Fatalf("sysctl guard must stay a single-file SubPath mount: path=%q subPath=%q",
++			guard.MountPath, guard.SubPath)
++	}
++	// They must not shadow each other.
++	if strings.HasPrefix(guard.MountPath, hostBlockMaskMountPath+"/") {
++		t.Fatalf("sysctl guard %q lands under the block mask %q", guard.MountPath, hostBlockMaskMountPath)
++	}
++}
++
++// The mask is a per-device kill switch, not a build-time constant: an operator
++// must be able to hand a single device back its host block-device view without
++// rebuilding the controller. Turning it off must NOT disturb the sysctl guard —
++// that one is unconditional by design.
++func TestGetPodHostBlockMaskKillSwitch(t *testing.T) {
++	device := &ceoslabv1alpha1.CEosLabDevice{
++		ObjectMeta: metav1.ObjectMeta{Name: "leaf1", Namespace: "demo"},
++		Spec: ceoslabv1alpha1.CEosLabDeviceSpec{
++			EnvVar: map[string]string{"SKYFORGE_EOS_HOST_BLOCK_MASK": "off"},
++		},
++	}
++	pod := &corev1.Pod{}
++	if err := getPod(pod, device, map[string]client.Object{}, true); err != nil {
++		t.Fatalf("getPod() failed: %v", err)
++	}
++	sawGuard := false
++	for _, volume := range pod.Spec.Volumes {
++		if volume.Name == hostBlockMaskVolumeName {
++			t.Fatalf("getPod() declared %s despite SKYFORGE_EOS_HOST_BLOCK_MASK=off", hostBlockMaskVolumeName)
++		}
++		if volume.Name == sysctlGuardVolumeName {
++			sawGuard = true
++		}
++	}
++	if !sawGuard {
++		t.Fatalf("the block-mask kill switch must not disable the sysctl guard")
++	}
++	for _, mount := range pod.Spec.Containers[0].VolumeMounts {
++		if mount.MountPath == hostBlockMaskMountPath {
++			t.Fatalf("getPod() masked %s despite SKYFORGE_EOS_HOST_BLOCK_MASK=off", hostBlockMaskMountPath)
++		}
++	}
++}

@@ -1,0 +1,207 @@
+From 2e974ab4b0006be2db532bff8df6634229afa9b9 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sun, 20 Sep 2026 19:02:52 -0500
+Subject: [PATCH] daemon: verify an Update() RPC against the local pod's
+ declared links before honoring it
+
+---
+ daemon/meshnet/handler.go                |  65 +++++++++++++++
+ daemon/meshnet/update_vni_verify_test.go | 102 +++++++++++++++++++++++
+ 2 files changed, 167 insertions(+)
+ create mode 100644 daemon/meshnet/update_vni_verify_test.go
+
+diff --git a/daemon/meshnet/handler.go b/daemon/meshnet/handler.go
+index 12783a4..d3d7505 100644
+--- a/daemon/meshnet/handler.go
++++ b/daemon/meshnet/handler.go
+@@ -11,6 +11,7 @@ import (
+ 	"github.com/networkop/meshnet-cni/api/types/v1beta1"
+ 	"github.com/networkop/meshnet-cni/daemon/grpcwire"
+ 	"github.com/networkop/meshnet-cni/daemon/vxlan"
++	"github.com/networkop/meshnet-cni/utils/wireutil"
+ 
+ 	log "github.com/sirupsen/logrus"
+ 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+@@ -505,7 +506,71 @@ func (m *Meshnet) IsSkipped(ctx context.Context, skip *mpb.SkipQuery) (*mpb.Bool
+ 	return &mpb.BoolResponse{Response: false}, nil
+ }
+ 
++// verifyUpdateIsDeclared checks that an incoming cross-node Update() RPC
++// actually corresponds to a link the LOCAL pod's own Topology CR declares,
++// before honoring it.
++//
++// THE BUG THIS CLOSES. VxlanID (utils/wireutil) is `fnv32(namespace, uid)`
++// mapped into [4096, 2^24) -- roughly 16.7M buckets. 0006 made this
++// deterministic specifically so two topologies reusing the same low link uid
++// would not collide the way the OLD `5000+uid` scheme did, but a 32-bit hash
++// CAN still ALIAS across genuinely unrelated (namespace, uid) pairs, and
++// nothing before this check ever verified that the update it just received
++// actually belongs to it. Update() took whatever NetNs/IntfName/Vni/PeerVtep
++// a caller sent and blindly called vxlan.CreateOrUpdate -- there was no
++// check that the CALLER was this pod's declared peer for that link at all.
++//
++// MEASURED live, 2026-09-20, example-lab-shared: siteE-rr-rt01 (sm-node-b) ended up
++// with its eth1 vxlan device (VNI 14101293, the deterministic VNI for its
++// link to siteE-dis-rt01 on sm-node-d, 192.0.2.45) programmed with remote
++// 192.0.2.203 instead -- Loki confirmed the Update() RPC that created it
++// had `peer.address="192.0.2.203:..."`, i.e. it was called BY worker-a, not
++// by dis-rt01. Some entirely unrelated pod on worker-a, wiring up ITS OWN
++// cross-node link, independently computed the SAME VNI and its Update()
++// call was honored with no verification at all. dis-rt01's own Topology CR
++// `status.src_ip` was independently confirmed correct throughout -- this was
++// never a stale-read race, only a genuine VNI alias accepted uncritically.
++//
++// THE FIX. Before applying an Update(), look up the Topology CR that owns
++// the target NetNs (list is scoped to the caller-supplied KubeNs, so this is
++// one namespaced List, not a cluster-wide one) and require that its declared
++// links contain an entry whose LocalIntf matches AND whose OWN VxlanID
++// recomputation matches pod.Vni. An update that does not correspond to any
++// link this pod actually declares is refused loudly (visible in the caller's
++// error, not silently mis-wired) instead of being honored.
++func (m *Meshnet) verifyUpdateIsDeclared(ctx context.Context, pod *mpb.RemotePod) error {
++	list, err := m.tClient.Topology(pod.KubeNs).List(ctx, metav1.ListOptions{})
++	if err != nil {
++		return fmt.Errorf("cannot list topologies in %s to verify update: %w", pod.KubeNs, err)
++	}
++	targetNetNs := strings.TrimSpace(pod.NetNs)
++	for i := range list.Items {
++		topo := &list.Items[i]
++		if strings.TrimSpace(topo.Status.NetNS) != targetNetNs {
++			continue
++		}
++		for _, link := range topo.Spec.Links {
++			if link.LocalIntf != pod.IntfName {
++				continue
++			}
++			if int64(wireutil.VxlanID(pod.KubeNs, int64(link.UID))) == pod.Vni {
++				return nil
++			}
++		}
++		return fmt.Errorf(
++			"pod %s (netns %s) declares no link on interface %s with VNI %d -- refusing an Update whose VNI does not belong to it (peer_vtep=%s); this is very likely a cross-topology VNI alias, not a wire for this pod",
++			topo.GetName(), targetNetNs, pod.IntfName, pod.Vni, pod.PeerVtep,
++		)
++	}
++	return fmt.Errorf("no topology in %s owns netns %s -- refusing an Update for an unrecognized local pod", pod.KubeNs, targetNetNs)
++}
++
+ func (m *Meshnet) Update(ctx context.Context, pod *mpb.RemotePod) (*mpb.BoolResponse, error) {
++	if err := m.verifyUpdateIsDeclared(ctx, pod); err != nil {
++		mnetdLogger.Errorf("Rejected Update for netns %s (ns %s) intf %s vni %d peer %s: %v",
++			pod.NetNs, pod.KubeNs, pod.IntfName, pod.Vni, pod.PeerVtep, err)
++		return &mpb.BoolResponse{Response: false}, err
++	}
+ 	if err := vxlan.CreateOrUpdate(pod); err != nil {
+ 		// Return the REAL error. Discarding it (returning nil) left the caller
+ 		// with only Response=false and no reason, which is how a vxlan EEXIST
+diff --git a/daemon/meshnet/update_vni_verify_test.go b/daemon/meshnet/update_vni_verify_test.go
+new file mode 100644
+index 0000000..d2c3c55
+--- /dev/null
++++ b/daemon/meshnet/update_vni_verify_test.go
+@@ -0,0 +1,102 @@
++package meshnet
++
++import (
++	"context"
++	"testing"
++
++	topologyclientv1 "github.com/networkop/meshnet-cni/api/clientset/v1beta1"
++	topologyv1 "github.com/networkop/meshnet-cni/api/types/v1beta1"
++	mpb "github.com/networkop/meshnet-cni/daemon/proto/meshnet/v1beta1"
++	"github.com/networkop/meshnet-cni/utils/wireutil"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++	"k8s.io/apimachinery/pkg/watch"
++)
++
++// fakeTopologyInterface implements topologyclientv1.TopologyInterface with
++// only List() behaving; every other method is unused by verifyUpdateIsDeclared.
++type fakeTopologyInterface struct {
++	items []topologyv1.Topology
++}
++
++func (f *fakeTopologyInterface) List(ctx context.Context, opts metav1.ListOptions) (*topologyv1.TopologyList, error) {
++	return &topologyv1.TopologyList{Items: f.items}, nil
++}
++func (f *fakeTopologyInterface) Get(ctx context.Context, name string, opts metav1.GetOptions) (*topologyv1.Topology, error) {
++	panic("not used by verifyUpdateIsDeclared")
++}
++func (f *fakeTopologyInterface) Create(ctx context.Context, t *topologyv1.Topology, opts metav1.CreateOptions) (*topologyv1.Topology, error) {
++	panic("not used by verifyUpdateIsDeclared")
++}
++func (f *fakeTopologyInterface) Delete(ctx context.Context, name string, opts metav1.DeleteOptions) error {
++	panic("not used by verifyUpdateIsDeclared")
++}
++func (f *fakeTopologyInterface) Watch(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
++	panic("not used by verifyUpdateIsDeclared")
++}
++func (f *fakeTopologyInterface) Unstructured(ctx context.Context, name string, opts metav1.GetOptions, subresources ...string) (*unstructured.Unstructured, error) {
++	panic("not used by verifyUpdateIsDeclared")
++}
++func (f *fakeTopologyInterface) Update(ctx context.Context, obj *unstructured.Unstructured, opts metav1.UpdateOptions) (*topologyv1.Topology, error) {
++	panic("not used by verifyUpdateIsDeclared")
++}
++
++type fakeTopologyClient struct {
++	byNS map[string]*fakeTopologyInterface
++}
++
++func (f *fakeTopologyClient) Topology(namespace string) topologyclientv1.TopologyInterface {
++	if f.byNS[namespace] == nil {
++		return &fakeTopologyInterface{}
++	}
++	return f.byNS[namespace]
++}
++
++// TestVerifyUpdateIsDeclared is the regression test for the VNI-alias bug:
++// an Update() RPC must only be honored when the local pod's own Topology CR
++// actually declares a link, on the claimed interface, whose OWN VxlanID
++// recomputation matches the VNI in the request. A request whose VNI merely
++// happens to match (a hash alias from an unrelated topology) must be
++// refused, not silently applied.
++func TestVerifyUpdateIsDeclared(t *testing.T) {
++	const ns = "user-skyforge-example-lab-shared-e75ab1ba-e"
++	const netns = "/var/run/netns/cni-768f96a6-ffc0-35d5-b40e-1f6f69d747cc"
++	declaredUID := int64(73)
++	declaredVNI := int64(wireutil.VxlanID(ns, declaredUID))
++
++	topo := topologyv1.Topology{}
++	topo.Name = "siteE-rr-rt01"
++	topo.Namespace = ns
++	topo.Status.NetNS = netns
++	topo.Spec.Links = []topologyv1.Link{
++		{LocalIntf: "eth1", PeerPod: "siteE-dis-rt01", UID: int(declaredUID)},
++	}
++
++	m := &Meshnet{tClient: &fakeTopologyClient{byNS: map[string]*fakeTopologyInterface{
++		ns: {items: []topologyv1.Topology{topo}},
++	}}}
++
++	t.Run("declared VNI on the declared interface is accepted", func(t *testing.T) {
++		pod := &mpb.RemotePod{KubeNs: ns, NetNs: netns, IntfName: "eth1", Vni: declaredVNI, PeerVtep: "192.0.2.45"}
++		if err := m.verifyUpdateIsDeclared(context.Background(), pod); err != nil {
++			t.Fatalf("expected the declared link's own VNI to be accepted, got: %v", err)
++		}
++	})
++
++	t.Run("a VNI alias from an unrelated topology is refused", func(t *testing.T) {
++		// This is exactly the live incident: an update carrying the RIGHT
++		// VNI (it collided) but from a peer this pod never declared a link
++		// to, and on the same interface. Must be refused.
++		pod := &mpb.RemotePod{KubeNs: ns, NetNs: netns, IntfName: "eth1", Vni: declaredVNI + 1, PeerVtep: "192.0.2.203"}
++		if err := m.verifyUpdateIsDeclared(context.Background(), pod); err == nil {
++			t.Fatal("expected a VNI that does not match the declared link to be refused, got nil error")
++		}
++	})
++
++	t.Run("an update for an unknown netns is refused", func(t *testing.T) {
++		pod := &mpb.RemotePod{KubeNs: ns, NetNs: "/var/run/netns/cni-does-not-exist", IntfName: "eth1", Vni: declaredVNI, PeerVtep: "192.0.2.45"}
++		if err := m.verifyUpdateIsDeclared(context.Background(), pod); err == nil {
++			t.Fatal("expected an update for a netns with no owning topology to be refused, got nil error")
++		}
++	})
++}
+-- 
+2.55.0
+

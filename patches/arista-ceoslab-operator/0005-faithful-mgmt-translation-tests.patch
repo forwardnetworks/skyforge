@@ -1,0 +1,91 @@
+From 6c0f38e62b36d2b8b003d9c05bd09e228d6a3bab Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Fri, 17 Jul 2026 18:27:12 -0500
+Subject: [PATCH 5/6] skyforge(test): faithful getJsonIntfMapping translation
+ (drop mgmt injection)
+
+Lock in that getJsonIntfMapping is a faithful 1:1 translator: a management
+interface present in the CR appears in EosIntfMapping.json, and no management
+entry is synthesized when the CR carries none. Guards against reintroducing the
+operator-side eth0->Management0 injection hack now that the mapping is authored
+at the netlab source-of-truth layer.
+---
+ .../ceoslabdevice_controller_unit_test.go     | 61 +++++++++++++++++++
+ 1 file changed, 61 insertions(+)
+
+diff --git a/controllers/ceoslabdevice_controller_unit_test.go b/controllers/ceoslabdevice_controller_unit_test.go
+index fe99926..fd17a4e 100644
+--- a/controllers/ceoslabdevice_controller_unit_test.go
++++ b/controllers/ceoslabdevice_controller_unit_test.go
+@@ -2,6 +2,7 @@ package controllers
+ 
+ import (
+ 	"context"
++	"encoding/json"
+ 	"fmt"
+ 	"strings"
+ 	"testing"
+@@ -329,3 +330,63 @@ func TestBringupThrottledAdaptive(t *testing.T) {
+ 	}
+ 	assert(t, mk(many...), true, "ceiling")
+ }
++
++// getJsonIntfMapping must be a faithful 1:1 translator of the kernel-device -> EOS
++// interface map carried in the CR. The eth0 -> Management0 mapping is now authored at
++// the netlab source-of-truth layer, so the operator must translate what it is given and
++// never synthesize a management entry (the dropped injection hack).
++
++type eosIntfMapping struct {
++	EthernetIntf   map[string]string `json:"EthernetIntf"`
++	ManagementIntf map[string]string `json:"ManagementIntf"`
++}
++
++func decodeEosIntfMapping(t *testing.T, cm *corev1.ConfigMap) eosIntfMapping {
++	t.Helper()
++	raw, ok := cm.BinaryData["EosIntfMapping.json"]
++	if !ok {
++		t.Fatalf("getJsonIntfMapping() did not write EosIntfMapping.json: %#v", cm.BinaryData)
++	}
++	var m eosIntfMapping
++	if err := json.Unmarshal(raw, &m); err != nil {
++		t.Fatalf("unmarshal EosIntfMapping.json: %v", err)
++	}
++	return m
++}
++
++func TestGetJsonIntfMappingTranslatesManagementFaithfully(t *testing.T) {
++	cm := &corev1.ConfigMap{}
++	if err := getJsonIntfMapping(cm, map[string]string{
++		"eth0": "Management0",
++		"eth1": "Ethernet1",
++	}); err != nil {
++		t.Fatalf("getJsonIntfMapping() failed: %v", err)
++	}
++	m := decodeEosIntfMapping(t, cm)
++	if got := m.ManagementIntf["eth0"]; got != "Management0" {
++		t.Fatalf("ManagementIntf[eth0] = %q, want Management0 (%#v)", got, m.ManagementIntf)
++	}
++	if got := m.EthernetIntf["eth1"]; got != "Ethernet1" {
++		t.Fatalf("EthernetIntf[eth1] = %q, want Ethernet1 (%#v)", got, m.EthernetIntf)
++	}
++	if len(m.ManagementIntf) != 1 {
++		t.Fatalf("ManagementIntf should contain exactly the CR-provided entry, got %#v", m.ManagementIntf)
++	}
++}
++
++func TestGetJsonIntfMappingOmitsManagementWhenAbsent(t *testing.T) {
++	cm := &corev1.ConfigMap{}
++	if err := getJsonIntfMapping(cm, map[string]string{
++		"eth1": "Ethernet1",
++		"eth2": "Ethernet2",
++	}); err != nil {
++		t.Fatalf("getJsonIntfMapping() failed: %v", err)
++	}
++	m := decodeEosIntfMapping(t, cm)
++	if len(m.ManagementIntf) != 0 {
++		t.Fatalf("ManagementIntf must stay empty when the CR carries no management interface; got %#v", m.ManagementIntf)
++	}
++	if got := m.EthernetIntf["eth1"]; got != "Ethernet1" {
++		t.Fatalf("EthernetIntf[eth1] = %q, want Ethernet1 (%#v)", got, m.EthernetIntf)
++	}
++}

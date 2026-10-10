@@ -1,0 +1,157 @@
+From 843d3d84d236bd9a14f54d79839329319eedd09b Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sat, 18 Jul 2026 08:16:01 -0500
+Subject: [PATCH 6/9] vxlan: deterministic namespace-scoped VNIs and strict
+ create semantics
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- VNI: replace 5000+link.Uid with fnv32(namespace, uid) mapped into
+  [4096, 2^24): concurrently running topologies that reuse the same low
+  link UIDs no longer collide on host VNIs, and both wire ends (local
+  create and remote-VTEP update payload) carry the same derived VNI.
+  NOTE: changes the on-the-wire VNI scheme — all meshnet daemons/plugins
+  in a cluster must upgrade together.
+- Drop the plugin's pre-delete of an existing interface before MakeVxLan
+  and the daemon's 'file exists -> log and swallow' tolerances in
+  vxlan.CreateOrUpdate: koko's MakeVxLan now provides real ensure
+  semantics (adopt matching, replace owned-stale, loud on foreign), so
+  blind pre-deletes hide state and swallowed EEXIST hides real failures.
+  Requires the koko series (idempotent vxlan creation).
+
+Upstreamable with the upgrade caveat above.
+---
+ daemon/vxlan/vxlan.go | 15 +++------------
+ plugin/meshnet.go     | 40 ++++++++++++++++++++++++----------------
+ 2 files changed, 27 insertions(+), 28 deletions(-)
+
+diff --git a/daemon/vxlan/vxlan.go b/daemon/vxlan/vxlan.go
+index 5192ac0..20756b3 100644
+--- a/daemon/vxlan/vxlan.go
++++ b/daemon/vxlan/vxlan.go
+@@ -4,7 +4,6 @@ import (
+ 	"fmt"
+ 	"net"
+ 	"strconv"
+-	"strings"
+ 
+ 	"github.com/containernetworking/plugins/pkg/ns"
+ 	"github.com/redhat-nfvpe/koko/api"
+@@ -78,11 +77,7 @@ func CreateOrUpdate(v *mpb.RemotePod) error {
+ 			}
+ 
+ 			if err = api.MakeVxLan(veth, vxlan); err != nil {
+-				if strings.Contains(err.Error(), "file exists") {
+-					vxLanOvrlyLogger.Infof(" MESHNETD: Error when creating a Vxlan interface with koko, file exists")
+-				} else {
+-					return fmt.Errorf(" MESHNETD: Error when re-creating a Vxlan interface with koko: %s", err)
+-				}
++				return fmt.Errorf(" MESHNETD: Error when re-creating a Vxlan interface with koko: %s", err)
+ 			}
+ 		} // If Vxlan attrs are the same, do nothing
+ 
+@@ -100,12 +95,8 @@ func CreateOrUpdate(v *mpb.RemotePod) error {
+ 		// Then we simply create a new one
+ 		vxLanOvrlyLogger.Infof("Creating a VXLAN link: %v; inside the pod: %v", vxlan, veth)
+ 		if err = api.MakeVxLan(veth, vxlan); err != nil {
+-			if strings.Contains(err.Error(), "file exists") {
+-				vxLanOvrlyLogger.Warnf(" MESHNETD: Error when creating a Vxlan interface with koko, file exists")
+-			} else {
+-				vxLanOvrlyLogger.Errorf(" MESHNETD: Error when creating a new Vxlan interface with koko: %s", err)
+-				return err
+-			}
++			vxLanOvrlyLogger.Errorf(" MESHNETD: Error when creating a new Vxlan interface with koko: %s", err)
++			return err
+ 		}
+ 	}
+ 
+diff --git a/plugin/meshnet.go b/plugin/meshnet.go
+index 3b9f6e1..7878d0c 100644
+--- a/plugin/meshnet.go
++++ b/plugin/meshnet.go
+@@ -2,8 +2,10 @@ package main
+ 
+ import (
+ 	"context"
++	"encoding/binary"
+ 	"encoding/json"
+ 	"fmt"
++	"hash/fnv"
+ 	"net"
+ 	"os"
+ 	"runtime"
+@@ -26,9 +28,10 @@ import (
+ )
+ 
+ const (
+-	vxlanBase   = 5000
+-	localhost   = "localhost"
+-	macvlanMode = netlink.MACVLAN_MODE_BRIDGE
++	vxlanBaseMin = 4096
++	vxlanBaseMax = 1<<24 - 1
++	localhost    = "localhost"
++	macvlanMode  = netlink.MACVLAN_MODE_BRIDGE
+ 
+ 	// rpcTimeout bounds the daemon dial and every individual RPC so a wedged
+ 	// meshnetd (or API server) cannot stall a CNI command indefinitely.
+@@ -194,12 +197,25 @@ func makeVeth(netNS, linkName string, ip string) (*koko.VEth, error) {
+ }
+ 
+ // -------------------------------------------------------------------------------------------------
++// Creates a deterministic topology-scoped VNI so active topologies do not
++// collide just because they reuse the same low link UID values.
++func makeVxlanID(namespace string, idx int64) int {
++	h := fnv.New32a()
++	_, _ = h.Write([]byte(namespace))
++	_, _ = h.Write([]byte{0})
++	var uidBytes [8]byte
++	binary.LittleEndian.PutUint64(uidBytes[:], uint64(idx))
++	_, _ = h.Write(uidBytes[:])
++
++	return vxlanBaseMin + int(h.Sum32()%uint32(vxlanBaseMax-vxlanBaseMin))
++}
++
+ // Creates koko.Vxlan from ParentIF, destination IP and VNI
+-func makeVxlan(srcIntf string, peerIP string, idx int64) *koko.VxLan {
++func makeVxlan(srcIntf string, peerIP string, vni int) *koko.VxLan {
+ 	return &koko.VxLan{
+ 		ParentIF: srcIntf,
+ 		IPAddr:   net.ParseIP(peerIP),
+-		ID:       int(vxlanBase + idx),
++		ID:       vni,
+ 	}
+ }
+ 
+@@ -422,17 +438,9 @@ func cmdAdd(args *skel.CmdArgs) (retErr error) {
+ 					}
+ 					continue
+ 				}
++				vni := makeVxlanID(string(cniArgs.K8S_POD_NAMESPACE), link.Uid)
+ 				// Creating koko's Vxlan struct
+-				vxlan := makeVxlan(srcIntf, peerPod.SrcIp, link.Uid)
+-				// Checking if interface already exists
+-				iExist, _ := koko.IsExistLinkInNS(myVeth.NsName, myVeth.LinkName)
+-				if iExist { // If VXLAN intf exists, we need to remove it first
+-					log.Infof("Add[%s]: VXLAN intf already exists, removing it first", string(cniArgs.K8S_POD_NAME))
+-					if err := myVeth.RemoveVethLink(); err != nil {
+-						log.Infof("Add[%s], Failed to remove a local stale VXLAN interface %s for pod %s", string(cniArgs.K8S_POD_NAME), myVeth.LinkName, localPod.Name)
+-						return err
+-					}
+-				}
++				vxlan := makeVxlan(srcIntf, peerPod.SrcIp, vni)
+ 				if err = koko.MakeVxLan(*myVeth, *vxlan); err != nil {
+ 					log.Infof("Add[%s]: Error when creating a Vxlan interface with koko: %s", string(cniArgs.K8S_POD_NAME), err)
+ 					return err
+@@ -444,7 +452,7 @@ func cmdAdd(args *skel.CmdArgs) (retErr error) {
+ 					IntfName: link.PeerIntf,
+ 					IntfIp:   link.PeerIp,
+ 					PeerVtep: localPod.SrcIp,
+-					Vni:      link.Uid + vxlanBase,
++					Vni:      int64(vni),
+ 					KubeNs:   string(cniArgs.K8S_POD_NAMESPACE),
+ 					NodeIntf: srcIntf,
+ 				}
+-- 
+2.55.0
+

@@ -1,0 +1,343 @@
+From a6be43c11c15e8c350913bed3402fb645857a7bb Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sun, 19 Jul 2026 10:08:35 -0500
+Subject: [PATCH 8/8] skyforge(readiness): honest mgmt readiness gate + startup
+ budget for parallel bringup
+
+Pod-Ready has been a lie: the startupProbe (wfw ConfigAgent Sysdb) passes at
+~t+32s, but the device only becomes USABLE around t+100s. Adds an honest
+readinessProbe (interface-form default route + reinstalled global IPv4 + mgmt
+port listening) gated on the same netlab-authored mgmt intent, and keeps the
+CR-driven wfw startup budget (48 x 5s = 240s). No CRD schema change.
+
+The mgmt-materialized assertion accepts EITHER interface-form signal (additive,
+not a replacement): the seeded mgmt default (default dev eth0) OR a seeded
+return CIDR (SKYFORGE_MGMT_RETURN_CIDRS, threaded from 0007) present as
+"<cidr> dev eth0 proto gated" with no via. A ROUTED cEOS -- a DC leaf carrying
+a data-plane 0/0 into the fabric -- legitimately displaces the mgmt default
+from the FIB, and would otherwise false-NEGATIVE forever. proto gated
+(EOS-installed) is the anchor so the connected mgmt subnet (proto kernel) and
+the pre-claim CNI via-default cannot false-pass; the phase discriminator is
+preserved.
+
+---
+ controllers/ceoslabdevice_controller.go       | 116 +++++++++++++++++-
+ .../ceoslabdevice_controller_unit_test.go     | 146 ++++++++++++++++++++++
+ 2 files changed, 260 insertions(+), 2 deletions(-)
+
+diff --git a/controllers/ceoslabdevice_controller.go b/controllers/ceoslabdevice_controller.go
+index c565e0e..e07285f 100644
+--- a/controllers/ceoslabdevice_controller.go
++++ b/controllers/ceoslabdevice_controller.go
+@@ -1001,6 +1001,7 @@ func getPod(pod *corev1.Pod, device *ceoslabv1alpha1.CEosLabDevice, secretsAndCo
+ 	volumeMounts := getVolumeMounts(secretsAndConfigMaps, useStartupPersistence, device.Name)
+ 	resources := getResourcesAPI(resourceMap)
+ 	startupProbe := getStartupProbeAPI(device)
++	readinessProbe := getReadinessProbeAPI(device, envVarsMap, useStartupPersistence)
+ 	initContainers := []corev1.Container{{
+ 		Name:  fmt.Sprintf("init-%s", device.Name),
+ 		Image: initImage,
+@@ -1030,6 +1031,9 @@ func getPod(pod *corev1.Pod, device *ceoslabv1alpha1.CEosLabDevice, secretsAndCo
+ 			Lifecycle:       lifecycle,
+ 			// Check if agents are warm
+ 			StartupProbe: startupProbe,
++			// Honest gate: Ready == mgmt address installed + config replayed
++			// + mgmt port listening (nil when no mgmt mapping is claimed)
++			ReadinessProbe: readinessProbe,
+ 		}},
+ 		TerminationGracePeriodSeconds: pointer.Int64(0),
+ 		Volumes:                       volumes,
+@@ -1536,6 +1540,10 @@ func getStartupSeedInitContainer(device *ceoslabv1alpha1.CEosLabDevice, envVarsM
+ 
+ func getStartupProbeAPI(device *ceoslabv1alpha1.CEosLabDevice) *corev1.Probe {
+ 	agents := device.Spec.WaitForAgents
++	// The command shape ["wfw","-t","5", agents...] is load-bearing: the
++	// reconciler reads the agent list back out of the live pod via
++	// getWaitForAgentsFromK8sAPI (command[3:]) to detect CR drift, so
++	// spec.waitforagents stays the CR-driven source of truth for this probe.
+ 	command := append([]string{"wfw", "-t", "5"}, agents...)
+ 	return &corev1.Probe{
+ 		ProbeHandler: corev1.ProbeHandler{
+@@ -1543,10 +1551,116 @@ func getStartupProbeAPI(device *ceoslabv1alpha1.CEosLabDevice) *corev1.Probe {
+ 				Command: command,
+ 			},
+ 		},
+-		// Try to boot for up to two minutes
++		// Agent warm-up (ConfigAgent+Sysdb) is ~32s on an idle node, but a
++		// full cEOS boot to a USABLE device is ~100s (SYSTEM_INITIALIZED
++		// ~t+103s), and a 13-node parallel bringup contends CPU well past
++		// that. 48 x 5s = 240s keeps a slow-but-healthy boot from being
++		// killed while the readiness gate (below) carries the honest
++		// "usable" signal. cEOS taking ~100s is NORMAL — the budget encodes
++		// it instead of making callers retry around restarts.
+ 		TimeoutSeconds:   5,
+ 		PeriodSeconds:    5,
+-		FailureThreshold: 24,
++		FailureThreshold: 48,
++	}
++}
++
++// mgmtReadyScript is the honest management readiness gate, rendered with the
++// mgmt kernel device (%[1]s, always eth0 today) and the 4-hex-digit TCP port
++// (%[2]s). Pod-Ready used to mean "wfw saw ConfigAgent+Sysdb warm" (~t+32s),
++// while the device only becomes usable — startup-config replayed, mgmt address
++// installed, AAA/CLI answering — around t+100s: a ~70s lie consumed by every
++// Service endpoint (KNE mgmt LoadBalancers select only Ready pods) and every
++// caller. The gate checks kernel state the runtime mgmt block must produce:
++//
++//  1. Management materialized, proven by EITHER of two interface-form signals
++//     (accept either — do not require the first):
++//       a. The default route is the INTERFACE-FORM route EOS installs from
++//          "ip route 0.0.0.0/0 <MgmtIntf>" ("default dev eth0", no `via`) — the
++//          ordinary cEOS whose only 0/0 is the mgmt default, OR
++//       b. a SEEDED RETURN CIDR (0007 installs "ip route <cidr> <MgmtIntf>" for
++//          each SKYFORGE_MGMT_RETURN_CIDRS entry) is present as "<cidr> dev eth0
++//          proto gated" with no `via` — a ROUTED cEOS (e.g. a DC leaf carrying a
++//          data-plane 0/0 into the fabric) whose data default legitimately
++//          displaces the mgmt default from the FIB. proto gated (EOS-installed)
++//          is the anchor: the connected mgmt subnet is proto kernel and the
++//          pre-claim CNI default is via-gateway, so neither false-passes.
++//     This is the phase discriminator: pre-claim (via-form default, no seeded
++//     gated statics) and the post-claim/pre-apply window (no default at all,
++//     no gated statics) both fail BOTH signals; only EOS's own config replay
++//     produces either. Because the runtime block is appended LAST in
++//     startup-config and replay is sequential, a match also witnesses that the
++//     entire seeded config (users, AAA, gNMI, ...) replayed.
++//  2. eth0 carries a global IPv4 address again (EOS-installed post-strip).
++//  3. The mgmt TCP port (default 22 — SSH is the universal collection
++//     contract; override via spec.envvars SKYFORGE_MGMT_READY_PORT) has a
++//     LISTEN socket (state 0A in /proc/net/tcp{,6}).
++//
++// Deliberately NO `Cli -c` in the probe loop: a FastCli spawn costs 0.5-2s of
++// CPU per exec and can hang while ConfigAgent is busy; at 13 devices probing
++// every 5s forever that is real sustained load, versus ~1-2ms for these kernel
++// checks. The residual AAA warm-up tail after config replay is covered by
++// SuccessThreshold=2 (two consecutive passes, +5s hysteresis).
++const mgmtReadyScript = `set -eu
++mgmt_ok=0
++if ip -4 route show default | grep -q '^default dev %[1]s'; then
++  mgmt_ok=1
++else
++  for cidr in %[3]s; do
++    route="$(ip -4 route show "$cidr" 2>/dev/null || true)"
++    [ -n "$route" ] || continue
++    case "$route" in *" via "*) continue ;; esac
++    echo "$route" | grep -q ' dev %[1]s' || continue
++    echo "$route" | grep -q 'proto gated' || continue
++    mgmt_ok=1
++    break
++  done
++fi
++[ "$mgmt_ok" = 1 ] || exit 1
++ip -4 addr show dev %[1]s | grep -q 'inet .* scope global' || exit 1
++cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | awk '$4=="0A" {split($2,a,":"); if (a[2]=="%[2]s") ok=1} END {exit ok?0:1}'
++`
++
++// getReadinessProbeAPI renders the readiness gate for the ceos container, or
++// nil (today's behavior) when the device has no claimed management interface,
++// no persisted startup-config to materialize into, or the gate is switched off
++// per-device via spec.envvars SKYFORGE_MGMT_READY_GATE=off. No CRD change:
++// spec.waitforagents keeps driving the startup probe; the readiness contract
++// follows the same netlab-authored intent switch as the runtime mgmt block
++// (fail-closed: if EOS rejects the materialized config, the pod stays visibly
++// NotReady instead of silently dark).
++func getReadinessProbeAPI(device *ceoslabv1alpha1.CEosLabDevice, envVarsMap map[string]string, useStartupPersistence bool) *corev1.Probe {
++	if !useStartupPersistence || !mgmtRuntimeConfigEnabled(device, envVarsMap) {
++		return nil
++	}
++	if strings.EqualFold(strings.TrimSpace(envVarsMap["SKYFORGE_MGMT_READY_GATE"]), "off") {
++		return nil
++	}
++	port := 22
++	if v := strings.TrimSpace(envVarsMap["SKYFORGE_MGMT_READY_PORT"]); v != "" {
++		if n, err := strconv.Atoi(v); err == nil && n > 0 && n < 65536 {
++			port = n
++		}
++	}
++	// The data-plane default (a routed cEOS carrying "ip route 0.0.0.0/0"
++	// into the fabric) displaces the interface-form mgmt default, so the
++	// primary clause alone would false-NEGATIVE such a pod even though
++	// management is fully materialized. Thread the operator-seeded return
++	// CIDRs (0007 installs each as "ip route <cidr> %[MgmtIntf]", proto
++	// gated, no via) as the additive discriminator; comma list -> space
++	// list for the shell for-loop. Empty when unset -> new clause dormant,
++	// gate falls back to the mgmt-default check (safe, no false pass).
++	returnCIDRs := strings.ReplaceAll(strings.TrimSpace(envVarsMap["SKYFORGE_MGMT_RETURN_CIDRS"]), ",", " ")
++	script := fmt.Sprintf(mgmtReadyScript, "eth0", fmt.Sprintf("%04X", port), returnCIDRs)
++	return &corev1.Probe{
++		ProbeHandler: corev1.ProbeHandler{
++			Exec: &corev1.ExecAction{
++				Command: []string{"/bin/sh", "-c", script},
++			},
++		},
++		PeriodSeconds:    5,
++		TimeoutSeconds:   3,
++		FailureThreshold: 3,
++		SuccessThreshold: 2,
+ 	}
+ }
+ 
+diff --git a/controllers/ceoslabdevice_controller_unit_test.go b/controllers/ceoslabdevice_controller_unit_test.go
+index bfc6ac3..a1a449a 100644
+--- a/controllers/ceoslabdevice_controller_unit_test.go
++++ b/controllers/ceoslabdevice_controller_unit_test.go
+@@ -6,6 +6,7 @@ import (
+ 	"fmt"
+ 	"os"
+ 	"os/exec"
++	"reflect"
+ 	"strings"
+ 	"testing"
+ 	"time"
+@@ -403,6 +404,151 @@ func TestGetPodSeedInitFaithfulWithoutMgmtMapping(t *testing.T) {
+ 	}
+ }
+ 
++// The startup probe stays the CR-driven agent-warm wait (wfw + waitforagents),
++// with a budget that encodes reality: ~100s to a usable cEOS is NORMAL, plus
++// headroom for a 13-node parallel bringup. The command shape is load-bearing
++// (getWaitForAgentsFromK8sAPI parses command[3:] for CR drift detection).
++func TestGetStartupProbeBudgetAndShape(t *testing.T) {
++	device := &ceoslabv1alpha1.CEosLabDevice{
++		Spec: ceoslabv1alpha1.CEosLabDeviceSpec{
++			WaitForAgents: []string{"ConfigAgent", "Sysdb"},
++		},
++	}
++	probe := getStartupProbeAPI(device)
++	command := probe.ProbeHandler.Exec.Command
++	if command[0] != "wfw" || command[1] != "-t" || command[2] != "5" {
++		t.Fatalf("startup probe command shape changed (drift parser reads command[3:]): %#v", command)
++	}
++	if got := getWaitForAgentsFromK8sAPI(probe); !reflect.DeepEqual(got, []string{"ConfigAgent", "Sysdb"}) {
++		t.Fatalf("getWaitForAgentsFromK8sAPI() = %#v, want the CR agents", got)
++	}
++	if probe.PeriodSeconds != 5 || probe.TimeoutSeconds != 5 {
++		t.Fatalf("startup probe cadence changed: %#v", probe)
++	}
++	if probe.FailureThreshold != 48 {
++		t.Fatalf("startup probe budget = %d x 5s, want 48 x 5s = 240s (~100s normal boot + 13-node contention headroom)", probe.FailureThreshold)
++	}
++}
++
++// Ready must mean usable: with a claimed management interface the ceos
++// container carries a readiness gate on the kernel state EOS must produce from
++// the runtime mgmt block (interface-form default route, reinstalled global
++// IPv4, mgmt port listening).
++func TestGetPodReadinessGate(t *testing.T) {
++	mgmtSpec := func(env map[string]string) ceoslabv1alpha1.CEosLabDeviceSpec {
++		return ceoslabv1alpha1.CEosLabDeviceSpec{
++			IntfMapping: map[string]string{"eth0": "Management0", "eth1": "Ethernet1"},
++			EnvVar:      env,
++		}
++	}
++	startupCM := func(name string) map[string]client.Object {
++		return map[string]client.Object{
++			startupConfigName(name): &corev1.ConfigMap{
++				ObjectMeta: metav1.ObjectMeta{Name: startupConfigName(name)},
++				Data:       map[string]string{"startup-config": "hostname leaf1\n"},
++			},
++		}
++	}
++
++	// Gated ON: mgmt mapping + persisted startup-config.
++	device := &ceoslabv1alpha1.CEosLabDevice{
++		ObjectMeta: metav1.ObjectMeta{Name: "leaf1", Namespace: "demo"},
++		Spec:       mgmtSpec(nil),
++	}
++	pod := &corev1.Pod{}
++	if err := getPod(pod, device, startupCM(device.Name), true); err != nil {
++		t.Fatalf("getPod() failed: %v", err)
++	}
++	probe := pod.Spec.Containers[0].ReadinessProbe
++	if probe == nil || probe.ProbeHandler.Exec == nil {
++		t.Fatalf("readiness gate missing with claimed mgmt interface: %#v", pod.Spec.Containers[0])
++	}
++	script := probe.ProbeHandler.Exec.Command[2]
++	for _, want := range []string{
++		// phase discriminator, primary clause: EOS interface-form mgmt default
++		"'^default dev eth0'",
++		// additive clause markers: OR-branch on a seeded return-CIDR present as
++		// an interface-form static (proto gated, no via) out the mgmt device, so
++		// a routed cEOS whose data 0/0 displaced the mgmt default still gates.
++		"mgmt_ok=1",
++		"proto gated",
++		"scope global",
++		// port 22 in /proc/net/tcp hex, LISTEN state
++		`"0016"`,
++		`"0A"`,
++		"/proc/net/tcp",
++	} {
++		if !strings.Contains(script, want) {
++			t.Fatalf("readiness script missing %q: %s", want, script)
++		}
++	}
++	if strings.Contains(script, "Cli") {
++		t.Fatalf("readiness probe must not spawn Cli every period: %s", script)
++	}
++	if probe.SuccessThreshold != 2 || probe.FailureThreshold != 3 || probe.PeriodSeconds != 5 || probe.TimeoutSeconds != 3 {
++		t.Fatalf("readiness cadence = %#v, want period 5 timeout 3 failure 3 success 2", probe)
++	}
++
++	// Port override via spec.envvars (no CRD change): 6030 -> 178E.
++	device = &ceoslabv1alpha1.CEosLabDevice{
++		ObjectMeta: metav1.ObjectMeta{Name: "leaf1", Namespace: "demo"},
++		Spec:       mgmtSpec(map[string]string{"SKYFORGE_MGMT_READY_PORT": "6030"}),
++	}
++	pod = &corev1.Pod{}
++	if err := getPod(pod, device, startupCM(device.Name), true); err != nil {
++		t.Fatalf("getPod() failed: %v", err)
++	}
++	if script := pod.Spec.Containers[0].ReadinessProbe.ProbeHandler.Exec.Command[2]; !strings.Contains(script, `"178E"`) {
++		t.Fatalf("readiness port override not rendered: %s", script)
++	}
++
++	// Routed cEOS: the operator-seeded return CIDRs (comma list in env) are
++	// threaded into the additive clause as a SPACE-separated for-loop list, so
++	// a leaf whose data default displaced the mgmt default still gates on a
++	// seeded return-CIDR static (dev eth0, proto gated, no via).
++	device = &ceoslabv1alpha1.CEosLabDevice{
++		ObjectMeta: metav1.ObjectMeta{Name: "leaf1", Namespace: "demo"},
++		Spec:       mgmtSpec(map[string]string{"SKYFORGE_MGMT_RETURN_CIDRS": "100.64.0.0/10,198.18.0.0/15"}),
++	}
++	pod = &corev1.Pod{}
++	if err := getPod(pod, device, startupCM(device.Name), true); err != nil {
++		t.Fatalf("getPod() failed: %v", err)
++	}
++	script = pod.Spec.Containers[0].ReadinessProbe.ProbeHandler.Exec.Command[2]
++	if !strings.Contains(script, "for cidr in 100.64.0.0/10 198.18.0.0/15;") {
++		t.Fatalf("return CIDRs not threaded as a space-separated for-loop list: %s", script)
++	}
++	// The anchor must be proto gated, NOT a bare "dev eth0": the connected mgmt
++	// subnet is proto kernel and must not satisfy the additive clause, or the
++	// post-claim/pre-apply window would false-pass.
++	if !strings.Contains(script, "grep -q 'proto gated'") {
++		t.Fatalf("additive clause must anchor on proto gated (connected route is proto kernel): %s", script)
++	}
++
++	// Gated OFF cases keep today's behavior (no readiness probe).
++	for name, tc := range map[string]struct {
++		spec        ceoslabv1alpha1.CEosLabDeviceSpec
++		persistence bool
++	}{
++		"no mgmt mapping":         {ceoslabv1alpha1.CEosLabDeviceSpec{IntfMapping: map[string]string{"eth1": "Ethernet1"}}, true},
++		"no startup persistence":  {mgmtSpec(nil), false},
++		"ready gate kill switch":  {mgmtSpec(map[string]string{"SKYFORGE_MGMT_READY_GATE": "off"}), true},
++		"runtime config disabled": {mgmtSpec(map[string]string{"SKYFORGE_MGMT_RUNTIME_CONFIG": "off"}), true},
++	} {
++		device := &ceoslabv1alpha1.CEosLabDevice{
++			ObjectMeta: metav1.ObjectMeta{Name: "leaf1", Namespace: "demo"},
++			Spec:       tc.spec,
++		}
++		pod := &corev1.Pod{}
++		if err := getPod(pod, device, startupCM(device.Name), tc.persistence); err != nil {
++			t.Fatalf("%s: getPod() failed: %v", name, err)
++		}
++		if pod.Spec.Containers[0].ReadinessProbe != nil {
++			t.Fatalf("%s: unexpected readiness probe: %#v", name, pod.Spec.Containers[0].ReadinessProbe)
++		}
++	}
++}
++
+ func TestMgmtRuntimeIntf(t *testing.T) {
+ 	for want, mapping := range map[string]map[string]string{
+ 		"Management0": {"eth0": "Management0"},

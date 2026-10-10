@@ -1,0 +1,110 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Wed, 22 Jul 2026 02:27:15 -0500
+Subject: [PATCH] skyforge(firewall): permit VRF-netns data-plane control
+ traffic (L3VPN eBGP)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+cEOS implements VRFs as Linux network namespaces (ns-<vrf>), not l3mdev. Each VRF
+netns gets its OWN EOS control-plane firewall: another INPUT-policy-DROP with an
+empty EOS_INPUT and an orphaned EOS_BGP chain nothing jumps to. Patch 0009's
+apply_dataplane_permits restores the trusted-fabric permit ONLY in the pod's
+default netns, so VRF/L3VPN control traffic (CE<->PE eBGP, VRF OSPF, VRF ICMP)
+that arrives on the VRF-netns data interfaces falls straight through to that
+netns's default DROP. The session sticks in Connect: ARP resolves (arptables,
+separate) but no L4 is delivered — the VRF-netns IpInReceives climbs while
+IpInDelivers stays 0. This is NOT a checksum/offload problem: the on-wire L4
+checksums are correct (the fabric veth's software checksum fixup handles the
+macvlan's fixed-on tx-checksum), and ethtool cannot change the macvlan offload
+(all [fixed]) anyway.
+
+Proven live on the banksim sr-migrate demo (2026-07-22): all 10 CE<->PE VRF eBGP
+sessions were stuck in Connect with the VRF-netns INPUT default-DROP counter
+climbing on good-checksum SYNs; a single
+'ip netns exec ns-corporate iptables -I INPUT 1 -i eth2 -j ACCEPT' took that one
+session Connect->Established immediately (and kernel ping 100%% on the same rule),
+while the untouched payments VRF stayed Connect.
+
+Mirror the default-netns permit into every VRF netns (ns-*), enumerating the VRF
+data interfaces from within each netns and re-asserting in the same retry loop:
+VRF netns appear only after EOS processes the VRF config, slightly after the
+fabric interfaces are wired and while EOS reprograms its chains during boot.
+Delete-then-insert keeps exactly one ACCEPT per interface ahead of the DROP.
+
+---
+ controllers/ceoslabdevice_controller.go       | 32 +++++++++++++++++++
+ .../ceoslabdevice_controller_unit_test.go     |  7 ++++
+ 2 files changed, 39 insertions(+)
+
+diff --git a/controllers/ceoslabdevice_controller.go b/controllers/ceoslabdevice_controller.go
+index d3239cf..61d4afa 100644
+--- a/controllers/ceoslabdevice_controller.go
++++ b/controllers/ceoslabdevice_controller.go
+@@ -1084,8 +1084,39 @@ apply_dataplane_permits() {
+     iptables -I INPUT 1 -i "${intf}" -j ACCEPT || true
+   done
+ }
++# cEOS implements VRFs as Linux network namespaces named "ns-<vrf>" (e.g.
++# ns-corporate, ns-payments), NOT l3mdev. When an L3 interface is placed in a VRF,
++# EOS moves it into that netns (as a macvlan over the fabric veth) and gives the
++# netns its OWN control-plane firewall — another INPUT-policy-DROP with an empty
++# EOS_INPUT and an ORPHANED EOS_BGP permit chain that nothing jumps to.
++# apply_dataplane_permits above runs only in the pod's DEFAULT netns, so it never
++# reaches these VRF netns: VRF eBGP/OSPF/ICMP (the CE<->PE L3VPN sessions) arrives
++# on the VRF-netns data interfaces and falls straight through to that netns's
++# default DROP. The session sticks in Connect — ARP resolves (arptables, separate)
++# but no L4 is ever delivered (the netns IpInReceives counter climbs while
++# IpInDelivers stays 0; it is NOT a checksum/offload problem — the wire checksums
++# are correct). Proven live on the banksim sr-migrate demo (2026-07-22): all 10
++# CE<->PE VRF eBGP sessions were stuck Connect with the VRF-netns INPUT DROP
++# counter climbing on good-checksum SYNs, and a single
++# 'ip netns exec ns-corporate iptables -I INPUT 1 -i eth2 -j ACCEPT' took that one
++# session Connect->Established immediately (kernel ping 0%->100% on the same rule).
++# Mirror the trusted-fabric permit into every VRF netns. The netns appear only
++# after EOS processes the VRF config (slightly after the fabric interfaces are
++# wired), so this is re-asserted every pass in the same retry loop below; the
++# delete-then-insert keeps exactly one ACCEPT per interface ahead of the DROP.
++apply_vrf_dataplane_permits() {
++  for _ns in $(ip netns list 2>/dev/null | awk '{print $1}'); do
++    case "${_ns}" in ns-*) ;; *) continue ;; esac
++    for _vifpath in $(ip netns exec "${_ns}" ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | sed 's/@.*//'); do
++      case "${_vifpath}" in eth[1-9]*) ;; *) continue ;; esac
++      ip netns exec "${_ns}" iptables -D INPUT -i "${_vifpath}" -j ACCEPT 2>/dev/null || true
++      ip netns exec "${_ns}" iptables -I INPUT 1 -i "${_vifpath}" -j ACCEPT || true
++    done
++  done
++}
+ apply_permits
+ apply_dataplane_permits
++apply_vrf_dataplane_permits
+ (
+   i=0
+   max="${SKYFORGE_MGMT_RETURN_ROUTE_RETRIES:-60}"
+@@ -1093,6 +1124,7 @@ apply_dataplane_permits
+   while [ "${i}" -lt "${max}" ]; do
+     apply_permits
+     apply_dataplane_permits
++    apply_vrf_dataplane_permits
+     i=$((i + 1))
+     sleep "${interval}"
+   done
+diff --git a/controllers/ceoslabdevice_controller_unit_test.go b/controllers/ceoslabdevice_controller_unit_test.go
+index 565908f..5d33ea5 100644
+--- a/controllers/ceoslabdevice_controller_unit_test.go
++++ b/controllers/ceoslabdevice_controller_unit_test.go
+@@ -187,6 +187,13 @@ func TestGetPodAddsManagementReturnRouteLifecycle(t *testing.T) {
+ 		"apply_dataplane_permits",
+ 		"/sys/class/net/eth*",
+ 		"iptables -I INPUT 1 -i",
++		// cEOS implements VRFs as network namespaces (ns-<vrf>), each with its own
++		// INPUT-policy-DROP control-plane firewall that apply_dataplane_permits (default
++		// netns only) never reaches — so VRF/L3VPN eBGP/OSPF is dropped there too. The
++		// same trusted-fabric permit must be mirrored into every VRF netns.
++		"apply_vrf_dataplane_permits",
++		"ip netns list",
++		`ip netns exec "${_ns}" iptables -I INPUT 1 -i`,
+ 	} {
+ 		if !strings.Contains(script, want) {
+ 			t.Fatalf("lifecycle script missing %q: %s", want, script)

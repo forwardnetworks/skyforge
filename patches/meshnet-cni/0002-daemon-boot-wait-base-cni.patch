@@ -1,0 +1,93 @@
+From 08453538de4fe1d13edaf413e7d076e14e32e4df Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sat, 18 Jul 2026 08:13:07 -0500
+Subject: [PATCH 2/9] daemon: wait for the base CNI config instead of
+ CrashLooping at boot
+
+At node boot meshnetd races the primary CNI's conflist write into
+/etc/cni/net.d. cni.Init() fails hard on 'no configs found', which put the
+DaemonSet into CrashLoopBackOff on every boot until the primary CNI won the
+race. InitOrWaitForBaseConfig polls (2s interval, 30s log cadence)
+specifically on libcni.NoConfigsFoundError until a base (non-meshnet)
+config appears; any other error still fails immediately.
+
+Upstreamable.
+---
+ daemon/cni/cni.go | 31 +++++++++++++++++++++++++++++++
+ daemon/main.go    |  5 ++++-
+ 2 files changed, 35 insertions(+), 1 deletion(-)
+
+diff --git a/daemon/cni/cni.go b/daemon/cni/cni.go
+index 4249190..79b3645 100644
+--- a/daemon/cni/cni.go
++++ b/daemon/cni/cni.go
+@@ -2,12 +2,14 @@ package cni
+ 
+ import (
+ 	"encoding/json"
++	"errors"
+ 	"fmt"
+ 	"io/ioutil"
+ 	"os"
+ 	"path/filepath"
+ 	"sort"
+ 	"strings"
++	"time"
+ 
+ 	"github.com/containernetworking/cni/libcni"
+ 	"github.com/containernetworking/cni/pkg/types"
+@@ -134,6 +136,35 @@ func Init() error {
+ 	return saveConfList(conf)
+ }
+ 
++// InitOrWaitForBaseConfig installs the meshnet CNI configuration, waiting for
++// a base (non-meshnet) CNI config to show up in /etc/cni/net.d first. At node
++// boot meshnetd races the primary CNI's conflist write; failing hard here
++// puts the DaemonSet into CrashLoopBackOff on every boot, so instead we poll
++// indefinitely until the base config appears. Only the "no configs found yet"
++// case is waited on; any other error is returned immediately.
++func InitOrWaitForBaseConfig() error {
++	const (
++		pollInterval = 2 * time.Second
++		logInterval  = 30 * time.Second
++	)
++	var lastLog time.Time
++	for {
++		err := Init()
++		if err == nil {
++			return nil
++		}
++		var noConfigs libcni.NoConfigsFoundError
++		if !errors.As(err, &noConfigs) {
++			return err
++		}
++		if lastLog.IsZero() || time.Since(lastLog) >= logInterval {
++			log.Infof("Waiting for a base CNI config to appear in %s before installing meshnet: %v", defaultNetDir, err)
++			lastLog = time.Now()
++		}
++		time.Sleep(pollInterval)
++	}
++}
++
+ // Cleanup removes meshnet CNI configuration
+ func Cleanup() {
+ 	if err := os.Remove(meshnetCNIPath); err != nil {
+diff --git a/daemon/main.go b/daemon/main.go
+index 3615129..3fed3d9 100644
+--- a/daemon/main.go
++++ b/daemon/main.go
+@@ -15,7 +15,10 @@ import (
+ 
+ func main() {
+ 
+-	if err := cni.Init(); err != nil {
++	// Wait for the base CNI config instead of exiting: at node boot meshnetd
++	// races the primary CNI's conflist write and a hard exit here means
++	// CrashLoopBackOff on every boot.
++	if err := cni.InitOrWaitForBaseConfig(); err != nil {
+ 		log.Errorf("Failed to initialise CNI plugin: %v", err)
+ 		os.Exit(1)
+ 	}
+-- 
+2.55.0
+

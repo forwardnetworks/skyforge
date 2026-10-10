@@ -1,0 +1,219 @@
+From 55a71946d97410f850b19637d4590ef7999a17c8 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sat, 18 Jul 2026 08:14:12 -0500
+Subject: [PATCH 4/9] plugin: bound every RPC and give ADD/DEL overall budgets
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+CNI commands used unbounded contexts and non-blocking dials, so a wedged
+meshnetd, API server or remote daemon stalled kubelet's CNI ADD (and with
+it containerd's CRI workers) indefinitely — the sandbox-creation wedge
+observed under bringup bursts.
+
+- dialGRPC: bounded blocking dial (30s) plus a unary interceptor giving
+  every RPC its own 30s timeout under the caller's overall budget; adopted
+  for the local daemon dials, the remote-VTEP update dial and both
+  grpc-wire dials in grpcwires-plugin.go (with the underlying dial errors
+  finally included in the messages).
+- cmdAdd runs under a 90s overall budget and decorates deadline-exceeded
+  failures with the pod identity and budget.
+- cmdDel runs under a best-effort 45s budget: on expiry the error is logged
+  and DEL returns success, so pod teardown is never blocked by meshnet
+  cleanup; leftover state is reconciled by the next ADD.
+
+Upstreamable.
+---
+ plugin/grpcwires-plugin.go | 10 ++---
+ plugin/meshnet.go          | 83 +++++++++++++++++++++++++++++++-------
+ 2 files changed, 73 insertions(+), 20 deletions(-)
+
+diff --git a/plugin/grpcwires-plugin.go b/plugin/grpcwires-plugin.go
+index 89bf2c7..4df7b16 100644
+--- a/plugin/grpcwires-plugin.go
++++ b/plugin/grpcwires-plugin.go
+@@ -12,8 +12,6 @@ import (
+ 	"github.com/networkop/meshnet-cni/utils/wireutil"
+ 	koko "github.com/redhat-nfvpe/koko/api"
+ 	log "github.com/sirupsen/logrus"
+-	"google.golang.org/grpc"
+-	"google.golang.org/grpc/credentials/insecure"
+ )
+ 
+ const (
+@@ -152,9 +150,9 @@ func CreatGRPCChan(link *mpb.Link, localPod *mpb.Pod, peerPod *mpb.Pod, localCli
+ 
+ 	url := fmt.Sprintf("%s:%d", peerPod.SrcIp, wireutil.GRPCDefaultPort)
+ 	url = strings.TrimSpace(url)
+-	remote, err := grpc.Dial(url, grpc.WithTransportCredentials(insecure.NewCredentials()))
++	remote, err := dialGRPC(ctx, url)
+ 	if err != nil {
+-		return fmt.Errorf("Add-GRPC[%s]: creating GRPC wire: failed to dial remote gRPC url %s", localPod.Name, url)
++		return fmt.Errorf("Add-GRPC[%s]: creating GRPC wire: failed to dial remote gRPC url %s: %v", localPod.Name, url, err)
+ 	}
+ 	remoteClient := mpb.NewRemoteClient(remote)
+ 	locInf, err := net.InterfaceByName(hostEndVeth.LinkName)
+@@ -263,9 +261,9 @@ func MakeGRPCChanDown(link *mpb.Link, localPod *mpb.Pod, peerPod *mpb.Pod, ctx c
+ 
+ 	url := fmt.Sprintf("%s:%d", peerPod.SrcIp, wireutil.GRPCDefaultPort)
+ 	url = strings.TrimSpace(url)
+-	remote, err := grpc.Dial(url, grpc.WithTransportCredentials(insecure.NewCredentials()))
++	remote, err := dialGRPC(ctx, url)
+ 	if err != nil {
+-		return fmt.Errorf("MakeGRPCChanDown failed to dial remote gRPC url %s", url)
++		return fmt.Errorf("MakeGRPCChanDown failed to dial remote gRPC url %s: %v", url, err)
+ 	}
+ 	remoteClient := mpb.NewRemoteClient(remote)
+ 
+diff --git a/plugin/meshnet.go b/plugin/meshnet.go
+index a38c0d7..5051fde 100644
+--- a/plugin/meshnet.go
++++ b/plugin/meshnet.go
+@@ -7,6 +7,7 @@ import (
+ 	"net"
+ 	"os"
+ 	"runtime"
++	"time"
+ 
+ 	"github.com/containernetworking/cni/pkg/skel"
+ 	"github.com/containernetworking/cni/pkg/types"
+@@ -27,6 +28,17 @@ const (
+ 	vxlanBase   = 5000
+ 	localhost   = "localhost"
+ 	macvlanMode = netlink.MACVLAN_MODE_BRIDGE
++
++	// rpcTimeout bounds the daemon dial and every individual RPC so a wedged
++	// meshnetd (or API server) cannot stall a CNI command indefinitely.
++	rpcTimeout = 30 * time.Second
++	// addBudget is the overall CNI ADD deadline. Without it a stuck ADD holds
++	// kubelet/containerd CRI workers past their own timeouts and wedges the
++	// node's sandbox creation pipeline.
++	addBudget = 90 * time.Second
++	// delBudget is the best-effort CNI DEL deadline; on expiry we log and
++	// return success so pod teardown is never blocked by meshnet cleanup.
++	delBudget = 45 * time.Second
+ )
+ 
+ var (
+@@ -154,12 +166,34 @@ func makeVxlan(srcIntf string, peerIP string, idx int64) *koko.VxLan {
+ 	}
+ }
+ 
+-// -------------------------------------------------------------------------------------------------
+-// Adds interfaces to a POD. the POD name and the POD Namespace is passed as arguments.
+-func cmdAdd(args *skel.CmdArgs) error {
+-	ctx, cancel := context.WithCancel(context.Background())
++// perRPCTimeout is a grpc unary interceptor that bounds every RPC with
++// rpcTimeout while still honouring the caller's overall command budget
++// carried by the parent context.
++func perRPCTimeout(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
++	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+ 	defer cancel()
++	return invoker(rpcCtx, method, req, reply, cc, opts...)
++}
+ 
++// dialGRPC dials a meshnet daemon with a bounded blocking dial and installs
++// the per-RPC timeout interceptor on the returned connection.
++func dialGRPC(ctx context.Context, target string) (*grpc.ClientConn, error) {
++	dialCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
++	defer cancel()
++	conn, err := grpc.DialContext(dialCtx, target,
++		grpc.WithTransportCredentials(insecure.NewCredentials()),
++		grpc.WithBlock(),
++		grpc.WithUnaryInterceptor(perRPCTimeout),
++	)
++	if err != nil {
++		return nil, fmt.Errorf("dialing meshnet daemon %s: %w", target, err)
++	}
++	return conn, nil
++}
++
++// -------------------------------------------------------------------------------------------------
++// Adds interfaces to a POD. the POD name and the POD Namespace is passed as arguments.
++func cmdAdd(args *skel.CmdArgs) (retErr error) {
+ 	log.Info("Parsing cni .conf file")
+ 	n, result, err := loadConf(args.StdinData)
+ 	if err != nil {
+@@ -171,13 +205,24 @@ func cmdAdd(args *skel.CmdArgs) error {
+ 	if err := types.LoadArgs(args.Args, &cniArgs); err != nil {
+ 		return err
+ 	}
++
++	// Overall ADD budget: fail crisply instead of letting a wedged daemon or
++	// API server stall kubelet's CNI ADD (and containerd's CRI workers).
++	ctx, cancel := context.WithTimeout(context.Background(), addBudget)
++	defer cancel()
++	defer func() {
++		if retErr != nil && ctx.Err() == context.DeadlineExceeded {
++			retErr = fmt.Errorf("meshnet CNI ADD for pod %s/%s exceeded its %v budget: %w", string(cniArgs.K8S_POD_NAMESPACE), string(cniArgs.K8S_POD_NAME), addBudget, retErr)
++		}
++	}()
++
+ 	log.Infof("Processing ADD POD %s in namespace %s, container_id %s", string(cniArgs.K8S_POD_NAME), string(cniArgs.K8S_POD_NAMESPACE), string(cniArgs.K8S_POD_INFRA_CONTAINER_ID))
+ 	defer log.Infof("DONE > Processing ADD POD %s in namespace %s, container_id %s", string(cniArgs.K8S_POD_NAME), string(cniArgs.K8S_POD_NAMESPACE), string(cniArgs.K8S_POD_INFRA_CONTAINER_ID))
+ 
+ 	log.Infof("Attempting to connect to local meshnet daemon")
+-	conn, err := grpc.Dial(localDaemon, grpc.WithTransportCredentials(insecure.NewCredentials()))
++	conn, err := dialGRPC(ctx, localDaemon)
+ 	if err != nil {
+-		log.Errorf("Failed to connect to local meshnetd on %s", localDaemon)
++		log.Errorf("Failed to connect to local meshnetd on %s: %v", localDaemon, err)
+ 		return err
+ 	}
+ 	defer conn.Close()
+@@ -370,9 +415,9 @@ func cmdAdd(args *skel.CmdArgs) error {
+ 				url := fmt.Sprintf("%s:%d", peerPod.SrcIp, wireutil.GRPCDefaultPort)
+ 				log.Infof("Add[%s]: Trying to do a remote update on %s", string(cniArgs.K8S_POD_NAME), url)
+ 
+-				remote, err := grpc.Dial(url, grpc.WithTransportCredentials(insecure.NewCredentials()))
++				remote, err := dialGRPC(ctx, url)
+ 				if err != nil {
+-					log.Infof("Add[%s]: Failed to dial remote gRPC url %s", string(cniArgs.K8S_POD_NAME), url)
++					log.Infof("Add[%s]: Failed to dial remote gRPC url %s: %v", string(cniArgs.K8S_POD_NAME), url, err)
+ 					return err
+ 				}
+ 				remoteClient := mpb.NewRemoteClient(remote)
+@@ -406,14 +451,24 @@ func cmdAdd(args *skel.CmdArgs) error {
+ 
+ // -------------------------------------------------------------------------------------------------
+ // Deletes interfaces from a POD
+-func cmdDel(args *skel.CmdArgs) error {
+-	ctx, cancel := context.WithCancel(context.Background())
+-	defer cancel()
+-
++func cmdDel(args *skel.CmdArgs) (retErr error) {
+ 	cniArgs := k8sArgs{}
+ 	if err := types.LoadArgs(args.Args, &cniArgs); err != nil {
+ 		return err
+ 	}
++
++	// Best-effort DEL budget: never block pod teardown on meshnet cleanup.
++	// On expiry we log and return success; leftover state is reconciled on
++	// the next ADD or by the daemon.
++	ctx, cancel := context.WithTimeout(context.Background(), delBudget)
++	defer cancel()
++	defer func() {
++		if retErr != nil && ctx.Err() == context.DeadlineExceeded {
++			log.Warnf("Del[%s]: meshnet CNI DEL exceeded its %v budget; continuing pod teardown despite: %v", string(cniArgs.K8S_POD_NAME), delBudget, retErr)
++			retErr = nil
++		}
++	}()
++
+ 	log.Infof("========> Processing DEL POD %s in namespace %s, container_id %s", string(cniArgs.K8S_POD_NAME), string(cniArgs.K8S_POD_NAMESPACE), cniArgs.K8S_POD_INFRA_CONTAINER_ID)
+ 	defer log.Infof("DONE ========>  Processing DEL POD %s in namespace %s, container_id %s", string(cniArgs.K8S_POD_NAME), string(cniArgs.K8S_POD_NAMESPACE), cniArgs.K8S_POD_INFRA_CONTAINER_ID)
+ 
+@@ -426,9 +481,9 @@ func cmdDel(args *skel.CmdArgs) error {
+ 		return err
+ 	}
+ 
+-	conn, err := grpc.Dial(localDaemon, grpc.WithTransportCredentials(insecure.NewCredentials()))
++	conn, err := dialGRPC(ctx, localDaemon)
+ 	if err != nil {
+-		log.Errorf("Failed to connect to local meshnetd on %s", localDaemon)
++		log.Errorf("Failed to connect to local meshnetd on %s: %v", localDaemon, err)
+ 		return err
+ 	}
+ 	defer conn.Close()
+-- 
+2.55.0
+

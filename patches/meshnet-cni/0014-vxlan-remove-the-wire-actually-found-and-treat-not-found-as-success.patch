@@ -1,0 +1,330 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Fri, 5 Sep 2026 09:40:00 -0500
+Subject: [PATCH] vxlan: remove the wire actually found, and treat not-found as
+ success
+
+0013 taught CreateOrUpdate to SEE a KubeVirt bridge-binding-renamed wire
+("podXXXX" renamed to "XXXX-nic", enslaved to "k6t-XXXX") by looking up the
+renamed form and setting `link = renamed`. It left veth.LinkName as the
+ORIGINAL "podXXXX". That is fine while the found wire's attrs match; the
+moment they differ (a peer whose VTEP moved, or a wire left behind by an
+earlier incarnation of the peer) the attrs-differ branch calls
+veth.RemoveVethLink(), koko does LinkByName("podXXXX") INSIDE the netns, the
+name no longer exists there, and the daemon returns it as fatal:
+
+  failed to lookup "pod980816f36b7" in "/var/run/netns/cni-...": Link not found
+
+The CNI ADD fails, kubelet recreates the sandbox, and because the VNI is
+deterministic per link (0006) every retry recomputes the same request and
+hits the same wall FOREVER. The else-branch removal for a found non-vxlan
+link carried the same latent defect.
+
+Measured 2026-09-05 (Loki, meshnet daemon on worker-a): example-lab pod
+virt-launcher-siteB-cor-sw01 on sm-node-b, 776+ sandbox recreations at ~2s
+intervals, restarts=0, every retry failing on that exact line; the dangling
+wire lives in the PEER pod siteB-fw01's netns on worker-a. This is the sibling
+sub-case 0013 did not cover: 0013 made the renamed wire visible, but never
+made it REMOVABLE.
+
+Both call sites now go through removeExistingWire, which (1) removes the
+link under the name it was actually FOUND as -- the name the kernel knows --
+and (2) treats a not-found result as success with an Info log, because the
+postcondition of "remove the old wire" already holds when the wire is
+absent. Every other removal error is still returned under the two existing
+MESHNETD error strings. koko formats the lookup failure with %v, which
+breaks the error chain, so the substring "Link not found" is the match that
+fires in production; errors.As on netlink.LinkNotFoundError is kept for a
+koko that wraps with %w.
+
+The remover is injected so daemon/vxlan/vxlan_remove_test.go proves both
+rules without a netns. The tests are a positive control: against the pre-fix
+body (name untouched, every error fatal) TargetsTheLinkActuallyFound and
+TreatsNotFoundAsSuccess go RED and the rest stay green -- run and observed
+2026-09-05 with a byte-copied swap of the helper body.
+
+---
+ daemon/vxlan/vxlan.go             |  82 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++--
+ daemon/vxlan/vxlan_remove_test.go | 161 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 241 insertions(+), 2 deletions(-)
+ create mode 100644 daemon/vxlan/vxlan_remove_test.go
+
+--- a/daemon/vxlan/vxlan.go
++++ b/daemon/vxlan/vxlan.go
+@@ -1,6 +1,7 @@
+ package vxlan
+ 
+ import (
++	"errors"
+ 	"fmt"
+ 	"net"
+ 	"os"
+@@ -108,7 +109,7 @@
+ 
+ 			// We remove the existing link and add a new one
+ 			vxLanOvrlyLogger.Infof("Vxlan attrs are different: %d!=%d or %v!=%v", vxlanLink.VxlanId, vxlan.ID, vxlanLink.Group, vxlan.IPAddr)
+-			if err = veth.RemoveVethLink(); err != nil {
++			if err = removeExistingWire(veth, link, kokoRemoveVethLink); err != nil {
+ 				return fmt.Errorf(" MESHNETD: Error when removing an old Vxlan interface with koko: %s", err)
+ 			}
+ 
+@@ -123,7 +124,7 @@
+ 		// If link exists but wasn't matched as vxlan, we need to delete it
+ 		if link != nil {
+ 			vxLanOvrlyLogger.Infof("Attempting to remove link %+v", veth)
+-			if err = veth.RemoveVethLink(); err != nil {
++			if err = removeExistingWire(veth, link, kokoRemoveVethLink); err != nil {
+ 				return fmt.Errorf(" MESHNETD: Error when removing an old non-Vxlan interface with koko: %s", err)
+ 			}
+ 		}
+@@ -151,6 +152,83 @@
+ 	return mtu, nil
+ }
+ 
++// kokoRemoveVethLink is the production remover handed to removeExistingWire:
++// koko's RemoveVethLink, which enters veth.NsName and deletes veth.LinkName.
++func kokoRemoveVethLink(v *api.VEth) error {
++	return v.RemoveVethLink()
++}
++
++// removeExistingWire removes the wire that CreateOrUpdate actually FOUND, and
++// treats "already gone" as success.
++//
++// This is the sibling sub-case that 0013 did not cover. 0013 taught
++// CreateOrUpdate to see a KubeVirt bridge-binding-renamed wire ("podXXXX"
++// renamed to "XXXX-nic", enslaved to "k6t-XXXX") by setting `link = renamed`,
++// but it left veth.LinkName as the ORIGINAL "podXXXX". The moment the found
++// link's attrs differ from the desired ones (a peer that came back with a new
++// VTEP, or a wire left behind by an earlier incarnation of the peer), the
++// attrs-differ branch calls veth.RemoveVethLink(), koko does
++// LinkByName("podXXXX") inside the netns, the name no longer exists there, and
++// the daemon returns it as fatal:
++//
++//	failed to lookup "pod980816f36b7" in "/var/run/netns/cni-...": Link not found
++//
++// Measured 2026-09-05 (Loki, meshnet daemon on worker-a): example-lab pod
++// virt-launcher-siteB-cor-sw01 on sm-node-b, 776+ sandbox recreations at ~2s
++// intervals, restarts=0, every retry failing on that exact line. The dangling
++// wire lives in the PEER pod siteB-fw01's netns on worker-a. The VNI is
++// deterministic per link (0006), so every kubelet retry recomputes the same
++// request and hits the same wall FOREVER. The else-branch removal for a found
++// non-vxlan link carried the same latent defect.
++//
++// Two rules follow. (1) Remove the link that was FOUND: if `found` is non-nil,
++// its name is the name the kernel knows, so that is the name koko must delete.
++// (2) The postcondition of "remove the old wire" already holds when the wire
++// is absent: a not-found result is success, logged, not a fatal error. Any
++// other removal error is still returned. koko formats the lookup failure with
++// %v, which breaks the error chain, so the substring match is the one that
++// fires in production; errors.As is kept for a future koko that wraps with %w.
++//
++// The remover is injected so daemon/vxlan/vxlan_remove_test.go can prove both
++// rules without a netns; production passes kokoRemoveVethLink.
++func removeExistingWire(veth api.VEth, found netlink.Link, remove func(*api.VEth) error) error {
++	if found != nil && found.Attrs() != nil && found.Attrs().Name != "" && found.Attrs().Name != veth.LinkName {
++		vxLanOvrlyLogger.Infof("Removing wire %s in %s under the name it was found as: %s",
++			veth.LinkName, veth.NsName, found.Attrs().Name)
++		veth.LinkName = found.Attrs().Name
++	}
++	err := remove(&veth)
++	if err == nil {
++		return nil
++	}
++	if isLinkNotFound(err) {
++		vxLanOvrlyLogger.Infof("Wire %s in %s is already gone; nothing to remove: %v",
++			veth.LinkName, veth.NsName, err)
++		return nil
++	}
++	return err
++}
++
++// isLinkNotFound reports whether err says the link does not exist. Both forms
++// are matched: the typed netlink error (survives %w wrapping) and the string
++// koko emits today ("failed to lookup %q in %q: %v" ... "Link not found").
++func isLinkNotFound(err error) bool {
++	if err == nil {
++		return false
++	}
++	var notFound netlink.LinkNotFoundError
++	if errors.As(err, &notFound) {
++		return true
++	}
++	msg := err.Error()
++	// "Link not found" is what LinkByName returns on ENODEV (the live line);
++	// "Link <name> not found" is its older dump-based fallback. A missing
++	// NETNS ("no such file or directory") deliberately does not match: that is
++	// a different absence, and the caller must hear about it.
++	return strings.Contains(msg, "Link not found") ||
++		(strings.Contains(msg, "Link ") && strings.Contains(msg, " not found"))
++}
++
+ // getLinkFromNS retrieves netlink.Link from NetNS
+ func getLinkFromNS(nsName string, linkName string) netlink.Link {
+ 	// If namespace doesn't exist, do nothing and return empty result
+--- /dev/null
++++ b/daemon/vxlan/vxlan_remove_test.go
+@@ -0,0 +1,161 @@
++package vxlan
++
++import (
++	"errors"
++	"fmt"
++	"testing"
++
++	"github.com/redhat-nfvpe/koko/api"
++	"github.com/vishvananda/netlink"
++)
++
++// These tests are the POSITIVE CONTROL for removeExistingWire. Each one names
++// the pre-fix behaviour it would have failed against, so a green here asserts
++// something: the two call sites in CreateOrUpdate used to call
++// veth.RemoveVethLink() directly with veth.LinkName still set to the
++// pre-rename "podXXXX", and returned every error as fatal.
++
++// fakeRemover records the VEth it was handed and returns a scripted error, so
++// no netns is needed to prove which NAME the removal targets.
++type fakeRemover struct {
++	calls []api.VEth
++	err   error
++}
++
++func (f *fakeRemover) remove(v *api.VEth) error {
++	f.calls = append(f.calls, *v)
++	return f.err
++}
++
++func TestRemoveExistingWireTargetsTheLinkActuallyFound(t *testing.T) {
++	// Pre-fix: CreateOrUpdate set `link = renamed` (0013) but left
++	// veth.LinkName = "pod980816f36b7", so RemoveVethLink looked up the
++	// pre-rename name inside the netns. This test asserts the remover is
++	// handed the name the kernel knows, "980816f36b7-nic"; it FAILS against
++	// the old behaviour because the old code never rewrote LinkName.
++	InitLogger()
++	found := &netlink.Vxlan{LinkAttrs: netlink.LinkAttrs{Name: "980816f36b7-nic"}, VxlanId: 4242}
++	veth := api.VEth{NsName: "/var/run/netns/cni-test", LinkName: "pod980816f36b7"}
++	fr := &fakeRemover{}
++
++	if err := removeExistingWire(veth, found, fr.remove); err != nil {
++		t.Fatalf("removeExistingWire() = %v, want nil", err)
++	}
++	if len(fr.calls) != 1 {
++		t.Fatalf("remover called %d times, want 1", len(fr.calls))
++	}
++	if got, want := fr.calls[0].LinkName, "980816f36b7-nic"; got != want {
++		t.Fatalf("remover targeted LinkName %q, want the found name %q", got, want)
++	}
++	if got, want := fr.calls[0].NsName, veth.NsName; got != want {
++		t.Fatalf("remover NsName %q, want %q (netns must not change)", got, want)
++	}
++	// The caller's copy is untouched: CreateOrUpdate goes on to MakeVxLan
++	// with the ORIGINAL name, which is the name the new wire must be born as.
++	if veth.LinkName != "pod980816f36b7" {
++		t.Fatalf("caller's veth.LinkName mutated to %q", veth.LinkName)
++	}
++}
++
++func TestRemoveExistingWireKeepsTheNameWhenFoundUnderIt(t *testing.T) {
++	// An unrenamed wire (no KubeVirt in the picture) must be removed under its
++	// own name, exactly as before the fix. Guards against over-correcting.
++	InitLogger()
++	found := &netlink.Vxlan{LinkAttrs: netlink.LinkAttrs{Name: "eth1"}}
++	fr := &fakeRemover{}
++	if err := removeExistingWire(api.VEth{NsName: "ns", LinkName: "eth1"}, found, fr.remove); err != nil {
++		t.Fatalf("removeExistingWire() = %v, want nil", err)
++	}
++	if got := fr.calls[0].LinkName; got != "eth1" {
++		t.Fatalf("remover targeted %q, want eth1", got)
++	}
++}
++
++func TestRemoveExistingWireTreatsNotFoundAsSuccess(t *testing.T) {
++	// Pre-fix: the exact string koko emits was returned as fatal, CNI ADD
++	// failed, and kubelet recreated the sandbox every ~2s (776+ times on
++	// virt-launcher-siteB-cor-sw01, 2026-09-05). This test FAILS against the old
++	// behaviour because the old call sites propagated every non-nil error.
++	InitLogger()
++	cases := []struct {
++		name string
++		err  error
++	}{
++		{
++			// koko wraps with %v, which breaks the error chain: only the
++			// substring can match this one. This is the live log line,
++			// byte for byte apart from the netns id.
++			name: "koko string form",
++			err:  errors.New("failed to lookup \"pod980816f36b7\" in \"/var/run/netns/cni-0d2f\": Link not found"),
++		},
++		{
++			// netlink's older dump-based fallback names the link.
++			name: "netlink dump fallback form",
++			err:  errors.New("failed to lookup \"pod980816f36b7\" in \"/var/run/netns/cni-0d2f\": Link pod980816f36b7 not found"),
++		},
++		{
++			// A future koko that wraps with %w must keep working through the
++			// typed match even if the message changes. The typed error is
++			// obtained from netlink itself (an unprivileged lookup of a name
++			// nothing owns), because its embedded error is unexported.
++			name: "typed, wrapped with %w",
++			err:  wrapRealNotFound(t),
++		},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			if tc.err == nil {
++				t.Skip("netlink did not yield a typed LinkNotFoundError in this environment")
++			}
++			fr := &fakeRemover{err: tc.err}
++			if err := removeExistingWire(api.VEth{NsName: "ns", LinkName: "podX"}, nil, fr.remove); err != nil {
++				t.Fatalf("removeExistingWire() = %v, want nil (absent wire is the postcondition)", err)
++			}
++			if len(fr.calls) != 1 {
++				t.Fatalf("remover called %d times, want 1", len(fr.calls))
++			}
++		})
++	}
++}
++
++// wrapRealNotFound returns a %w-wrapped netlink.LinkNotFoundError produced by
++// netlink itself, or nil (skip) if the environment cannot do the lookup.
++func wrapRealNotFound(t *testing.T) error {
++	t.Helper()
++	_, err := netlink.LinkByName("sf-absent-0014")
++	var typed netlink.LinkNotFoundError
++	if err == nil || !errors.As(err, &typed) {
++		return nil
++	}
++	return fmt.Errorf("remove: %w", err)
++}
++
++func TestRemoveExistingWirePropagatesOtherErrors(t *testing.T) {
++	// A genuine failure (EBUSY, a netns that cannot be entered, ...) must still
++	// reach the caller so the MESHNETD error strings stay meaningful.
++	InitLogger()
++	want := errors.New("failed to lookup \"podX\" in \"/var/run/netns/cni-1\": open /var/run/netns/cni-1: no such file or directory")
++	fr := &fakeRemover{err: want}
++	got := removeExistingWire(api.VEth{NsName: "ns", LinkName: "podX"}, nil, fr.remove)
++	if !errors.Is(got, want) {
++		t.Fatalf("removeExistingWire() = %v, want %v propagated", got, want)
++	}
++}
++
++func TestIsLinkNotFound(t *testing.T) {
++	if isLinkNotFound(nil) {
++		t.Fatal("nil must not read as not-found")
++	}
++	if isLinkNotFound(errors.New("device or resource busy")) {
++		t.Fatal("EBUSY must not read as not-found")
++	}
++	if !isLinkNotFound(errors.New("failed to lookup \"pod980816f36b7\" in \"/var/run/netns/cni-x\": Link not found")) {
++		t.Fatal("koko's string form must read as not-found")
++	}
++	if isLinkNotFound(errors.New("failed to lookup \"podX\" in \"/var/run/netns/cni-1\": open /var/run/netns/cni-1: no such file or directory")) {
++		t.Fatal("a missing NETNS is a different absence and must not read as link-not-found")
++	}
++	if typed := wrapRealNotFound(t); typed != nil && !isLinkNotFound(typed) {
++		t.Fatal("%w-wrapped typed error must read as not-found")
++	}
++}
+-- 
+2.55.0
+

@@ -1,0 +1,33 @@
+From b1750f70d65919d643e76bd4b8a1cebc3a62f947 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Fri, 17 Jul 2026 18:27:12 -0500
+Subject: [PATCH 6/6] skyforge(build): multi-arch buildx Dockerfile
+
+Add BUILDPLATFORM/TARGETOS/TARGETARCH so the manager image cross-builds under
+docker buildx; runtime base and entrypoint unchanged from upstream.
+---
+ Dockerfile | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/Dockerfile b/Dockerfile
+index 456533d..0557a60 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -1,5 +1,7 @@
+ # Build the manager binary
+-FROM golang:1.17 as builder
++FROM --platform=$BUILDPLATFORM golang:1.17 as builder
++ARG TARGETOS
++ARG TARGETARCH
+ 
+ WORKDIR /workspace
+ # Copy the Go Modules manifests
+@@ -15,7 +17,7 @@ COPY api/ api/
+ COPY controllers/ controllers/
+ 
+ # Build
+-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -o manager main.go
++RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} go build -a -o manager main.go
+ 
+ # Use distroless as minimal base image to package the manager binary
+ # Refer to https://github.com/GoogleContainerTools/distroless for more details

@@ -1,0 +1,179 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Tue, 8 Sep 2026 05:00:00 -0500
+Subject: [PATCH] catalystwan: DeviceModel is an enum, so every model was refused
+
+Three modules build their `device_model` choices with
+
+    choices=list(get_args(DeviceModel))
+
+which assumes DeviceModel is a typing.Literal. In the catalystwan we
+vendor (0.41.5.dev2) it is an ENUM -- enum.EnumType, 293 members -- and
+typing.get_args() on an enum returns (). The choices list is therefore
+EMPTY, and ansible rejects every possible value:
+
+    value of device_model must be one of: , got: vedge-C8000V
+
+Note the empty list before the comma. `vedge-C8000V` is a perfectly valid
+member (DeviceModel.VEDGE_C8000V = 'vedge-C8000V'); the input was never
+wrong, the introspection was.
+
+MEASURED on the SD-WAN service lane, 2026-09-08. The merge had
+just succeeded -- 142 base lines grafted to 163, interface
+GigabitEthernet3 replaced, the device reachable -- and then:
+
+    stage=service-template ... msg=value of device_model must be one of: ,
+                                   got: vedge-C8000V
+    stage=service-attach   ... msg=Template with name:
+                                   skyforge-site1-edge01-service doesn't exist
+    stage=service          ... verdict=NOT_PROVEN omp_seen=[]
+
+The template was never created, so the attach could not find it.
+
+All THREE call sites are fixed, not just the one that failed:
+cli_templates (create), device_templates (attach -- it would have failed
+on the very next step), and feature_templates. The helper accepts either
+shape, so this keeps working whichever way upstream defines DeviceModel.
+
+PROVEN both ways, by executing the helper against both shapes:
+  Enum (what we ship):    ['vedge-C8000V', 'ISR4451'] -> accepted
+  Literal (what upstream assumed): same -> accepted
+  the shipped expression on that Enum: [] -> rejects everything
+
+UPSTREAM ASK: FILE -- get_args() is the wrong introspection for an enum,
+and any consumer on a catalystwan that defines DeviceModel this way has
+every template module broken with a message that blames the caller's
+input.
+---
+diff --git a/plugins/modules/cli_templates.py b/plugins/modules/cli_templates.py
+index aff7e96..b86b704 100644
+--- a/plugins/modules/cli_templates.py
++++ b/plugins/modules/cli_templates.py
+@@ -122,6 +122,30 @@ except ImportError:
+     from catalystwan.models.common import DeviceModel
+ 
+ from ..module_utils.result import ModuleResult
++
++# DeviceModel IS AN ENUM IN THE catalystwan WE VENDOR, NOT A Literal.
++#
++# catalystwan 0.41.5.dev2 ships DeviceModel as enum.EnumType with 293
++# members. typing.get_args() on an Enum returns () -- it only yields the
++# arguments of a Literal/Union -- so `choices=list(get_args(DeviceModel))`
++# is an EMPTY list, and ansible then rejects every possible value:
++#
++#   value of device_model must be one of: , got: vedge-C8000V
++#
++# Note the empty list before the comma. `vedge-C8000V` is a perfectly valid
++# member value (DeviceModel.VEDGE_C8000V); nothing was wrong with the input.
++# Measured on the example lab's SD-WAN service lane 2026-09-08: the CLI
++# template was never created, so the attach then failed with "Template ...
++# does not exist" and every edge came back NOT_PROVEN.
++#
++# Accept both shapes so this keeps working whichever way upstream defines it.
++def _device_model_choices():
++    members = getattr(DeviceModel, "__members__", None)
++    if members:
++        return [m.value for m in DeviceModel]
++    return list(get_args(DeviceModel))
++
++
+ from ..module_utils.vmanage_module import AnsibleCatalystwanModule
+ 
+ State = Literal["present", "absent"]
+@@ -143,7 +167,7 @@ def run_module():
+         ),
+         template_name=dict(type="str", required=True),
+         template_description=dict(type="str", default=None),
+-        device_model=dict(type="str", aliases=["device_type"], choices=list(get_args(DeviceModel)), default=None),
++        device_model=dict(type="str", aliases=["device_type"], choices=_device_model_choices(), default=None),
+         config_file=dict(type="str", aliases=["running_config_file_path"]),
+         force=dict(type="bool", default=False),
+         timeout_seconds=dict(type="int", default=300),
+diff --git a/plugins/modules/device_templates.py b/plugins/modules/device_templates.py
+index 27c3715..d75999c 100644
+--- a/plugins/modules/device_templates.py
++++ b/plugins/modules/device_templates.py
+@@ -147,6 +147,30 @@ except ImportError:
+     from catalystwan.models.common import DeviceModel
+ 
+ from ..module_utils.result import ModuleResult
++
++# DeviceModel IS AN ENUM IN THE catalystwan WE VENDOR, NOT A Literal.
++#
++# catalystwan 0.41.5.dev2 ships DeviceModel as enum.EnumType with 293
++# members. typing.get_args() on an Enum returns () -- it only yields the
++# arguments of a Literal/Union -- so `choices=list(get_args(DeviceModel))`
++# is an EMPTY list, and ansible then rejects every possible value:
++#
++#   value of device_model must be one of: , got: vedge-C8000V
++#
++# Note the empty list before the comma. `vedge-C8000V` is a perfectly valid
++# member value (DeviceModel.VEDGE_C8000V); nothing was wrong with the input.
++# Measured on the example lab's SD-WAN service lane 2026-09-08: the CLI
++# template was never created, so the attach then failed with "Template ...
++# does not exist" and every edge came back NOT_PROVEN.
++#
++# Accept both shapes so this keeps working whichever way upstream defines it.
++def _device_model_choices():
++    members = getattr(DeviceModel, "__members__", None)
++    if members:
++        return [m.value for m in DeviceModel]
++    return list(get_args(DeviceModel))
++
++
+ from ..module_utils.vmanage_module import AnsibleCatalystwanModule
+ 
+ State = Literal["present", "absent", "attached", "detached"]
+@@ -161,7 +185,7 @@ def run_module():
+         ),
+         template_name=dict(type="str", default=None),
+         template_description=dict(type="str", default=None),
+-        device_type=dict(type="str", aliases=["device_model"], choices=list(get_args(DeviceModel)), default=None),
++        device_type=dict(type="str", aliases=["device_model"], choices=_device_model_choices(), default=None),
+         device_role=dict(type="str", choices=["sdwan-edge", "service-node"], default="sdwan-edge"),
+         general_templates=dict(
+             type="list",
+diff --git a/plugins/modules/feature_templates.py b/plugins/modules/feature_templates.py
+index 8648d2b..fbf89d2 100644
+--- a/plugins/modules/feature_templates.py
++++ b/plugins/modules/feature_templates.py
+@@ -115,6 +115,30 @@ from ..module_utils.feature_templates.system_vsmart import system_vsmart_definit
+ from ..module_utils.feature_templates.vpn_vsmart import vpn_vsmart_definition
+ from ..module_utils.feature_templates.vpn_vsmart_interface import vpn_vsmart_interface_definition
+ from ..module_utils.result import ModuleResult
++
++# DeviceModel IS AN ENUM IN THE catalystwan WE VENDOR, NOT A Literal.
++#
++# catalystwan 0.41.5.dev2 ships DeviceModel as enum.EnumType with 293
++# members. typing.get_args() on an Enum returns () -- it only yields the
++# arguments of a Literal/Union -- so `choices=list(get_args(DeviceModel))`
++# is an EMPTY list, and ansible then rejects every possible value:
++#
++#   value of device_model must be one of: , got: vedge-C8000V
++#
++# Note the empty list before the comma. `vedge-C8000V` is a perfectly valid
++# member value (DeviceModel.VEDGE_C8000V); nothing was wrong with the input.
++# Measured on the example lab's SD-WAN service lane 2026-09-08: the CLI
++# template was never created, so the attach then failed with "Template ...
++# does not exist" and every edge came back NOT_PROVEN.
++#
++# Accept both shapes so this keeps working whichever way upstream defines it.
++def _device_model_choices():
++    members = getattr(DeviceModel, "__members__", None)
++    if members:
++        return [m.value for m in DeviceModel]
++    return list(get_args(DeviceModel))
++
++
+ from ..module_utils.vmanage_module import AnsibleCatalystwanModule
+ 
+ ALLOW: Final[str] = "allow"
+@@ -140,7 +164,7 @@ def run_module():
+         ),
+         template_name=dict(type="str", required=True),
+         template_description=dict(type="str", default=None),
+-        device_models=dict(type="list", choices=list(get_args(DeviceModel)), default=[]),
++        device_models=dict(type="list", choices=_device_model_choices(), default=[]),
+         debug=dict(type="bool", default=False),
+         device_specific_variables=dict(type="raw", default={}),
+         # device=dict(type="str", default=None),  # For this we need to think how to pass devices

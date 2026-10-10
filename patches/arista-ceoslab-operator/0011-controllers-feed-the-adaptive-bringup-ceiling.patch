@@ -1,0 +1,187 @@
+From 5c6cfe91ad25f3ca35bfc4224ef62a9b25fae1db Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Thu, 23 Jul 2026 21:19:00 -0500
+Subject: [PATCH] controllers: feed the adaptive bringup ceiling
+
+---
+ controllers/ceoslabdevice_controller.go       | 50 ++++++++++++++++---
+ .../ceoslabdevice_controller_unit_test.go     | 30 +++++++++++
+ main.go                                       |  5 +-
+ 3 files changed, 76 insertions(+), 9 deletions(-)
+
+diff --git a/controllers/ceoslabdevice_controller.go b/controllers/ceoslabdevice_controller.go
+index 285085f..9e75aa7 100644
+--- a/controllers/ceoslabdevice_controller.go
++++ b/controllers/ceoslabdevice_controller.go
+@@ -34,6 +34,7 @@ import (
+ 	"sort"
+ 	"strconv"
+ 	"strings"
++	"sync"
+ 	"time"
+ 
+ 	ceoslabv1alpha1 "github.com/aristanetworks/arista-ceoslab-operator/v2/api/v1alpha1"
+@@ -104,12 +105,18 @@ var (
+ 	noRequeue  = ctrl.Result{}
+ 	ethIntfRe  = regexp.MustCompile(`^Ethernet\d+(?:/\d+)?(?:/\d+)?$`)
+ 	mgmtIntfRe = regexp.MustCompile(`^Management\d+(?:/\d+)?$`)
++
++	// The throttle decision and pod creation form one admission transaction.
++	// Without this lock, concurrent reconciles can all observe inflight below
++	// the ceiling and collectively overshoot it before any pod is visible.
++	bringupAdmissionMu sync.Mutex
+ )
+ 
+ // CEosLabDeviceReconciler reconciles a CEosLabDevice object
+ type CEosLabDeviceReconciler struct {
+ 	client.Client
+-	Scheme *apiRuntime.Scheme
++	APIReader client.Reader
++	Scheme    *apiRuntime.Scheme
+ }
+ 
+ // Helpers for updating status
+@@ -308,9 +315,18 @@ func (r *CEosLabDeviceReconciler) Reconcile(ctx context.Context, req ctrl.Reques
+ 	// EOS ssdinit, stalling Sysdb past the startup-probe budget (task #77).
+ 	startupPersistenceEnabled := startupConfigResourceVersion != nil
+ 
+-	// Adaptive bringup pacing: defer (don't fail) creating this device's pod when the
+-	// node is backing up on sandbox creation, so a topology of any size comes up instead
+-	// of bursting meshnet/containerd and wedging the node (see task#40/#47).
++	// Adaptive bringup pacing: serialize only the admission decision plus pod
++	// create, not pod startup. This makes the count-and-create transaction
++	// atomic while admitted pods still initialize concurrently.
++	bringupAdmissionMu.Lock()
++	admissionHeld := true
++	releaseBringupAdmission := func() {
++		if admissionHeld {
++			bringupAdmissionMu.Unlock()
++			admissionHeld = false
++		}
++	}
++	defer releaseBringupAdmission()
+ 	if throttled, reason, err := r.bringupThrottled(ctx, device); err != nil {
+ 		return noRequeue, err
+ 	} else if throttled {
+@@ -339,6 +355,7 @@ func (r *CEosLabDeviceReconciler) Reconcile(ctx context.Context, req ctrl.Reques
+ 			return noRequeue, err
+ 		}
+ 	}
++	releaseBringupAdmission()
+ 
+ 	// Services
+ 
+@@ -674,7 +691,7 @@ func (r *CEosLabDeviceReconciler) SetupWithManager(mgr ctrl.Manager) error {
+ 		Owns(&corev1.ConfigMap{}).
+ 		Owns(&corev1.Secret{}).
+ 		WithOptions(rctrl.Options{
+-			MaxConcurrentReconciles: runtime.NumCPU(),
++			MaxConcurrentReconciles: maxConcurrentReconciles(runtime.NumCPU(), maxConcurrentBringup()),
+ 		}).
+ 		Complete(r)
+ }
+@@ -732,6 +749,18 @@ func maxConcurrentBringup() int {
+ 	return defaultMaxConcurrentBringup
+ }
+ 
++// maxConcurrentReconciles keeps the upstream CPU-derived worker count but
++// floors it at the configured adaptive bringup ceiling. By default, a
++// controller scheduled on a small node can therefore keep all 16 safe
++// admission slots fed; larger nodes retain their existing worker count. Extra
++// workers cannot burst pod creation past the gate because admission is atomic.
++func maxConcurrentReconciles(cpuCount, bringupCeiling int) int {
++	if cpuCount > bringupCeiling {
++		return cpuCount
++	}
++	return bringupCeiling
++}
++
+ // podSandboxStarted reports whether a pod has progressed past sandbox creation — any
+ // init or main container has started (Running or Terminated). A Pending pod with no
+ // started container is still in the CNI/sandbox-creation window (ContainerCreating);
+@@ -779,8 +808,15 @@ func ownedByCEosLabDevice(p *corev1.Pod) bool {
+ // stale timeout because there is no host-pod miscount left to deadlock on. Returns a
+ // human-readable reason when throttling.
+ func (r *CEosLabDeviceReconciler) bringupThrottled(ctx context.Context, device *ceoslabv1alpha1.CEosLabDevice) (bool, string, error) {
++	reader := r.APIReader
++	if reader == nil {
++		// Unit tests and embedders that do not provide an uncached reader keep
++		// the historical client behavior. The production manager always sets
++		// APIReader so each serialized admission sees the preceding pod create.
++		reader = r.Client
++	}
+ 	existing := &corev1.Pod{}
+-	err := r.Get(ctx, types.NamespacedName{Name: device.Name, Namespace: device.Namespace}, existing)
++	err := reader.Get(ctx, types.NamespacedName{Name: device.Name, Namespace: device.Namespace}, existing)
+ 	if err == nil {
+ 		return false, "", nil // pod already exists; never throttle
+ 	}
+@@ -788,7 +824,7 @@ func (r *CEosLabDeviceReconciler) bringupThrottled(ctx context.Context, device *
+ 		return false, "", err
+ 	}
+ 	podList := &corev1.PodList{}
+-	if err := r.List(ctx, podList, client.InNamespace(device.Namespace)); err != nil {
++	if err := reader.List(ctx, podList, client.InNamespace(device.Namespace)); err != nil {
+ 		return false, "", err
+ 	}
+ 	inflight, stuckCreating := 0, 0
+diff --git a/controllers/ceoslabdevice_controller_unit_test.go b/controllers/ceoslabdevice_controller_unit_test.go
+index 345e47a..eddaf8a 100644
+--- a/controllers/ceoslabdevice_controller_unit_test.go
++++ b/controllers/ceoslabdevice_controller_unit_test.go
+@@ -728,6 +728,36 @@ func TestBringupThrottledAdaptive(t *testing.T) {
+ 		many = append(many, pendingPod(fmt.Sprintf("y%d", i), 5, false), hostPod(fmt.Sprintf("y%dh1", i), 5))
+ 	}
+ 	assert(t, mk(many...), true, "ceiling")
++
++	// Production admission reads bypass the cache so the next serialized
++	// decision observes the preceding pod create.
++	uncached := &CEosLabDeviceReconciler{
++		Client:    fake.NewClientBuilder().WithScheme(scheme).Build(),
++		APIReader: fake.NewClientBuilder().WithScheme(scheme).WithObjects(many...).Build(),
++		Scheme:    scheme,
++	}
++	assert(t, uncached, true, "ceiling")
++}
++
++func TestMaxConcurrentReconcilesFeedsBringupCeiling(t *testing.T) {
++	for _, tc := range []struct {
++		name           string
++		cpuCount       int
++		bringupCeiling int
++		want           int
++	}{
++		{name: "invalid cpu count", cpuCount: 0, bringupCeiling: 16, want: 16},
++		{name: "small controller node", cpuCount: 2, bringupCeiling: 16, want: 16},
++		{name: "configured ceiling", cpuCount: 2, bringupCeiling: 24, want: 24},
++		{name: "large controller node", cpuCount: 96, bringupCeiling: 16, want: 96},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			if got := maxConcurrentReconciles(tc.cpuCount, tc.bringupCeiling); got != tc.want {
++				t.Fatalf("maxConcurrentReconciles(%d, %d) = %d, want %d",
++					tc.cpuCount, tc.bringupCeiling, got, tc.want)
++			}
++		})
++	}
+ }
+ 
+ // getJsonIntfMapping must be a faithful 1:1 translator of the kernel-device -> EOS
+diff --git a/main.go b/main.go
+index 01ceec9..8236971 100644
+--- a/main.go
++++ b/main.go
+@@ -79,8 +79,9 @@ func main() {
+ 	}
+ 
+ 	if err = (&controllers.CEosLabDeviceReconciler{
+-		Client: mgr.GetClient(),
+-		Scheme: mgr.GetScheme(),
++		Client:    mgr.GetClient(),
++		APIReader: mgr.GetAPIReader(),
++		Scheme:    mgr.GetScheme(),
+ 	}).SetupWithManager(mgr); err != nil {
+ 		setupLog.Error(err, "unable to create controller", "controller", "CEosLabDevice")
+ 		os.Exit(1)
+-- 
+2.55.0
+

@@ -1,0 +1,338 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sat, 5 Sep 2026 10:54:28 -0500
+Subject: [PATCH] api: add InspectVethWire, a read-only wire verdict that fails
+ to "unknown"
+
+EnsureVethWire (0005) answers "make this wire correct". A reconciler must
+first answer a different and strictly weaker question -- "IS this wire
+correct?" -- with no side effects, and it cannot reuse EnsureVethWire's
+answer, because the two have opposite defaults.
+
+EnsureVethWire runs inside a CNI ADD. The sandbox is new, nothing is
+carrying traffic, and recreating a wire it cannot verify costs nothing, so
+decideEnsureVeth folds every unproven case into `recreate` -- including the
+case where the reciprocal veth-pair check simply could not be performed. A
+background reconciler runs against a LIVE lab. There, recreating a wire it
+merely failed to verify is far worse than the fault it went looking for: it
+takes down an adjacency that was carrying traffic.
+
+So decideInspectVeth is a separate decision with the burden of proof
+inverted. WireHealthBroken requires positive evidence:
+
+  * an end that is ABSENT while its namespace is enterable, or
+  * two ends that exist but are demonstrably NOT the two ends of one veth
+    pair -- each side's kernel-reported peer ifindex must equal the other
+    side's own ifindex; ifindexes are per-namespace, so the reciprocal
+    requirement is what makes the check mean anything, or
+  * an end occupied by something that is not a veth at all.
+
+Everything else is WireHealthUnknown and the caller must not act on it: a
+namespace that cannot be entered (returned with a *NamespaceGoneError so a
+caller can tell "the pod is going away" from "the wire is dead"), a pair
+check that could not be performed, a protected ifname. A slot owned by a
+DIFFERENT wire's alias is WireHealthConflict -- a configuration error for a
+human, never an automatic repair.
+
+InspectVethWire takes no creation lock. It writes nothing, and a verdict
+raced by a concurrent ADD is Unknown or Broken, both of which the caller is
+required to confirm on a later pass before acting.
+
+Why upstream wants this: koko can already realize a wire idempotently but has
+no way to ASK about one, so every caller that wants to know must either
+re-run the mutating path or reimplement observation against netlink. This is
+the missing read half of the same API, and it is what makes a safe
+reconciler possible on top of koko at all.
+
+Positive control: a table over every observation shape, plus
+TestDecideInspectVethIsConservativeWhereEnsureIsNot, which pins the exact
+disagreement -- for identical observations decideEnsureVeth must say
+"recreate" and decideInspectVeth must say "unknown". Executed negative
+control: rewriting decideInspectVeth to delegate to decideEnsureVeth fails
+both that test ("= broken ... want unknown") and the "unverifiable pair is
+unknown" row ("= ok ... want unknown"), i.e. it catches the collapse in both
+directions.
+---
+ api/koko_veth_inspect.go      | 146 ++++++++++++++++++++++++++++++++++
+ api/koko_veth_inspect_test.go | 119 +++++++++++++++++++++++++++
+ 2 files changed, 265 insertions(+)
+ create mode 100644 api/koko_veth_inspect.go
+ create mode 100644 api/koko_veth_inspect_test.go
+
+diff --git a/api/koko_veth_inspect.go b/api/koko_veth_inspect.go
+new file mode 100644
+index 0000000..8219d6a
+--- /dev/null
++++ b/api/koko_veth_inspect.go
+@@ -0,0 +1,146 @@
++/*
++Read-only veth wire inspection.
++
++EnsureVethWire answers "make this wire correct". A reconciler needs a
++different and strictly weaker question answered first: "is this wire
++correct?", with NO side effects and with the burden of proof on the claim
++that it is broken.
++
++The two questions cannot share one answer, because their default is
++opposite. EnsureVethWire runs inside a CNI ADD, where the sandbox is new and
++recreating a wire it cannot verify costs nothing; so decideEnsureVeth folds
++every unproven case into `recreate`. A background reconciler runs against a
++LIVE lab. There, recreating a wire it merely failed to verify is worse than
++the fault it is looking for: it takes down an adjacency that was carrying
++traffic. So InspectVethWire folds every unproven case into
++WireHealthUnknown, and reports WireHealthBroken only on positive evidence:
++
++  - an end that is ABSENT while its namespace is enterable, or
++  - two ends that exist but are demonstrably NOT the two ends of one veth
++    pair (each side's kernel-reported peer ifindex must equal the other
++    side's own ifindex -- ifindexes are per-namespace, so the reciprocal
++    requirement is what makes this meaningful), or
++  - an end occupied by something that is not a veth at all.
++
++Everything else -- a namespace that cannot be entered, a pair check that
++could not be performed, an unfamiliar IFLA_IFALIAS on an otherwise correct
++pair -- is Unknown. Unknown is not a failure; it is the honest answer, and
++the caller must not act on it.
++*/
++package api
++
++import "fmt"
++
++// WireHealth is the read-only verdict about one veth wire.
++type WireHealth int
++
++const (
++	// WireHealthUnknown means the wire's state could NOT be established.
++	// Never treat it as broken.
++	WireHealthUnknown WireHealth = iota
++	// WireHealthOK means both ends were observed as the two verified ends of
++	// one veth pair.
++	WireHealthOK
++	// WireHealthBroken means positive evidence the wire is not realized:
++	// a missing end, a non-veth occupant, or a failed reciprocal pair check.
++	WireHealthBroken
++	// WireHealthConflict means a DIFFERENT meshnet wire's alias owns one of
++	// the slots. Repairing would break that other link; this is a
++	// configuration error for a human, never an automatic repair.
++	WireHealthConflict
++)
++
++func (h WireHealth) String() string {
++	switch h {
++	case WireHealthUnknown:
++		return "unknown"
++	case WireHealthOK:
++		return "ok"
++	case WireHealthBroken:
++		return "broken"
++	case WireHealthConflict:
++		return "conflict"
++	}
++	return "invalid"
++}
++
++// decideInspectVeth is the pure decision core of InspectVethWire. It is
++// deliberately NOT decideEnsureVeth: see the package comment above for why
++// the two must disagree on every unproven case.
++func decideInspectVeth(local, peer wireEndObservation, pair pairCheck, alias string) (WireHealth, string) {
++	for _, end := range []struct {
++		side string
++		obs  wireEndObservation
++	}{{"local", local}, {"peer", peer}} {
++		if end.obs.Exists && aliasIsOtherWire(end.obs.Alias, alias) {
++			return WireHealthConflict, fmt.Sprintf(
++				"%s end is owned by a different wire alias %q (want %q)",
++				end.side, end.obs.Alias, alias)
++		}
++	}
++
++	if !local.Exists && !peer.Exists {
++		return WireHealthBroken, "neither end exists"
++	}
++	if !local.Exists {
++		return WireHealthBroken, "local end is absent while the peer end exists"
++	}
++	if !peer.Exists {
++		return WireHealthBroken, "peer end is absent while the local end exists"
++	}
++	if !local.IsVeth {
++		return WireHealthBroken, "local end exists but is not a veth"
++	}
++	if !peer.IsVeth {
++		return WireHealthBroken, "peer end exists but is not a veth"
++	}
++
++	switch pair {
++	case pairMatch:
++		return WireHealthOK, "both ends verified as one veth pair"
++	case pairMismatch:
++		return WireHealthBroken, "both ends exist but are not the two ends of one veth pair"
++	default:
++		// pairUnknown: the reciprocal ifindex check could not be performed.
++		// An unverifiable wire is unfamiliar, not dead.
++		return WireHealthUnknown, "veth pair verification unavailable; wire state not established"
++	}
++}
++
++// InspectVethWire reports the health of the wire local<->peer identified by
++// alias WITHOUT modifying anything. It takes no creation lock: it writes
++// nothing, and a verdict raced by a concurrent CNI ADD is Unknown or Broken,
++// both of which the caller must confirm on a later pass before acting.
++//
++// A namespace that cannot be entered yields WireHealthUnknown together with
++// a *NamespaceGoneError, so a caller can tell "the pod is going away" from
++// "the wire is dead".
++func InspectVethWire(local, peer VEth, alias string) (WireHealth, string, error) {
++	if isProtectedIfName(local.LinkName) || isProtectedIfName(peer.LinkName) {
++		return WireHealthUnknown, "protected interface name", fmt.Errorf(
++			"InspectVethWire: refusing to inspect protected interface %q/%q", local.LinkName, peer.LinkName)
++	}
++	if err := probeNetNS(local.NsName); err != nil {
++		return WireHealthUnknown, "local namespace is not usable", err
++	}
++	if err := probeNetNS(peer.NsName); err != nil {
++		return WireHealthUnknown, "peer namespace is not usable", err
++	}
++
++	localObs, err := observeWireEnd(local)
++	if err != nil {
++		return WireHealthUnknown, "local end could not be observed", err
++	}
++	peerObs, err := observeWireEnd(peer)
++	if err != nil {
++		return WireHealthUnknown, "peer end could not be observed", err
++	}
++
++	pair := pairUnknown
++	if localObs.Exists && localObs.IsVeth && peerObs.Exists && peerObs.IsVeth {
++		pair = verifyVethPair(local, peer)
++	}
++
++	health, reason := decideInspectVeth(localObs, peerObs, pair, alias)
++	return health, reason, nil
++}
+diff --git a/api/koko_veth_inspect_test.go b/api/koko_veth_inspect_test.go
+new file mode 100644
+index 0000000..7e7e63a
+--- /dev/null
++++ b/api/koko_veth_inspect_test.go
+@@ -0,0 +1,119 @@
++package api
++
++import (
++	"errors"
++	"testing"
++)
++
++func asNamespaceGone(err error, target **NamespaceGoneError) bool {
++	return errors.As(err, target)
++}
++
++// TestDecideInspectVethIsConservativeWhereEnsureIsNot is the whole point of
++// InspectVethWire: for the SAME observations, decideEnsureVeth answers
++// "recreate" (correct inside a CNI ADD) and decideInspectVeth must answer
++// "unknown" (correct against a live lab). A reconciler wired to
++// decideEnsureVeth would tear down a healthy adjacency it merely could not
++// verify. This test fails immediately if the two are ever collapsed.
++func TestDecideInspectVethIsConservativeWhereEnsureIsNot(t *testing.T) {
++	alias := VethWireAlias("example-lab", 14)
++	veth := wireEndObservation{Exists: true, IsVeth: true, Alias: "Ethernet1/2 to siteB-acc-sw01"}
++
++	action, _ := decideEnsureVeth(veth, veth, pairUnknown, alias)
++	if action != ensureActionRecreate {
++		t.Fatalf("decideEnsureVeth(pairUnknown) = %v, want recreate (guard on the premise of this test)", action)
++	}
++
++	health, reason := decideInspectVeth(veth, veth, pairUnknown, alias)
++	if health != WireHealthUnknown {
++		t.Fatalf("decideInspectVeth(pairUnknown) = %v (%s), want unknown: an unverifiable wire is unfamiliar, not dead", health, reason)
++	}
++}
++
++func TestDecideInspectVeth(t *testing.T) {
++	alias := VethWireAlias("example-lab", 14)
++	other := VethWireAlias("example-lab", 15)
++	present := wireEndObservation{Exists: true, IsVeth: true, Alias: alias}
++	absent := wireEndObservation{}
++
++	cases := []struct {
++		name       string
++		local      wireEndObservation
++		peer       wireEndObservation
++		pair       pairCheck
++		wantHealth WireHealth
++	}{
++		{"verified pair is healthy", present, present, pairMatch, WireHealthOK},
++		{"unaliased but verified pair is healthy", // a NOS may overwrite IFLA_IFALIAS with its own description
++			wireEndObservation{Exists: true, IsVeth: true, Alias: "to siteB-acc-sw01"},
++			wireEndObservation{Exists: true, IsVeth: true},
++			pairMatch, WireHealthOK},
++		{"reciprocal mismatch is broken", present, present, pairMismatch, WireHealthBroken},
++		{"peer end gone is broken (the measured cdg case)", present, absent, pairUnknown, WireHealthBroken},
++		{"local end gone is broken", absent, present, pairUnknown, WireHealthBroken},
++		{"neither end is broken", absent, absent, pairUnknown, WireHealthBroken},
++		{"non-veth occupant is broken",
++			wireEndObservation{Exists: true, IsVeth: false, Alias: alias}, present, pairUnknown, WireHealthBroken},
++		{"unverifiable pair is unknown", present, present, pairUnknown, WireHealthUnknown},
++		{"another wire's alias is a conflict, never a repair",
++			wireEndObservation{Exists: true, IsVeth: true, Alias: other}, present, pairMatch, WireHealthConflict},
++		{"another wire's alias on the peer end is a conflict",
++			present, wireEndObservation{Exists: true, IsVeth: true, Alias: other}, pairMatch, WireHealthConflict},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			got, reason := decideInspectVeth(tc.local, tc.peer, tc.pair, alias)
++			if got != tc.wantHealth {
++				t.Fatalf("decideInspectVeth() = %v (%s), want %v", got, reason, tc.wantHealth)
++			}
++			if reason == "" {
++				t.Fatal("every verdict must carry a reason; a green that asserted nothing is not a result")
++			}
++		})
++	}
++}
++
++func TestInspectVethWireRefusesProtectedNames(t *testing.T) {
++	for _, name := range []string{"eth0", "lo", ""} {
++		health, _, err := InspectVethWire(
++			VEth{NsName: "/var/run/netns/cni-a", LinkName: name},
++			VEth{NsName: "/var/run/netns/cni-b", LinkName: "eth1"},
++			VethWireAlias("example-lab", 1))
++		if err == nil {
++			t.Fatalf("InspectVethWire(%q) returned no error; protected names must be refused", name)
++		}
++		if health != WireHealthUnknown {
++			t.Fatalf("InspectVethWire(%q) = %v, want unknown", name, health)
++		}
++	}
++}
++
++func TestInspectVethWireReportsAnUnusableNamespaceAsUnknown(t *testing.T) {
++	// A vanished sandbox must NOT read as a broken wire: the pod is going
++	// away and nothing should be recreated for it.
++	health, reason, err := InspectVethWire(
++		VEth{NsName: "/var/run/netns/does-not-exist-0015", LinkName: "eth1"},
++		VEth{NsName: "/var/run/netns/also-absent-0015", LinkName: "eth1"},
++		VethWireAlias("example-lab", 1))
++	if health != WireHealthUnknown {
++		t.Fatalf("InspectVethWire(missing netns) = %v (%s), want unknown", health, reason)
++	}
++	var gone *NamespaceGoneError
++	if err == nil {
++		t.Fatal("a missing namespace must be reported as an error the caller can classify")
++	}
++	if !asNamespaceGone(err, &gone) {
++		t.Fatalf("error %v is not a *NamespaceGoneError; callers cannot tell 'pod going away' from 'wire dead'", err)
++	}
++}
++
++func TestWireHealthStringsAreDistinct(t *testing.T) {
++	seen := map[string]bool{}
++	for _, h := range []WireHealth{WireHealthUnknown, WireHealthOK, WireHealthBroken, WireHealthConflict} {
++		s := h.String()
++		if s == "" || s == "invalid" || seen[s] {
++			t.Fatalf("WireHealth(%d).String() = %q is empty or not distinct", h, s)
++		}
++		seen[s] = true
++	}
++}

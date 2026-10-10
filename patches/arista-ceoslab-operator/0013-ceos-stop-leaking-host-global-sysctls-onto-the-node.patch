@@ -1,0 +1,437 @@
+From 2af25adce4859d1e5d8a787970918f07491a94d7 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Fri, 14 Aug 2026 18:00:34 -0500
+Subject: [PATCH] ceos: stop leaking host-global sysctls onto the node
+
+cEOS runs privileged, so /proc/sys inside the container is WRITABLE and every
+non-namespaced sysctl in the image's own /etc/sysctl.d/99-eos.conf is applied to
+the HOST kernel rather than to the container.
+
+Arista knows. From 99-zceoslab.conf, shipped in the image:
+
+    Some sysctl values are global, so even though we are running inside a
+    container, the container can overwrite the values for the rest of the
+    system.
+
+and from /usr/bin/ceoslab-apply-sysctls:
+
+    Linux has not yet namespaced every sysctl, so there are some values that
+    EOS wants to set that may leak outside of the container. We have a
+    two-phase approach to this: 1. disable any non-namespaced setting that EOS
+    does, by using the "-fs.inotify.max_user_instances" syntax...
+
+They shipped the mechanism and then used it for four keys: kernel.pid_max and
+three fs.inotify.* ones. Everything else non-namespaced in 99-eos.conf still
+lands on the machine. The leak is by OMISSION.
+
+WHAT IT COST, measured on worker-a 2026-08-14. 99-eos.conf declares
+
+    kernel.panic = 60
+    vm.max_map_count = 256000
+
+and 99-zceoslab.conf raises fs.inotify.max_user_watches to 25600000. The host
+was found holding exactly those three values against a declared contract of 10,
+1048576 and 524288.
+
+kernel.panic is the expensive one. kubelet validates --protect-kernel-defaults
+ONLY AT STARTUP, so the node ran normally for hours; the next kubelet restart
+crash-looped with
+
+    Failed to start ContainerManager - invalid kernel flag: kernel/panic,
+    expected value: 10, actual value: 60
+
+while the Node object still reported Ready, and `kubectl exec` and
+`port-forward` broke for every pod on it. Nothing pointed at cEOS: the drift
+outlives the container that caused it, Talos does not re-reconcile an unchanged
+spec, and `talosctl get kernelparamstatuses` reported the value Talos last WROTE
+(524288) rather than what the kernel held (256000).
+
+Only worker-a ever drifted because every user-* lab namespace is placed there, so
+it is the only node that runs a cEOS container at all.
+
+THE FIX is Arista's own opt-out: a drop-in whose filename sorts after
+99-zceoslab.conf, carrying a bare "-key" line for each host-global setting.
+systemd-sysctl skips those keys and ceoslab-apply-sysctls drops them from its
+increase-only pass. The namespaced net.* settings are deliberately left alone --
+those are EOS's business inside its own netns.
+
+PROOF THE SYNTAX WORKS (positive control, read from a live cEOS container):
+99-eos.conf declares kernel.pid_max = 32768 and 99-zceoslab.conf carries
+"-kernel.pid_max". The host reads 4194304. The opt-out held; the two keys
+without one did not.
+
+Delivered by a tiny unconditional init container writing into an emptyDir,
+mounted into the ceos container with SubPath so it ADDS a file to
+/etc/sysctl.d/ rather than replacing the directory and hiding 99-eos.conf. It
+reuses the image the startup seed already uses, so it pulls nothing new. It is
+unconditional because the leak does not depend on startup persistence or on any
+other option -- a guard that only appeared alongside the startup seed would
+leave half the fleet leaking.
+
+The existing unit tests indexed init containers positionally and shifted; they
+now look the seed up by name, which is what they were actually asserting.
+
+Detection for the same defect class lands separately as
+scripts/check-lab-node-sysctl-parity.sh, which compares the DECLARED Talos
+contract against /proc on every node -- because the drift outlives its cause and
+must be visible without knowing who wrote it.
+
+---
+ controllers/ceoslabdevice_controller.go       | 146 ++++++++++++++++++
+ .../ceoslabdevice_controller_unit_test.go     | 128 +++++++++++++--
+ 2 files changed, 264 insertions(+), 10 deletions(-)
+
+diff --git a/controllers/ceoslabdevice_controller.go b/controllers/ceoslabdevice_controller.go
+index cf989a4..5180902 100644
+--- a/controllers/ceoslabdevice_controller.go
++++ b/controllers/ceoslabdevice_controller.go
+@@ -68,6 +68,14 @@ const (
+ 	startupPersistenceSeedDir    = "/var/run/ceos/startup-seed"
+ 	startupPersistenceActiveDir  = "/var/run/ceos/startup-active"
+ 
++	// See getSysctlGuardInitContainer. The filename must sort AFTER
++	// 99-zceoslab.conf so systemd-sysctl and ceoslab-apply-sysctls both read
++	// our opt-outs last; "zz" does that and says why at a glance.
++	sysctlGuardVolumeName = "skyforge-sysctl-guard"
++	sysctlGuardDir        = "/var/run/ceos/sysctl-guard"
++	sysctlGuardFile       = "99-zzskyforge-no-global-sysctl-leak.conf"
++	sysctlGuardMountPath  = "/etc/sysctl.d/" + sysctlGuardFile
++
+ 	// Bringup pacing (ADAPTIVE): a large topology otherwise creates every CEosLab pod
+ 	// at once; the burst of per-pod meshnet CNI-ADD + veth wiring overwhelms containerd's
+ 	// sandbox creation (FailedCreatePodSandBox / DeadlineExceeded -> the CRI wedges and
+@@ -1155,6 +1163,9 @@ func getPod(pod *corev1.Pod, device *ceoslabv1alpha1.CEosLabDevice, secretsAndCo
+ 		},
+ 		ImagePullPolicy: "IfNotPresent",
+ 	}}
++	// Unconditional, and BEFORE the startup seed: nothing about the host-global
++	// sysctl leak depends on persistence being enabled.
++	initContainers = append(initContainers, getSysctlGuardInitContainer())
+ 	if useStartupPersistence {
+ 		initContainers = append(initContainers, getStartupSeedInitContainer(device, envVarsMap))
+ 	}
+@@ -1515,6 +1526,14 @@ func getVolumes(secretsAndConfigMaps map[string]client.Object, useStartupPersist
+ 			},
+ 		})
+ 	}
++	// Carries the sysctl opt-out drop-in from the sysctl-guard-seed init
++	// container into the ceos container. Unconditional -- see sysctlGuardConf.
++	volumes = append(volumes, corev1.Volume{
++		Name: sysctlGuardVolumeName,
++		VolumeSource: corev1.VolumeSource{
++			EmptyDir: &corev1.EmptyDirVolumeSource{},
++		},
++	})
+ 	return volumes
+ }
+ 
+@@ -1563,6 +1582,16 @@ func getVolumeMounts(secretsAndConfigMaps map[string]client.Object, useStartupPe
+ 			MountPath: "/mnt/flash",
+ 		})
+ 	}
++	// SubPath so this lands as ONE file inside the image's /etc/sysctl.d/
++	// rather than replacing the directory and hiding 99-eos.conf entirely --
++	// EOS needs its own per-netns net.* settings, we only want its host-global
++	// ones suppressed.
++	mounts = append(mounts, corev1.VolumeMount{
++		Name:      sysctlGuardVolumeName,
++		MountPath: sysctlGuardMountPath,
++		SubPath:   sysctlGuardFile,
++		ReadOnly:  true,
++	})
+ 	return mounts
+ }
+ 
+@@ -1705,6 +1734,123 @@ if [ -n "${SKYFORGE_MGMT_EOS_INTF:-}" ]; then
+ fi
+ `
+ 
++// sysctlGuardConf is a systemd sysctl.d drop-in that stops cEOS writing
++// host-global kernel settings.
++//
++// A bare "-key" line (no value) is Arista's OWN opt-out syntax. They document
++// it in /etc/sysctl.d/99-zceoslab.conf:
++//
++//	"Some sysctl values are global, so even though we are running inside a
++//	 container, the container can overwrite the values for the rest of the
++//	 system."
++//
++// and in /usr/bin/ceoslab-apply-sysctls:
++//
++//	"Linux has not yet namespaced every sysctl, so there are some values that
++//	 EOS wants to set that may leak outside of the container. We have a
++//	 two-phase approach to this: 1. disable any non-namespaced setting that EOS
++//	 does, by using the '-fs.inotify.max_user_instances' syntax..."
++//
++// They shipped the mechanism and then used it for only four keys. Everything
++// else in 99-eos.conf that is not namespaced still lands on the host, because
++// cEOS runs privileged and therefore has a writable /proc/sys.
++//
++// WHAT THAT COST US, measured on worker-a 2026-08-14. 99-eos.conf
++// declares `kernel.panic = 60` and `vm.max_map_count = 256000`; the host was
++// found holding exactly those, against a declared contract of 10 and 1048576.
++// kernel.panic is the expensive one: kubelet validates
++// --protect-kernel-defaults ONLY AT STARTUP, so the node ran fine for hours
++// and then, on the next kubelet restart, crash-looped with
++//
++//	Failed to start ContainerManager - invalid kernel flag: kernel/panic,
++//	expected value: 10, actual value: 60
++//
++// while the Node object still reported Ready. `kubectl exec` and
++// `port-forward` broke for every pod on the node. Nothing pointed at cEOS,
++// because the drift outlives the container that caused it and Talos does not
++// re-reconcile an unchanged spec.
++//
++// Only worker-a drifted because every user-* lab namespace is placed there, so
++// worker-a is the only node that ever runs a cEOS container.
++//
++// THE LIST. Everything below is non-namespaced, so it is the container writing
++// to the machine. The net.* settings in 99-eos.conf are deliberately NOT here:
++// those are per-netns and are cEOS's business.
++//
++// PROOF THE SYNTAX WORKS (positive control, read from a live cEOS container):
++// 99-eos.conf declares kernel.pid_max = 32768 and 99-zceoslab.conf carries
++// "-kernel.pid_max"; the host reads 4194304. The opt-out held. The two keys
++// without one did not.
++const sysctlGuardConf = `# Managed by arista-ceoslab-operator (skyforge). Do not edit in the image.
++#
++# cEOS runs privileged, so /proc/sys is writable and every NON-NAMESPACED
++# sysctl in /etc/sysctl.d/99-eos.conf is written to the HOST kernel, not to the
++# container. Arista documents this leak and ships the opt-out used below, but
++# applied it to only four keys.
++#
++# A bare "-key" line means "leave this alone": systemd-sysctl skips it, and
++# ceoslab-apply-sysctls drops it from its increase-only pass.
++#
++# kernel.panic is the load-bearing one. 99-eos.conf sets it to 60; kubelet
++# requires 10 with --protect-kernel-defaults and checks ONLY at startup, so a
++# leaked 60 crash-loops the next kubelet restart on a node that looks healthy.
++
++-kernel.panic
++-kernel.panic_on_oops
++-kernel.printk
++-kernel.sysrq
++-kernel.print-fatal-signals
++-kernel.hung_task_timeout_secs
++-kernel.core_pattern
++
++# 99-eos.conf sets 256000, BELOW the 262144 XRd requires on the same host.
++-vm.max_map_count
++-vm.swappiness
++-vm.dirty_bytes
++-vm.dirty_background_bytes
++-vm.oom_dump_tasks
++
++-fs.suid_dumpable
++-fs.protected_regular
++
++# Already opted out of systemd-sysctl by 99-zceoslab.conf, but that file also
++# asks ceoslab-apply-sysctls to RAISE them host-wide via "#>" directives
++# (max_user_watches to 25600000, observed on worker-a). Repeating the bare key
++# here deletes them from that pass too, so the node keeps what Talos declares.
++-fs.inotify.max_user_watches
++-fs.inotify.max_user_instances
++-fs.inotify.max_queued_events
++`
++
++// getSysctlGuardInitContainer writes sysctlGuardConf into an emptyDir that the
++// ceos container mounts over /etc/sysctl.d/. It is UNCONDITIONAL: the leak does
++// not depend on startup persistence, management mapping, or any other option,
++// so neither does the guard.
++//
++// It is an init container rather than a ConfigMap because the content is
++// static and identical for every device -- a per-device ConfigMap would add an
++// API object per node to reconcile and keep in sync for a file that never
++// changes. It reuses the image the startup seed already uses, so it pulls
++// nothing new, and it does no I/O beyond one write.
++func getSysctlGuardInitContainer() corev1.Container {
++	return corev1.Container{
++		Name:            "sysctl-guard-seed",
++		Image:           DEFAULT_STARTUP_SEED_IMAGE,
++		ImagePullPolicy: "IfNotPresent",
++		Command:         []string{"/bin/sh", "-c"},
++		Args: []string{
++			// Single-quoted heredoc: the content is written verbatim, no shell
++			// expansion, no way for a stray $ or backtick to change it.
++			"set -eu\ncat >" + sysctlGuardDir + "/" + sysctlGuardFile + " <<'SKYFORGE_SYSCTL_GUARD'\n" +
++				sysctlGuardConf + "SKYFORGE_SYSCTL_GUARD\n",
++		},
++		VolumeMounts: []corev1.VolumeMount{{
++			Name:      sysctlGuardVolumeName,
++			MountPath: sysctlGuardDir,
++		}},
++	}
++}
++
+ func getStartupSeedInitContainer(device *ceoslabv1alpha1.CEosLabDevice, envVarsMap map[string]string) corev1.Container {
+ 	seedFile := startupPersistenceSeedDir + "/startup-config"
+ 	var env []corev1.EnvVar
+diff --git a/controllers/ceoslabdevice_controller_unit_test.go b/controllers/ceoslabdevice_controller_unit_test.go
+index 767477b..39b8397 100644
+--- a/controllers/ceoslabdevice_controller_unit_test.go
++++ b/controllers/ceoslabdevice_controller_unit_test.go
+@@ -44,11 +44,11 @@ func TestGetPodStartupPersistence(t *testing.T) {
+ 	if err := getPod(pod, device, secretsAndConfigMaps, true); err != nil {
+ 		t.Fatalf("getPod() failed: %v", err)
+ 	}
+-	if len(pod.Spec.InitContainers) != 2 {
+-		t.Fatalf("getPod() initContainers len = %d, want 2", len(pod.Spec.InitContainers))
++	if len(pod.Spec.InitContainers) != 3 {
++		t.Fatalf("getPod() initContainers len = %d, want 3 (init-wait, sysctl-guard-seed, startup-config-seed)", len(pod.Spec.InitContainers))
+ 	}
+-	if pod.Spec.InitContainers[1].Name != "startup-config-seed" {
+-		t.Fatalf("getPod() second init container = %q, want startup-config-seed", pod.Spec.InitContainers[1].Name)
++	if initContainerByName(t, pod, "startup-config-seed") == nil {
++		t.Fatalf("getPod() has no startup-config-seed init container: %#v", pod.Spec.InitContainers)
+ 	}
+ 	foundFlashMount := false
+ 	foundRCMount := false
+@@ -116,8 +116,8 @@ func TestGetPodWithoutStartupPersistence(t *testing.T) {
+ 	if err := getPod(pod, device, secretsAndConfigMaps, false); err != nil {
+ 		t.Fatalf("getPod() failed: %v", err)
+ 	}
+-	if len(pod.Spec.InitContainers) != 1 {
+-		t.Fatalf("getPod() initContainers len = %d, want 1", len(pod.Spec.InitContainers))
++	if len(pod.Spec.InitContainers) != 2 {
++		t.Fatalf("getPod() initContainers len = %d, want 2 (init-wait, sysctl-guard-seed)", len(pod.Spec.InitContainers))
+ 	}
+ 	foundDirectStartupMount := false
+ 	for _, mount := range pod.Spec.Containers[0].VolumeMounts {
+@@ -270,10 +270,10 @@ func TestGetPodSeedInitMaterializesMgmtRuntime(t *testing.T) {
+ 	if err := getPod(pod, device, secretsAndConfigMaps, true); err != nil {
+ 		t.Fatalf("getPod() failed: %v", err)
+ 	}
+-	if len(pod.Spec.InitContainers) != 2 {
+-		t.Fatalf("getPod() initContainers len = %d, want 2", len(pod.Spec.InitContainers))
++	if len(pod.Spec.InitContainers) != 3 {
++		t.Fatalf("getPod() initContainers len = %d, want 3 (init-wait, sysctl-guard-seed, startup-config-seed)", len(pod.Spec.InitContainers))
+ 	}
+-	seed := pod.Spec.InitContainers[1]
++	seed := *initContainerByName(t, pod, "startup-config-seed")
+ 	env := map[string]corev1.EnvVar{}
+ 	for _, e := range seed.Env {
+ 		env[e.Name] = e
+@@ -441,7 +441,7 @@ func TestGetPodSeedInitFaithfulWithoutMgmtMapping(t *testing.T) {
+ 		if err := getPod(pod, device, secretsAndConfigMaps, true); err != nil {
+ 			t.Fatalf("%s: getPod() failed: %v", name, err)
+ 		}
+-		seed := pod.Spec.InitContainers[1]
++		seed := *initContainerByName(t, pod, "startup-config-seed")
+ 		for _, e := range seed.Env {
+ 			if e.Name == "SKYFORGE_MGMT_EOS_INTF" || e.Name == "SKYFORGE_POD_IP" {
+ 				t.Fatalf("%s: seed container unexpectedly carries mgmt runtime env %q: %#v", name, e.Name, seed.Env)
+@@ -883,3 +883,111 @@ func TestGetJsonIntfMappingOmitsManagementWhenAbsent(t *testing.T) {
+ 		t.Fatalf("EthernetIntf[eth1] = %q, want Ethernet1 (%#v)", got, m.EthernetIntf)
+ 	}
+ }
++
++// initContainerByName finds an init container by name. The tests used to index
++// positionally, which broke the moment an init container was added ahead of the
++// one they meant. Name is what they were actually asserting about.
++func initContainerByName(t *testing.T, pod *corev1.Pod, name string) *corev1.Container {
++	t.Helper()
++	for i := range pod.Spec.InitContainers {
++		if pod.Spec.InitContainers[i].Name == name {
++			return &pod.Spec.InitContainers[i]
++		}
++	}
++	return nil
++}
++
++// TestSysctlGuardSuppressesHostGlobalLeak asserts that every cEOS pod carries
++// the sysctl.d drop-in that stops the container writing host-global kernel
++// settings, and that the drop-in names the keys that actually leaked.
++//
++// cEOS runs privileged, so /proc/sys is writable and the non-namespaced keys in
++// its own /etc/sysctl.d/99-eos.conf land on the HOST. On 2026-08-14 that put
++// kernel.panic=60 and vm.max_map_count=256000 on worker-a against a
++// declared contract of 10 and 1048576; the kernel.panic drift then crash-looped
++// the kubelet on its next restart with "invalid kernel flag: kernel/panic,
++// expected value: 10, actual value: 60" while the Node still reported Ready.
++//
++// The startup-persistence-disabled case is the negative control for
++// "unconditional": the leak has nothing to do with persistence, so a guard that
++// only appeared alongside the startup seed would leave the other half of the
++// fleet leaking.
++func TestSysctlGuardSuppressesHostGlobalLeak(t *testing.T) {
++	for _, useStartupPersistence := range []bool{true, false} {
++		device := &ceoslabv1alpha1.CEosLabDevice{
++			ObjectMeta: metav1.ObjectMeta{Name: "leaf1", Namespace: "test"},
++			Spec:       ceoslabv1alpha1.CEosLabDeviceSpec{NumInterfaces: 2},
++		}
++		secretsAndConfigMaps := map[string]client.Object{
++			startupConfigName(device.Name): &corev1.ConfigMap{
++				ObjectMeta: metav1.ObjectMeta{Name: startupConfigName(device.Name)},
++				Data:       map[string]string{"startup-config": "hostname leaf1\n"},
++			},
++		}
++		pod := &corev1.Pod{}
++		if err := getPod(pod, device, secretsAndConfigMaps, useStartupPersistence); err != nil {
++			t.Fatalf("persistence=%v: getPod() failed: %v", useStartupPersistence, err)
++		}
++
++		guard := initContainerByName(t, pod, "sysctl-guard-seed")
++		if guard == nil {
++			t.Fatalf("persistence=%v: no sysctl-guard-seed init container; cEOS will write the host kernel: %#v",
++				useStartupPersistence, pod.Spec.InitContainers)
++		}
++		if len(guard.Args) != 1 || !strings.Contains(guard.Args[0], sysctlGuardFile) {
++			t.Fatalf("persistence=%v: guard init container does not write %s: %#v",
++				useStartupPersistence, sysctlGuardFile, guard.Args)
++		}
++
++		var mount *corev1.VolumeMount
++		for i := range pod.Spec.Containers[0].VolumeMounts {
++			if pod.Spec.Containers[0].VolumeMounts[i].MountPath == sysctlGuardMountPath {
++				mount = &pod.Spec.Containers[0].VolumeMounts[i]
++			}
++		}
++		if mount == nil {
++			t.Fatalf("persistence=%v: ceos container does not mount %s: %#v",
++				useStartupPersistence, sysctlGuardMountPath, pod.Spec.Containers[0].VolumeMounts)
++		}
++		// SubPath matters: without it the mount replaces the whole
++		// /etc/sysctl.d directory and hides 99-eos.conf, taking EOS's own
++		// per-netns net.* settings with it.
++		if mount.SubPath != sysctlGuardFile {
++			t.Fatalf("persistence=%v: guard mount must use SubPath %q so it adds a file rather than replacing /etc/sysctl.d, got %q",
++				useStartupPersistence, sysctlGuardFile, mount.SubPath)
++		}
++
++		var volume *corev1.Volume
++		for i := range pod.Spec.Volumes {
++			if pod.Spec.Volumes[i].Name == sysctlGuardVolumeName {
++				volume = &pod.Spec.Volumes[i]
++			}
++		}
++		if volume == nil || volume.EmptyDir == nil {
++			t.Fatalf("persistence=%v: guard volume missing or not an emptyDir: %#v",
++				useStartupPersistence, pod.Spec.Volumes)
++		}
++	}
++
++	// The drop-in must actually opt out the keys that leaked. A guard that
++	// mounts an empty or unrelated file would satisfy every assertion above.
++	for _, key := range []string{
++		"-kernel.panic",
++		"-vm.max_map_count",
++		"-fs.inotify.max_user_watches",
++		"-kernel.printk",
++		"-kernel.core_pattern",
++	} {
++		if !strings.Contains(sysctlGuardConf, key+"\n") {
++			t.Fatalf("sysctl guard drop-in does not opt out %q:\n%s", key, sysctlGuardConf)
++		}
++	}
++	// Namespaced settings are cEOS's own business; suppressing them would
++	// change EOS behaviour inside its netns for no host-safety gain.
++	for _, key := range []string{"-net.ipv4.", "-net.ipv6.", "-net.core."} {
++		if strings.Contains(sysctlGuardConf, key) {
++			t.Fatalf("sysctl guard drop-in suppresses namespaced %q; only host-global keys belong here:\n%s",
++				key, sysctlGuardConf)
++		}
++	}
++}
+-- 
+2.55.0
+

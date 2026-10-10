@@ -1,0 +1,628 @@
+From ed61877b285cc3f1fff65e6e04c101cbe5150a2d Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sat, 18 Jul 2026 07:54:25 -0500
+Subject: [PATCH 7/8] skyforge(mgmt-runtime): materialize pod IP into
+ Management0 startup-config (config-as-truth)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When the CR maps eth0 to an EOS management interface (netlab-authored intent,
+faithfully translated into EosIntfMapping.json since the mgmt-faithful series),
+cEOS claims eth0 and ENFORCES its config at apply time: a startup-config with no
+Management0 stanza reads as "no ip address", so EOS strips the CNI-assigned pod
+IP and every kernel route (live evidence 2026-07-18, cEOS 4.34.2f) — all mgmt
+(SSH/eAPI/gNMI) goes externally dark. Upstream never hits this because upstream
+never claims eth0 at all: KNE's own CLI path is `kubectl exec ... Cli`, its
+example configs carry no Management0 stanza, and pristine-operator pods leave
+eth0 to the CNI. The moment a Management mapping exists, the config must carry
+the runtime identity — exactly how containerlab solves the same problem by
+templating the mgmt IP + route into ceos.cfg.
+
+The pod IP is assigned at sandbox creation, AFTER the operator renders the pod
+and configmaps, so the only honest place to bind it is inside the pod at start:
+the startup-config-seed init container now (when the CR maps eth0->ManagementN)
+reads status.podIP via the downward API and refreshes a marker-delimited block
+appended to the persisted startup-config:
+
+    ! SKYFORGE-RUNTIME-MGMT BEGIN ...
+    interface Management0
+       mtu <observed /sys/class/net/eth0/mtu, clamped 68..9214>
+       ip address <podIP>/<derived prefix>     e.g. 198.18.0.132/15
+    ip route 0.0.0.0/0 Management0
+    ip route <cidr> Management0                per SKYFORGE_MGMT_RETURN_CIDRS,
+                                               minus the connected one
+    ! SKYFORGE-RUNTIME-MGMT END
+
+EOS's enforcement then INSTALLS the address/routes instead of stripping them
+(config-as-truth; enforcement is one-shot at claim/config-apply, verified live:
+a manually restored addr + `default dev eth0 scope link` route sticks and makes
+SSH/eAPI reachable).
+
+Mask decision — live-validated on canary br1 (cEOS 4.34.2f, 2026-07-18): EOS
+REJECTS "ip address <ip>/32" with "% Prefix length must be less than 32" (a
+rejected line would abort config replay), /31 carries point-to-point pair
+semantics, so the prefix is DERIVED at pod start: the prefix length of the
+first return CIDR that contains the pod IP (198.18.0.132 in 198.18.0.0/15 ->
+/15; pure busybox-sh containment math, (ip XOR base) >> (32-plen)), bounded
+/16 fallback when nothing matches — never /32. Canary confirms the full chain:
+/15 address accepted, interface-form statics accepted and rendered to kernel
+exactly as designed ("default dev eth0 proto gated scope link src <ip>",
+"100.64.0.0/10 dev eth0 proto gated"), and SSH/eAPI OPEN through the KNE
+Service under the EOS-authored state. The containing CIDR arrives as a
+proto-kernel CONNECTED route once the address is up, so it gets no static twin
+(avoids static-vs-connected ambiguity); the default route and all other return
+CIDRs stay interface-form statics. Interface-form routes are valid EOS grammar
+(destinations treated as directly connected, resolved per-destination by ARP —
+which the CNI answers) and deliberately embed NO gateway: after `write memory`
+absorbs the block into the body, stale route lines are IP-free (config
+set-semantics dedupe) and a later `ip address` replaces an earlier one on
+replay, so a rescheduled pod with a new IP still converges. Strip-then-append
+on every start keeps exactly one block. Return-CIDR routes pin mgmt client
+ranges to the management interface so fabric routing learned later (BGP in the
+default VRF) cannot hijack replies.
+
+The postStart hook drops its gateway-discovery kernel-route half — it could
+never survive the claim (post-strip there is no gateway left to discover), and
+the return path is EOS-owned now. The iptables ingress permits stay: EOS offers
+no config surface for its control-plane firewall here, and the permit loop must
+keep re-asserting while EOS (re)programs its chains during boot.
+
+No CRD schema change (api/ stays pristine); no netlab change (it keeps authoring
+intfmapping only). Per-device kill switch: spec.envvars
+SKYFORGE_MGMT_RUNTIME_CONFIG=off. Downward-API env lives ONLY on the seed init
+container: the reconciler's env drift check compares the ceos container's
+literal env values, and a valueFrom var there would read back empty and force a
+delete/recreate loop. The seed/active file paths are env-overridable solely so
+the unit tests execute the script for real (the curated seed-container env never
+sets them in a pod).
+
+---
+ controllers/ceoslabdevice_controller.go       | 216 ++++++++++++---
+ .../ceoslabdevice_controller_unit_test.go     | 248 +++++++++++++++++-
+ 2 files changed, 423 insertions(+), 41 deletions(-)
+
+diff --git a/controllers/ceoslabdevice_controller.go b/controllers/ceoslabdevice_controller.go
+index ec2d0c2..8f87374 100644
+--- a/controllers/ceoslabdevice_controller.go
++++ b/controllers/ceoslabdevice_controller.go
+@@ -985,7 +985,7 @@ func getPod(pod *corev1.Pod, device *ceoslabv1alpha1.CEosLabDevice, secretsAndCo
+ 		ImagePullPolicy: "IfNotPresent",
+ 	}}
+ 	if useStartupPersistence {
+-		initContainers = append(initContainers, getStartupSeedInitContainer(device))
++		initContainers = append(initContainers, getStartupSeedInitContainer(device, envVarsMap))
+ 	}
+ 	pod.ObjectMeta.Labels = labels
+ 	pod.Spec = corev1.PodSpec{
+@@ -1021,33 +1021,24 @@ func getLifecycleAPI(envVarsMap map[string]string) *corev1.Lifecycle {
+ 				Command: []string{"/bin/sh", "-ceu", strings.TrimSpace(`
+ cidrs="${SKYFORGE_MGMT_RETURN_CIDRS:-}"
+ [ -n "${cidrs}" ] || exit 0
+-apply_routes() {
+-  gw="$(ip -4 route show dev eth0 scope link | awk '{print $1; exit}')"
+-  if [ -z "${gw}" ]; then
+-    gw="$(ip -4 route show default dev eth0 | awk '{print $3; exit}')"
+-  fi
+-  [ -n "${gw}" ] || return 0
+-  mtu="${SKYFORGE_MGMT_RETURN_MTU:-1370}"
+-  old_ifs="${IFS}"
+-  IFS=","
+-  for cidr in ${cidrs}; do
+-    cidr="$(printf '%s' "${cidr}" | tr -d '[:space:]')"
+-    [ -n "${cidr}" ] || continue
+-    ip route replace "${cidr}" via "${gw}" dev eth0 mtu "${mtu}" || true
+-  done
+-  IFS="${old_ifs}"
+-}
+ # cEOS enforces an EOS control-plane firewall: the iptables INPUT policy is DROP
+ # and the EOS_INPUT chain starts empty, so every inbound management packet from
+ # the Kubernetes pod / Service network (where the analysis system collector pod and the
+-# per-device Services it dials both live) is dropped before EOS processes it. The
+-# return routes above only correct the reply *path*; they do not lift this
+-# ingress filter (a route to the source CIDR does not create a permit). Without
+-# an explicit permit the collector's SSH/gNMI SYNs — and even ICMP echo replies —
+-# are silently dropped, which is the cEOS-on-Talos "collector cannot reach the
+-# device" regression. Permit each management source CIDR explicitly. The
+-# delete-then-insert keeps exactly one ACCEPT per CIDR across the retry loop,
+-# ordered ahead of the default DROP.
++# per-device Services it dials both live) is dropped before EOS processes it.
++# Without an explicit permit the collector's SSH/gNMI SYNs — and even ICMP echo
++# replies — are silently dropped, which is the cEOS-on-Talos "collector cannot
++# reach the device" regression. Permit each management source CIDR explicitly.
++# The delete-then-insert keeps exactly one ACCEPT per CIDR across the retry
++# loop, ordered ahead of the default DROP; the loop re-asserts the permits
++# because EOS (re)programs its firewall chains during boot.
++#
++# NOTE: the return-PATH is no longer handled here. When the CR maps eth0 to an
++# EOS management interface, EOS owns eth0's address and routes end to end: the
++# startup-config-seed init container materializes the pod IP and interface
++# routes into /mnt/flash/startup-config, and EOS installs them at config apply
++# (config-as-truth). The old gateway-discovery route half of this hook could
++# never survive that claim anyway: after EOS strips the CNI routes there is no
++# gateway left to discover.
+ apply_permits() {
+   old_ifs="${IFS}"
+   IFS=","
+@@ -1059,19 +1050,17 @@ apply_permits() {
+   done
+   IFS="${old_ifs}"
+ }
+-apply_routes
+ apply_permits
+ (
+   i=0
+   max="${SKYFORGE_MGMT_RETURN_ROUTE_RETRIES:-60}"
+   interval="${SKYFORGE_MGMT_RETURN_ROUTE_INTERVAL:-5}"
+   while [ "${i}" -lt "${max}" ]; do
+-    apply_routes
+     apply_permits
+     i=$((i + 1))
+     sleep "${interval}"
+   done
+-) >/tmp/skyforge-mgmt-return-routes.log 2>&1 &
++) >/tmp/skyforge-mgmt-permits.log 2>&1 &
+ `)},
+ 			},
+ 		},
+@@ -1336,21 +1325,174 @@ func getVolumeMounts(secretsAndConfigMaps map[string]client.Object, useStartupPe
+ 	return mounts
+ }
+ 
+-func getStartupSeedInitContainer(device *ceoslabv1alpha1.CEosLabDevice) corev1.Container {
++// mgmtRuntimeIntf returns the EOS management interface the CR maps the pod's
++// primary kernel interface (eth0 — the interface that carries status.podIP) to,
++// or "" when the CR does not claim eth0 as a management interface. This is the
++// netlab-authored intent switch: the operator never synthesizes the mapping
++// (see the faithful-translation tests for getJsonIntfMapping); it only
++// materializes runtime facts for a mapping the topology author declared.
++func mgmtRuntimeIntf(device *ceoslabv1alpha1.CEosLabDevice) string {
++	name := device.Spec.IntfMapping["eth0"]
++	if mgmtIntfRe.MatchString(name) {
++		return name
++	}
++	return ""
++}
++
++// mgmtRuntimeConfigEnabled reports whether the startup-config-seed init
++// container should materialize the pod's runtime management identity (pod IP,
++// interface routes, observed MTU) into the persisted startup-config. Requires
++// the CR to map eth0 to a ManagementN interface; per-device kill switch via
++// spec.envvars SKYFORGE_MGMT_RUNTIME_CONFIG=off (no CRD schema change).
++func mgmtRuntimeConfigEnabled(device *ceoslabv1alpha1.CEosLabDevice, envVarsMap map[string]string) bool {
++	if strings.EqualFold(strings.TrimSpace(envVarsMap["SKYFORGE_MGMT_RUNTIME_CONFIG"]), "off") {
++		return false
++	}
++	return mgmtRuntimeIntf(device) != ""
++}
++
++// startupSeedScript is the startup-config-seed init container program. Two jobs:
++//
++//  1. Seed: copy the KNE-rendered startup-config from the configmap into the
++//     per-device PVC once (first boot only) — runtime `write memory` state
++//     persists across pod restarts (patch: startup-config PVC persistence).
++//
++//  2. Materialize runtime management identity (only when the CR maps eth0 to an
++//     EOS management interface — SKYFORGE_MGMT_EOS_INTF set): cEOS treats the
++//     startup-config as authoritative for a claimed management interface and
++//     ENFORCES it at config apply — with no Management0 stanza it strips the
++//     CNI-assigned pod IP and every kernel route, leaving the device dark. The
++//     pod IP only exists at sandbox creation, AFTER the operator rendered this
++//     pod, so the only honest place to bind it into config is here, at pod
++//     start, from the downward API. Append it BETWEEN markers, refreshed every
++//     start (strip-then-append) so a rescheduled pod with a new IP converges
++//     instead of duplicating. Interface-form routes ("ip route <pfx> <MgmtIntf>",
++//     valid EOS grammar: destinations treated as directly connected, resolved by
++//     ARP — which the CNI answers) deliberately embed NO gateway address, so a
++//     stale copy absorbed into the body by `write memory` stays harmless: route
++//     lines are IP-free (set-semantics dedupe) and a later `ip address` replaces
++//     an earlier one on replay. The block is appended LAST so EOS installing the
++//     address/routes also witnesses that the entire seeded config replayed.
++//
++// Address prefix length (canary br1, cEOS 4.34.2f, 2026-07-18): EOS REJECTS a
++// /32 interface address ("% Prefix length must be less than 32") — and a
++// rejected line would abort config replay. The prefix is therefore derived at
++// pod start as the prefix length of the FIRST return CIDR (SKYFORGE_MGMT_RETURN_CIDRS,
++// in order) that CONTAINS the pod IP — e.g. 198.18.0.132 in 198.18.0.0/15 ->
++// "ip address 198.18.0.132/15" (live-validated: accepted, kernel gets
++// "default dev eth0 proto gated scope link src <ip>", SSH/eAPI reachable
++// through the KNE Service). The matched CIDR becomes a CONNECTED subnet once
++// the address is up, so no static twin is emitted for it (avoids
++// static-vs-connected ambiguity); statics are still emitted for the default
++// route and every OTHER return CIDR. If no return CIDR contains the pod IP the
++// fallback is /16 (never /32), with a note on stderr. Containment is pure
++// POSIX/busybox sh: dotted quads to integers, then (ip XOR base) >> (32-plen).
++const startupSeedScript = `set -eu
++active="${SKYFORGE_SEED_ACTIVE_FILE:-/var/run/ceos/startup-active/startup-config}"
++seed="${SKYFORGE_SEED_SOURCE_FILE:-/var/run/ceos/startup-seed/startup-config}"
++mkdir -p "$(dirname "${active}")"
++if [ ! -f "${active}" ]; then cp "${seed}" "${active}"; fi
++if [ -n "${SKYFORGE_MGMT_EOS_INTF:-}" ]; then
++  ip="${SKYFORGE_POD_IP:-}"
++  case "${ip}" in
++  ''|*:*)
++    echo "skyforge-mgmt-runtime: no usable IPv4 pod IP (got '${ip}'); startup-config left untouched" >&2
++    ;;
++  *)
++    mtu="$(cat /sys/class/net/eth0/mtu 2>/dev/null || true)"
++    case "${mtu}" in ''|*[!0-9]*) mtu='' ;; esac
++    if [ -n "${mtu}" ] && [ "${mtu}" -gt 9214 ]; then mtu=9214; fi
++    if [ -n "${mtu}" ] && [ "${mtu}" -lt 68 ]; then mtu=''; fi
++    ip4_to_int() {
++      _oldifs="${IFS}"; IFS=.
++      set -- $1
++      IFS="${_oldifs}"
++      if [ $# -ne 4 ]; then return 0; fi
++      for _o in "$1" "$2" "$3" "$4"; do
++        case "${_o}" in ''|*[!0-9]*) return 0 ;; 0) ;; 0*) return 0 ;; esac
++        if [ "${_o}" -gt 255 ]; then return 0; fi
++      done
++      echo $(( ($1 << 24) | ($2 << 16) | ($3 << 8) | $4 ))
++    }
++    pod_n="$(ip4_to_int "${ip}")"
++    pfx=''
++    addr_cidr=''
++    if [ -n "${pod_n}" ]; then
++      _oldifs="${IFS}"; IFS=','
++      for cidr in ${SKYFORGE_MGMT_RETURN_CIDRS:-}; do
++        cidr="$(printf '%s' "${cidr}" | tr -d '[:space:]')"
++        case "${cidr}" in */*) ;; *) continue ;; esac
++        plen="${cidr#*/}"
++        case "${plen}" in ''|*[!0-9]*) continue ;; esac
++        if [ "${plen}" -lt 1 ] || [ "${plen}" -ge 32 ]; then continue; fi
++        base_n="$(ip4_to_int "${cidr%/*}")"
++        if [ -z "${base_n}" ]; then continue; fi
++        if [ $(( (pod_n ^ base_n) >> (32 - plen) )) -eq 0 ]; then
++          pfx="${plen}"
++          addr_cidr="${cidr}"
++          break
++        fi
++      done
++      IFS="${_oldifs}"
++    fi
++    if [ -z "${pfx}" ]; then
++      pfx=16
++      echo "skyforge-mgmt-runtime: no return CIDR contains pod IP ${ip}; falling back to /${pfx}" >&2
++    fi
++    tmp="${active}.skyforge.$$"
++    awk 'index($0,"! SKYFORGE-RUNTIME-MGMT BEGIN")==1{drop=1;next} index($0,"! SKYFORGE-RUNTIME-MGMT END")==1{drop=0;next} !drop' "${active}" >"${tmp}"
++    {
++      printf '%s\n' '! SKYFORGE-RUNTIME-MGMT BEGIN (operator-rendered; regenerated every pod start; do not edit)'
++      printf 'interface %s\n' "${SKYFORGE_MGMT_EOS_INTF}"
++      if [ -n "${mtu}" ]; then printf '   mtu %s\n' "${mtu}"; fi
++      printf '   ip address %s/%s\n' "${ip}" "${pfx}"
++      printf 'ip route 0.0.0.0/0 %s\n' "${SKYFORGE_MGMT_EOS_INTF}"
++      _oldifs="${IFS}"
++      IFS=','
++      for cidr in ${SKYFORGE_MGMT_RETURN_CIDRS:-}; do
++        cidr="$(printf '%s' "${cidr}" | tr -d '[:space:]')"
++        if [ -z "${cidr}" ]; then continue; fi
++        if [ "${cidr}" = "${addr_cidr}" ]; then continue; fi
++        printf 'ip route %s %s\n' "${cidr}" "${SKYFORGE_MGMT_EOS_INTF}"
++      done
++      IFS="${_oldifs}"
++      printf '%s\n' '! SKYFORGE-RUNTIME-MGMT END'
++    } >>"${tmp}"
++    mv "${tmp}" "${active}"
++    ;;
++  esac
++fi
++`
++
++func getStartupSeedInitContainer(device *ceoslabv1alpha1.CEosLabDevice, envVarsMap map[string]string) corev1.Container {
+ 	seedFile := startupPersistenceSeedDir + "/startup-config"
+-	activeFile := startupPersistenceActiveDir + "/startup-config"
++	var env []corev1.EnvVar
++	if mgmtRuntimeConfigEnabled(device, envVarsMap) {
++		env = []corev1.EnvVar{
++			{Name: "SKYFORGE_MGMT_EOS_INTF", Value: mgmtRuntimeIntf(device)},
++			{Name: "SKYFORGE_MGMT_RETURN_CIDRS", Value: envVarsMap["SKYFORGE_MGMT_RETURN_CIDRS"]},
++			{
++				// The pod IP exists only at sandbox creation — after the
++				// operator rendered this pod — so it can only be observed
++				// from inside, via the downward API. Deliberately on this
++				// init container ONLY: the reconciler's env drift check
++				// compares the ceos container's literal env values, and a
++				// valueFrom var there would read back empty and force a
++				// delete/recreate loop.
++				Name: "SKYFORGE_POD_IP",
++				ValueFrom: &corev1.EnvVarSource{
++					FieldRef: &corev1.ObjectFieldSelector{FieldPath: "status.podIP"},
++				},
++			},
++		}
++	}
+ 	return corev1.Container{
+ 		Name:            "startup-config-seed",
+ 		Image:           DEFAULT_STARTUP_SEED_IMAGE,
+ 		ImagePullPolicy: "IfNotPresent",
+ 		Command:         []string{"/bin/sh", "-lc"},
+-		Args: []string{fmt.Sprintf(
+-			"set -eu; mkdir -p %q; if [ ! -f %q ]; then cp %q %q; fi",
+-			startupPersistenceActiveDir,
+-			activeFile,
+-			seedFile,
+-			activeFile,
+-		)},
++		Args:            []string{startupSeedScript},
++		Env:             env,
+ 		VolumeMounts: []corev1.VolumeMount{
+ 			{
+ 				Name:      volumeName(startupConfigName(device.Name)),
+diff --git a/controllers/ceoslabdevice_controller_unit_test.go b/controllers/ceoslabdevice_controller_unit_test.go
+index fd17a4e..b9bc730 100644
+--- a/controllers/ceoslabdevice_controller_unit_test.go
++++ b/controllers/ceoslabdevice_controller_unit_test.go
+@@ -4,6 +4,8 @@ import (
+ 	"context"
+ 	"encoding/json"
+ 	"fmt"
++	"os"
++	"os/exec"
+ 	"strings"
+ 	"testing"
+ 	"time"
+@@ -169,21 +171,259 @@ func TestGetPodAddsManagementReturnRouteLifecycle(t *testing.T) {
+ 	script := command[2]
+ 	for _, want := range []string{
+ 		"SKYFORGE_MGMT_RETURN_CIDRS",
+-		"ip -4 route show dev eth0 scope link",
+-		"ip route replace",
+ 		// The EOS control-plane firewall drops inbound management traffic
+ 		// unless each source CIDR is explicitly permitted (see getLifecycleAPI).
+ 		"apply_permits",
+ 		"iptables -D INPUT -s",
+ 		"iptables -I INPUT 1 -s",
+-		"SKYFORGE_MGMT_RETURN_MTU",
+ 		"SKYFORGE_MGMT_RETURN_ROUTE_RETRIES",
+-		"/tmp/skyforge-mgmt-return-routes.log",
++		"/tmp/skyforge-mgmt-permits.log",
+ 	} {
+ 		if !strings.Contains(script, want) {
+ 			t.Fatalf("lifecycle script missing %q: %s", want, script)
+ 		}
+ 	}
++	// The return-PATH must NOT be kernel-managed here anymore: when eth0 is a
++	// claimed management interface, EOS owns address+routes end to end via the
++	// startup-config runtime block (config-as-truth). The old gateway-discovery
++	// route half could never survive the claim (no gateway left to discover).
++	for _, banned := range []string{"ip route replace", "apply_routes"} {
++		if strings.Contains(script, banned) {
++			t.Fatalf("lifecycle script still contains kernel route management %q: %s", banned, script)
++		}
++	}
++}
++
++// The startup-config-seed init container is where the pod's runtime management
++// identity is materialized into the persisted startup-config: the pod IP exists
++// only at sandbox creation (after the operator renders the pod), so it must be
++// observed from inside via the downward API and bound into config before EOS
++// starts. EOS's config enforcement then INSTALLS it instead of stripping the
++// CNI state (config-as-truth).
++func TestGetPodSeedInitMaterializesMgmtRuntime(t *testing.T) {
++	device := &ceoslabv1alpha1.CEosLabDevice{
++		ObjectMeta: metav1.ObjectMeta{Name: "leaf1", Namespace: "demo"},
++		Spec: ceoslabv1alpha1.CEosLabDeviceSpec{
++			IntfMapping: map[string]string{
++				"eth0": "Management0",
++				"eth1": "Ethernet1",
++			},
++			EnvVar: map[string]string{
++				"SKYFORGE_MGMT_RETURN_CIDRS": "100.64.0.0/10,198.18.0.0/15",
++			},
++		},
++	}
++	secretsAndConfigMaps := map[string]client.Object{
++		startupConfigName(device.Name): &corev1.ConfigMap{
++			ObjectMeta: metav1.ObjectMeta{Name: startupConfigName(device.Name)},
++			Data:       map[string]string{"startup-config": "hostname leaf1\n"},
++		},
++	}
++	pod := &corev1.Pod{}
++	if err := getPod(pod, device, secretsAndConfigMaps, true); err != nil {
++		t.Fatalf("getPod() failed: %v", err)
++	}
++	if len(pod.Spec.InitContainers) != 2 {
++		t.Fatalf("getPod() initContainers len = %d, want 2", len(pod.Spec.InitContainers))
++	}
++	seed := pod.Spec.InitContainers[1]
++	env := map[string]corev1.EnvVar{}
++	for _, e := range seed.Env {
++		env[e.Name] = e
++	}
++	if got := env["SKYFORGE_MGMT_EOS_INTF"].Value; got != "Management0" {
++		t.Fatalf("SKYFORGE_MGMT_EOS_INTF = %q, want Management0 (%#v)", got, seed.Env)
++	}
++	if got := env["SKYFORGE_MGMT_RETURN_CIDRS"].Value; got != "100.64.0.0/10,198.18.0.0/15" {
++		t.Fatalf("SKYFORGE_MGMT_RETURN_CIDRS = %q (%#v)", got, seed.Env)
++	}
++	podIP, ok := env["SKYFORGE_POD_IP"]
++	if !ok || podIP.ValueFrom == nil || podIP.ValueFrom.FieldRef == nil || podIP.ValueFrom.FieldRef.FieldPath != "status.podIP" {
++		t.Fatalf("SKYFORGE_POD_IP must be a downward-API ref to status.podIP: %#v", seed.Env)
++	}
++	if len(seed.Args) != 1 {
++		t.Fatalf("seed args = %#v, want single script", seed.Args)
++	}
++	script := seed.Args[0]
++	for _, want := range []string{
++		// seed-once semantics preserved (write memory state survives restarts)
++		"if [ ! -f \"${active}\" ]; then cp \"${seed}\" \"${active}\"; fi",
++		// refresh-not-duplicate: previous runtime block stripped before append
++		"! SKYFORGE-RUNTIME-MGMT BEGIN",
++		"! SKYFORGE-RUNTIME-MGMT END",
++		// config-as-truth: address EOS will install; prefix derived from the
++		// return CIDR containing the pod IP (canary br1 2026-07-18: EOS
++		// rejects /32 with "% Prefix length must be less than 32")
++		"ip address %s/%s",
++		"ip4_to_int",
++		">> (32 - plen)",
++		// bounded fallback when no return CIDR contains the pod IP: /16, never /32
++		"pfx=16",
++		// the matched CIDR is CONNECTED once the address is up — no static twin
++		"if [ \"${cidr}\" = \"${addr_cidr}\" ]; then continue; fi",
++		// interface-form routes: no gateway to embed, EOS ARPs per destination
++		"ip route 0.0.0.0/0 %s",
++		// observed-MTU materialization (runtime truth, like the IP)
++		"/sys/class/net/eth0/mtu",
++	} {
++		if !strings.Contains(script, want) {
++			t.Fatalf("seed script missing %q: %s", want, script)
++		}
++	}
++	if strings.Contains(script, " via ") {
++		t.Fatalf("seed script must not render gateway-form routes: %s", script)
++	}
++	if strings.Contains(script, "ip address %s/32") {
++		t.Fatalf("seed script must never render a /32 management address (EOS rejects it): %s", script)
++	}
++}
++
++// Execute the seed script for real (POSIX sh; the pod runs it under busybox
++// ash) and check the CIDR-containment math, the connected-CIDR static
++// suppression, and refresh idempotency across a pod-IP change. The file paths
++// are overridable via env precisely so this test can drive the script without
++// /var/run or /sys (no MTU line is rendered when /sys/class/net/eth0/mtu is
++// unreadable, which is also the correct pod-side degradation).
++func TestStartupSeedScriptCIDRMath(t *testing.T) {
++	shPath, err := exec.LookPath("sh")
++	if err != nil {
++		t.Skip("no sh on PATH")
++	}
++	dir := t.TempDir()
++	seedFile := dir + "/seed-startup-config"
++	activeFile := dir + "/active/startup-config"
++	if err := os.WriteFile(seedFile, []byte("hostname leaf1\n"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	run := func(podIP string) string {
++		t.Helper()
++		cmd := exec.Command(shPath, "-c", startupSeedScript)
++		cmd.Env = append(os.Environ(),
++			"SKYFORGE_SEED_ACTIVE_FILE="+activeFile,
++			"SKYFORGE_SEED_SOURCE_FILE="+seedFile,
++			"SKYFORGE_MGMT_EOS_INTF=Management0",
++			"SKYFORGE_MGMT_RETURN_CIDRS=100.64.0.0/10,198.18.0.0/15",
++			"SKYFORGE_POD_IP="+podIP,
++		)
++		out, err := cmd.CombinedOutput()
++		if err != nil {
++			t.Fatalf("seed script failed for pod IP %s: %v\n%s", podIP, err, out)
++		}
++		data, err := os.ReadFile(activeFile)
++		if err != nil {
++			t.Fatal(err)
++		}
++		return string(data)
++	}
++
++	// Pod IP inside 198.18.0.0/15: /15 address, no static twin for it, static
++	// for the OTHER return CIDR, interface-form default.
++	got := run("198.18.0.132")
++	for _, want := range []string{
++		"hostname leaf1\n",
++		"   ip address 198.18.0.132/15\n",
++		"ip route 0.0.0.0/0 Management0\n",
++		"ip route 100.64.0.0/10 Management0\n",
++	} {
++		if !strings.Contains(got, want) {
++			t.Fatalf("active config missing %q:\n%s", want, got)
++		}
++	}
++	if strings.Contains(got, "ip route 198.18.0.0/15") {
++		t.Fatalf("connected CIDR must not get a static twin:\n%s", got)
++	}
++
++	// Rescheduled pod, new IP in the FIRST CIDR: refresh replaces the block
++	// (no duplicates), /10 address, static twin flips to the other CIDR.
++	got = run("100.64.3.7")
++	if n := strings.Count(got, "! SKYFORGE-RUNTIME-MGMT BEGIN"); n != 1 {
++		t.Fatalf("runtime block count = %d, want exactly 1 after refresh:\n%s", n, got)
++	}
++	if !strings.Contains(got, "   ip address 100.64.3.7/10\n") {
++		t.Fatalf("refreshed address missing:\n%s", got)
++	}
++	if strings.Contains(got, "198.18.0.132") {
++		t.Fatalf("stale pod IP survived refresh:\n%s", got)
++	}
++	if !strings.Contains(got, "ip route 198.18.0.0/15 Management0\n") || strings.Contains(got, "ip route 100.64.0.0/10") {
++		t.Fatalf("static/connected split wrong after refresh:\n%s", got)
++	}
++
++	// No containing CIDR: bounded /16 fallback (never /32).
++	got = run("203.0.113.9")
++	if !strings.Contains(got, "   ip address 203.0.113.9/16\n") {
++		t.Fatalf("fallback /16 address missing:\n%s", got)
++	}
++	if !strings.Contains(got, "ip route 100.64.0.0/10 Management0\n") || !strings.Contains(got, "ip route 198.18.0.0/15 Management0\n") {
++		t.Fatalf("all return CIDRs must be statics when none is connected:\n%s", got)
++	}
++}
++
++// Faithful-translator boundary: no eth0->ManagementN mapping in the CR means no
++// runtime materialization — the operator must not invent management intent.
++func TestGetPodSeedInitFaithfulWithoutMgmtMapping(t *testing.T) {
++	for name, spec := range map[string]ceoslabv1alpha1.CEosLabDeviceSpec{
++		"no mapping at all": {},
++		"fabric-only mapping": {
++			IntfMapping: map[string]string{"eth1": "Ethernet1"},
++		},
++		"eth0 mapped as fabric": {
++			IntfMapping: map[string]string{"eth0": "Ethernet1"},
++		},
++		"mgmt mapped from non-eth0 device": {
++			// status.podIP belongs to eth0; a Management mapping on another
++			// kernel device is not something the operator can bind the pod IP to.
++			IntfMapping: map[string]string{"eth5": "Management1"},
++		},
++		"kill switch": {
++			IntfMapping: map[string]string{"eth0": "Management0"},
++			EnvVar:      map[string]string{"SKYFORGE_MGMT_RUNTIME_CONFIG": "off"},
++		},
++	} {
++		device := &ceoslabv1alpha1.CEosLabDevice{
++			ObjectMeta: metav1.ObjectMeta{Name: "leaf1", Namespace: "demo"},
++			Spec:       spec,
++		}
++		secretsAndConfigMaps := map[string]client.Object{
++			startupConfigName(device.Name): &corev1.ConfigMap{
++				ObjectMeta: metav1.ObjectMeta{Name: startupConfigName(device.Name)},
++				Data:       map[string]string{"startup-config": "hostname leaf1\n"},
++			},
++		}
++		pod := &corev1.Pod{}
++		if err := getPod(pod, device, secretsAndConfigMaps, true); err != nil {
++			t.Fatalf("%s: getPod() failed: %v", name, err)
++		}
++		seed := pod.Spec.InitContainers[1]
++		for _, e := range seed.Env {
++			if e.Name == "SKYFORGE_MGMT_EOS_INTF" || e.Name == "SKYFORGE_POD_IP" {
++				t.Fatalf("%s: seed container unexpectedly carries mgmt runtime env %q: %#v", name, e.Name, seed.Env)
++			}
++		}
++	}
++}
++
++func TestMgmtRuntimeIntf(t *testing.T) {
++	for want, mapping := range map[string]map[string]string{
++		"Management0": {"eth0": "Management0"},
++		"Management1": {"eth0": "Management1", "eth1": "Ethernet1"},
++	} {
++		device := &ceoslabv1alpha1.CEosLabDevice{Spec: ceoslabv1alpha1.CEosLabDeviceSpec{IntfMapping: mapping}}
++		if got := mgmtRuntimeIntf(device); got != want {
++			t.Fatalf("mgmtRuntimeIntf(%v) = %q, want %q", mapping, got, want)
++		}
++	}
++	for _, mapping := range []map[string]string{
++		nil,
++		{"eth1": "Ethernet1"},
++		{"eth0": "Ethernet0"},
++		{"eth5": "Management0"},
++	} {
++		device := &ceoslabv1alpha1.CEosLabDevice{Spec: ceoslabv1alpha1.CEosLabDeviceSpec{IntfMapping: mapping}}
++		if got := mgmtRuntimeIntf(device); got != "" {
++			t.Fatalf("mgmtRuntimeIntf(%v) = %q, want empty", mapping, got)
++		}
++	}
+ }
+ 
+ func TestGetPodSkipsManagementReturnRouteLifecycleWithoutContract(t *testing.T) {

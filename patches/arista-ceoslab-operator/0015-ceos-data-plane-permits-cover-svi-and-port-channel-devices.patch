@@ -1,0 +1,99 @@
+From ade36d593d551af962233e8c48cee846d32a3565 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sat, 12 Sep 2026 11:27:04 -0500
+Subject: [PATCH] ceos: data-plane permits cover every kernel device, not only
+ eth[1-9]
+
+iptables matches -i against the device the IP stack received on; in cEOS an
+SVI is vlanNNNN and a port-channel is poN, so traffic terminated on a VLAN
+interface or a LAG fell through to the default DROP even after the per-eth
+permits (0009): the MLAG peer keepalive over Vlan4094/Port-Channel4094 never
+arrived, a host could not ping its VLAN gateway, MLAG sat in Connecting -- ARP
+resolved on both sides (EOS handles ARP), ICMP 0/3 (2026-09-12, a user's MLAG
+lab, reproduced on r99). Default netns: every /sys/class/net device except eth0
+and lo; VRF namespaces: same rule. Unit test pins the loop shape.
+---
+ controllers/ceoslabdevice_controller.go       | 21 ++++++++++++++++---
+ .../ceoslabdevice_controller_unit_test.go     | 15 ++++++++++---
+ 2 files changed, 30 insertions(+), 6 deletions(-)
+
+diff --git a/controllers/ceoslabdevice_controller.go b/controllers/ceoslabdevice_controller.go
+index d16bbab..b437657 100644
+--- a/controllers/ceoslabdevice_controller.go
++++ b/controllers/ceoslabdevice_controller.go
+@@ -1320,12 +1320,24 @@ apply_permits() {
+ # PostStart, and the retry loop below re-asserts as they appear and as EOS
+ # reprograms its firewall chains during boot. Delete-then-insert keeps exactly one
+ # ACCEPT per interface, ordered ahead of the default DROP.
++#
++# EVERY data-plane device, not only the physical eth[1-9]. iptables matches
++# -i against the device the IP stack RECEIVED on, and in cEOS that is the
++# kernel device of the logical interface: an SVI is vlanNNNN, a port-channel
++# is poN. So traffic terminated on a VLAN interface or a LAG (the MLAG peer
++# keepalive over Vlan4094 across Port-Channel4094, a host pinging its VLAN
++# gateway, any routed-VLAN design) still fell through to the default DROP even
++# after the per-eth permits: ARP resolved on both sides, ICMP 0/3, MLAG stuck
++# in "Connecting" (2026-09-12, a user's MLAG lab). Enumerate the whole netns
++# and permit everything except eth0 -- the trust argument is the same: only the
++# modeled topology's own wires and their logical children land here. lo is
++# skipped because EOS owns its loopback rules.
+ apply_dataplane_permits() {
+-  for _ifpath in /sys/class/net/eth*; do
++  for _ifpath in /sys/class/net/*; do
+     [ -e "${_ifpath}" ] || continue
+     intf="${_ifpath##*/}"
+     [ "${intf}" = "eth0" ] && continue
+-    case "${intf}" in eth[0-9]*) ;; *) continue ;; esac
++    [ "${intf}" = "lo" ] && continue
+     iptables -D INPUT -i "${intf}" -j ACCEPT 2>/dev/null || true
+     iptables -I INPUT 1 -i "${intf}" -j ACCEPT || true
+   done
+@@ -1354,7 +1366,10 @@ apply_vrf_dataplane_permits() {
+   for _ns in $(ip netns list 2>/dev/null | awk '{print $1}'); do
+     case "${_ns}" in ns-*) ;; *) continue ;; esac
+     for _vifpath in $(ip netns exec "${_ns}" ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | sed 's/@.*//'); do
+-      case "${_vifpath}" in eth[1-9]*) ;; *) continue ;; esac
++      # Same rule as the default netns: every device in a VRF namespace is data
++      # plane (an SVI moved into a VRF is vlanNNNN there too); only eth0 and lo
++      # are excluded. A VRF never holds eth0, the check is belt and braces.
++      case "${_vifpath}" in eth0|lo) continue ;; esac
+       ip netns exec "${_ns}" iptables -D INPUT -i "${_vifpath}" -j ACCEPT 2>/dev/null || true
+       ip netns exec "${_ns}" iptables -I INPUT 1 -i "${_vifpath}" -j ACCEPT || true
+     done
+diff --git a/controllers/ceoslabdevice_controller_unit_test.go b/controllers/ceoslabdevice_controller_unit_test.go
+index edce06f..b1363b6 100644
+--- a/controllers/ceoslabdevice_controller_unit_test.go
++++ b/controllers/ceoslabdevice_controller_unit_test.go
+@@ -207,10 +207,12 @@ func TestGetPodAddsManagementReturnRouteLifecycle(t *testing.T) {
+ 		// The same firewall drops DATA-plane control traffic (OSPF/BGP/ICMP) on
+ 		// the fabric links, which arrives on the non-mgmt data interfaces from
+ 		// the routed fabric subnets. Restore router behavior by permitting all
+-		// inbound on every data interface (eth1+), enumerated from the pod netns,
+-		// re-asserted in the retry loop; eth0 (Management0) stays source-scoped.
++		// inbound on every data-plane kernel device -- physical eth1+ AND the
++		// logical ones (SVIs vlanNNNN, port-channels poN) -- enumerated from the
++		// pod netns, re-asserted in the retry loop; eth0 (Management0) stays
++		// source-scoped.
+ 		"apply_dataplane_permits",
+-		"/sys/class/net/eth*",
++		"/sys/class/net/*",
+ 		"iptables -I INPUT 1 -i",
+ 		// cEOS implements VRFs as network namespaces (ns-<vrf>), each with its own
+ 		// INPUT-policy-DROP control-plane firewall that apply_dataplane_permits (default
+@@ -227,6 +229,13 @@ func TestGetPodAddsManagementReturnRouteLifecycle(t *testing.T) {
+ 	// eth0 is the management interface and must NOT get a blanket interface
+ 	// permit — only the source-scoped management return-CIDRs may reach the
+ 	// control plane over eth0.
++	// Logical data interfaces (SVIs vlanNNNN, port-channels poN) are kernel
++	// devices of their own; a permit list restricted to eth[1-9] dropped MLAG
++	// keepalives and VLAN-gateway pings (2026-09-12). The loop must walk the
++	// whole netns, never only /sys/class/net/eth*.
++	if !strings.Contains(script, `for _ifpath in /sys/class/net/*; do`) || strings.Contains(script, `/sys/class/net/eth*`) {
++		t.Fatalf("data-plane permits must cover every kernel device except eth0/lo, not only eth*: %s", script)
++	}
+ 	if !strings.Contains(script, `[ "${intf}" = "eth0" ] && continue`) {
+ 		t.Fatalf("lifecycle script does not exclude eth0 from data-plane permits: %s", script)
+ 	}
+-- 
+2.55.0
+

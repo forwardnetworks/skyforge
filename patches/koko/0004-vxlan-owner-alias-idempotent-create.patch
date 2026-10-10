@@ -1,0 +1,640 @@
+From c8d3d52a818b5111b5b19223f85edaa97395ff9f Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sat, 18 Jul 2026 08:10:34 -0500
+Subject: [PATCH 4/5] api: idempotent, owner-tagged, node-serialized vxlan
+ creation
+
+Rework MakeVxLan from create-and-hope into ensure semantics:
+
+- Every vxlan link is created with an ownership alias in IFLA_IFALIAS
+  ('koko:vxlan:<owner-key>:<spec-key>', owner-key = hash(netns, ifname),
+  spec-key = hash of the desired vxlan tuple). A legacy single-hash alias
+  form is still recognized.
+- If the target name already exists in the pod namespace: adopt it when it
+  matches the desired vxlan tuple (bring it up, re-add addresses
+  EEXIST-tolerantly); delete and recreate it when it is stale but carries
+  our ownership alias; fail loudly when it is not ours.
+- Host-side EEXIST during staging is resolved against the kernel's real
+  uniqueness tuple (VNI, lower device, UDP port), not the transient staging
+  name: an owned conflicting host link is deleted and creation retried
+  (bounded attempts); an unowned conflict fails with a full conflict dump.
+- All creators on the node (every CNI plugin invocation and meshnetd)
+  serialize behind an in-process mutex plus a shared file lock
+  (KOKO_VXLAN_LOCK override; default /opt/cni/bin/.koko-vxlan-create.lock,
+  a hostPath shared by kubelet's plugin execution and the daemonset).
+- SetVethLink failure after staging also removes the link by name in the
+  target namespace instead of relying on a stale pre-move handle.
+
+The old 'retry once and swallow file exists' behavior is gone; callers that
+special-cased 'file exists' strings can rely on ensure semantics instead.
+
+Core is upstreamable; the default lock path is deployment-specific and
+overridable via KOKO_VXLAN_LOCK.
+---
+ api/koko_api.go                 | 382 +++++++++++++++++++++++++++++++-
+ api/koko_vxlan_conflict_test.go | 144 ++++++++++++
+ 2 files changed, 515 insertions(+), 11 deletions(-)
+ create mode 100644 api/koko_vxlan_conflict_test.go
+
+diff --git a/api/koko_api.go b/api/koko_api.go
+index 8a49612..ef086f6 100644
+--- a/api/koko_api.go
++++ b/api/koko_api.go
+@@ -8,9 +8,11 @@ import (
+ 	"encoding/binary"
+ 	"errors"
+ 	"fmt"
++	"hash/fnv"
+ 	"net"
+ 	"os"
+ 	"strings"
++	"sync"
+ 	"syscall"
+ 	"time"
+ 
+@@ -67,6 +69,8 @@ type MacVLan struct {
+ 	Mode     netlink.MacvlanMode // MacVlan mode
+ }
+ 
++var vxlanCreateMu sync.Mutex
++
+ // getRandomIFName generates random string for unique interface name
+ func getRandomIFName() string {
+ 	var buf [4]byte
+@@ -118,8 +122,54 @@ func GetVethPair(name1 string, name2 string) (link1 netlink.Link,
+ 	return
+ }
+ 
++func hashParts(parts ...string) uint64 {
++	h := fnv.New64a()
++	for _, part := range parts {
++		_, _ = h.Write([]byte(part))
++		_, _ = h.Write([]byte{0})
++	}
++	return h.Sum64()
++}
++
++func vxlanOwnerKey(veth VEth) string {
++	return fmt.Sprintf("%016x", hashParts(veth.NsName, veth.LinkName))
++}
++
++func vxlanSpecKey(vxlan VxLan) string {
++	return fmt.Sprintf("%016x", hashParts(
++		vxlan.ParentIF,
++		fmt.Sprintf("%d", vxlan.ID),
++		vxlan.IPAddr.String(),
++		fmt.Sprintf("%d", normalizedVXLANPort(vxlan.UDPPort)),
++		fmt.Sprintf("%d", vxlan.MTU),
++	))
++}
++
++func vxlanOwnerAlias(veth VEth, vxlan VxLan) string {
++	return fmt.Sprintf("koko:vxlan:%s:%s", vxlanOwnerKey(veth), vxlanSpecKey(vxlan))
++}
++
++func vxlanAliasMatchesOwner(alias, ownerKey string) bool {
++	return strings.HasPrefix(alias, "koko:vxlan:"+ownerKey+":")
++}
++
++func legacyVxlanOwnerAlias(veth VEth, vxlan VxLan) string {
++	return fmt.Sprintf("koko:vxlan:%016x", hashParts(
++		veth.NsName,
++		veth.LinkName,
++		vxlan.ParentIF,
++		fmt.Sprintf("%d", vxlan.ID),
++		vxlan.IPAddr.String(),
++		fmt.Sprintf("%d", normalizedVXLANPort(vxlan.UDPPort)),
++	))
++}
++
+ // AddVxLanInterface creates VxLan interface by given vxlan object
+ func AddVxLanInterface(vxlan VxLan, devName string) (err error) {
++	return addVxLanInterface(vxlan, devName, "")
++}
++
++func addVxLanInterface(vxlan VxLan, devName, ownerAlias string) (err error) {
+ 	var parentIF netlink.Link
+ 	logger.Infof("koko: create vxlan link %s under %s", devName, vxlan.ParentIF)
+ 	UDPPort := 4789
+@@ -136,6 +186,7 @@ func AddVxLanInterface(vxlan VxLan, devName string) (err error) {
+ 		LinkAttrs: netlink.LinkAttrs{
+ 			Name:   devName,
+ 			TxQLen: 1000,
++			Alias:  ownerAlias,
+ 		},
+ 		VxlanId:      vxlan.ID,
+ 		VtepDevIndex: parentIF.Attrs().Index,
+@@ -151,7 +202,7 @@ func AddVxLanInterface(vxlan VxLan, devName string) (err error) {
+ 	err = netlink.LinkAdd(&vxlanconf)
+ 
+ 	if err != nil {
+-		return fmt.Errorf("Failed to add vxlan %s: %v", devName, err)
++		return fmt.Errorf("Failed to add vxlan %s: %w", devName, err)
+ 	}
+ 	return nil
+ }
+@@ -699,24 +750,332 @@ func removeLinkInNSIfExists(nsName, linkName string) error {
+ 	})
+ }
+ 
++func normalizedVXLANPort(port int) int {
++	if port == 0 {
++		return 4789
++	}
++	return port
++}
++
++func sameIP(a, b net.IP) bool {
++	if a == nil || b == nil {
++		return a == nil && b == nil
++	}
++	return a.Equal(b)
++}
++
++func sameVxLanSpec(existing *netlink.Vxlan, vxlan VxLan, parentIndex int) bool {
++	if existing == nil || existing.Attrs() == nil {
++		return false
++	}
++	if existing.VxlanId != vxlan.ID {
++		return false
++	}
++	if parentIndex > 0 && existing.VtepDevIndex > 0 && existing.VtepDevIndex != parentIndex {
++		return false
++	}
++	if normalizedVXLANPort(existing.Port) != normalizedVXLANPort(vxlan.UDPPort) {
++		return false
++	}
++	if !sameIP(existing.Group, vxlan.IPAddr) {
++		return false
++	}
++	if vxlan.MTU != 0 && existing.Attrs().MTU != 0 && existing.Attrs().MTU != vxlan.MTU {
++		return false
++	}
++	return true
++}
++
++func linkByNameInNS(nsName, linkName string) (netlink.Link, error) {
++	var vethNs ns.NetNS
++	var err error
++	if nsName == "" {
++		if vethNs, err = ns.GetCurrentNS(); err != nil {
++			return nil, err
++		}
++	} else {
++		if vethNs, err = ns.GetNS(nsName); err != nil {
++			return nil, err
++		}
++	}
++	defer vethNs.Close()
++
++	var link netlink.Link
++	err = vethNs.Do(func(_ ns.NetNS) error {
++		link, err = netlink.LinkByName(linkName)
++		return err
++	})
++	return link, err
++}
++
++func ensureExistingVxLan(veth VEth, vxlan VxLan, parentIndex int, ownerKey string) (bool, error) {
++	link, err := linkByNameInNS(veth.NsName, veth.LinkName)
++	if err != nil {
++		if _, notFound := err.(netlink.LinkNotFoundError); notFound {
++			return false, nil
++		}
++		return false, err
++	}
++	existing, ok := link.(*netlink.Vxlan)
++	if !ok {
++		return false, fmt.Errorf("target link %s exists in %s but is not desired vxlan: type=%T", veth.LinkName, veth.NsName, link)
++	}
++	if !sameVxLanSpec(existing, vxlan, parentIndex) {
++		alias := ""
++		if existing.Attrs() != nil {
++			alias = existing.Attrs().Alias
++		}
++		if vxlanAliasMatchesOwner(alias, ownerKey) || alias == legacyVxlanOwnerAlias(veth, vxlan) {
++			logger.Warnf("koko: deleting owned stale vxlan %s in %s alias=%s owner=%s", veth.LinkName, veth.NsName, alias, ownerKey)
++			if err := removeLinkInNSIfExists(veth.NsName, veth.LinkName); err != nil {
++				return false, err
++			}
++			return false, nil
++		}
++		return false, fmt.Errorf("target link %s exists in %s but vxlan tuple does not match desired owner=%s alias=%s", veth.LinkName, veth.NsName, ownerKey, alias)
++	}
++	if err := configureLinkInNS(veth); err != nil {
++		return false, err
++	}
++	return true, nil
++}
++
++func configureLinkInNS(veth VEth) error {
++	var vethNs ns.NetNS
++	var err error
++	if veth.NsName == "" {
++		if vethNs, err = ns.GetCurrentNS(); err != nil {
++			return err
++		}
++	} else {
++		if vethNs, err = ns.GetNS(veth.NsName); err != nil {
++			return err
++		}
++	}
++	defer vethNs.Close()
++
++	return vethNs.Do(func(_ ns.NetNS) error {
++		link, err := netlink.LinkByName(veth.LinkName)
++		if err != nil {
++			return err
++		}
++		if err := netlink.LinkSetUp(link); err != nil {
++			return err
++		}
++		for i := 0; i < len(veth.IPAddr); i++ {
++			addr := &netlink.Addr{IPNet: &veth.IPAddr[i], Label: ""}
++			if err := netlink.AddrAdd(link, addr); err != nil {
++				if errors.Is(err, syscall.EEXIST) || strings.Contains(err.Error(), "file exists") {
++					continue
++				}
++				return err
++			}
++		}
++		return nil
++	})
++}
++
++func hostVxLanConflicts(vxlan VxLan, requestedName string) ([]*netlink.Vxlan, error) {
++	parentIF, err := netlink.LinkByName(vxlan.ParentIF)
++	if err != nil {
++		return nil, fmt.Errorf("failed to get %s: %w", vxlan.ParentIF, err)
++	}
++	udpPort := normalizedVXLANPort(vxlan.UDPPort)
++	links, err := netlink.LinkList()
++	if err != nil {
++		return nil, err
++	}
++	conflicts := []*netlink.Vxlan{}
++	for _, link := range links {
++		existing, _ := link.(*netlink.Vxlan)
++		if !isConflictingHostVxLan(existing, vxlan.ID, parentIF.Attrs().Index, udpPort, requestedName) {
++			continue
++		}
++		conflicts = append(conflicts, existing)
++	}
++	return conflicts, nil
++}
++
++func removeOwnedConflictingVxLanIfExists(vxlan VxLan, requestedName, ownerKey string) (bool, error) {
++	conflicts, err := hostVxLanConflicts(vxlan, requestedName)
++	if err != nil {
++		return false, err
++	}
++	for _, existing := range conflicts {
++		if existing == nil || existing.Attrs() == nil || !vxlanAliasMatchesOwner(existing.Attrs().Alias, ownerKey) {
++			continue
++		}
++		logger.Warnf(
++			"koko: deleting owned conflicting host vxlan link %s with id=%d parent=%s requested_name=%s requested_peer=%s existing_peer=%s owner=%s alias=%s",
++			existing.Attrs().Name,
++			vxlan.ID,
++			vxlan.ParentIF,
++			requestedName,
++			vxlan.IPAddr.String(),
++			existing.Group.String(),
++			ownerKey,
++			existing.Attrs().Alias,
++		)
++		return true, netlink.LinkDel(existing)
++	}
++	return false, nil
++}
++
++func describeHostVxLanConflicts(vxlan VxLan, requestedName string) string {
++	conflicts, err := hostVxLanConflicts(vxlan, requestedName)
++	if err != nil {
++		return fmt.Sprintf("conflict_scan_error=%v", err)
++	}
++	if len(conflicts) == 0 {
++		return "conflicts=[]"
++	}
++	parts := make([]string, 0, len(conflicts))
++	for _, existing := range conflicts {
++		if existing == nil || existing.Attrs() == nil {
++			continue
++		}
++		parts = append(parts, fmt.Sprintf(
++			"name=%s alias=%s vni=%d parentIndex=%d port=%d peer=%s",
++			existing.Attrs().Name,
++			existing.Attrs().Alias,
++			existing.VxlanId,
++			existing.VtepDevIndex,
++			normalizedVXLANPort(existing.Port),
++			existing.Group.String(),
++		))
++	}
++	return "conflicts=[" + strings.Join(parts, ";") + "]"
++}
++
++func isConflictingHostVxLan(existing *netlink.Vxlan, vni, parentIndex, udpPort int, requestedName string) bool {
++	if existing == nil || existing.Attrs() == nil {
++		return false
++	}
++	if requestedName != "" && existing.Attrs().Name == requestedName {
++		return true
++	}
++	if existing.VxlanId != vni {
++		return false
++	}
++	if existing.VtepDevIndex != parentIndex {
++		return false
++	}
++	if normalizedVXLANPort(existing.Port) != normalizedVXLANPort(udpPort) {
++		return false
++	}
++
++	// Linux rejects duplicate host VXLANs for the same VNI/lower device/port.
++	// Treat that tuple as the ownership key, not the transient staging name.
++	return true
++}
++
++func vxlanLockPaths() []string {
++	if path := strings.TrimSpace(os.Getenv("KOKO_VXLAN_LOCK")); path != "" {
++		return []string{path}
++	}
++	// /opt/cni/bin is a hostPath mounted into meshnetd and is also the host path
++	// used by kubelet when it executes the CNI plugin. /run is container-local
++	// for meshnetd, so it cannot coordinate plugin/daemon VXLAN staging.
++	return []string{"/opt/cni/bin/.koko-vxlan-create.lock", "/var/run/netns/.koko-vxlan-create.lock", "/run/koko-vxlan-create.lock"}
++}
++
++func acquireVXLANCreateLock() func() {
++	vxlanCreateMu.Lock()
++	var lastErr error
++	for _, path := range vxlanLockPaths() {
++		lockFile, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
++		if err != nil {
++			lastErr = err
++			continue
++		}
++		if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
++			lastErr = err
++			_ = lockFile.Close()
++			continue
++		}
++		return func() {
++			_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
++			_ = lockFile.Close()
++			vxlanCreateMu.Unlock()
++		}
++	}
++	logger.Warnf("koko: continuing without vxlan create file lock: %+v", lastErr)
++	return func() {
++		vxlanCreateMu.Unlock()
++	}
++}
++
+ // MakeVxLan makes vxlan interface and put it into container namespace
+ func MakeVxLan(veth1 VEth, vxlan VxLan) (err error) {
+ 	var link netlink.Link
+ 	tempLinkName1 := veth1.LinkName
++	const maxVXLANAttempts = 5
+ 
+-	if veth1.NsName != "" {
+-		tempLinkName1 = getRandomIFName()
++	unlockVXLANCreate := acquireVXLANCreateLock()
++	defer unlockVXLANCreate()
++
++	parentIF, err := netlink.LinkByName(vxlan.ParentIF)
++	if err != nil {
++		return fmt.Errorf("vxlan ensure failed: parent interface %s: %w", vxlan.ParentIF, err)
++	}
++	parentIndex := parentIF.Attrs().Index
++	ownerKey := vxlanOwnerKey(veth1)
++	ownerAlias := vxlanOwnerAlias(veth1, vxlan)
++	if ok, err := ensureExistingVxLan(veth1, vxlan, parentIndex, ownerKey); err != nil {
++		return fmt.Errorf("vxlan ensure failed: %w", err)
++	} else if ok {
++		logger.Infof("koko: vxlan %s already exists in %s and matches desired owner=%s", veth1.LinkName, veth1.NsName, ownerAlias)
++		return nil
+ 	}
+ 
+-	if err = AddVxLanInterface(vxlan, tempLinkName1); err != nil {
+-		if err != nil {
+-			// retry once if failed. thanks meshnet-cni to pointing it out!
+-			logger.Errorf("koko: cannot create vxlan interface: %+v. Retrying...", err)
+-			veth1.RemoveVethLink()
+-			if err = AddVxLanInterface(vxlan, tempLinkName1); err != nil {
+-				return fmt.Errorf("vxlan add failed: %v", err)
++	for attempt := 1; attempt <= maxVXLANAttempts; attempt++ {
++		tempLinkName1 = veth1.LinkName
++		if veth1.NsName != "" {
++			tempLinkName1 = getRandomIFName()
++		}
++
++		if err = addVxLanInterface(vxlan, tempLinkName1, ownerAlias); err != nil {
++			_ = removeLinkIfExists(tempLinkName1)
++			if errors.Is(err, syscall.EEXIST) || strings.Contains(err.Error(), "file exists") {
++				cleaned, cleanupErr := removeOwnedConflictingVxLanIfExists(vxlan, tempLinkName1, ownerKey)
++				if cleanupErr != nil {
++					logger.Warnf(
++						"koko: failed conflicting vxlan cleanup for id=%d parent=%s temp=%s peer=%s: %+v",
++						vxlan.ID,
++						vxlan.ParentIF,
++						tempLinkName1,
++						vxlan.IPAddr.String(),
++						cleanupErr,
++					)
++				}
++				if !cleaned {
++					return fmt.Errorf(
++						"vxlan add failed: unowned host vxlan conflict for id=%d parent=%s temp=%s peer=%s owner=%s alias=%s: %w; %s",
++						vxlan.ID,
++						vxlan.ParentIF,
++						tempLinkName1,
++						vxlan.IPAddr.String(),
++						ownerKey,
++						ownerAlias,
++						err,
++						describeHostVxLanConflicts(vxlan, tempLinkName1),
++					)
++				}
++				logger.Warnf(
++					"koko: cleaned owned vxlan conflict for %s on attempt %d/%d: %+v. Retrying...",
++					tempLinkName1,
++					attempt,
++					maxVXLANAttempts,
++					err,
++				)
++				continue
+ 			}
++			return fmt.Errorf("vxlan add failed: %w", err)
+ 		}
++		break
++	}
++	if err != nil {
++		return fmt.Errorf("vxlan add failed after %d attempts: %w", maxVXLANAttempts, err)
+ 	}
+ 
+ 	if link, err = netlink.LinkByName(tempLinkName1); err != nil {
+@@ -724,7 +1083,8 @@ func MakeVxLan(veth1 VEth, vxlan VxLan) (err error) {
+ 	}
+ 
+ 	if err = veth1.SetVethLink(link); err != nil {
+-		netlink.LinkDel(link)
++		_ = netlink.LinkDel(link)
++		_ = removeLinkInNSIfExists(veth1.NsName, tempLinkName1)
+ 		return fmt.Errorf("Cannot add IPaddr/netns failed: %v", err)
+ 	}
+ 
+diff --git a/api/koko_vxlan_conflict_test.go b/api/koko_vxlan_conflict_test.go
+new file mode 100644
+index 0000000..4927b06
+--- /dev/null
++++ b/api/koko_vxlan_conflict_test.go
+@@ -0,0 +1,144 @@
++package api
++
++import (
++	"net"
++	"testing"
++
++	"github.com/vishvananda/netlink"
++)
++
++func TestIsConflictingHostVxLanMatchesKernelOwnershipTuple(t *testing.T) {
++	link := &netlink.Vxlan{
++		LinkAttrs:    netlink.LinkAttrs{Name: "meshnet-leftover"},
++		VxlanId:      12345,
++		VtepDevIndex: 7,
++		Port:         4789,
++	}
++
++	if !isConflictingHostVxLan(link, 12345, 7, 4789, "koko-new") {
++		t.Fatalf("expected VXLAN with same VNI, parent and UDP port to conflict regardless of name")
++	}
++}
++
++func TestIsConflictingHostVxLanNormalizesDefaultUDPPort(t *testing.T) {
++	link := &netlink.Vxlan{
++		LinkAttrs:    netlink.LinkAttrs{Name: "meshnet-leftover"},
++		VxlanId:      12345,
++		VtepDevIndex: 7,
++		Port:         0,
++	}
++
++	if !isConflictingHostVxLan(link, 12345, 7, 4789, "koko-new") {
++		t.Fatalf("expected zero existing UDP port to normalize to the VXLAN default port")
++	}
++}
++
++func TestIsConflictingHostVxLanMatchesRequestedStagingName(t *testing.T) {
++	link := &netlink.Vxlan{
++		LinkAttrs:    netlink.LinkAttrs{Name: "koko123"},
++		VxlanId:      1,
++		VtepDevIndex: 2,
++		Port:         4789,
++	}
++
++	if !isConflictingHostVxLan(link, 999, 9, 9999, "koko123") {
++		t.Fatalf("expected requested staging-name collision to conflict")
++	}
++}
++
++func TestIsConflictingHostVxLanIgnoresDifferentTuple(t *testing.T) {
++	link := &netlink.Vxlan{
++		LinkAttrs:    netlink.LinkAttrs{Name: "meshnet-other"},
++		VxlanId:      12345,
++		VtepDevIndex: 7,
++		Port:         4789,
++	}
++
++	if isConflictingHostVxLan(link, 12345, 8, 4789, "koko-new") {
++		t.Fatalf("different parent must not conflict")
++	}
++	if isConflictingHostVxLan(link, 12345, 7, 4790, "koko-new") {
++		t.Fatalf("different UDP port must not conflict")
++	}
++}
++
++func TestSameVxLanSpecMatchesDesiredTuple(t *testing.T) {
++	link := &netlink.Vxlan{
++		LinkAttrs:    netlink.LinkAttrs{Name: "eth1", MTU: 1450},
++		VxlanId:      12345,
++		VtepDevIndex: 7,
++		Port:         0,
++		Group:        net.ParseIP("192.0.2.10"),
++	}
++	desired := VxLan{
++		ParentIF: "breth2",
++		ID:       12345,
++		IPAddr:   net.ParseIP("192.0.2.10"),
++		UDPPort:  4789,
++		MTU:      1450,
++	}
++
++	if !sameVxLanSpec(link, desired, 7) {
++		t.Fatalf("expected VXLAN with same VNI, parent, normalized port, peer, and MTU to match")
++	}
++}
++
++func TestSameVxLanSpecRejectsDifferentPeer(t *testing.T) {
++	link := &netlink.Vxlan{
++		LinkAttrs:    netlink.LinkAttrs{Name: "eth1"},
++		VxlanId:      12345,
++		VtepDevIndex: 7,
++		Port:         4789,
++		Group:        net.ParseIP("192.0.2.10"),
++	}
++	desired := VxLan{
++		ParentIF: "breth2",
++		ID:       12345,
++		IPAddr:   net.ParseIP("192.0.2.11"),
++		UDPPort:  4789,
++	}
++
++	if sameVxLanSpec(link, desired, 7) {
++		t.Fatalf("VXLANs with different peers must not be treated as desired")
++	}
++}
++
++func TestVxlanOwnerAliasStableAndSpecific(t *testing.T) {
++	veth := VEth{NsName: "/var/run/netns/cni-a", LinkName: "eth1"}
++	vxlan := VxLan{ParentIF: "breth2", ID: 12345, IPAddr: net.ParseIP("192.0.2.10"), UDPPort: 4789}
++
++	first := vxlanOwnerAlias(veth, vxlan)
++	second := vxlanOwnerAlias(veth, vxlan)
++	if first == "" || first != second {
++		t.Fatalf("owner alias should be stable, got %q and %q", first, second)
++	}
++	ownerKey := vxlanOwnerKey(veth)
++	if !vxlanAliasMatchesOwner(first, ownerKey) {
++		t.Fatalf("owner alias %q should match owner key %q", first, ownerKey)
++	}
++
++	vxlan.IPAddr = net.ParseIP("192.0.2.11")
++	changed := vxlanOwnerAlias(veth, vxlan)
++	if first == changed {
++		t.Fatalf("owner alias must change when desired VXLAN tuple changes")
++	}
++	if !vxlanAliasMatchesOwner(changed, ownerKey) {
++		t.Fatalf("changed spec alias %q should still match owner key %q", changed, ownerKey)
++	}
++}
++
++func TestVxlanLockPathsDefaultsToSharedHostPath(t *testing.T) {
++	t.Setenv("KOKO_VXLAN_LOCK", "")
++	paths := vxlanLockPaths()
++	if len(paths) == 0 || paths[0] != "/opt/cni/bin/.koko-vxlan-create.lock" {
++		t.Fatalf("vxlanLockPaths()[0] = %q, want shared /opt/cni/bin lock path", paths)
++	}
++}
++
++func TestVxlanLockPathsHonorsExplicitOverride(t *testing.T) {
++	t.Setenv("KOKO_VXLAN_LOCK", "/tmp/custom.lock")
++	paths := vxlanLockPaths()
++	if len(paths) != 1 || paths[0] != "/tmp/custom.lock" {
++		t.Fatalf("vxlanLockPaths() = %q, want explicit override only", paths)
++	}
++}
+-- 
+2.55.0
+

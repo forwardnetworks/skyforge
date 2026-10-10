@@ -1,0 +1,286 @@
+From 69f37d512250ebe27e0922a69819121f3fd1d692 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sat, 18 Jul 2026 08:21:42 -0500
+Subject: [PATCH 9/9] plugin,daemon: damp the sandbox-churn feedback loop
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Kubelet retries failed sandbox creation every few seconds with no
+meaningful backoff, so any meshnet ADD failure mode that a retry cannot fix
+becomes a permanent ~3s create/teardown loop that also drags every peer of
+the pod through interface flaps and skip-list rewrites. Reduce both the
+loop's fuel and its noise:
+
+- Park, do not fail, on peer instability: when EnsureVethWire reports the
+  PEER pod's netns vanished (koko.NamespaceGoneError for the peer's
+  namespace), set the existing Skip flag and continue — identical to the
+  established peer-not-alive contract; the peer completes the wire on its
+  own next ADD. A vanished LOCAL netns still fails the ADD (our sandbox is
+  genuinely bad).
+- Collect genuine same-node wiring failures per link (errors.Join) instead
+  of aborting at the first one: one bad link no longer hides the state of
+  the other nine, and the combined error names every failed link.
+- cmdDel refuses to remove protected interface names (eth0/lo/empty) as
+  defense in depth; the delegated interface is untouchable in every path.
+- SkipReverse's own-list filter dropped every entry sharing EITHER the
+  peer name OR the link id (De Morgan bug); entries are now removed only
+  on an exact (peer, linkId) match via keepSkippedEntry.
+- DeletePodWires logged '[WIRE-DELETE]:All grpc-wires ... deleted' at Info
+  on every CNI DEL even with zero wires — reading as gRPC overlay churn in
+  same-node/VXLAN labs during sandbox retry loops. The no-op case now logs
+  at Debug; the real case reports the count.
+
+Upstreamable.
+---
+ daemon/grpcwire/grpcwire.go    | 11 ++++++-
+ daemon/meshnet/handler.go      | 11 ++++++-
+ daemon/meshnet/handler_test.go | 30 +++++++++++++++++++
+ plugin/meshnet.go              | 54 +++++++++++++++++++++++++++++++++-
+ plugin/meshnet_damping_test.go | 33 +++++++++++++++++++++
+ 5 files changed, 136 insertions(+), 3 deletions(-)
+ create mode 100644 daemon/meshnet/handler_test.go
+ create mode 100644 plugin/meshnet_damping_test.go
+
+diff --git a/daemon/grpcwire/grpcwire.go b/daemon/grpcwire/grpcwire.go
+index 45de3cc..9cf93c6 100644
+--- a/daemon/grpcwire/grpcwire.go
++++ b/daemon/grpcwire/grpcwire.go
+@@ -214,11 +214,13 @@ func DeleteWire(wire *GRPCWire) int {
+ // This function clear up the in-memory data base as well as the K8S Datastore.
+ func DeletePodWires(namespace string, podName string) error {
+ 	var errs errlist.List
++	removed := 0
+ 	for {
+ 		aW, _ := ExtractOneWireByPod(namespace, podName)
+ 		if aW == nil {
+ 			break
+ 		}
++		removed++
+ 
+ 		// Since this wire is already extracted, so it no more preset in in-memory-map. Next we need to clear only the K8S data store.
+ 		if err := RemoveWireAcrosAll(aW, false); err != nil {
+@@ -231,7 +233,14 @@ func DeletePodWires(namespace string, podName string) error {
+ 	if errs.Err() != nil {
+ 		return fmt.Errorf("[WIRE-DELETE]:failed to remove all grpc-wires for pod %s@%s: %w", podName, namespace, errs.Err())
+ 	}
+-	grpcOvrlyLogger.Infof("[WIRE-DELETE]:All grpc-wires for pod %s:%s is deleted", namespace, podName)
++	if removed > 0 {
++		grpcOvrlyLogger.Infof("[WIRE-DELETE]:All %d grpc-wires for pod %s:%s are deleted", removed, namespace, podName)
++	} else {
++		// Pods without grpc wires (same-node links, VXLAN mode) hit this on
++		// every CNI DEL; an Info line here reads like overlay churn during
++		// sandbox retry loops, so keep the no-op case quiet.
++		grpcOvrlyLogger.Debugf("[WIRE-DELETE]:No grpc-wires to delete for pod %s:%s", namespace, podName)
++	}
+ 	return nil
+ }
+ 
+diff --git a/daemon/meshnet/handler.go b/daemon/meshnet/handler.go
+index 9e6295e..a88cc58 100644
+--- a/daemon/meshnet/handler.go
++++ b/daemon/meshnet/handler.go
+@@ -243,6 +243,15 @@ func (m *Meshnet) Skip(ctx context.Context, skip *mpb.SkipQuery) (*mpb.BoolRespo
+ 	return &mpb.BoolResponse{Response: true}, nil
+ }
+ 
++// keepSkippedEntry reports whether a skipped-list entry survives removal of
++// the (peer, linkId) tuple. An entry is removed only when BOTH fields match.
++// The historical condition (entryPod != peer && entryLink != linkId) dropped
++// every entry sharing EITHER the pod name OR the link id, silently wiping
++// unrelated skip state for multi-link peers.
++func keepSkippedEntry(entryPod string, entryLink int64, peer string, linkID int64) bool {
++	return entryPod != peer || entryLink != linkID
++}
++
+ // Clean up function SkipReverse is called when a pod is getting deleted. It gets called once for every link the pod has.
+ // Anytime a pod is destroyed, for a link, it inserts itself along with its link-id in the skip list of its' peers on the link.
+ // It removes the the peer (and connecting link UID) from its own skip list.
+@@ -358,7 +367,7 @@ func (m *Meshnet) SkipReverse(ctx context.Context, skip *mpb.SkipQuery) (*mpb.Bo
+ 				mnetdLogger.Errorf("skipReverse : unable to retrieve Skipped: %v", err)
+ 				continue
+ 			}
+-			if skipped.PodName != skip.Peer && skipped.LinkId != skip.LinkId {
++			if keepSkippedEntry(skipped.PodName, skipped.LinkId, skip.Peer, skip.LinkId) {
+ 				mnetdLogger.Infof("Appending new element %s@%d", skipped.PodName, skipped.LinkId)
+ 				newThisSkipped = append(newThisSkipped, elSkipped)
+ 			}
+diff --git a/daemon/meshnet/handler_test.go b/daemon/meshnet/handler_test.go
+new file mode 100644
+index 0000000..df03a29
+--- /dev/null
++++ b/daemon/meshnet/handler_test.go
+@@ -0,0 +1,30 @@
++package meshnet
++
++import "testing"
++
++// TestKeepSkippedEntryRemovesOnlyExactTuple is the regression test for the
++// SkipReverse filter: an entry leaves the pod's own skipped list only when
++// BOTH the peer name AND the link id match the tuple being cleared.
++func TestKeepSkippedEntryRemovesOnlyExactTuple(t *testing.T) {
++	cases := []struct {
++		name      string
++		entryPod  string
++		entryLink int64
++		peer      string
++		linkID    int64
++		keep      bool
++	}{
++		{"exact match is removed", "br1", 4, "br1", 4, false},
++		{"same peer different link survives", "br1", 5, "br1", 4, true},
++		{"different peer same link survives", "br2", 4, "br1", 4, true},
++		{"unrelated entry survives", "br2", 9, "br1", 4, true},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			if got := keepSkippedEntry(tc.entryPod, tc.entryLink, tc.peer, tc.linkID); got != tc.keep {
++				t.Fatalf("keepSkippedEntry(%q,%d,%q,%d) = %t, want %t",
++					tc.entryPod, tc.entryLink, tc.peer, tc.linkID, got, tc.keep)
++			}
++		})
++	}
++}
+diff --git a/plugin/meshnet.go b/plugin/meshnet.go
+index 53c6783..ecd3e9f 100644
+--- a/plugin/meshnet.go
++++ b/plugin/meshnet.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"encoding/binary"
+ 	"encoding/json"
++	"errors"
+ 	"fmt"
+ 	"hash/fnv"
+ 	"net"
+@@ -349,6 +350,21 @@ func protectedIfName(name string) bool {
+ 	return name == "" || name == "eth0" || name == "lo"
+ }
+ 
++// peerNotReady reports whether err means the PEER pod's network namespace
++// vanished (its sandbox is being torn down or recreated). That is a normal
++// transient during churn: the link is parked exactly like the
++// peer-not-alive case and the peer completes the wire on its own next ADD,
++// instead of this pod failing its whole ADD and feeding the teardown loop.
++// A vanished LOCAL namespace is NOT peer-not-ready: our own sandbox is bad
++// and the ADD must fail so kubelet replaces it.
++func peerNotReady(err error, peerNetNS string) bool {
++	var nsErr *koko.NamespaceGoneError
++	if !errors.As(err, &nsErr) {
++		return false
++	}
++	return strings.TrimSpace(peerNetNS) != "" && nsErr.NsName == peerNetNS
++}
++
+ // rollbackCreatedLinks removes the local ends of fabric links realized by a
+ // failed CNI ADD so the next attempt starts from a clean slate. Only
+ // local-namespace ends are recorded by cmdAdd: removing one veth end removes
+@@ -475,6 +491,11 @@ func cmdAdd(args *skel.CmdArgs) (retErr error) {
+ 		return err
+ 	}
+ 	log.Infof("Add[%s]: Starting to traverse %d of %d links for CNI interface %q", string(cniArgs.K8S_POD_NAME), len(links), len(localPod.Links), requestedIntf)
++	// Genuine same-node wiring failures are collected per link instead of
++	// aborting at the first one, so one bad link does not hide the state of
++	// the rest; infrastructure failures (daemon RPCs, vxlan/grpc wiring)
++	// still fail fast.
++	var linkErrs []error
+ 	for _, link := range links { // Iterate over each link of the local pod
+ 		// Build koko's veth struct for local intf
+ 		myVeth, err := makeVeth(args.Netns, link.LocalIntf, link.LocalIp)
+@@ -544,8 +565,31 @@ func cmdAdd(args *skel.CmdArgs) (retErr error) {
+ 				// fatal to the entire multi-link ADD.
+ 				alias := koko.VethWireAlias(string(cniArgs.K8S_POD_NAMESPACE), link.Uid)
+ 				if err := koko.EnsureVethWire(*myVeth, *peerVeth, alias); err != nil {
++					if peerNotReady(err, peerPod.NetNs) {
++						// The peer's sandbox vanished mid-wire (it is being
++						// recreated). Park this link like the peer-not-alive
++						// case: set the skip flag and move on; the peer
++						// completes the wire on its own next ADD.
++						log.Warnf("Add[%s]: parking link %s (link id %d): peer pod %s not ready: %v", string(cniArgs.K8S_POD_NAME), link.LocalIntf, link.Uid, peerPod.Name, err)
++						ok, serr := meshnetClient.Skip(ctx, &mpb.SkipQuery{
++							Pod:    localPod.Name,
++							Peer:   peerPod.Name,
++							LinkId: link.Uid,
++							KubeNs: string(cniArgs.K8S_POD_NAMESPACE),
++						})
++						if serr != nil {
++							log.Errorf("Add[%s]: Failed to set a skipped flag on peer %s: %v", string(cniArgs.K8S_POD_NAME), peerPod.Name, serr)
++							return serr
++						}
++						if !ok.Response {
++							log.Errorf("Add[%s]: Failed to set a skipped flag on peer %s", string(cniArgs.K8S_POD_NAME), peerPod.Name)
++							return fmt.Errorf("could not set skipped flag on peer %s for link %d", peerPod.Name, link.Uid)
++						}
++						continue
++					}
+ 					log.Errorf("Add[%s]: Error ensuring VEth wire %s (link id %d) with koko: %s", string(cniArgs.K8S_POD_NAME), link.LocalIntf, link.Uid, err)
+-					return err
++					linkErrs = append(linkErrs, fmt.Errorf("link %d (%s): %w", link.Uid, link.LocalIntf, err))
++					continue
+ 				}
+ 				// Record only the local end for rollback: removing it removes
+ 				// the pair, and this sandbox is abandoned on ADD failure
+@@ -624,6 +668,10 @@ func cmdAdd(args *skel.CmdArgs) (retErr error) {
+ 		}
+ 	}
+ 
++	if len(linkErrs) > 0 {
++		return fmt.Errorf("meshnet CNI ADD for pod %s realized %d of %d links: %w", string(cniArgs.K8S_POD_NAME), len(links)-len(linkErrs), len(links), errors.Join(linkErrs...))
++	}
++
+ 	addSucceeded = true
+ 	if n.KubeVirtSecondary {
+ 		return printKubeVirtSecondaryResult(result, n.CNIVersion, requestedIntf)
+@@ -788,6 +836,10 @@ func cmdDel(args *skel.CmdArgs) (retErr error) {
+ 				linkType = "vxlan"
+ 			}
+ 		}
++		if protectedIfName(link.LocalIntf) {
++			log.Warnf("Del: refusing to touch protected interface %q for pod %s", link.LocalIntf, localPod.Name)
++			continue
++		}
+ 		// Creating koko's Veth struct for local intf
+ 		myVeth, err := makeVeth(args.Netns, link.LocalIntf, link.LocalIp)
+ 		if err != nil {
+diff --git a/plugin/meshnet_damping_test.go b/plugin/meshnet_damping_test.go
+new file mode 100644
+index 0000000..056a943
+--- /dev/null
++++ b/plugin/meshnet_damping_test.go
+@@ -0,0 +1,33 @@
++package main
++
++import (
++	"errors"
++	"fmt"
++	"testing"
++
++	koko "github.com/redhat-nfvpe/koko/api"
++)
++
++func TestPeerNotReadyClassifiesPeerNamespaceOnly(t *testing.T) {
++	peerNS := "/var/run/netns/cni-peer"
++	localNS := "/var/run/netns/cni-local"
++
++	peerGone := fmt.Errorf("ensure failed: %w",
++		&koko.NamespaceGoneError{NsName: peerNS, Err: errors.New("no such file or directory")})
++	if !peerNotReady(peerGone, peerNS) {
++		t.Fatal("vanished PEER namespace must classify as peer-not-ready")
++	}
++
++	localGone := fmt.Errorf("ensure failed: %w",
++		&koko.NamespaceGoneError{NsName: localNS, Err: errors.New("no such file or directory")})
++	if peerNotReady(localGone, peerNS) {
++		t.Fatal("vanished LOCAL namespace must NOT classify as peer-not-ready")
++	}
++
++	if peerNotReady(errors.New("file exists"), peerNS) {
++		t.Fatal("generic errors must not classify as peer-not-ready")
++	}
++	if peerNotReady(peerGone, "") {
++		t.Fatal("empty peer netns must not classify as peer-not-ready")
++	}
++}
+-- 
+2.55.0
+

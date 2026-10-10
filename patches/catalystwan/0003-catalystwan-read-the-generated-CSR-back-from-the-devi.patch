@@ -1,0 +1,134 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Thu, 4 Sep 2026 21:40:00 -0500
+Subject: [PATCH] catalystwan: read the generated CSR back from the device record
+
+devices_certificates reported "no CSR" for a CSR that exists. vManage generates
+the CSR ON THE DEVICE and stores it on the DEVICE RECORD; the generate call's
+own response carries inventory columns and no certificate. So read it back and
+publish it under the same response key, in the legacy shape, on every version.
+
+THIS REPLACES THE PREVIOUS 0003, WHICH ALSO DISPATCHED ON THE MANAGER VERSION.
+That half was wrong and is deleted. The reasoning behind it was that the SDK
+splits one endpoint in two:
+
+    @versions("<20.16")   @post("/certificate/generate/csr", "data")
+    def generate_csr(...)      -> DataSequence[DeviceCsrGenerationResponse]
+
+    @versions(">=20.16")  @post("/certificate/generate/csr")
+    def generate_csr_task(...) -> CertActionResponse   # id: UUID
+
+which reads as "20.16 moved this endpoint to an async task". It did not, or at
+least 20.18.4 did not. MEASURED, on a live box:
+
+    TASK [Ask the device to generate a CSR (vmanage)]
+    1 validation error for CertActionResponse
+    id
+      Field required [type=missing,
+       input_value={'header': {'columns': [{...host-name': 'vmanage'}]}]
+
+That is the LEGACY GRID -- header + data -- which is exactly what the pre-20.16
+signature unwraps. Routing a 20.18 Manager to generate_csr_task made the SDK
+parse a grid as a task object and die on the missing id, converting a
+recoverable empty result into a hard failure in the middle of enrolment, after
+the certificate-signing switch had already succeeded. The @versions annotations
+describe the SDK's model of the appliance, not the appliance.
+
+This is the SECOND patch in this fork built on an SDK-declared version rule
+instead of a measurement; the first was patches/catalystwan/0001, deleted today
+for the same reason. The rule is now: a version gate is a claim about the
+appliance and needs an appliance to back it.
+
+Controlled offline against catalystwan 0.41.5.dev2, feeding the observed
+envelope to both models:
+
+    NEG: CertActionResponse rejects the grid: ('id',) missing
+    NEG: reproduces the measured failure exactly (id / missing)
+    POS: generate_csr path parses 1 row(s) ->
+         [{"deviceIP": "10.0.0.1", "host-name": "vmanage"}]
+    POS: no deviceCSR in the grid row -> the device-record read-back is load-bearing
+
+The last line is why only the dispatch half is dropped: the grid genuinely does
+not carry the certificate, so the read-back is still the fix for the original
+"no CSR" report, and netlab 0036 stays retired.
+
+Both spellings are emitted (deviceCSR alias, device_csr field) because callers
+in the wild read either. The read never overwrites a CSR the generate call
+already returned, and a failed read cannot mask a generate that succeeded.
+
+UPSTREAM ASK: FILE. The read-back is a plain bug fix against
+cisco-en-programmability/ansible-collection-catalystwan.
+
+---
+diff --git a/plugins/modules/devices_certificates.py b/plugins/modules/devices_certificates.py
+--- a/plugins/modules/devices_certificates.py
++++ b/plugins/modules/devices_certificates.py
+@@ -213,6 +213,32 @@
+             module.exit_json(**result.model_dump(mode="json"))
+ 
+         payload = TargetDevice(deviceIP=target_device_details.device_ip)
++
++        # SKYFORGE FIX: READ THE CSR BACK FROM THE DEVICE RECORD.
++        #
++        # The generate call itself is left ALONE, deliberately. The SDK splits
++        # this one endpoint in two, by version:
++        #
++        #   @versions("<20.16")  @post("/certificate/generate/csr", "data")
++        #   def generate_csr(...)      -> DataSequence[DeviceCsrGenerationResponse]
++        #
++        #   @versions(">=20.16") @post("/certificate/generate/csr")
++        #   def generate_csr_task(...) -> CertActionResponse   # id: UUID
++        #
++        # and it is tempting to read that as "dispatch on the Manager version".
++        # WE TRIED THAT AND IT WAS WRONG. Measured against live vManage 20.18.4,
++        # the endpoint returns the LEGACY GRID -- {"header": {...}, "data": [...]}
++        # -- which is precisely what the pre-20.16 signature unwraps. Routing a
++        # 20.18 Manager to generate_csr_task made the SDK parse that grid as a
++        # task object and it died on the missing id, turning a recoverable empty
++        # result into a hard failure mid-enrolment. The @versions annotations
++        # describe the SDK's model of the appliance, not the appliance.
++        #
++        # What IS real is that the grid row carries no CSR: the columns are
++        # inventory fields (host-name, deviceIP, ...). vManage generates the CSR
++        # ON THE DEVICE and stores it on the DEVICE RECORD, so read it from
++        # there and publish it under the same response key. That is the whole
++        # defect -- the module reported "no CSR" for a CSR that exists.
+         module.send_request_safely(
+             result=result,
+             action_name="Generate CSR for vManage",
+@@ -221,6 +247,33 @@
+             response_key="generate_csr",
+         )
+ 
++        # RESTORE THE LEGACY RESPONSE SHAPE so a caller reading
++        # response.generate_csr[0].deviceCSR works on every Manager version and
++        # never needs to know which endpoint ran.
++        #
++        # Both spellings are emitted: the pydantic alias is deviceCSR, the model
++        # field is device_csr. Callers in the wild read either, and emitting one
++        # would silently break the other. The read never overwrites a CSR the
++        # generate call already returned, and a failed read cannot mask a
++        # generate that already succeeded.
++        try:
++            regenerated = get_target_device(module=module, device_category="controllers")
++            device_csr = getattr(regenerated, "device_csr", None)
++            if device_csr:
++                existing = result.response.get("generate_csr")
++                already_has_csr = (
++                    isinstance(existing, list)
++                    and existing
++                    and isinstance(existing[0], dict)
++                    and (existing[0].get("deviceCSR") or existing[0].get("device_csr"))
++                )
++                if not already_has_csr:
++                    result.response["generate_csr"] = [
++                        {"deviceCSR": device_csr, "device_csr": device_csr}
++                    ]
++        except Exception:  # noqa: BLE001 - the generate call already succeeded; this is enrichment
++            pass
++
+     if module.params.get("send_to_controllers"):
+         module.execute_action_safely(
+             result,
+-- 
+2.51.0

@@ -1,0 +1,86 @@
+From 90d5b8e16e9456e88d3edaa44544bf14af54efe8 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sat, 18 Jul 2026 08:06:42 -0500
+Subject: [PATCH 1/5] api: fix IsExistLinkInNS always returning false
+
+An unconditional 'result = false' immediately after the 'result = true'
+assignment made IsExistLinkInNS report every link as absent, regardless of
+whether netlink found it. Every existence check built on this helper (koko's
+own CLI check-mode and, more importantly, meshnet-cni's veth/vxlan
+idempotency branches) has therefore been dead at runtime: callers always
+took the neither-link-exists path and blindly re-created links, which
+surfaces as fatal 'failed to rename link kokoNNN -> ethN: file exists'
+collisions whenever the link in fact already existed.
+
+Drop the clobber so the function returns (true, nil) for existing links and
+(false, LinkNotFoundError) for absent ones, preserving the historical error
+contract for absent links.
+
+Upstreamable: the bug is present on redhat-nfvpe/koko master
+(introduced by ab451e0 "Add decent ifname handling in namespaces").
+---
+ api/koko_api.go          |  1 -
+ api/koko_isexist_test.go | 39 +++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 39 insertions(+), 1 deletion(-)
+ create mode 100644 api/koko_isexist_test.go
+
+diff --git a/api/koko_api.go b/api/koko_api.go
+index 68b7bdc..c22116e 100644
+--- a/api/koko_api.go
++++ b/api/koko_api.go
+@@ -799,7 +799,6 @@ func IsExistLinkInNS(nsName string, linkName string) (result bool, err error) {
+ 		if link != nil {
+ 			result = true
+ 		}
+-		result = false
+ 		return err
+ 	})
+ 
+diff --git a/api/koko_isexist_test.go b/api/koko_isexist_test.go
+new file mode 100644
+index 0000000..0115888
+--- /dev/null
++++ b/api/koko_isexist_test.go
+@@ -0,0 +1,39 @@
++package api
++
++import (
++	"testing"
++
++	"github.com/containernetworking/plugins/pkg/ns"
++)
++
++// TestIsExistLinkInNSTruthTable exercises IsExistLinkInNS in the current
++// network namespace: loopback must be reported as existing, a bogus name as
++// absent. This is the regression test for the unconditional `result = false`
++// that made IsExistLinkInNS return false for links that do exist, silently
++// disabling every existence check built on top of it.
++//
++// Entering a netns (even the current one) requires CAP_SYS_ADMIN, so the
++// test skips when running unprivileged.
++func TestIsExistLinkInNSTruthTable(t *testing.T) {
++	cur, err := ns.GetCurrentNS()
++	if err != nil {
++		t.Skipf("cannot open current netns: %v", err)
++	}
++	defer cur.Close()
++	if err := cur.Do(func(_ ns.NetNS) error { return nil }); err != nil {
++		t.Skipf("cannot enter current netns (need CAP_SYS_ADMIN): %v", err)
++	}
++
++	exists, err := IsExistLinkInNS("", "lo")
++	if err != nil {
++		t.Fatalf("IsExistLinkInNS(lo) returned error: %v", err)
++	}
++	if !exists {
++		t.Fatal("IsExistLinkInNS(lo) = false, want true (always-false regression)")
++	}
++
++	exists, _ = IsExistLinkInNS("", "koko-definitely-missing0")
++	if exists {
++		t.Fatal("IsExistLinkInNS(bogus link) = true, want false")
++	}
++}
+-- 
+2.55.0
+

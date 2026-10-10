@@ -1,0 +1,112 @@
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sat, 29 Aug 2026 12:20:00 +0000
+Subject: [PATCH] api: adopt a late wire into the KubeVirt bridge waiting for it
+
+virt-launcher builds k6t-XXXX and enslaves the wire ONCE, at VM start, from
+whatever it finds in the pod netns. meshnet realizes a veth only when BOTH
+endpoints exist, which for a link between two KubeVirt VMs can be after the VM
+has already started. The wire then lands correct, up, and orphaned: the bridge
+holds only its tap, so the VM has no path off the box -- and nothing reports an
+error. The link is present from every angle except traffic.
+
+Measured 2026-08-29 on example-lab-shared: siteB-dis-sw01 and siteB-dis-sw02 each held an
+UP, master-less pod980816f36b7 beside a k6t-980816f36b7 containing only
+tap980816f36b7. Every vJunos-to-vJunos adjacency was 100% loss in both
+directions with ARP never resolving, while vJunos-to-container links on the same
+nodes were fine. Enslaving the two orphans by hand restored all of them to 0%
+loss immediately, which is the proof this is the whole fault.
+
+The analysis system collected all 59 devices green throughout, because collection runs over
+management: a dead fabric certifies clean. The pings caught it, the snapshot
+never would have.
+
+koko 0013 (meshnet-cni) taught the VXLAN path to SEE a KubeVirt-renamed wire.
+This is the same lesson for the veth path: the wire may be realized after the VM
+owns the interface, so the component that creates it must also hand it to the
+bridge.
+
+Deliberately conservative: an absent bridge is the ordinary container case and
+not an error; a link already on that bridge is left alone; and a link owned by a
+DIFFERENT master is never stolen.
+
+diff --git a/api/koko_api.go b/api/koko_api.go
+index 5448046..77473d3 100644
+--- a/api/koko_api.go
++++ b/api/koko_api.go
+@@ -883,6 +883,9 @@ func configureLinkInNS(veth VEth) error {
+ 		if err := netlink.LinkSetUp(link); err != nil {
+ 			return err
+ 		}
++		if err := adoptIntoKubeVirtBridge(veth.LinkName, link); err != nil {
++			return err
++		}
+ 		for i := 0; i < len(veth.IPAddr); i++ {
+ 			addr := &netlink.Addr{IPNet: &veth.IPAddr[i], Label: ""}
+ 			if err := netlink.AddrAdd(link, addr); err != nil {
+@@ -896,6 +899,66 @@ func configureLinkInNS(veth VEth) error {
+ 	})
+ }
+ 
++// kubeVirtBridgeName mirrors virt-launcher's bridge-binding convention: it
++// fronts pod interface XXXX with a linux bridge k6t-XXXX and a tap, then
++// enslaves the pod interface (renamed XXXX-nic) to that bridge. The VM reaches
++// the wire only through the bridge.
++func kubeVirtBridgeName(linkName string) string {
++	return "k6t-" + linkName
++}
++
++// adoptIntoKubeVirtBridge enslaves a freshly realized wire end to the KubeVirt
++// bridge that is already waiting for it.
++//
++// WHY THIS EXISTS. virt-launcher builds k6t-XXXX and enslaves the wire ONCE, at
++// VM start, from whatever it finds in the pod netns. meshnet realizes a veth
++// when BOTH endpoints exist, which for a link between two KubeVirt VMs can be
++// after the VM has already started. The wire then lands in the netns correct,
++// up, and orphaned: the bridge holds only its tap, so the VM has no path off
++// the box and nothing reports an error -- the link looks present from every
++// angle except traffic.
++//
++// Measured 2026-08-29 on example-lab-shared: siteB-dis-sw01 and siteB-dis-sw02 each held
++// an UP, master-less pod980816f36b7 beside a k6t-980816f36b7 containing only
++// tap980816f36b7. Every vJunos-to-vJunos adjacency was 100% loss in both
++// directions with ARP never resolving, while vJunos-to-container links on the
++// same nodes were fine. The analysis system still collected all 59 devices green, because
++// collection runs over management -- a dead fabric certifies clean.
++//
++// Enslaving here is the same repair, done by the component that owns the wire.
++//
++// DELIBERATELY CONSERVATIVE: absent bridge is the ordinary container case and
++// is not an error; a link already enslaved to that bridge is left alone; and a
++// link owned by a DIFFERENT master is never stolen -- that is someone else's
++// topology decision, not ours to override.
++func adoptIntoKubeVirtBridge(linkName string, link netlink.Link) error {
++	br, err := netlink.LinkByName(kubeVirtBridgeName(linkName))
++	if err != nil {
++		// No KubeVirt bridge fronting this wire: a plain container pod.
++		return nil
++	}
++	bridge, ok := br.(*netlink.Bridge)
++	if !ok {
++		return nil
++	}
++	if link.Attrs().MasterIndex == bridge.Attrs().Index {
++		return nil
++	}
++	if link.Attrs().MasterIndex != 0 {
++		return nil
++	}
++	if err := netlink.LinkSetMaster(link, bridge); err != nil {
++		return fmt.Errorf("adopt %s into KubeVirt bridge %s: %w",
++			linkName, bridge.Attrs().Name, err)
++	}
++	// Enslaving can clear the operational state; make the wire usable.
++	if err := netlink.LinkSetUp(link); err != nil {
++		return fmt.Errorf("adopt %s into KubeVirt bridge %s: set up: %w",
++			linkName, bridge.Attrs().Name, err)
++	}
++	return nil
++}
++
+ // hostVxLanConflicts finds vxlans already holding this VNI.
+ //
+ // SCOPE WARNING, learned the hard way. This scans netlink.LinkList() in the

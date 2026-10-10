@@ -1,0 +1,106 @@
+From cb3ea53a0ead60fdb274f75416096abf49868d3e Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sat, 25 Jul 2026 19:05:51 -0500
+Subject: [PATCH] api: make fabric veth MTU explicit
+
+---
+ api/koko_api.go              | 25 +++++++++++++++++++++++--
+ api/koko_veth_ensure.go      |  3 +++
+ api/koko_veth_ensure_test.go | 10 ++++++++++
+ 3 files changed, 36 insertions(+), 2 deletions(-)
+
+diff --git a/api/koko_api.go b/api/koko_api.go
+index ef086f6..30386f1 100644
+--- a/api/koko_api.go
++++ b/api/koko_api.go
+@@ -43,6 +43,7 @@ func SetLogLevel(level string) error {
+ type VEth struct {
+ 	NsName        string      // What's the network namespace?
+ 	LinkName      string      // And what will we call the link.
++	MTU           int         // Interface MTU; zero preserves the safe 1450 default.
+ 	IPAddr        []net.IPNet // (optional) Slice of IPv4/v6 address.
+ 	MirrorEgress  string      // (optional) source interface for egress mirror
+ 	MirrorIngress string      // (optional) source interface for ingress mirror
+@@ -101,7 +102,16 @@ func makeVethPair(name, peer string, mtu int) (netlink.Link, error) {
+ // both links.
+ func GetVethPair(name1 string, name2 string) (link1 netlink.Link,
+ 	link2 netlink.Link, err error) {
+-	link1, err = makeVethPair(name1, name2, 1500)
++	return GetVethPairWithMTU(name1, name2, 1450)
++}
++
++// GetVethPairWithMTU creates a veth pair with an explicit, uniform MTU.
++func GetVethPairWithMTU(name1 string, name2 string, mtu int) (link1 netlink.Link,
++	link2 netlink.Link, err error) {
++	if mtu <= 0 {
++		mtu = 1450
++	}
++	link1, err = makeVethPair(name1, name2, mtu)
+ 	if err != nil {
+ 		switch {
+ 		case os.IsExist(err):
+@@ -680,7 +690,11 @@ func MakeVeth(veth1 VEth, veth2 VEth) error {
+ 		tempLinkName2 = getRandomIFName()
+ 	}
+ 
+-	link1, link2, err := GetVethPair(tempLinkName1, tempLinkName2)
++	mtu := veth1.MTU
++	if mtu <= 0 {
++		mtu = veth2.MTU
++	}
++	link1, link2, err := GetVethPairWithMTU(tempLinkName1, tempLinkName2, mtu)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -859,6 +873,13 @@ func configureLinkInNS(veth VEth) error {
+ 		if err != nil {
+ 			return err
+ 		}
++		mtu := veth.MTU
++		if mtu <= 0 {
++			mtu = 1450
++		}
++		if err := netlink.LinkSetMTU(link, mtu); err != nil {
++			return fmt.Errorf("set %s MTU %d: %w", veth.LinkName, mtu, err)
++		}
+ 		if err := netlink.LinkSetUp(link); err != nil {
+ 			return err
+ 		}
+diff --git a/api/koko_veth_ensure.go b/api/koko_veth_ensure.go
+index 9b75274..d156ee7 100644
+--- a/api/koko_veth_ensure.go
++++ b/api/koko_veth_ensure.go
+@@ -400,6 +400,9 @@ func isEExistErr(err error) bool {
+ // Both directions of a link may call this concurrently; correctness comes
+ // from locking both endpoint slots plus the symmetric alias.
+ func EnsureVethWire(local, peer VEth, alias string) error {
++	if local.MTU > 0 && peer.MTU > 0 && local.MTU != peer.MTU {
++		return fmt.Errorf("EnsureVethWire: endpoint MTUs differ: %d != %d", local.MTU, peer.MTU)
++	}
+ 	if isProtectedIfName(local.LinkName) || isProtectedIfName(peer.LinkName) {
+ 		return fmt.Errorf("EnsureVethWire: refusing to manage protected interface %q/%q",
+ 			local.LinkName, peer.LinkName)
+diff --git a/api/koko_veth_ensure_test.go b/api/koko_veth_ensure_test.go
+index 31f85bb..b4e0ca0 100644
+--- a/api/koko_veth_ensure_test.go
++++ b/api/koko_veth_ensure_test.go
+@@ -244,6 +244,16 @@ func TestEnsureVethWireRefusesProtectedNames(t *testing.T) {
+ 	}
+ }
+ 
++func TestEnsureVethWireRejectsAsymmetricMTU(t *testing.T) {
++	err := EnsureVethWire(
++		VEth{NsName: "/var/run/netns/a", LinkName: "eth1", MTU: 1450},
++		VEth{NsName: "/var/run/netns/b", LinkName: "eth2", MTU: 8950},
++		VethWireAlias("ns", 1))
++	if err == nil || !strings.Contains(err.Error(), "endpoint MTUs differ") {
++		t.Fatalf("EnsureVethWire(asymmetric MTU) err = %v", err)
++	}
++}
++
+ func TestEnsureVethWireRejectsNonCanonicalAlias(t *testing.T) {
+ 	err := EnsureVethWire(
+ 		VEth{NsName: "/var/run/netns/a", LinkName: "eth1"},
+-- 
+2.55.0
+

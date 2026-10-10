@@ -1,0 +1,72 @@
+From 58f911de2051df7863aa89b6d34b621f125c4f4b Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sat, 18 Jul 2026 08:07:17 -0500
+Subject: [PATCH 2/5] api: derive staging interface names from crypto/rand
+
+getRandomIFName used the global math/rand source. In the MakeVxLan path
+nothing ever seeded it, so on Go <1.20 every short-lived process (each CNI
+plugin invocation is one) generated the SAME deterministic 'kokoNNN'
+staging-name sequence, and concurrent or back-to-back invocations collided
+on the staging name in the host namespace ('file exists' before the real
+link was even attempted). MakeVeth seeded with wall-clock nanoseconds,
+which still collides for simultaneous invocations.
+
+Read 4 bytes from crypto/rand instead (per-process uniqueness without any
+seeding discipline), falling back to the nanosecond clock only if the
+random source fails. Drop the now-pointless rand.Seed in MakeVeth.
+
+Upstreamable: koko master's c8cc616 addressed the same failure by
+re-seeding per call, which keeps the birthday-collision window; this
+supersedes it.
+---
+ api/koko_api.go | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/api/koko_api.go b/api/koko_api.go
+index c22116e..f853cb5 100644
+--- a/api/koko_api.go
++++ b/api/koko_api.go
+@@ -4,8 +4,9 @@ Package api provides koko's connector funcitionlity as API.
+ package api
+ 
+ import (
++	cryptorand "crypto/rand"
++	"encoding/binary"
+ 	"fmt"
+-	"math/rand"
+ 	"net"
+ 	"os"
+ 	"syscall"
+@@ -66,7 +67,11 @@ type MacVLan struct {
+ 
+ // getRandomIFName generates random string for unique interface name
+ func getRandomIFName() string {
+-	return fmt.Sprintf("koko%d", rand.Uint32())
++	var buf [4]byte
++	if _, err := cryptorand.Read(buf[:]); err == nil {
++		return fmt.Sprintf("koko%d", binary.LittleEndian.Uint32(buf[:]))
++	}
++	return fmt.Sprintf("koko%d", uint32(time.Now().UnixNano()))
+ }
+ 
+ // makeVethPair makes veth pair and returns its link.
+@@ -87,7 +92,7 @@ func makeVethPair(name, peer string, mtu int) (netlink.Link, error) {
+ }
+ 
+ // GetVethPair takes two link names and create a veth pair and return
+-//both links.
++// both links.
+ func GetVethPair(name1 string, name2 string) (link1 netlink.Link,
+ 	link2 netlink.Link, err error) {
+ 	link1, err = makeVethPair(name1, name2, 1500)
+@@ -602,7 +607,6 @@ func (veth *VEth) SetEgressTxQLen(qlen int) (err error) {
+ // MakeVeth is top-level handler to create veth links given two VEth data
+ // objects: veth1 and veth2.
+ func MakeVeth(veth1 VEth, veth2 VEth) error {
+-	rand.Seed(time.Now().UnixNano())
+ 	tempLinkName1 := veth1.LinkName
+ 	tempLinkName2 := veth2.LinkName
+ 
+-- 
+2.55.0
+

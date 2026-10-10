@@ -1,0 +1,191 @@
+From 9fca595bd418af63324034cd13e81d3be890bfa2 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Mon, 21 Sep 2026 10:43:58 -0500
+Subject: [PATCH] api: fix kubeVirtBridgeName to strip meshnet's pod prefix,
+ and rename on adopt
+
+kubeVirtBridgeName returned "k6t-" + linkName verbatim. The name meshnet
+always hands a KubeVirt pod interface is "podXXXX" (confirmed live, CNI
+network annotations), so this produced "k6t-podXXXX" -- a bridge that
+never exists, since virt-launcher's own convention is "k6t-XXXX", no
+"pod" prefix. netlink.LinkByName(that) always failed, so
+adoptIntoKubeVirtBridge (0009) silently treated every real KubeVirt pod as
+"no bridge, ordinary container" and adopted nothing -- the exact bug 0009
+shipped to fix, never actually working.
+
+Also renames the link to virt-launcher's own "XXXX-nic" convention on
+adopt, before enslaving: without this a late-adopted wire would connect
+but stay named "podXXXX" inside the bridge, unrecognized by every
+reconcile-time inspector in the fork (daemon/vxlan.resolveSlot,
+daemon/meshnet.resolveVethSlot, meshnet-cni patches 0020/0021) that looks
+specifically for the "-nic" name.
+
+Measured live, repeated occurrences (example-lab-shared, most recently
+2026-09-19/21): a wire between two KubeVirt VMs realized after either had
+already started stayed a master-less, un-renamed podXXXX beside a
+k6t-XXXX bridge holding only the tap -- 100% loss, no OSPF neighbor, no
+error anywhere. Hand repair (nsenter + ip link set master) worked every
+time, confirming this was the whole fault; this is the source fix that
+was never landed.
+---
+ api/koko_api.go                 | 61 +++++++++++++++++++++++++++++++--
+ api/koko_kubevirt_adopt_test.go | 55 +++++++++++++++++++++++++++++
+ 2 files changed, 113 insertions(+), 3 deletions(-)
+ create mode 100644 api/koko_kubevirt_adopt_test.go
+
+diff --git a/api/koko_api.go b/api/koko_api.go
+index 8cc5faf..4b230e5 100644
+--- a/api/koko_api.go
++++ b/api/koko_api.go
+@@ -903,12 +903,51 @@ func configureLinkInNS(veth VEth) error {
+ 	})
+ }
+ 
++// kubeVirtID strips meshnet's "pod" prefix off a wire's pod-side interface
++// name, returning "" when the name is not one meshnet hands to a pod at all
++// (kubevirtID("podXXXX") == "XXXX", kubevirtID("eth0") == "").
++//
++// virt-launcher's own bridge-binding convention is keyed on this bare ID --
++// "k6t-XXXX" (the bridge), "tapXXXX" (to QEMU), "XXXX-nic" (the renamed wire)
++// -- never on meshnet's "podXXXX" form. daemon/vxlan.kubevirtNames and
++// daemon/meshnet.kubevirtRenamedName (meshnet-cni patches 0013/0020/0021)
++// compute the same ID the same way; this is koko's copy of that one rule,
++// kept in lockstep rather than shared because the two repos do not import
++// each other.
++func kubevirtID(linkName string) string {
++	if !strings.HasPrefix(linkName, "pod") || linkName == "pod" {
++		return ""
++	}
++	return strings.TrimPrefix(linkName, "pod")
++}
++
+ // kubeVirtBridgeName mirrors virt-launcher's bridge-binding convention: it
+ // fronts pod interface XXXX with a linux bridge k6t-XXXX and a tap, then
+ // enslaves the pod interface (renamed XXXX-nic) to that bridge. The VM reaches
+ // the wire only through the bridge.
++//
++// Returns "" when linkName is not KubeVirt-shaped (see kubevirtID) -- the
++// caller must treat that the same as "no bridge found", never look one up.
+ func kubeVirtBridgeName(linkName string) string {
+-	return "k6t-" + linkName
++	id := kubevirtID(linkName)
++	if id == "" {
++		return ""
++	}
++	return "k6t-" + id
++}
++
++// kubeVirtRenamedName is the name virt-launcher's own binding would have
++// given this wire had it arrived before VM start. Adoption renames to this
++// so a late-wired link ends up in the identical shape reconcile-time code
++// (daemon/vxlan.resolveSlot, daemon/meshnet.resolveVethSlot) already expects
++// every KubeVirt-bound wire to be in -- never left enslaved under its bare
++// "podXXXX" name, which nothing else in the fork looks for.
++func kubeVirtRenamedName(linkName string) string {
++	id := kubevirtID(linkName)
++	if id == "" {
++		return ""
++	}
++	return id + "-nic"
+ }
+ 
+ // adoptIntoKubeVirtBridge enslaves a freshly realized wire end to the KubeVirt
+@@ -936,9 +975,14 @@ func kubeVirtBridgeName(linkName string) string {
+ // link owned by a DIFFERENT master is never stolen -- that is someone else's
+ // topology decision, not ours to override.
+ func adoptIntoKubeVirtBridge(linkName string, link netlink.Link) error {
+-	br, err := netlink.LinkByName(kubeVirtBridgeName(linkName))
++	bridgeName := kubeVirtBridgeName(linkName)
++	if bridgeName == "" {
++		// Not a name meshnet hands to a KubeVirt pod: a plain container.
++		return nil
++	}
++	br, err := netlink.LinkByName(bridgeName)
+ 	if err != nil {
+-		// No KubeVirt bridge fronting this wire: a plain container pod.
++		// No KubeVirt bridge fronting this wire (yet, or ever).
+ 		return nil
+ 	}
+ 	bridge, ok := br.(*netlink.Bridge)
+@@ -951,6 +995,17 @@ func adoptIntoKubeVirtBridge(linkName string, link netlink.Link) error {
+ 	if link.Attrs().MasterIndex != 0 {
+ 		return nil
+ 	}
++	// Rename to virt-launcher's own convention BEFORE enslaving, so a late
++	// wire lands in the identical shape one bound at VM start would have --
++	// "XXXX-nic", never the bare "podXXXX" name. Renaming first and
++	// operating on the same *already-resolved* netlink.Link handle by index
++	// means the enslave/up calls below still target the right device even
++	// though its name just changed.
++	renamed := kubeVirtRenamedName(linkName)
++	if err := netlink.LinkSetName(link, renamed); err != nil {
++		return fmt.Errorf("adopt %s into KubeVirt bridge %s: rename to %s: %w",
++			linkName, bridge.Attrs().Name, renamed, err)
++	}
+ 	if err := netlink.LinkSetMaster(link, bridge); err != nil {
+ 		return fmt.Errorf("adopt %s into KubeVirt bridge %s: %w",
+ 			linkName, bridge.Attrs().Name, err)
+diff --git a/api/koko_kubevirt_adopt_test.go b/api/koko_kubevirt_adopt_test.go
+new file mode 100644
+index 0000000..fdb6469
+--- /dev/null
++++ b/api/koko_kubevirt_adopt_test.go
+@@ -0,0 +1,55 @@
++package api
++
++import "testing"
++
++// TestKubeVirtBridgeNameMatchesVirtLauncherNotMeshnet pins the actual bug:
++// kubeVirtBridgeName used to return "k6t-" + linkName verbatim, so for the
++// name meshnet always hands a KubeVirt pod ("podXXXX") it produced
++// "k6t-podXXXX" -- a bridge that never exists, since virt-launcher's own
++// convention is "k6t-XXXX" (no "pod" prefix). netlink.LinkByName(that) always
++// failed, so adoptIntoKubeVirtBridge silently treated every real KubeVirt
++// pod as "no bridge, ordinary container" and never adopted anything. Measured
++// live (example-lab-shared, repeated occurrences): a late-realized wire between
++// two KubeVirt VMs stayed a master-less, un-renamed "podXXXX" beside a
++// "k6t-XXXX" bridge holding only the tap, with 100% loss and no error from
++// anywhere. This is the one-line reason patch 0009 never actually adopted
++// anything in production despite shipping and being exercised.
++func TestKubeVirtBridgeNameMatchesVirtLauncherNotMeshnet(t *testing.T) {
++	cases := []struct {
++		linkName string
++		want     string
++	}{
++		{"pod980816f36b7", "k6t-980816f36b7"},
++		{"pod151b6d47576", "k6t-151b6d47576"},
++		{"eth0", ""},        // not a name meshnet gives a KubeVirt pod
++		{"", ""},
++		{"pod", ""}, // the bare prefix with nothing after it is not an ID
++	}
++	for _, tc := range cases {
++		if got := kubeVirtBridgeName(tc.linkName); got != tc.want {
++			t.Errorf("kubeVirtBridgeName(%q) = %q, want %q", tc.linkName, got, tc.want)
++		}
++	}
++}
++
++// TestKubeVirtRenamedNameMatchesTheRestOfTheFork pins the second half: an
++// adopted wire must land under the SAME "XXXX-nic" name that
++// daemon/vxlan.resolveSlot and daemon/meshnet.resolveVethSlot (meshnet-cni
++// 0020/0021) already expect every KubeVirt-bound wire to carry. Leaving it
++// enslaved under the bare "podXXXX" name would fix connectivity but still
++// look unresolved to every reconcile-time inspector in the fork.
++func TestKubeVirtRenamedNameMatchesTheRestOfTheFork(t *testing.T) {
++	cases := []struct {
++		linkName string
++		want     string
++	}{
++		{"pod980816f36b7", "980816f36b7-nic"},
++		{"eth0", ""},
++		{"", ""},
++	}
++	for _, tc := range cases {
++		if got := kubeVirtRenamedName(tc.linkName); got != tc.want {
++			t.Errorf("kubeVirtRenamedName(%q) = %q, want %q", tc.linkName, got, tc.want)
++		}
++	}
++}
+-- 
+2.55.0
+

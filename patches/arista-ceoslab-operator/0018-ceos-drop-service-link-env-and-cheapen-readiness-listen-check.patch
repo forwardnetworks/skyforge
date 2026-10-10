@@ -1,0 +1,422 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 23:28:43 -0500
+Subject: [PATCH] ceos: drop service-link env from cEOS pods; cheapen the
+ readiness listen check
+
+Measured 2026-09-23 on user-skyforge-demo-estate-13-fu-798b2b0d (275
+Services, 63 cEOS on worker-a): during the bringup (03:27-03:29)
+and again during the netlab config push (03:33-03:36) EVERY cEOS readiness
+probe (0008) timed out at 3s; 52/63 pods show their last Ready transition at
+03:35-03:36. NotReady pulls the device's KNE management Service endpoint,
+which is the path the analysis system collects over.
+
+The probe body issues no iptables and no Cli, so xtables-lock contention with
+the 0017 permit loop is not possible. What it does run is bash, and bash
+imports and re-exports its whole environment on start. Kubernetes put a
+service-link variable set for every Service port in the namespace into the
+container: 4188 vars / 225 KB, 4155 of them SERVICE_*. Same pod, same
+node, same minute:
+
+  probe body, pod env      0.27-0.40s wall, 0.22-0.34s USER
+  probe body, env -i       0.04-0.065s wall, 0.01-0.02s user
+  cEOS, 14-Service lab     0.04-0.05s (same node, env 11 KB)
+
+kubelet's own histogram agrees: the mean successful readiness probe on the 63
+demo-estate cEOS was 0.360s, against 0.124s/0.134s for cEOS in the two small
+labs on the same node. cEOS requests 25m CPU, so its pod cgroup has
+cpu.weight=1. On a saturated node (71/96 cores busy even at rest, an A10 VM
+at 32 cores) a probe needing ~0.3s of CPU in a weight-1 cgroup that also
+holds ConfigAgent applying a push does not finish in 3s.
+
+1. EnableServiceLinks=false on the cEOS pod. Nothing in cEOS, the seed init
+   container or the PostStart script reads a service-link variable, and
+   KUBERNETES_SERVICE_HOST/PORT are still injected. This also cheapens the
+   startup probe (wfw), the 0017 permit loop and every exec. The pod drift
+   check does not compare it, so rolling the operator restarts no running
+   pod; running labs pick it up when their pods are recreated.
+
+2. The LISTEN check reads /proc/net/tcp first and /proc/net/tcp6 only when
+   the port is absent there, with awk reading the file directly (no cat).
+   Each /proc/net/tcp* read walks the host-wide TCP hash (pod netns share
+   it: tcp_child_ehash_entries=0), ~16ms kernel CPU each on this node however
+   few sockets the pod has. sshd binds 0.0.0.0:22, so the tcp6 walk is
+   normally skipped. Combined, the body drops to 0.021-0.028s (12x).
+
+Probe cadence (period 5, timeout 3, failure 3, success 2) is unchanged:
+the fix removes the cost instead of widening the budget.
+
+Tests: TestGetPodDisablesServiceLinks (explicit false, nil is a failure);
+TestMgmtReadyScriptExecutes runs the production-rendered script against a
+stubbed ip, a logging awk and fixture /proc/net/tcp{,6}. It covers four YES
+shapes and six NO shapes, and checks that tcp6 is not read when tcp matches.
+Positive controls, each run and seen to fail: dropping EnableServiceLinks,
+restoring the cat tcp+tcp6 pipeline, a gate that can only say yes (mgmt
+check removed), a wrong port hex, and an unthreaded CIDR list.
+---
+ controllers/ceoslabdevice_controller.go       |  60 +++-
+ .../ceoslabdevice_readiness_cost_test.go      | 260 ++++++++++++++++++
+ 2 files changed, 305 insertions(+), 15 deletions(-)
+ create mode 100644 controllers/ceoslabdevice_readiness_cost_test.go
+
+diff --git a/controllers/ceoslabdevice_controller.go b/controllers/ceoslabdevice_controller.go
+index 8e0a6df..0e6ea06 100644
+--- a/controllers/ceoslabdevice_controller.go
++++ b/controllers/ceoslabdevice_controller.go
+@@ -1253,10 +1253,32 @@ func getPod(pod *corev1.Pod, device *ceoslabv1alpha1.CEosLabDevice, secretsAndCo
+ 			ReadinessProbe: readinessProbe,
+ 		}},
+ 		TerminationGracePeriodSeconds: pointer.Int64(0),
+-		NodeSelector:                  nodeSelector,
+-		Tolerations:                   tolerations,
+-		PriorityClassName:             priorityClassName,
+-		Volumes:                       volumes,
++		// NO SERVICE-LINK ENV. Kubernetes injects seven <SVC>_SERVICE_*/_PORT_*
++		// variables per Service port for EVERY Service in the namespace, into
++		// every process of the container: PID 1, the PostStart hook and its
++		// permit loop, and every readiness/startup probe exec. A KNE topology
++		// namespace holds one Service per node with ~8 ports, so the env grows
++		// with the lab. Measured 2026-09-23 on a 275-Service DemoEstate lab:
++		// 4188 env vars / 225 KB in the ceos container, 4155 of them service
++		// links. bash (/bin/sh) imports and re-exports that environment on every
++		// start and command, so the 0008 readiness body cost 0.27-0.40s wall,
++		// ~0.3s of it USER CPU, instead of 0.04-0.065s with a clean env (same
++		// pod, same node, same moment). kubelet agreed: the mean successful
++		// readiness probe was 0.36s there against 0.12s for cEOS on the same node
++		// in a 14-Service lab. Under a config push on a saturated node (cEOS
++		// requests 25m, so cgroup cpu.weight=1) that 6-8x CPU demand pushed the
++		// probe past its 3s timeout on 63/63 cEOS, pulling their management
++		// Service endpoints -- the path the analysis system collects over -- for ~4 minutes.
++		// Nothing in cEOS, the seed init container or the lifecycle script reads
++		// a service-link variable (the operator passes everything it needs as
++		// explicit env), and KUBERNETES_SERVICE_HOST/PORT are still injected.
++		// Not part of the pod drift check: running pods keep their env until
++		// they are recreated, so rolling the operator restarts nothing.
++		EnableServiceLinks: pointer.Bool(false),
++		NodeSelector:       nodeSelector,
++		Tolerations:        tolerations,
++		PriorityClassName:  priorityClassName,
++		Volumes:            volumes,
+ 	}
+ 	return nil
+ }
+@@ -2223,16 +2245,16 @@ func getStartupProbeAPI(device *ceoslabv1alpha1.CEosLabDevice) *corev1.Probe {
+ //
+ //  1. Management materialized, proven by EITHER of two interface-form signals
+ //     (accept either — do not require the first):
+-//       a. The default route is the INTERFACE-FORM route EOS installs from
+-//          "ip route 0.0.0.0/0 <MgmtIntf>" ("default dev eth0", no `via`) — the
+-//          ordinary cEOS whose only 0/0 is the mgmt default, OR
+-//       b. a SEEDED RETURN CIDR (0007 installs "ip route <cidr> <MgmtIntf>" for
+-//          each SKYFORGE_MGMT_RETURN_CIDRS entry) is present as "<cidr> dev eth0
+-//          proto gated" with no `via` — a ROUTED cEOS (e.g. a DC leaf carrying a
+-//          data-plane 0/0 into the fabric) whose data default legitimately
+-//          displaces the mgmt default from the FIB. proto gated (EOS-installed)
+-//          is the anchor: the connected mgmt subnet is proto kernel and the
+-//          pre-claim CNI default is via-gateway, so neither false-passes.
++//     a. The default route is the INTERFACE-FORM route EOS installs from
++//     "ip route 0.0.0.0/0 <MgmtIntf>" ("default dev eth0", no `via`) — the
++//     ordinary cEOS whose only 0/0 is the mgmt default, OR
++//     b. a SEEDED RETURN CIDR (0007 installs "ip route <cidr> <MgmtIntf>" for
++//     each SKYFORGE_MGMT_RETURN_CIDRS entry) is present as "<cidr> dev eth0
++//     proto gated" with no `via` — a ROUTED cEOS (e.g. a DC leaf carrying a
++//     data-plane 0/0 into the fabric) whose data default legitimately
++//     displaces the mgmt default from the FIB. proto gated (EOS-installed)
++//     is the anchor: the connected mgmt subnet is proto kernel and the
++//     pre-claim CNI default is via-gateway, so neither false-passes.
+ //     This is the phase discriminator: pre-claim (via-form default, no seeded
+ //     gated statics) and the post-claim/pre-apply window (no default at all,
+ //     no gated statics) both fail BOTH signals; only EOS's own config replay
+@@ -2244,6 +2266,13 @@ func getStartupProbeAPI(device *ceoslabv1alpha1.CEosLabDevice) *corev1.Probe {
+ //     contract; override via spec.envvars SKYFORGE_MGMT_READY_PORT) has a
+ //     LISTEN socket (state 0A in /proc/net/tcp{,6}).
+ //
++// The LISTEN check reads /proc/net/tcp first and /proc/net/tcp6 only when the
++// port is not found there. Both files are produced by walking the HOST-WIDE
++// TCP hash tables (net.ipv4.tcp_child_ehash_entries=0: pod netns share them),
++// so each read costs ~16ms of kernel CPU on worker-a no matter how
++// few sockets the pod owns; sshd listens on 0.0.0.0:22, so the tcp6 walk is
++// normally skipped, and awk reads the file itself (no cat process).
++//
+ // Deliberately NO `Cli -c` in the probe loop: a FastCli spawn costs 0.5-2s of
+ // CPU per exec and can hang while ConfigAgent is busy; at 13 devices probing
+ // every 5s forever that is real sustained load, versus ~1-2ms for these kernel
+@@ -2266,7 +2295,8 @@ else
+ fi
+ [ "$mgmt_ok" = 1 ] || exit 1
+ ip -4 addr show dev %[1]s | grep -q 'inet .* scope global' || exit 1
+-cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | awk '$4=="0A" {split($2,a,":"); if (a[2]=="%[2]s") ok=1} END {exit ok?0:1}'
++listening() { awk '$4=="0A" {split($2,a,":"); if (a[2]=="%[2]s") {ok=1; exit}} END {exit ok?0:1}' "$1" 2>/dev/null; }
++listening /proc/net/tcp || listening /proc/net/tcp6
+ `
+ 
+ // getReadinessProbeAPI renders the readiness gate for the ceos container, or
+diff --git a/controllers/ceoslabdevice_readiness_cost_test.go b/controllers/ceoslabdevice_readiness_cost_test.go
+new file mode 100644
+index 0000000..aad7001
+--- /dev/null
++++ b/controllers/ceoslabdevice_readiness_cost_test.go
+@@ -0,0 +1,260 @@
++package controllers
++
++import (
++	"fmt"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	ceoslabv1alpha1 "github.com/aristanetworks/arista-ceoslab-operator/v2/api/v1alpha1"
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++)
++
++// Every cEOS pod must opt out of service-link env injection, whether or not the
++// readiness gate is rendered: the env tax lands on the startup probe (wfw), the
++// PostStart permit loop and every exec, not only on the 0008 gate.
++func TestGetPodDisablesServiceLinks(t *testing.T) {
++	startupCM := map[string]client.Object{
++		startupConfigName("leaf1"): &corev1.ConfigMap{
++			ObjectMeta: metav1.ObjectMeta{Name: startupConfigName("leaf1")},
++			Data:       map[string]string{"startup-config": "hostname leaf1\n"},
++		},
++	}
++	for name, tc := range map[string]struct {
++		spec        ceoslabv1alpha1.CEosLabDeviceSpec
++		cms         map[string]client.Object
++		persistence bool
++	}{
++		"gated mgmt device": {
++			spec:        ceoslabv1alpha1.CEosLabDeviceSpec{IntfMapping: map[string]string{"eth0": "Management0"}},
++			cms:         startupCM,
++			persistence: true,
++		},
++		"plain device, no persistence": {},
++	} {
++		device := &ceoslabv1alpha1.CEosLabDevice{
++			ObjectMeta: metav1.ObjectMeta{Name: "leaf1", Namespace: "demo"},
++			Spec:       tc.spec,
++		}
++		pod := &corev1.Pod{}
++		if err := getPod(pod, device, tc.cms, tc.persistence); err != nil {
++			t.Fatalf("%s: getPod() failed: %v", name, err)
++		}
++		// nil means the API server defaults it to TRUE, so nil is a failure.
++		if pod.Spec.EnableServiceLinks == nil || *pod.Spec.EnableServiceLinks {
++			t.Fatalf("%s: EnableServiceLinks = %v, want explicit false (a 275-Service lab put 4155 vars / 225KB into every probe exec)",
++				name, pod.Spec.EnableServiceLinks)
++		}
++	}
++}
++
++// readyHarness EXECUTES the rendered readiness script (not a string match)
++// against a stubbed ip, a logging awk wrapper and fixture /proc/net/tcp{,6}
++// files, so both halves of the gate are proven: it says YES for a
++// materialized device and NO for every unmaterialized or not-listening shape.
++type readyHarness struct {
++	dir string
++	bin string
++}
++
++const (
++	tcpHeader  = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
++	tcp6Header = "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
++)
++
++func tcpLine(port, state string) string {
++	return fmt.Sprintf("   0: 00000000:%s 00000000:0000 %s 00000000:00000000 00:00000000 00000000     0        0 4242 1 0000000000000000 100 0 0 10 0\n", port, state)
++}
++
++func tcp6Line(port, state string) string {
++	return fmt.Sprintf("   0: 00000000000000000000000000000000:%s 00000000000000000000000000000000:0000 %s 00000000:00000000 00:00000000 00000000     0        0 4243 1 0000000000000000 100 0 0 10 0\n", port, state)
++}
++
++func newReadyHarness(t *testing.T) *readyHarness {
++	t.Helper()
++	if _, err := exec.LookPath("sh"); err != nil {
++		t.Skip("no sh on PATH")
++	}
++	realAwk, err := exec.LookPath("awk")
++	if err != nil {
++		t.Skip("no awk on PATH")
++	}
++	h := &readyHarness{dir: t.TempDir()}
++	h.bin = filepath.Join(h.dir, "bin")
++	if err := os.MkdirAll(h.bin, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	// ip: route show <target> -> route_<target with / and . as _>; addr -> addr.
++	writeStub(t, filepath.Join(h.bin, "ip"), `S="$STUB_STATE"
++if [ "$2" = route ]; then
++  k=$(printf '%s' "$4" | tr '/.' '__')
++  cat "$S/route_$k" 2>/dev/null
++  exit 0
++fi
++if [ "$2" = addr ]; then cat "$S/addr" 2>/dev/null; exit 0; fi
++exit 0
++`)
++	// awk: record which file each invocation read, then run the real awk.
++	writeStub(t, filepath.Join(h.bin, "awk"), fmt.Sprintf(`for a in "$@"; do last="$a"; done
++echo "$last" >>"$STUB_STATE/awk.log"
++exec %s "$@"
++`, realAwk))
++	return h
++}
++
++func (h *readyHarness) write(t *testing.T, name, body string) {
++	t.Helper()
++	if err := os.WriteFile(filepath.Join(h.dir, name), []byte(body), 0o644); err != nil {
++		t.Fatal(err)
++	}
++}
++
++// run renders the production script and redirects its two fixed /proc paths
++// into the fixture dir. Returns exit==0 and the files awk read.
++func (h *readyHarness) run(t *testing.T, port int, returnCIDRs string) (bool, []string) {
++	t.Helper()
++	_ = os.Remove(filepath.Join(h.dir, "awk.log"))
++	// Render through the production path (port hex, CIDR list threading).
++	device := &ceoslabv1alpha1.CEosLabDevice{
++		ObjectMeta: metav1.ObjectMeta{Name: "leaf1", Namespace: "demo"},
++		Spec: ceoslabv1alpha1.CEosLabDeviceSpec{
++			IntfMapping: map[string]string{"eth0": "Management0"},
++			EnvVar: map[string]string{
++				"SKYFORGE_MGMT_READY_PORT":   fmt.Sprint(port),
++				"SKYFORGE_MGMT_RETURN_CIDRS": returnCIDRs,
++			},
++		},
++	}
++	probe := getReadinessProbeAPI(device, getEnvVarsMap(device), true)
++	if probe == nil || probe.ProbeHandler.Exec == nil || len(probe.ProbeHandler.Exec.Command) != 3 {
++		t.Fatalf("readiness probe not rendered as [sh -c script]: %#v", probe)
++	}
++	script := probe.ProbeHandler.Exec.Command[2]
++	for _, p := range []string{"/proc/net/tcp6", "/proc/net/tcp"} {
++		if !strings.Contains(script, p) {
++			t.Fatalf("readiness script no longer reads %s; update the harness: %s", p, script)
++		}
++	}
++	// tcp6 first so the tcp replacement does not rewrite its prefix.
++	script = strings.ReplaceAll(script, "/proc/net/tcp6", filepath.Join(h.dir, "net_tcp6"))
++	script = strings.ReplaceAll(script, "/proc/net/tcp", filepath.Join(h.dir, "net_tcp"))
++	cmd := exec.Command("sh", "-c", script)
++	cmd.Env = []string{"PATH=" + h.bin + ":" + os.Getenv("PATH"), "STUB_STATE=" + h.dir}
++	err := cmd.Run()
++	if err != nil {
++		if _, ok := err.(*exec.ExitError); !ok {
++			t.Fatalf("readiness script did not run: %v", err)
++		}
++	}
++	var read []string
++	if b, rerr := os.ReadFile(filepath.Join(h.dir, "awk.log")); rerr == nil {
++		for _, l := range strings.Split(strings.TrimSpace(string(b)), "\n") {
++			if l != "" {
++				read = append(read, filepath.Base(l))
++			}
++		}
++	}
++	return err == nil, read
++}
++
++func TestMgmtReadyScriptExecutes(t *testing.T) {
++	const (
++		ifDefault  = "default dev eth0 proto gated scope link src 198.18.1.105 \n"
++		viaDefault = "default via 198.18.0.1 dev eth0 \n"
++		dataDflt   = "default via 10.1.0.1 dev eth1 proto gated \n"
++		gatedCIDR  = "100.64.0.0/10 dev eth0 proto gated scope link src 198.18.1.105 \n"
++		kernelCIDR = "198.18.0.0/15 dev eth0 proto kernel scope link src 198.18.1.105 \n"
++		globalAddr = "2: eth0: <UP>\n    inet 198.18.1.105/15 scope global eth0\n"
++		cidrs      = "100.64.0.0/10,198.18.0.0/15" // env form: comma list
++	)
++	type fixture struct {
++		dflt, cidr100, cidr198, addr, tcp, tcp6 string
++	}
++	materialized := fixture{
++		dflt: ifDefault, addr: globalAddr,
++		tcp: tcpHeader + tcpLine("0016", "0A"), tcp6: tcp6Header + tcp6Line("0016", "0A"),
++	}
++	for name, tc := range map[string]struct {
++		f        fixture
++		port     int
++		want     bool
++		wantRead []string // exact awk read set, nil = do not check
++	}{
++		// ---- the gate must be able to say YES ----
++		"materialized, v4 listener: tcp6 is never walked": {
++			f: materialized, port: 22, want: true, wantRead: []string{"net_tcp"},
++		},
++		"listener only in tcp6 (sshd bound [::]:22) falls back": {
++			f: fixture{dflt: ifDefault, addr: globalAddr,
++				tcp: tcpHeader + tcpLine("0016", "01"), tcp6: tcp6Header + tcp6Line("0016", "0A")},
++			port: 22, want: true, wantRead: []string{"net_tcp", "net_tcp6"},
++		},
++		"routed cEOS: data default + seeded gated return CIDR": {
++			f: fixture{dflt: dataDflt, cidr100: gatedCIDR, cidr198: kernelCIDR, addr: globalAddr,
++				tcp: tcpHeader + tcpLine("0016", "0A"), tcp6: tcp6Header},
++			port: 22, want: true,
++		},
++		"port override 6030 listening": {
++			f: fixture{dflt: ifDefault, addr: globalAddr,
++				tcp: tcpHeader + tcpLine("178E", "0A"), tcp6: tcp6Header},
++			port: 6030, want: true,
++		},
++		// ---- the gate must be able to say NO ----
++		"pre-claim: CNI via-form default only": {
++			f: fixture{dflt: viaDefault, cidr198: kernelCIDR, addr: globalAddr,
++				tcp: tcpHeader + tcpLine("0016", "0A"), tcp6: tcp6Header},
++			port: 22, want: false,
++		},
++		"post-claim/pre-apply: only the connected (proto kernel) route": {
++			f: fixture{cidr198: kernelCIDR, addr: globalAddr,
++				tcp: tcpHeader + tcpLine("0016", "0A"), tcp6: tcp6Header},
++			port: 22, want: false,
++		},
++		"no global address on eth0": {
++			f: fixture{dflt: ifDefault, addr: "2: eth0: <UP>\n",
++				tcp: tcpHeader + tcpLine("0016", "0A"), tcp6: tcp6Header},
++			port: 22, want: false,
++		},
++		"port 22 only ESTABLISHED, never LISTEN": {
++			f: fixture{dflt: ifDefault, addr: globalAddr,
++				tcp: tcpHeader + tcpLine("0016", "01"), tcp6: tcp6Header + tcp6Line("0016", "06")},
++			port: 22, want: false,
++		},
++		"listening, but on another port": {
++			f: fixture{dflt: ifDefault, addr: globalAddr,
++				tcp: tcpHeader + tcpLine("0017", "0A"), tcp6: tcp6Header + tcp6Line("0050", "0A")},
++			port: 22, want: false,
++		},
++		"proc files unreadable": {
++			f:    fixture{dflt: ifDefault, addr: globalAddr},
++			port: 22, want: false,
++		},
++	} {
++		h := newReadyHarness(t)
++		for file, body := range map[string]string{
++			"route_default":       tc.f.dflt,
++			"route_100_64_0_0_10": tc.f.cidr100,
++			"route_198_18_0_0_15": tc.f.cidr198,
++			"addr":                tc.f.addr,
++		} {
++			h.write(t, file, body)
++		}
++		if tc.f.tcp != "" {
++			h.write(t, "net_tcp", tc.f.tcp)
++		}
++		if tc.f.tcp6 != "" {
++			h.write(t, "net_tcp6", tc.f.tcp6)
++		}
++		got, read := h.run(t, tc.port, cidrs)
++		if got != tc.want {
++			t.Fatalf("%s: readiness = %v, want %v (awk read %v)", name, got, tc.want, read)
++		}
++		if tc.wantRead != nil && strings.Join(read, ",") != strings.Join(tc.wantRead, ",") {
++			t.Fatalf("%s: awk read %v, want exactly %v (each /proc/net/tcp* read walks the host-wide TCP hash)", name, read, tc.wantRead)
++		}
++	}
++}
+-- 
+2.55.0
+

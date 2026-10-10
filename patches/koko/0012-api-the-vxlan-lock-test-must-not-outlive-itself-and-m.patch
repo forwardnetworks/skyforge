@@ -1,0 +1,163 @@
+From 28c77d2931b45128f2c0e3fe11535da564e8bd2f Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sat, 5 Sep 2026 12:48:54 -0500
+Subject: api: the vxlan lock test must not outlive itself, and must say what
+ it saw
+
+TestVxlanCreateLockSerializesOverlapOnly failed about 1 run in 80 (measured
+over 80 runs by a second session, and it kills a build when it fires, because
+the build runs it once).
+
+The three acquirers it spawns all block until the held lock is released, and
+every early return skipped that release -- so a failure left three goroutines
+alive. They then woke, took their locks and created flock files inside
+t.TempDir() while its cleanup walked it:
+
+    TempDir RemoveAll cleanup: directory not empty
+
+That line reads like the cause and is only the wake. Worse, the in-process
+shard table is a package-level global, so under -count a leaked holder from
+one iteration still owned a key the NEXT iteration's disjoint acquirer needed
+-- one failure reappearing as an unrelated-looking failure a run later, which
+is what made this look like a sharding defect.
+
+Registering the release and a WaitGroup wait as t.Cleanup makes every exit
+path -- pass, t.Fatal, panic -- leave nothing running.
+
+The failure TEXT was also wrong. "the lock is still global" is a conclusion
+about the implementation; when this fired it was a stalled or leaked holder,
+and the message sent the first reader who hit it straight into the sharding
+logic. It now states what was observed and names the likelier cause. The 3s
+budget becomes 30s so a slow scheduler is never reported as a lock defect.
+
+The sharding itself is unchanged, and still proven: with the keys collapsed to
+one constant -- the pre-0010 global lock -- the test FAILS in 30s on the
+disjoint case. Restored, 200 consecutive runs pass where the measured rate
+would have predicted about 2.5 failures.
+---
+ api/koko_vxlan_lock_test.go | 81 ++++++++++++++++++++++++-------------
+ 1 file changed, 52 insertions(+), 29 deletions(-)
+
+diff --git a/api/koko_vxlan_lock_test.go b/api/koko_vxlan_lock_test.go
+index a9d3c16..11b5357 100644
+--- a/api/koko_vxlan_lock_test.go
++++ b/api/koko_vxlan_lock_test.go
+@@ -2,6 +2,7 @@ package api
+ 
+ import (
+ 	"net"
++	"sync"
+ 	"testing"
+ 	"time"
+ )
+@@ -81,59 +82,81 @@ func TestVxlanCreateLockSerializesOverlapOnly(t *testing.T) {
+ 	heldVx := vxlanFor(4242, "bond0")
+ 
+ 	release := acquireVXLANCreateLock(held, heldVx)
++	var releaseOnce sync.Once
++	releaseHeld := func() { releaseOnce.Do(release) }
++
++	// NO ACQUIRER MAY OUTLIVE THE TEST BODY.
++	//
++	// Every goroutine below blocks until releaseHeld() runs, so any early
++	// return that skipped the release left three goroutines alive. They then
++	// woke up, took their locks and CREATED flock files inside t.TempDir()
++	// while its cleanup was walking it -- surfacing as
++	//
++	//   TempDir RemoveAll cleanup: directory not empty
++	//
++	// which reads like the cause and is only the wake. Worse, the in-process
++	// shard table is a package-level global, so under -count a leaked holder
++	// from one iteration still owned a key the NEXT iteration's disjoint
++	// acquirer needed, turning a single failure into an unrelated-looking one
++	// a run later. Registering the release and the wait as cleanup makes every
++	// exit path -- pass, t.Fatal, panic -- leave nothing running.
++	var wg sync.WaitGroup
++	t.Cleanup(func() {
++		releaseHeld()
++		wg.Wait()
++	})
++
++	acquireAsync := func(veth VEth, vxlan VxLan) chan struct{} {
++		done := make(chan struct{})
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			unlock := acquireVXLANCreateLock(veth, vxlan)
++			unlock()
++			close(done)
++		}()
++		return done
++	}
+ 
+ 	// Disjoint: a different pod, a different interface, a different VNI.
+ 	// Under the old global lock this could not proceed.
+-	disjoint := make(chan struct{})
+-	go func() {
+-		unlock := acquireVXLANCreateLock(VEth{NsName: "/var/run/netns/cni-b", LinkName: "eth3"}, vxlanFor(9999, "bond0"))
+-		unlock()
+-		close(disjoint)
+-	}()
+-
++	disjoint := acquireAsync(VEth{NsName: "/var/run/netns/cni-b", LinkName: "eth3"}, vxlanFor(9999, "bond0"))
+ 	// Overlapping on the TARGET slot only (same netns+ifname, different VNI).
+-	sameTarget := make(chan struct{})
+-	go func() {
+-		unlock := acquireVXLANCreateLock(held, vxlanFor(9999, "bond0"))
+-		unlock()
+-		close(sameTarget)
+-	}()
+-
++	sameTarget := acquireAsync(held, vxlanFor(9999, "bond0"))
+ 	// Overlapping on the HOST tuple only (different slot, same VNI+parent).
+-	sameHost := make(chan struct{})
+-	go func() {
+-		unlock := acquireVXLANCreateLock(VEth{NsName: "/var/run/netns/cni-c", LinkName: "eth9"}, heldVx)
+-		unlock()
+-		close(sameHost)
+-	}()
+-
++	sameHost := acquireAsync(VEth{NsName: "/var/run/netns/cni-c", LinkName: "eth9"}, heldVx)
++
++	// The failure text states what was OBSERVED, not what it implies. "the
++	// lock is still global" is a conclusion about the implementation, and when
++	// this fires it sends the reader into the sharding logic -- which is
++	// exactly where it does not belong if the real cause was a stalled
++	// acquirer. Timeout is generous because a slow scheduler must not be
++	// reported as a lock defect.
+ 	select {
+ 	case <-disjoint:
+-	case <-time.After(3 * time.Second):
+-		release()
+-		t.Fatal("a disjoint vxlan creator was blocked: the lock is still global")
++	case <-time.After(30 * time.Second):
++		t.Fatal("a disjoint vxlan creator did not acquire within 30s while an unrelated wire held its shards; " +
++			"if the shard keys are correct this acquirer never contends, so suspect a stalled or leaked holder before the sharding")
+ 	}
+ 
+ 	select {
+ 	case <-sameTarget:
+-		release()
+ 		t.Fatal("a creator of the SAME target slot acquired while it was locked")
+ 	case <-time.After(150 * time.Millisecond):
+ 	}
+ 	select {
+ 	case <-sameHost:
+-		release()
+ 		t.Fatal("a creator of the SAME host VNI tuple acquired while it was locked")
+ 	case <-time.After(150 * time.Millisecond):
+ 	}
+ 
+-	release()
++	releaseHeld()
+ 
+ 	for name, ch := range map[string]chan struct{}{"same target slot": sameTarget, "same host tuple": sameHost} {
+ 		select {
+ 		case <-ch:
+-		case <-time.After(3 * time.Second):
+-			t.Fatalf("%s creator did not acquire after release", name)
++		case <-time.After(30 * time.Second):
++			t.Fatalf("%s creator did not acquire within 30s of the release", name)
+ 		}
+ 	}
+ }

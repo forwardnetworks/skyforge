@@ -1,0 +1,205 @@
+From ecb78945c8a5de4f598dd2b736a6f4774f59e4b5 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Tue, 8 Sep 2026 03:13:44 -0500
+Subject: [PATCH] vxlan: MTU is an attribute, so compare it
+
+The wire-reuse check was VNI + remote VTEP only:
+
+    if !(vxlanLink.VxlanId == vxlan.ID && vxlanLink.Group.Equal(vxlan.IPAddr))
+
+so a wire carrying the right VNI to the right peer was accepted WHATEVER its
+MTU, and "If Vxlan attrs are the same, do nothing" did nothing. The VNI is
+deterministic -- FNV-32a over namespace+linkUID -- and a lab namespace survives
+stop/start, so a wire built while the fabric was 1450 is adopted unchanged by
+every later run, including runs whose fabric is 8950. The fleet's jumbo flip
+could not reach a single wire that already existed.
+
+MEASURED 2026-09-08 on example-lab. siteB-vedge01's wires sat at MTU 1450 while
+att-siteC-pe01 in the SAME lab ran 8950 on both a same-node and a cross-node link,
+so the fabric itself was healthy (MESHNET_FABRIC_MTU=8950, all four nodes
+labelled meshnet-fabric-mtu=8950, conflist fabricMTU 8950). The daemon asked for
+the right value on every pass:
+
+    Created koko Veth struct {... LinkName:pod151b6d47576 MTU:8950 ...}
+    Found KubeVirt-renamed wire for pod151b6d47576 ...: 151b6d47576-nic
+                                        -- treating as existing
+    Is link &{... MTU:1450 ... Name:151b6d47576-nic ...}
+
+It found the stale wire and left it. VM-backed pods are hit hardest because
+KubeVirt renames our interface, so they reach this branch on a reconcile rather
+than being created fresh; container pods are usually built once and keep the
+MTU they were built with.
+
+WHAT IT COST, two layers up, looking nothing like a meshnet bug: IOS-XE observed
+a vNIC that could not carry the 1500 its interface claimed
+("%VXE_VNIC_IF-4-MTUERROR ... setting MTU minimum to 1450"), OSPF padded its DBD
+to the configured MTU, EXSTART never completed ("Neighbor Down: Too many
+retransmissions", every ~3 minutes), no adjacency formed, no site prefix reached
+OMP, and 6 of 7 example-lab overlay paths were dead -- while every SD-WAN
+control-plane gate read PROVEN, because DTLS control connections PMTU-discover
+and use small packets. A green control plane over a dead data plane.
+
+The comparison now includes MTU, extracted into vxlanAttrsMatch so the rule is
+one testable expression rather than a condition buried in a 12-line if. A stale
+wire is torn down and rebuilt at the current fabric MTU -- the same correction
+this code already applies to a wrong VNI or a wrong peer.
+
+Tests, both polarities, with the positive control that matters: an
+already-correct wire is still ACCEPTED (otherwise "compare MTU" could be
+satisfied by rebuilding every wire on every reconcile); right VNI + right peer +
+stale MTU is REFUSED; wrong VNI, wrong peer and nil each still refused.
+Negative control: with the MTU term replaced by `true`, the stale-MTU case fails
+with its own message. Restored, green.
+
+---
+ daemon/vxlan/vxlan.go          | 59 ++++++++++++++++++++++++++++++++--
+ daemon/vxlan/vxlan_mtu_test.go | 54 ++++++++++++++++++++++++++++++-
+ 2 files changed, 110 insertions(+), 3 deletions(-)
+
+diff --git a/daemon/vxlan/vxlan.go b/daemon/vxlan/vxlan.go
+index ba31834..3d1c5dc 100644
+--- a/daemon/vxlan/vxlan.go
++++ b/daemon/vxlan/vxlan.go
+@@ -105,10 +105,32 @@ func CreateOrUpdate(v *mpb.RemotePod) error {
+ 	vxLanOvrlyLogger.Infof("Is link %+v a VXLAN?: %s", vxlanLink, strconv.FormatBool(ok))
+ 	if ok { // the link we've found is a vxlan link
+ 
+-		if !(vxlanLink.VxlanId == vxlan.ID && vxlanLink.Group.Equal(vxlan.IPAddr)) { // If Vxlan attrs are different
++		// MTU IS AN ATTRIBUTE, NOT A DETAIL. This comparison used to check the
++		// VNI and the remote VTEP only, so a wire that already carried the
++		// right VNI to the right peer was accepted WHATEVER its MTU -- and the
++		// VNI is deterministic (FNV-32a over namespace+linkUID) while a lab
++		// namespace survives stop/start. A wire built when the fabric was 1450
++		// is therefore adopted, unchanged, by every later run, including runs
++		// whose fabric is 8950. The fleet's jumbo flip could not reach it.
++		//
++		// MEASURED 2026-09-08 on example-lab: siteB-vedge01's wires sat at MTU 1450
++		// while its container neighbours on the same lab ran 8950 -- the
++		// daemon asked for 8950 on every pass ("Created koko Veth struct
++		// {... MTU:8950}"), found the existing wire, and did nothing. The
++		// consequence was two layers up and looked like nothing to do with
++		// meshnet: IOS-XE clamped its vNIC below the 1500 its interface
++		// claimed, OSPF padded DBD to the configured MTU, EXSTART never
++		// completed ("Too many retransmissions"), no adjacency formed, no site
++		// prefixes reached OMP, and 6 of 7 example-lab overlay paths were dead
++		// while every SD-WAN control-plane gate read PROVEN.
++		//
++		// Comparing MTU makes the wire self-heal: a stale one is torn down and
++		// rebuilt at the current fabric MTU, which is what every other
++		// attribute mismatch here already does.
++		if !vxlanAttrsMatch(vxlanLink, vxlan) { // If Vxlan attrs are different
+ 
+ 			// We remove the existing link and add a new one
+-			vxLanOvrlyLogger.Infof("Vxlan attrs are different: %d!=%d or %v!=%v", vxlanLink.VxlanId, vxlan.ID, vxlanLink.Group, vxlan.IPAddr)
++			vxLanOvrlyLogger.Infof("Vxlan attrs are different: %d!=%d or %v!=%v or mtu %d!=%d", vxlanLink.VxlanId, vxlan.ID, vxlanLink.Group, vxlan.IPAddr, vxlanLink.Attrs().MTU, vxlan.MTU)
+ 			if err = removeExistingWire(veth, link, kokoRemoveVethLink); err != nil {
+ 				return fmt.Errorf(" MESHNETD: Error when removing an old Vxlan interface with koko: %s", err)
+ 			}
+@@ -302,3 +324,36 @@ func vxlanDifferent(l1 *netlink.Vxlan, l2 api.VxLan) bool {
+ 	}
+ 	return true
+ }
++
++// vxlanAttrsMatch reports whether an EXISTING wire already is what we want.
++//
++// MTU IS AN ATTRIBUTE, NOT A DETAIL, and leaving it out of this comparison is
++// what let the fleet's jumbo flip miss every VM-backed node. The check used to
++// be VNI + remote VTEP only, so a wire carrying the right VNI to the right peer
++// was accepted WHATEVER its MTU. The VNI is deterministic (FNV-32a over
++// namespace+linkUID) and a lab namespace survives stop/start, so a wire built
++// when the fabric was 1450 is adopted unchanged by every later run -- including
++// runs whose fabric is 8950.
++//
++// MEASURED 2026-09-08 on example-lab: siteB-vedge01's wires sat at 1450 while its
++// container neighbours in the SAME lab ran 8950. The daemon asked for 8950 on
++// every pass ("Created koko Veth struct {... MTU:8950}"), found the existing
++// wire, and did nothing. The damage surfaced two layers up and looked unrelated
++// to meshnet: IOS-XE clamped its vNIC below the 1500 its interface claimed,
++// OSPF padded DBD to the configured MTU, EXSTART never completed ("Too many
++// retransmissions"), no adjacency formed, no site prefix reached OMP, and 6 of
++// 7 example-lab overlay paths were dead while every SD-WAN control-plane gate still
++// read PROVEN.
++//
++// Returning false makes the caller tear the wire down and rebuild it at the
++// current fabric MTU -- the same correction it already applies to every other
++// attribute mismatch, so a stale wire self-heals instead of pinning a lab to an
++// MTU nobody chose.
++func vxlanAttrsMatch(existing *netlink.Vxlan, want api.VxLan) bool {
++	if existing == nil {
++		return false
++	}
++	return existing.VxlanId == want.ID &&
++		existing.Group.Equal(want.IPAddr) &&
++		existing.Attrs().MTU == want.MTU
++}
+diff --git a/daemon/vxlan/vxlan_mtu_test.go b/daemon/vxlan/vxlan_mtu_test.go
+index 6160ace..2267610 100644
+--- a/daemon/vxlan/vxlan_mtu_test.go
++++ b/daemon/vxlan/vxlan_mtu_test.go
+@@ -1,6 +1,12 @@
+ package vxlan
+ 
+-import "testing"
++import (
++	"net"
++	"testing"
++
++	api "github.com/redhat-nfvpe/koko/api"
++	"github.com/vishvananda/netlink"
++)
+ 
+ func TestFabricMTUFromEnv(t *testing.T) {
+ 	t.Setenv("MESHNET_FABRIC_MTU", "")
+@@ -12,3 +18,49 @@ func TestFabricMTUFromEnv(t *testing.T) {
+ 		t.Fatalf("jumbo = %d,%v, want 8950,nil", got, err)
+ 	}
+ }
++
++// THE REGRESSION THIS FILE EXISTS FOR. example-lab, 2026-09-08: every VM-backed
++// node ran 1450 links while its container neighbours in the same lab ran 8950,
++// because a wire with the right VNI and peer was accepted whatever its MTU.
++// Six of seven overlay paths were dead and every control-plane gate read
++// PROVEN, so nothing upstream of the data plane noticed.
++func TestVxlanAttrsMatchComparesMTU(t *testing.T) {
++	const (
++		vni    = 10641554
++		fabric = 8950
++		stale  = 1450
++	)
++	peer := net.ParseIP("192.0.2.203")
++	want := api.VxLan{ID: vni, IPAddr: peer, MTU: fabric}
++
++	mk := func(id int, group net.IP, mtu int) *netlink.Vxlan {
++		v := &netlink.Vxlan{VxlanId: id, Group: group}
++		v.LinkAttrs.MTU = mtu
++		return v
++	}
++
++	// POSITIVE CONTROL: an already-correct wire must be left alone. Without
++	// this, "compare MTU" could be satisfied by returning false always, which
++	// would rebuild every wire on every reconcile.
++	if !vxlanAttrsMatch(mk(vni, peer, fabric), want) {
++		t.Error("a wire that already matches must be accepted, not rebuilt")
++	}
++
++	// THE BUG: right VNI, right peer, stale MTU. This returned true before.
++	if vxlanAttrsMatch(mk(vni, peer, stale), want) {
++		t.Errorf("a wire at MTU %d must NOT match a fabric of %d -- this is the "+
++			"comparison that let the jumbo flip miss every VM-backed node", stale, fabric)
++	}
++
++	// The pre-existing dimensions must keep working.
++	if vxlanAttrsMatch(mk(vni+1, peer, fabric), want) {
++		t.Error("a wire with the wrong VNI must not match")
++	}
++	if vxlanAttrsMatch(mk(vni, net.ParseIP("192.0.2.204"), fabric), want) {
++		t.Error("a wire to the wrong peer must not match")
++	}
++	// An absent wire is not a match; the caller creates one.
++	if vxlanAttrsMatch(nil, want) {
++		t.Error("a nil link must not match")
++	}
++}
+-- 
+2.55.0
+

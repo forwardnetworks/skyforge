@@ -1,0 +1,309 @@
+From a4538111fbeb55d0c4b0368c92686dbe44fdcebf Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Fri, 17 Jul 2026 18:27:12 -0500
+Subject: [PATCH 1/8] skyforge(kne-runtime): startup-config /mnt/flash seed +
+ ceos-config identity
+
+Pre-existing Skyforge KNE-runtime delta carried on top of upstream v2.1.2:
+startup-config seeding into an emptyDir /mnt/flash (seed init-container
+re-materializes the config from its configmap every bringup) and CR-driven
+/mnt/flash/ceos-config platform identity (SERIALNUMBER/SYSTEMMACADDR), plus
+MAPETH0/MGMT_INTF env defaults and the getPod/getVolumes/getVolumeMounts
+signature refactor they require.
+
+task #77: /mnt/flash is an emptyDir, NOT a per-device longhorn PVC. A privileged
+cEOS pod sees ALL host /dev/sd* nodes; each attached longhorn volume adds one,
+and EOS ssdinit.sh serial-scans (I/O-erroring on foreign devices) every one,
+stalling Sysdb past the startup probe budget -> SIGKILL exit137 crashloop. The
+change-demo re-seeds startup-config from a configmap each bringup, so durable
+per-device persistence is unnecessary; dropping the PVCs removes ~40 host block
+devices from the scan. (Removed with it: ensureStartupConfigPVC,
+startupConfigPVCName, DEFAULT_STARTUP_PVC_SIZE, the hash/fnv import.)
+---
+ controllers/ceoslabdevice_controller.go | 171 +++++++++++++++++++++---
+ 1 file changed, 156 insertions(+), 15 deletions(-)
+
+diff --git a/controllers/ceoslabdevice_controller.go b/controllers/ceoslabdevice_controller.go
+index 021e590..595628b 100644
+--- a/controllers/ceoslabdevice_controller.go
++++ b/controllers/ceoslabdevice_controller.go
+@@ -40,6 +40,7 @@ import (
+ 	corev1 "k8s.io/api/core/v1"
+ 	"k8s.io/apimachinery/pkg/api/errors"
+ 	"k8s.io/apimachinery/pkg/api/resource"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	apiRuntime "k8s.io/apimachinery/pkg/runtime"
+ 	"k8s.io/apimachinery/pkg/types"
+ 	"k8s.io/apimachinery/pkg/util/intstr"
+@@ -59,6 +60,11 @@ const (
+ 	DEFAULT_INIT_CONTAINER_IMAGE = "networkop/init-wait:latest"
+ 	CEOS_COMMAND                 = "/sbin/init"
+ 	DEFAULT_CEOS_IMAGE           = "ceos:latest"
++	DEFAULT_STARTUP_SEED_IMAGE   = "registry.k8s.io/e2e-test-images/busybox:1.29-4"
++
++	startupPersistenceVolumeName = "startup-config-persistence"
++	startupPersistenceSeedDir    = "/var/run/ceos/startup-seed"
++	startupPersistenceActiveDir  = "/var/run/ceos/startup-active"
+ )
+ 
+ var (
+@@ -69,6 +75,8 @@ var (
+ 		"ETBA":                                "1",
+ 		"SKIP_ZEROTOUCH_BARRIER_IN_SYSDBINIT": "1",
+ 		"INTFTYPE":                            "eth",
++		"MAPETH0":                             "1",
++		"MGMT_INTF":                           "eth0",
+ 	}
+ 
+ 	requeue    = ctrl.Result{Requeue: true}
+@@ -112,6 +120,7 @@ func (r *CEosLabDeviceReconciler) updateDeviceSuccess(ctx context.Context, devic
+ //+kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;create;update;patch;delete
+ //+kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
+ //+kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
++//+kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
+ //+kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete
+ 
+ // Reconcile is part of the main kubernetes reconciliation loop which aims to
+@@ -238,6 +247,20 @@ func (r *CEosLabDeviceReconciler) Reconcile(ctx context.Context, req ctrl.Reques
+ 		secretsAndConfigMaps[toggleOverridesName] = configMap
+ 	}
+ 
++	// cEOS reads platform identity from /mnt/flash/ceos-config. Allow KNE to
++	// drive that file through explicit CR environment values instead of relying
++	// on image startup side effects.
++	ceosConfigData := getCEosConfigData(getEnvVarsMap(device))
++	ceosConfigName := fmt.Sprintf("configmap-ceos-config-%s", device.Name)
++	if ceosConfigData != "" {
++		configMap := &corev1.ConfigMap{}
++		err := r.ensureCEosConfigMap(ctx, device, ceosConfigName, ceosConfigData, configMap)
++		if err != nil {
++			return noRequeue, err
++		}
++		secretsAndConfigMaps[ceosConfigName] = configMap
++	}
++
+ 	// KNE may create a configmap to be used as a startup config.
+ 	var startupConfigResourceVersion *string = nil
+ 	startupConfigName := fmt.Sprintf("%s-config", device.Name)
+@@ -257,13 +280,20 @@ func (r *CEosLabDeviceReconciler) Reconcile(ctx context.Context, req ctrl.Reques
+ 		}
+ 	}
+ 
++	// /mnt/flash persistence is backed by an emptyDir (see getVolumes) that the
++	// startup-config-seed init container re-materializes from its configmap each
++	// bringup — no durable per-device PVC is created. This eliminates the per-
++	// device longhorn volumes whose host /dev/sd* nodes were serial-scanned by
++	// EOS ssdinit, stalling Sysdb past the startup-probe budget (task #77).
++	startupPersistenceEnabled := startupConfigResourceVersion != nil
++
+ 	// Pods
+ 
+ 	devicePod := &corev1.Pod{}
+ 	{
+ 		podName := device.Name
+ 		createPodObject := func(object client.Object) error {
+-			err := getPod(object.(*corev1.Pod), device, secretsAndConfigMaps)
++			err := getPod(object.(*corev1.Pod), device, secretsAndConfigMaps, startupPersistenceEnabled)
+ 			if err != nil {
+ 				return err
+ 			}
+@@ -658,6 +688,40 @@ func (r *CEosLabDeviceReconciler) getOrCreateObject(ctx context.Context, device
+ 	return nil
+ }
+ 
++func (r *CEosLabDeviceReconciler) ensureCEosConfigMap(ctx context.Context, device *ceoslabv1alpha1.CEosLabDevice, name string, data string, configMap *corev1.ConfigMap) error {
++	log := kLog.FromContext(ctx)
++	desired := map[string]string{"ceos-config": data}
++	err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: device.Namespace}, configMap)
++	if err != nil && errors.IsNotFound(err) {
++		log.Info(fmt.Sprintf("Creating %s for CEosLabDevice %s", name, device.Name))
++		configMap.ObjectMeta = metav1.ObjectMeta{Name: name, Namespace: device.Namespace}
++		configMap.Data = desired
++		ctrl.SetControllerReference(device, configMap, r.Scheme)
++		if err = r.Create(ctx, configMap); err != nil {
++			errMsg := fmt.Sprintf("Failed to create %s for CEosLabDevice %s", name, device.Name)
++			log.Error(err, errMsg)
++			r.updateDeviceFail(ctx, device, errMsg)
++			return err
++		}
++		return nil
++	} else if err != nil {
++		errMsg := fmt.Sprintf("Failed to get %s for CEosLabDevice %s", name, device.Name)
++		log.Error(err, errMsg)
++		r.updateDeviceFail(ctx, device, errMsg)
++		return err
++	}
++	if !reflect.DeepEqual(configMap.Data, desired) {
++		configMap.Data = desired
++		if err = r.Update(ctx, configMap); err != nil {
++			errMsg := fmt.Sprintf("Failed to update %s for CEosLabDevice %s", name, device.Name)
++			log.Error(err, errMsg)
++			r.updateDeviceFail(ctx, device, errMsg)
++			return err
++		}
++	}
++	return nil
++}
++
+ // ConfigMaps and Secrets
+ 
+ func getSelfSignedCert(secret *corev1.Secret, config ceoslabv1alpha1.SelfSignedCertConfig, deviceName string) error {
+@@ -778,9 +842,23 @@ func getToggleOverrides(configMap *corev1.ConfigMap, toggleOverrides map[string]
+ 	return
+ }
+ 
++func getCEosConfigData(env map[string]string) string {
++	lines := []string{}
++	if serial := strings.TrimSpace(env["SERIALNUMBER"]); serial != "" {
++		lines = append(lines, "SERIALNUMBER="+serial)
++	}
++	if mac := strings.TrimSpace(env["SYSTEMMACADDR"]); mac != "" {
++		lines = append(lines, "SYSTEMMACADDR="+mac)
++	}
++	if len(lines) == 0 {
++		return ""
++	}
++	return strings.Join(lines, "\n") + "\n"
++}
++
+ // Pods
+ 
+-func getPod(pod *corev1.Pod, device *ceoslabv1alpha1.CEosLabDevice, secretsAndConfigMaps map[string]client.Object) error {
++func getPod(pod *corev1.Pod, device *ceoslabv1alpha1.CEosLabDevice, secretsAndConfigMaps map[string]client.Object, useStartupPersistence bool) error {
+ 	labels := getLabels(device)
+ 	envVarsMap := getEnvVarsMap(device)
+ 	env := getEnvVarsAPI(device, envVarsMap)
+@@ -792,21 +870,25 @@ func getPod(pod *corev1.Pod, device *ceoslabv1alpha1.CEosLabDevice, secretsAndCo
+ 	if err != nil {
+ 		return err
+ 	}
+-	volumes := getVolumes(secretsAndConfigMaps)
+-	volumeMounts := getVolumeMounts(secretsAndConfigMaps)
++	volumes := getVolumes(secretsAndConfigMaps, useStartupPersistence, device.Name)
++	volumeMounts := getVolumeMounts(secretsAndConfigMaps, useStartupPersistence, device.Name)
+ 	resources := getResourcesAPI(resourceMap)
+ 	startupProbe := getStartupProbeAPI(device)
++	initContainers := []corev1.Container{{
++		Name:  fmt.Sprintf("init-%s", device.Name),
++		Image: initImage,
++		Args: []string{
++			fmt.Sprintf("%d", device.Spec.NumInterfaces+1),
++			fmt.Sprintf("%d", device.Spec.Sleep),
++		},
++		ImagePullPolicy: "IfNotPresent",
++	}}
++	if useStartupPersistence {
++		initContainers = append(initContainers, getStartupSeedInitContainer(device))
++	}
+ 	pod.ObjectMeta.Labels = labels
+ 	pod.Spec = corev1.PodSpec{
+-		InitContainers: []corev1.Container{{
+-			Name:  fmt.Sprintf("init-%s", device.Name),
+-			Image: initImage,
+-			Args: []string{
+-				fmt.Sprintf("%d", device.Spec.NumInterfaces+1),
+-				fmt.Sprintf("%d", device.Spec.Sleep),
+-			},
+-			ImagePullPolicy: "IfNotPresent",
+-		}},
++		InitContainers: initContainers,
+ 		Containers: []corev1.Container{{
+ 			Image:           image,
+ 			Name:            "ceos",
+@@ -967,7 +1049,11 @@ func volumeName(configMapName string) string {
+ 	return "volume-" + configMapName
+ }
+ 
+-func getVolumes(secretsAndConfigMaps map[string]client.Object) []corev1.Volume {
++func startupConfigName(deviceName string) string {
++	return fmt.Sprintf("%s-config", deviceName)
++}
++
++func getVolumes(secretsAndConfigMaps map[string]client.Object, useStartupPersistence bool, deviceName string) []corev1.Volume {
+ 	volumeNames := []string{}
+ 	for name := range secretsAndConfigMaps {
+ 		volumeNames = append(volumeNames, name)
+@@ -1015,17 +1101,36 @@ func getVolumes(secretsAndConfigMaps map[string]client.Object) []corev1.Volume {
+ 		}
+ 		volumes = append(volumes, volume)
+ 	}
++	if useStartupPersistence {
++		// /mnt/flash is an emptyDir, NOT a longhorn PVC. The startup-config is
++		// re-materialized from its configmap into this volume by the
++		// startup-config-seed init container on every bringup, so durable
++		// per-device persistence is unnecessary for the change-demo. Backing it
++		// with a PVC created one longhorn block device per device; those host
++		// /dev/sd* nodes were serial-scanned by EOS ssdinit and stalled Sysdb
++		// past the startup-probe budget → exit137 crashloop (task #77).
++		volumes = append(volumes, corev1.Volume{
++			Name: startupPersistenceVolumeName,
++			VolumeSource: corev1.VolumeSource{
++				EmptyDir: &corev1.EmptyDirVolumeSource{},
++			},
++		})
++	}
+ 	return volumes
+ }
+ 
+-func getVolumeMounts(secretsAndConfigMaps map[string]client.Object) []corev1.VolumeMount {
++func getVolumeMounts(secretsAndConfigMaps map[string]client.Object, useStartupPersistence bool, deviceName string) []corev1.VolumeMount {
+ 	volumeNames := []string{}
+ 	for name := range secretsAndConfigMaps {
+ 		volumeNames = append(volumeNames, name)
+ 	}
+ 	sort.Strings(volumeNames)
+ 	mounts := []corev1.VolumeMount{}
++	startupCM := startupConfigName(deviceName)
+ 	for _, name := range volumeNames {
++		if useStartupPersistence && name == startupCM {
++			continue
++		}
+ 		secretOrConfigMap := secretsAndConfigMaps[name]
+ 		filenames := []string{}
+ 		switch v := secretOrConfigMap.(type) {
+@@ -1053,9 +1158,45 @@ func getVolumeMounts(secretsAndConfigMaps map[string]client.Object) []corev1.Vol
+ 			})
+ 		}
+ 	}
++	if useStartupPersistence {
++		mounts = append(mounts, corev1.VolumeMount{
++			Name:      startupPersistenceVolumeName,
++			MountPath: "/mnt/flash",
++		})
++	}
+ 	return mounts
+ }
+ 
++func getStartupSeedInitContainer(device *ceoslabv1alpha1.CEosLabDevice) corev1.Container {
++	seedFile := startupPersistenceSeedDir + "/startup-config"
++	activeFile := startupPersistenceActiveDir + "/startup-config"
++	return corev1.Container{
++		Name:            "startup-config-seed",
++		Image:           DEFAULT_STARTUP_SEED_IMAGE,
++		ImagePullPolicy: "IfNotPresent",
++		Command:         []string{"/bin/sh", "-lc"},
++		Args: []string{fmt.Sprintf(
++			"set -eu; mkdir -p %q; if [ ! -f %q ]; then cp %q %q; fi",
++			startupPersistenceActiveDir,
++			activeFile,
++			seedFile,
++			activeFile,
++		)},
++		VolumeMounts: []corev1.VolumeMount{
++			{
++				Name:      volumeName(startupConfigName(device.Name)),
++				MountPath: seedFile,
++				SubPath:   "startup-config",
++				ReadOnly:  true,
++			},
++			{
++				Name:      startupPersistenceVolumeName,
++				MountPath: startupPersistenceActiveDir,
++			},
++		},
++	}
++}
++
+ func getStartupProbeAPI(device *ceoslabv1alpha1.CEosLabDevice) *corev1.Probe {
+ 	agents := device.Spec.WaitForAgents
+ 	command := append([]string{"wfw", "-t", "5"}, agents...)

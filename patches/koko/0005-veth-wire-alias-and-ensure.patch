@@ -1,0 +1,573 @@
+From 498d287b4172e73cb6dde4c18c170aa0737fd0af Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sat, 18 Jul 2026 08:12:31 -0500
+Subject: [PATCH 5/5] =?UTF-8?q?api:=20EnsureVethWire=20=E2=80=94=20idempot?=
+ =?UTF-8?q?ent=20veth=20wires=20with=20symmetric=20owner=20alias?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Extend the vxlan ownership concept to veth wires. A logical link is
+identified by a symmetric IFLA_IFALIAS ('meshnet:veth:<topo-ns>:<link-uid>',
+via VethWireAlias) that BOTH directions derive identically, so either side
+can recognize a wire the other side already realized.
+
+EnsureVethWire(local, peer, alias) replaces check-then-MakeVeth callers:
+
+- adopt: if both slots hold the two ends of one structurally verified veth
+  pair (kernel peer-ifindex reciprocity via ethtool, evaluated inside each
+  namespace) — or both carry our alias when verification is unavailable —
+  the wire is correct no matter who created it: refresh aliases, bring both
+  ends up, re-add addresses (EEXIST-tolerant), succeed.
+- recreate: absent ends, halves of broken pairs, and alias-less or
+  koko-vxlan leftovers occupying topology-owned names are deleted and the
+  pair is created fresh, then tagged on both ends.
+- conflict: a slot owned by a DIFFERENT meshnet wire alias fails loudly
+  (two links claiming one ifname is a topology error). Cosmetic aliases a
+  NOS may set (interface descriptions) never block.
+
+Safety and concurrency:
+- eth0/lo/empty names are refused outright: the delegated CNI interface is
+  never created, deleted or re-owned here.
+- All creators serialize behind the node-wide wire-create lock (shared with
+  MakeVxLan), making inspect-then-act atomic among koko actors; a bounded
+  re-inspect loop (3 attempts, backoff) absorbs races with anything else.
+- Namespace probes wrap failures in NamespaceGoneError so callers can park
+  a link (peer sandbox being recreated) instead of failing a whole CNI ADD.
+
+The decision core (decideEnsureVeth) is a pure function with a unit-test
+truth table. Upstreamable.
+---
+ api/koko_veth_ensure.go      | 388 +++++++++++++++++++++++++++++++++++
+ api/koko_veth_ensure_test.go | 124 +++++++++++
+ 2 files changed, 512 insertions(+)
+ create mode 100644 api/koko_veth_ensure.go
+ create mode 100644 api/koko_veth_ensure_test.go
+
+diff --git a/api/koko_veth_ensure.go b/api/koko_veth_ensure.go
+new file mode 100644
+index 0000000..fb22055
+--- /dev/null
++++ b/api/koko_veth_ensure.go
+@@ -0,0 +1,388 @@
++/*
++Idempotent point-to-point veth wire realization.
++
++EnsureVethWire generalizes the vxlan owner-alias concept to veth wires so
++that two racing creators (typically the CNI ADDs of the two pods on a link,
++or a daemon-side reconciler) converge on one correct wire instead of failing
++with "file exists" rename collisions. All koko wire creators on a node
++serialize behind the same wire-create lock, which makes inspect-then-act
++atomic among koko actors; a bounded re-inspect loop absorbs races with
++anything else.
++*/
++package api
++
++import (
++	"errors"
++	"fmt"
++	"strings"
++	"syscall"
++	"time"
++
++	"github.com/containernetworking/plugins/pkg/ns"
++	"github.com/vishvananda/netlink"
++)
++
++// vethAliasPrefix namespaces every IFLA_IFALIAS value EnsureVethWire manages.
++const vethAliasPrefix = "meshnet:veth:"
++
++// ensureVethAttempts bounds the in-process re-inspect loop that absorbs
++// creation races with actors not holding the wire-create lock.
++const ensureVethAttempts = 3
++
++// VethWireAlias returns the canonical IFLA_IFALIAS value identifying one
++// logical wire. Both directions of a link MUST derive the same alias so
++// either side can recognize the other side's completed work and adopt it.
++func VethWireAlias(topoNs string, linkUID int64) string {
++	return fmt.Sprintf("%s%s:%d", vethAliasPrefix, topoNs, linkUID)
++}
++
++// NamespaceGoneError reports that a network namespace path could not be
++// entered — typically because the owning pod sandbox is being torn down or
++// recreated. Callers can detect it (errors.As) to park a link and let the
++// peer complete the wire later, instead of failing a whole CNI ADD.
++type NamespaceGoneError struct {
++	NsName string
++	Err    error
++}
++
++func (e *NamespaceGoneError) Error() string {
++	return fmt.Sprintf("network namespace %q is not usable: %v", e.NsName, e.Err)
++}
++
++func (e *NamespaceGoneError) Unwrap() error { return e.Err }
++
++// wireEndObservation describes what currently occupies one wire end's
++// (netns, ifname) slot.
++type wireEndObservation struct {
++	Exists bool   // something with the target name exists
++	IsVeth bool   // it is a veth
++	Alias  string // its IFLA_IFALIAS value
++}
++
++type ensureAction int
++
++const (
++	ensureActionAdopt ensureAction = iota
++	ensureActionRecreate
++	ensureActionConflict
++)
++
++func (a ensureAction) String() string {
++	switch a {
++	case ensureActionAdopt:
++		return "adopt"
++	case ensureActionRecreate:
++		return "recreate"
++	case ensureActionConflict:
++		return "conflict"
++	}
++	return "unknown"
++}
++
++// pairCheck is the outcome of structural veth pair verification.
++type pairCheck int
++
++const (
++	pairUnknown pairCheck = iota
++	pairMatch
++	pairMismatch
++)
++
++// isProtectedIfName reports whether an interface name must never be created,
++// deleted or re-owned by koko wire management: eth0 belongs to the
++// delegated/primary CNI chain and lo to the kernel.
++func isProtectedIfName(name string) bool {
++	name = strings.TrimSpace(name)
++	return name == "" || name == "eth0" || name == "lo"
++}
++
++// aliasIsOtherWire reports whether alias marks a DIFFERENT meshnet veth wire
++// than want. That is the one occupancy EnsureVethWire refuses to resolve
++// automatically, because it means two topology links claim the same ifname.
++// Non-meshnet aliases (a NOS may copy interface descriptions into
++// IFLA_IFALIAS) never block: for names declared by the topology, the slot is
++// meshnet's by contract.
++func aliasIsOtherWire(alias, want string) bool {
++	return strings.HasPrefix(alias, vethAliasPrefix) && alias != want
++}
++
++// decideEnsureVeth is the pure decision core of EnsureVethWire.
++//
++//   - adopt: both ends exist as the verified two ends of one veth pair — or
++//     both already carry our alias when structural verification is
++//     unavailable — so the wire is correct regardless of which side created
++//     it.
++//   - conflict: a slot is owned by a different meshnet wire's alias;
++//     deleting it would break another link, so fail loudly.
++//   - recreate: everything else (absent ends, halves of broken pairs,
++//     alias-less or koko-vxlan leftovers on our names, non-veth leftovers):
++//     delete whatever exists and create the wire fresh. Protected names are
++//     rejected before any decision is made.
++func decideEnsureVeth(local, peer wireEndObservation, pair pairCheck, alias string) (ensureAction, string) {
++	for _, end := range []struct {
++		side string
++		obs  wireEndObservation
++	}{{"local", local}, {"peer", peer}} {
++		if end.obs.Exists && aliasIsOtherWire(end.obs.Alias, alias) {
++			return ensureActionConflict, fmt.Sprintf(
++				"%s end is owned by a different wire alias %q (want %q)",
++				end.side, end.obs.Alias, alias)
++		}
++	}
++	if local.Exists && peer.Exists && local.IsVeth && peer.IsVeth {
++		if pair == pairMatch {
++			return ensureActionAdopt, "existing veth pair structurally verified"
++		}
++		if pair == pairUnknown && local.Alias == alias && peer.Alias == alias {
++			return ensureActionAdopt, "both ends carry our alias (pair verification unavailable)"
++		}
++	}
++	return ensureActionRecreate, "absent, partial or stale wire"
++}
++
++// probeNetNS verifies a namespace path can be entered, wrapping failures in
++// NamespaceGoneError so callers can classify them.
++func probeNetNS(nsName string) error {
++	if nsName == "" {
++		return nil
++	}
++	netNS, err := ns.GetNS(nsName)
++	if err != nil {
++		return &NamespaceGoneError{NsName: nsName, Err: err}
++	}
++	return netNS.Close()
++}
++
++// observeWireEnd reports what occupies one end's (netns, ifname) slot; an
++// absent link is a normal observation, not an error.
++func observeWireEnd(end VEth) (wireEndObservation, error) {
++	link, err := linkByNameInNS(end.NsName, end.LinkName)
++	if err != nil {
++		if _, notFound := err.(netlink.LinkNotFoundError); notFound {
++			return wireEndObservation{}, nil
++		}
++		return wireEndObservation{}, err
++	}
++	obs := wireEndObservation{Exists: true}
++	_, obs.IsVeth = link.(*netlink.Veth)
++	if link.Attrs() != nil {
++		obs.Alias = link.Attrs().Alias
++	}
++	return obs, nil
++}
++
++// vethIndexes returns (own ifindex, kernel-reported peer ifindex) for a veth
++// end, evaluated inside its namespace.
++func vethIndexes(end VEth) (int, int, error) {
++	var vethNs ns.NetNS
++	var err error
++	if end.NsName == "" {
++		vethNs, err = ns.GetCurrentNS()
++	} else {
++		vethNs, err = ns.GetNS(end.NsName)
++	}
++	if err != nil {
++		return 0, 0, err
++	}
++	defer vethNs.Close()
++
++	self, peerIdx := 0, 0
++	err = vethNs.Do(func(_ ns.NetNS) error {
++		link, err := netlink.LinkByName(end.LinkName)
++		if err != nil {
++			return err
++		}
++		v, ok := link.(*netlink.Veth)
++		if !ok {
++			return fmt.Errorf("link %q in %q is %T, not a veth", end.LinkName, end.NsName, link)
++		}
++		self = v.Attrs().Index
++		peerIdx, err = netlink.VethPeerIndex(v)
++		return err
++	})
++	return self, peerIdx, err
++}
++
++// verifyVethPair structurally verifies that local and peer are the two ends
++// of one veth pair: each side's kernel-reported peer ifindex must equal the
++// other side's own ifindex. Ifindexes are per-namespace, so the reciprocal
++// requirement is what makes the check meaningful. Verification failures
++// (rather than mismatches) degrade to pairUnknown.
++func verifyVethPair(local, peer VEth) pairCheck {
++	lSelf, lPeer, err := vethIndexes(local)
++	if err != nil {
++		return pairUnknown
++	}
++	pSelf, pPeer, err := vethIndexes(peer)
++	if err != nil {
++		return pairUnknown
++	}
++	if lPeer == pSelf && pPeer == lSelf {
++		return pairMatch
++	}
++	return pairMismatch
++}
++
++// setAliasInNS applies the wire alias to one end inside its namespace.
++func setAliasInNS(end VEth, alias string) error {
++	var vethNs ns.NetNS
++	var err error
++	if end.NsName == "" {
++		vethNs, err = ns.GetCurrentNS()
++	} else {
++		vethNs, err = ns.GetNS(end.NsName)
++	}
++	if err != nil {
++		return err
++	}
++	defer vethNs.Close()
++
++	return vethNs.Do(func(_ ns.NetNS) error {
++		link, err := netlink.LinkByName(end.LinkName)
++		if err != nil {
++			return err
++		}
++		return netlink.LinkSetAlias(link, alias)
++	})
++}
++
++// makeVethTagged creates the pair and tags both ends with the wire alias.
++// It runs under the wire-create lock, so the momentary unaliased window is
++// invisible to other koko actors.
++func makeVethTagged(local, peer VEth, alias string) error {
++	if err := MakeVeth(local, peer); err != nil {
++		return err
++	}
++	if err := setAliasInNS(local, alias); err != nil {
++		logger.Warnf("koko: could not set wire alias on %s in %s: %v", local.LinkName, local.NsName, err)
++	}
++	if err := setAliasInNS(peer, alias); err != nil {
++		logger.Warnf("koko: could not set wire alias on %s in %s: %v", peer.LinkName, peer.NsName, err)
++	}
++	return nil
++}
++
++// acquireWireCreateLock serializes ALL koko wire creation on this node —
++// veth and vxlan alike — behind the same in-process mutex and shared file
++// lock used by MakeVxLan, so every CNI plugin invocation and daemon on the
++// node forms a single lock domain.
++func acquireWireCreateLock() func() {
++	return acquireVXLANCreateLock()
++}
++
++func isEExistErr(err error) bool {
++	return err != nil &&
++		(errors.Is(err, syscall.EEXIST) || strings.Contains(err.Error(), "file exists"))
++}
++
++// EnsureVethWire idempotently realizes the point-to-point veth wire
++// local<->peer identified by alias (built with VethWireAlias):
++//
++//   - If the wire already exists and is correct — created earlier by this
++//     side, or concurrently by the peer pod's CNI ADD — it is adopted:
++//     aliases are (re)applied and both ends are brought up and addressed.
++//   - Stale or partial occupants of either slot are deleted and the wire is
++//     created fresh (deleting one veth end deletes its pair peer as well).
++//   - A slot owned by a DIFFERENT wire's alias fails loudly: two topology
++//     links claiming one ifname is a configuration error.
++//
++// Both directions of a link may call this concurrently; correctness comes
++// from the node-wide wire-create lock plus the symmetric alias.
++func EnsureVethWire(local, peer VEth, alias string) error {
++	if isProtectedIfName(local.LinkName) || isProtectedIfName(peer.LinkName) {
++		return fmt.Errorf("EnsureVethWire: refusing to manage protected interface %q/%q",
++			local.LinkName, peer.LinkName)
++	}
++	if !strings.HasPrefix(alias, vethAliasPrefix) {
++		return fmt.Errorf("EnsureVethWire: alias %q must be built with VethWireAlias", alias)
++	}
++	if err := probeNetNS(local.NsName); err != nil {
++		return err
++	}
++	if err := probeNetNS(peer.NsName); err != nil {
++		return err
++	}
++
++	unlock := acquireWireCreateLock()
++	defer unlock()
++
++	var lastErr error
++	for attempt := 1; attempt <= ensureVethAttempts; attempt++ {
++		if attempt > 1 {
++			time.Sleep(time.Duration(attempt-1) * 150 * time.Millisecond)
++		}
++
++		localObs, err := observeWireEnd(local)
++		if err != nil {
++			return err
++		}
++		peerObs, err := observeWireEnd(peer)
++		if err != nil {
++			return err
++		}
++		pair := pairUnknown
++		if localObs.Exists && localObs.IsVeth && peerObs.Exists && peerObs.IsVeth {
++			pair = verifyVethPair(local, peer)
++		}
++		action, reason := decideEnsureVeth(localObs, peerObs, pair, alias)
++		logger.Infof("koko: ensure veth wire %s@%s <-> %s@%s alias=%s attempt=%d/%d: %s (%s)",
++			local.LinkName, local.NsName, peer.LinkName, peer.NsName,
++			alias, attempt, ensureVethAttempts, action, reason)
++
++		switch action {
++		case ensureActionConflict:
++			return fmt.Errorf("EnsureVethWire: %s@%s <-> %s@%s: %s",
++				local.LinkName, local.NsName, peer.LinkName, peer.NsName, reason)
++
++		case ensureActionAdopt:
++			if err := setAliasInNS(local, alias); err != nil {
++				logger.Warnf("koko: could not refresh wire alias on %s in %s: %v",
++					local.LinkName, local.NsName, err)
++			}
++			if err := setAliasInNS(peer, alias); err != nil {
++				logger.Warnf("koko: could not refresh wire alias on %s in %s: %v",
++					peer.LinkName, peer.NsName, err)
++			}
++			if err := configureLinkInNS(local); err != nil {
++				return fmt.Errorf("EnsureVethWire: adopted wire but could not configure %s in %s: %w",
++					local.LinkName, local.NsName, err)
++			}
++			if err := configureLinkInNS(peer); err != nil {
++				return fmt.Errorf("EnsureVethWire: adopted wire but could not configure %s in %s: %w",
++					peer.LinkName, peer.NsName, err)
++			}
++			return nil
++
++		case ensureActionRecreate:
++			if localObs.Exists {
++				if err := removeLinkInNSIfExists(local.NsName, local.LinkName); err != nil {
++					return fmt.Errorf("EnsureVethWire: could not remove stale %s in %s: %w",
++						local.LinkName, local.NsName, err)
++				}
++			}
++			if peerObs.Exists {
++				// May already be gone if it was the pair peer of the link
++				// removed above; removal is not-found tolerant.
++				if err := removeLinkInNSIfExists(peer.NsName, peer.LinkName); err != nil {
++					return fmt.Errorf("EnsureVethWire: could not remove stale %s in %s: %w",
++						peer.LinkName, peer.NsName, err)
++				}
++			}
++			err := makeVethTagged(local, peer, alias)
++			if err == nil {
++				return nil
++			}
++			lastErr = err
++			if !isEExistErr(err) {
++				return err
++			}
++			// An actor outside the koko lock domain raced our create. Loop
++			// to re-inspect: if it materialized our wire we adopt it,
++			// otherwise we retry the creation.
++			logger.Warnf("koko: veth wire create raced (%v); re-inspecting (attempt %d/%d)",
++				err, attempt, ensureVethAttempts)
++		}
++	}
++	return fmt.Errorf("EnsureVethWire: %s@%s <-> %s@%s did not converge after %d attempts: %w",
++		local.LinkName, local.NsName, peer.LinkName, peer.NsName, ensureVethAttempts, lastErr)
++}
+diff --git a/api/koko_veth_ensure_test.go b/api/koko_veth_ensure_test.go
+new file mode 100644
+index 0000000..6960746
+--- /dev/null
++++ b/api/koko_veth_ensure_test.go
+@@ -0,0 +1,124 @@
++package api
++
++import (
++	"errors"
++	"strings"
++	"testing"
++)
++
++func obs(exists, isVeth bool, alias string) wireEndObservation {
++	return wireEndObservation{Exists: exists, IsVeth: isVeth, Alias: alias}
++}
++
++func TestDecideEnsureVethTruthTable(t *testing.T) {
++	alias := VethWireAlias("3-node-ceos", 4)
++	otherWire := VethWireAlias("3-node-ceos", 7)
++
++	cases := []struct {
++		name  string
++		local wireEndObservation
++		peer  wireEndObservation
++		pair  pairCheck
++		want  ensureAction
++	}{
++		{"absent ends create fresh",
++			obs(false, false, ""), obs(false, false, ""), pairUnknown, ensureActionRecreate},
++		{"structurally verified pair adopts",
++			obs(true, true, ""), obs(true, true, ""), pairMatch, ensureActionAdopt},
++		{"verified pair with cosmetic NOS alias adopts",
++			obs(true, true, "uplink to spine1"), obs(true, true, ""), pairMatch, ensureActionAdopt},
++		{"matching aliases adopt when verification unavailable",
++			obs(true, true, alias), obs(true, true, alias), pairUnknown, ensureActionAdopt},
++		{"mismatched pair recreates even with matching aliases",
++			obs(true, true, alias), obs(true, true, alias), pairMismatch, ensureActionRecreate},
++		{"half wire recreates",
++			obs(true, true, ""), obs(false, false, ""), pairUnknown, ensureActionRecreate},
++		{"two unaliased unverified veths recreate",
++			obs(true, true, ""), obs(true, true, ""), pairUnknown, ensureActionRecreate},
++		{"foreign meshnet wire alias conflicts",
++			obs(true, true, otherWire), obs(false, false, ""), pairUnknown, ensureActionConflict},
++		{"foreign meshnet wire alias on peer end conflicts",
++			obs(false, false, ""), obs(true, true, otherWire), pairUnknown, ensureActionConflict},
++		{"koko vxlan leftover on our name recreates",
++			obs(true, false, "koko:vxlan:00aa:00bb"), obs(false, false, ""), pairUnknown, ensureActionRecreate},
++		{"cosmetic NOS alias does not block recreation",
++			obs(true, true, "leaf1 fabric"), obs(false, false, ""), pairUnknown, ensureActionRecreate},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			got, reason := decideEnsureVeth(tc.local, tc.peer, tc.pair, alias)
++			if got != tc.want {
++				t.Fatalf("decideEnsureVeth() = %s (%s), want %s", got, reason, tc.want)
++			}
++		})
++	}
++}
++
++func TestVethWireAliasCanonicalAndUnique(t *testing.T) {
++	a := VethWireAlias("ns1", 4)
++	if a != "meshnet:veth:ns1:4" {
++		t.Fatalf("VethWireAlias() = %q, want meshnet:veth:ns1:4", a)
++	}
++	if !strings.HasPrefix(a, vethAliasPrefix) {
++		t.Fatalf("VethWireAlias() = %q, must carry prefix %q", a, vethAliasPrefix)
++	}
++	if a == VethWireAlias("ns1", 5) || a == VethWireAlias("ns2", 4) {
++		t.Fatal("aliases must be unique per (namespace, link uid)")
++	}
++}
++
++func TestIsProtectedIfName(t *testing.T) {
++	for _, name := range []string{"", "   ", "eth0", "lo"} {
++		if !isProtectedIfName(name) {
++			t.Fatalf("isProtectedIfName(%q) = false, want true", name)
++		}
++	}
++	for _, name := range []string{"eth1", "eth10", "e1-1", "net1"} {
++		if isProtectedIfName(name) {
++			t.Fatalf("isProtectedIfName(%q) = true, want false", name)
++		}
++	}
++}
++
++func TestEnsureVethWireRefusesProtectedNames(t *testing.T) {
++	alias := VethWireAlias("ns", 1)
++	err := EnsureVethWire(
++		VEth{NsName: "/var/run/netns/a", LinkName: "eth0"},
++		VEth{NsName: "/var/run/netns/b", LinkName: "eth1"}, alias)
++	if err == nil || !strings.Contains(err.Error(), "protected") {
++		t.Fatalf("EnsureVethWire(eth0 local) err = %v, want protected-interface refusal", err)
++	}
++	err = EnsureVethWire(
++		VEth{NsName: "/var/run/netns/a", LinkName: "eth1"},
++		VEth{NsName: "/var/run/netns/b", LinkName: "lo"}, alias)
++	if err == nil || !strings.Contains(err.Error(), "protected") {
++		t.Fatalf("EnsureVethWire(lo peer) err = %v, want protected-interface refusal", err)
++	}
++}
++
++func TestEnsureVethWireRejectsNonCanonicalAlias(t *testing.T) {
++	err := EnsureVethWire(
++		VEth{NsName: "/var/run/netns/a", LinkName: "eth1"},
++		VEth{NsName: "/var/run/netns/b", LinkName: "eth2"}, "custom-alias")
++	if err == nil || !strings.Contains(err.Error(), "VethWireAlias") {
++		t.Fatalf("EnsureVethWire(bad alias) err = %v, want canonical-alias refusal", err)
++	}
++}
++
++func TestEnsureVethWireReportsNamespaceGone(t *testing.T) {
++	alias := VethWireAlias("ns", 1)
++	err := EnsureVethWire(
++		VEth{NsName: "/var/run/netns/koko-test-definitely-missing-a", LinkName: "eth1"},
++		VEth{NsName: "/var/run/netns/koko-test-definitely-missing-b", LinkName: "eth2"}, alias)
++	if err == nil {
++		t.Fatal("EnsureVethWire(missing netns) succeeded, want NamespaceGoneError")
++	}
++	var nsErr *NamespaceGoneError
++	if !errors.As(err, &nsErr) {
++		t.Fatalf("EnsureVethWire(missing netns) err = %v (%T), want NamespaceGoneError", err, err)
++	}
++	if nsErr.NsName != "/var/run/netns/koko-test-definitely-missing-a" {
++		t.Fatalf("NamespaceGoneError.NsName = %q, want the first probed namespace", nsErr.NsName)
++	}
++}
+-- 
+2.55.0
+

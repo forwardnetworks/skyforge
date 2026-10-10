@@ -1,0 +1,858 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sat, 5 Sep 2026 11:09:02 -0500
+Subject: [PATCH] plugin: realize a pod's links with a bounded number in flight
+
+Every link of a pod was realized strictly one after another
+(plugin/meshnet.go, the `for _, link := range links` loop). Each iteration
+blocks on IO the others do not share: a meshnetClient.Get RPC to the local
+daemon, koko.EnsureVethWire (two netns entries plus link creation) or
+koko.MakeVxLan, a remote gRPC dial and Update to the PEER NODE's daemon, and
+two SetTxChecksumOff netns entries. That latency is paid once per link,
+inside one 90 s ADD budget, for every pod on a KNE bringup.
+
+The loop body becomes wireLink(), lifted verbatim except that its control
+flow now travels in a linkOutcome value instead of `continue`, `return err`
+and appends to two shared slices -- concurrency is impossible while a loop
+body reaches out and mutates createdLinks and linkErrs. runLinks() then runs
+them with at most N in flight and returns the outcomes IN LINK ORDER, so
+rollback order and the "realized N of M links" message stay deterministic
+however completion interleaves.
+
+WHY THIS IS SAFE, precisely:
+  * No shared mutable state is left in the per-link path. Each call returns
+    its own outcome; the only package-level variable it reads
+    (interNodeLinkType) is set once before cmdAdd runs.
+  * Every namespace entry goes through containernetworking ns.Do, which runs
+    its callback on its OWN goroutine with runtime.LockOSThread and restores
+    (or abandons) that thread afterwards. It is goroutine-safe by
+    construction; the init()-time LockOSThread is about the MAIN thread and
+    is untouched.
+  * gRPC ClientConns are safe for concurrent use.
+  * The two koko creation paths serialize themselves exactly where they must
+    and nowhere else: EnsureVethWire locks both wire ENDPOINT slots (koko
+    0006) and MakeVxLan locks its target slot plus its host VNI tuple (koko
+    0010). Two links of one pod always have different local ifnames and
+    different deterministic VNIs (0006), so they never contend. No lock's
+    scope is widened by this patch; the concurrency is safe because the locks
+    were already the right shape.
+
+Bounded, not unbounded: a pod with 40 links must not open 40 concurrent gRPC
+dials to one peer node's daemon. Default 4, `linkConcurrency` in the CNI conf
+or MESHNET_LINK_CONCURRENCY in the environment; 1 restores exactly the old
+serial behaviour and is the kill switch.
+
+"Abort at the first fatal error" is preserved by cancelling the link-phase
+context on the first fatal outcome, so siblings stop at their next RPC
+instead of running to completion for a pod that is already lost. Their
+outcomes are still collected, so anything they DID create is still rolled
+back.
+
+ONE BEHAVIOUR CHANGE, forced by the restructure and worth having: the
+peer-not-alive branch ended in `if err != nil || !ok.Response { return err }`,
+where err is NIL when the trigger was !ok.Response. In the old loop that
+returned nil from cmdAdd without printing a CNI result, which multus reports
+as "failed to unmarshal raw result: unexpected end of JSON input" -- a
+message naming nothing. A nil fatal has no meaning in an outcome value, so
+the error is now synthesized, exactly as 0009 already did at the sibling park
+site twelve lines above.
+
+Why upstream wants this: nothing about the serialization is deliberate --
+it is just what a for loop does -- and the locking that makes overlapping
+safe is already in koko. It is a straight latency win on the hot path with a
+one-value kill switch.
+
+Positive controls: TestRunLinksBoundsConcurrency proves links overlap AT ALL
+(peak must REACH the limit, which is 1 under the old loop) and that nothing
+starts beyond it; plus order preservation, the limit-1 serial escape hatch,
+fatal-cancels-the-rest, and that a sibling's created link survives a
+concurrent fatal. The whole plugin suite passes under -race.
+
+Executed negative controls, each of which made the suite red:
+  * forcing the semaphore to depth 1 -> "only 1 of 4 links started; the
+    phase is not running them concurrently"
+  * removing the bound (semaphore = len(links)) -> "8 links started beyond
+    the limit of 4: the bound is not enforced"
+  * dropping the cancel on a fatal -> "0 of 3 sibling links saw the
+    cancellation"
+---
+ plugin/meshnet.go               | 490 +++++++++++++++++++++-----------
+ plugin/meshnet_parallel_test.go | 224 +++++++++++++++
+ 2 files changed, 541 insertions(+), 173 deletions(-)
+ create mode 100644 plugin/meshnet_parallel_test.go
+
+diff --git a/plugin/meshnet.go b/plugin/meshnet.go
+index d160ee6..ecfe450 100644
+--- a/plugin/meshnet.go
++++ b/plugin/meshnet.go
+@@ -8,7 +8,9 @@ import (
+ 	"net"
+ 	"os"
+ 	"runtime"
++	"strconv"
+ 	"strings"
++	"sync"
+ 	"time"
+ 
+ 	"github.com/containernetworking/cni/pkg/skel"
+@@ -39,6 +41,10 @@ const (
+ 	// delBudget is the best-effort CNI DEL deadline; on expiry we log and
+ 	// return success so pod teardown is never blocked by meshnet cleanup.
+ 	delBudget = 45 * time.Second
++	// defaultLinkConcurrency is how many of a pod's links are realized at
++	// once when nothing says otherwise. Small on purpose: the win is
++	// overlapping per-link IO, not saturating a node.
++	defaultLinkConcurrency = 4
+ )
+ 
+ var (
+@@ -53,6 +59,9 @@ type netConf struct {
+ 	KubeVirtSecondary    bool                   `json:"kubevirtSecondary,omitempty"`
+ 	SecondaryWaitSeconds int                    `json:"secondaryWaitSeconds,omitempty"`
+ 	FabricMTU            int                    `json:"fabricMTU,omitempty"`
++	// LinkConcurrency bounds how many of a pod's links are realized at once.
++	// 0 means defaultLinkConcurrency; 1 restores strictly serial wiring.
++	LinkConcurrency int `json:"linkConcurrency,omitempty"`
+ }
+ 
+ type k8sArgs struct {
+@@ -497,201 +506,336 @@ func cmdAdd(args *skel.CmdArgs) (retErr error) {
+ 	// the rest; infrastructure failures (daemon RPCs, vxlan/grpc wiring)
+ 	// still fail fast.
+ 	var linkErrs []error
+-	for _, link := range links { // Iterate over each link of the local pod
+-		// Build koko's veth struct for local intf
+-		myVeth, err := makeVeth(args.Netns, link.LocalIntf, link.LocalIp, n.FabricMTU)
+-		if err != nil {
+-			return err
++	linkConc := linkConcurrency(n, len(links))
++	log.Infof("Add[%s]: realizing %d link(s) with at most %d in flight", string(cniArgs.K8S_POD_NAME), len(links), linkConc)
++	outcomes := runLinks(ctx, links, linkConc, func(ctx context.Context, link *mpb.Link) linkOutcome {
++		return wireLink(ctx, n, args, cniArgs, meshnetClient, localPod, srcIntf, link)
++	})
++	for _, outcome := range outcomes {
++		if outcome.created != nil {
++			createdLinks = append(createdLinks, outcome.created)
++		}
++	}
++	for _, outcome := range outcomes {
++		if outcome.fatal != nil {
++			return outcome.fatal
+ 		}
++		if outcome.soft != nil {
++			linkErrs = append(linkErrs, outcome.soft)
++		}
++	}
+ 
+-		// First option is macvlan interface
+-		if link.PeerPod == localhost {
+-			log.Infof("Peer link is MacVlan")
+-			macVlan := koko.MacVLan{
+-				ParentIF: link.PeerIntf,
+-				Mode:     macvlanMode,
+-			}
+-			if err = koko.MakeMacVLan(*myVeth, macVlan); err != nil {
+-				log.Errorf("Failed to add macvlan interface")
+-				return err
+-			}
+-			createdLinks = append(createdLinks, myVeth)
+-			log.Infof("macvlan interface %s@%s has been added", link.LocalIntf, link.PeerIntf)
+-			continue
++	if len(linkErrs) > 0 {
++		return fmt.Errorf("meshnet CNI ADD for pod %s realized %d of %d links: %w", string(cniArgs.K8S_POD_NAME), len(links)-len(linkErrs), len(links), errors.Join(linkErrs...))
++	}
++
++	addSucceeded = true
++	if n.KubeVirtSecondary {
++		return printKubeVirtSecondaryResult(result, n.CNIVersion, requestedIntf)
++	}
++	return types.PrintResult(result, n.CNIVersion)
++}
++
++// linkOutcome is the result of realizing ONE link of a pod.
++//
++// The three fields are the three things the serial loop used to express with
++// control flow, which a concurrent phase cannot use:
++//   - created: the LOCAL end that now exists and must be rolled back if the
++//     ADD as a whole fails (removing one veth end removes its pair peer too).
++//   - soft:    this link failed, but the state of the others still matters --
++//     the loop used to append to linkErrs and continue.
++//   - fatal:   an infrastructure failure (a daemon RPC, vxlan or grpc wiring)
++//     that must fail the whole ADD -- the loop used to `return err`.
++//
++// All three may be zero: a link that was legitimately parked (peer not alive,
++// peer sandbox vanished mid-wire) produces nothing at all.
++type linkOutcome struct {
++	created *koko.VEth
++	soft    error
++	fatal   error
++}
++
++// linkConcurrency is how many of a pod's links may be realized at once.
++//
++// WHAT WAS ACTUALLY SERIAL. Every link of a pod was realized one after
++// another, and each one blocks on IO that the others do not share: a
++// meshnetClient.Get RPC to the local daemon, koko.EnsureVethWire (two netns
++// entries plus link creation) or koko.MakeVxLan, a remote gRPC dial and
++// Update to the PEER NODE's daemon, and two SetTxChecksumOff netns entries.
++// On a KNE bringup that latency is paid once per link, inside one 90s ADD
++// budget.
++//
++// WHY IT IS SAFE TO OVERLAP. Nothing in the per-link path shares mutable
++// state: the accumulators are gone (each link returns its own outcome),
++// every namespace entry goes through ns.Do, which runs its callback on its
++// OWN locked OS thread and is therefore goroutine-safe, gRPC client conns are
++// safe for concurrent use, and the only package-level variable the path reads
++// (interNodeLinkType) is set once before cmdAdd runs. The two koko creation
++// paths serialize themselves exactly where they must: EnsureVethWire locks
++// both wire ENDPOINT slots (koko 0006) and MakeVxLan locks its target slot
++// and its host VNI tuple (koko 0010). Two links of one pod always have
++// different local ifnames and different deterministic VNIs, so they never
++// contend with each other.
++//
++// Deliberately bounded rather than unbounded: a pod with 40 links must not
++// open 40 concurrent gRPC dials to one peer node's daemon. A value of 1
++// restores the old, strictly serial behaviour.
++func linkConcurrency(n *netConf, linkCount int) int {
++	limit := n.LinkConcurrency
++	if raw := strings.TrimSpace(os.Getenv("MESHNET_LINK_CONCURRENCY")); raw != "" {
++		if v, err := strconv.Atoi(raw); err == nil && v > 0 {
++			limit = v
++		} else {
++			log.Warnf("Ignoring invalid MESHNET_LINK_CONCURRENCY=%q, using %d", raw, limit)
+ 		}
++	}
++	if limit <= 0 {
++		limit = defaultLinkConcurrency
++	}
++	if limit > linkCount {
++		limit = linkCount
++	}
++	if limit < 1 {
++		limit = 1
++	}
++	return limit
++}
+ 
+-		// Initialising peer pod's metadata
+-		log.Infof("Add[%s]: retrieving peer pod %s information from meshnet daemon", string(cniArgs.K8S_POD_NAME), link.PeerPod)
+-		peerPod, err := meshnetClient.Get(ctx, &mpb.PodQuery{
+-			Name:   link.PeerPod,
+-			KubeNs: string(cniArgs.K8S_POD_NAMESPACE),
+-		})
+-		if n.KubeVirtSecondary && (err != nil || !isPodAlive(peerPod)) {
+-			// kubevirt secondary interfaces deliberately wait for their peer
+-			// pod: the NAD attach happens while the topology peer may still
+-			// be scheduling.
+-			if err != nil {
+-				log.Warnf("Add[%s]: kubevirt secondary interface %s could not read peer pod %s yet; waiting for topology/alive metadata", string(cniArgs.K8S_POD_NAME), link.LocalIntf, link.PeerPod)
+-			} else {
+-				log.Infof("Add[%s]: kubevirt secondary interface %s waiting for peer pod %s to become alive", string(cniArgs.K8S_POD_NAME), link.LocalIntf, peerPod.Name)
++// runLinks realizes links with at most `limit` in flight and returns the
++// outcomes in the SAME ORDER as links, so rollback order and error reporting
++// stay deterministic regardless of completion order.
++//
++// The first fatal outcome cancels the context handed to the still-running
++// workers, which is how the serial loop's "abort at the first fatal error" is
++// preserved: the others stop at their next RPC instead of running to
++// completion for a pod that is already lost. Their outcomes are still
++// collected, so anything they DID create is still rolled back.
++func runLinks(ctx context.Context, links []*mpb.Link, limit int, wire func(context.Context, *mpb.Link) linkOutcome) []linkOutcome {
++	outcomes := make([]linkOutcome, len(links))
++	if len(links) == 0 {
++		return outcomes
++	}
++	if limit < 1 {
++		limit = 1
++	}
++
++	linkCtx, cancel := context.WithCancel(ctx)
++	defer cancel()
++
++	sem := make(chan struct{}, limit)
++	var wg sync.WaitGroup
++	var once sync.Once
++	for i, link := range links {
++		wg.Add(1)
++		go func(i int, link *mpb.Link) {
++			defer wg.Done()
++			sem <- struct{}{}
++			defer func() { <-sem }()
++			outcomes[i] = wire(linkCtx, link)
++			if outcomes[i].fatal != nil {
++				once.Do(cancel)
+ 			}
+-			peerPod, err = waitForPeerPodAlive(ctx, meshnetClient, link.PeerPod, string(cniArgs.K8S_POD_NAMESPACE), localPod.Name, link.LocalIntf, kubeVirtSecondaryWaitDuration(n.SecondaryWaitSeconds))
++		}(i, link)
++	}
++	wg.Wait()
++	return outcomes
++}
++
++// wireLink realizes ONE link. It is the body of what used to be cmdAdd's
++// per-link loop, lifted verbatim except that its control flow now travels in
++// a linkOutcome instead of `continue`, `return err` and appends to shared
++// slices. Every value it closes over is read-only.
++func wireLink(ctx context.Context, n *netConf, args *skel.CmdArgs, cniArgs k8sArgs, meshnetClient mpb.LocalClient, localPod *mpb.Pod, srcIntf string, link *mpb.Link) linkOutcome {
++	var created *koko.VEth
++	// Build koko's veth struct for local intf
++	myVeth, err := makeVeth(args.Netns, link.LocalIntf, link.LocalIp, n.FabricMTU)
++	if err != nil {
++		return linkOutcome{fatal: err}
++	}
++
++	// First option is macvlan interface
++	if link.PeerPod == localhost {
++		log.Infof("Peer link is MacVlan")
++		macVlan := koko.MacVLan{
++			ParentIF: link.PeerIntf,
++			Mode:     macvlanMode,
++		}
++		if err = koko.MakeMacVLan(*myVeth, macVlan); err != nil {
++			log.Errorf("Failed to add macvlan interface")
++			return linkOutcome{fatal: err}
+ 		}
++		log.Infof("macvlan interface %s@%s has been added", link.LocalIntf, link.PeerIntf)
++		return linkOutcome{created: myVeth}
++	}
++
++	// Initialising peer pod's metadata
++	log.Infof("Add[%s]: retrieving peer pod %s information from meshnet daemon", string(cniArgs.K8S_POD_NAME), link.PeerPod)
++	peerPod, err := meshnetClient.Get(ctx, &mpb.PodQuery{
++		Name:   link.PeerPod,
++		KubeNs: string(cniArgs.K8S_POD_NAMESPACE),
++	})
++	if n.KubeVirtSecondary && (err != nil || !isPodAlive(peerPod)) {
++		// kubevirt secondary interfaces deliberately wait for their peer
++		// pod: the NAD attach happens while the topology peer may still
++		// be scheduling.
+ 		if err != nil {
+-			log.Errorf("Add[%s]: Failed to retrieve peer pod %s:%s topology", string(cniArgs.K8S_POD_NAME), string(cniArgs.K8S_POD_NAMESPACE), link.PeerPod)
+-			return err
++			log.Warnf("Add[%s]: kubevirt secondary interface %s could not read peer pod %s yet; waiting for topology/alive metadata", string(cniArgs.K8S_POD_NAME), link.LocalIntf, link.PeerPod)
++		} else {
++			log.Infof("Add[%s]: kubevirt secondary interface %s waiting for peer pod %s to become alive", string(cniArgs.K8S_POD_NAME), link.LocalIntf, peerPod.Name)
+ 		}
++		peerPod, err = waitForPeerPodAlive(ctx, meshnetClient, link.PeerPod, string(cniArgs.K8S_POD_NAMESPACE), localPod.Name, link.LocalIntf, kubeVirtSecondaryWaitDuration(n.SecondaryWaitSeconds))
++	}
++	if err != nil {
++		log.Errorf("Add[%s]: Failed to retrieve peer pod %s:%s topology", string(cniArgs.K8S_POD_NAME), string(cniArgs.K8S_POD_NAMESPACE), link.PeerPod)
++		return linkOutcome{fatal: err}
++	}
+ 
+-		isAlive := isPodAlive(peerPod)
+-		log.Infof("Add[%s]: Is peer pod %s alive?: %t", string(cniArgs.K8S_POD_NAME), peerPod.Name, isAlive)
++	isAlive := isPodAlive(peerPod)
++	log.Infof("Add[%s]: Is peer pod %s alive?: %t", string(cniArgs.K8S_POD_NAME), peerPod.Name, isAlive)
+ 
+-		if isAlive { // This means we're coming up AFTER our peer so things are pretty easy
+-			log.Infof("Add[%s]: Peer pod %s is alive", string(cniArgs.K8S_POD_NAME), peerPod.Name)
+-			if peerPod.SrcIp == localPod.SrcIp { // This means we're on the same host
+-				log.Infof("Add[%s]: %s and %s are on the same host", string(cniArgs.K8S_POD_NAME), localPod.Name, peerPod.Name)
+-				// Creating koko's Veth struct for peer intf
+-				peerVeth, err := makeVeth(peerPod.NetNs, link.PeerIntf, link.PeerIp, n.FabricMTU)
+-				if err != nil {
+-					log.Errorf("Add[%s]: Failed to build koko Veth struct", string(cniArgs.K8S_POD_NAME))
+-					return err
+-				}
++	if isAlive { // This means we're coming up AFTER our peer so things are pretty easy
++		log.Infof("Add[%s]: Peer pod %s is alive", string(cniArgs.K8S_POD_NAME), peerPod.Name)
++		if peerPod.SrcIp == localPod.SrcIp { // This means we're on the same host
++			log.Infof("Add[%s]: %s and %s are on the same host", string(cniArgs.K8S_POD_NAME), localPod.Name, peerPod.Name)
++			// Creating koko's Veth struct for peer intf
++			peerVeth, err := makeVeth(peerPod.NetNs, link.PeerIntf, link.PeerIp, n.FabricMTU)
++			if err != nil {
++				log.Errorf("Add[%s]: Failed to build koko Veth struct", string(cniArgs.K8S_POD_NAME))
++				return linkOutcome{fatal: err}
++			}
+ 
+-				// Idempotently realize the wire. Both directions of a link may
+-				// attempt this concurrently (both pods' ADDs); koko serializes
+-				// creators sharing either endpoint while allowing disjoint
+-				// wires to progress concurrently. It either adopts a wire the
+-				// peer already realized correctly, replaces stale halves, or
+-				// fails loudly when a different wire owns the name. This
+-				// replaces the old check-then-MakeVeth branches, whose
+-				// existence checks were racy and whose rename collisions were
+-				// fatal to the entire multi-link ADD.
+-				alias := koko.VethWireAlias(string(cniArgs.K8S_POD_NAMESPACE), link.Uid)
+-				if err := koko.EnsureVethWire(*myVeth, *peerVeth, alias); err != nil {
+-					if peerNotReady(err, peerPod.NetNs) {
+-						// The peer's sandbox vanished mid-wire (it is being
+-						// recreated). Park this link like the peer-not-alive
+-						// case: set the skip flag and move on; the peer
+-						// completes the wire on its own next ADD.
+-						log.Warnf("Add[%s]: parking link %s (link id %d): peer pod %s not ready: %v", string(cniArgs.K8S_POD_NAME), link.LocalIntf, link.Uid, peerPod.Name, err)
+-						ok, serr := meshnetClient.Skip(ctx, &mpb.SkipQuery{
+-							Pod:    localPod.Name,
+-							Peer:   peerPod.Name,
+-							LinkId: link.Uid,
+-							KubeNs: string(cniArgs.K8S_POD_NAMESPACE),
+-						})
+-						if serr != nil {
+-							log.Errorf("Add[%s]: Failed to set a skipped flag on peer %s: %v", string(cniArgs.K8S_POD_NAME), peerPod.Name, serr)
+-							return serr
+-						}
+-						if !ok.Response {
+-							log.Errorf("Add[%s]: Failed to set a skipped flag on peer %s", string(cniArgs.K8S_POD_NAME), peerPod.Name)
+-							return fmt.Errorf("could not set skipped flag on peer %s for link %d", peerPod.Name, link.Uid)
+-						}
+-						continue
++			// Idempotently realize the wire. Both directions of a link may
++			// attempt this concurrently (both pods' ADDs); koko serializes
++			// creators sharing either endpoint while allowing disjoint
++			// wires to progress concurrently. It either adopts a wire the
++			// peer already realized correctly, replaces stale halves, or
++			// fails loudly when a different wire owns the name. This
++			// replaces the old check-then-MakeVeth branches, whose
++			// existence checks were racy and whose rename collisions were
++			// fatal to the entire multi-link ADD.
++			alias := koko.VethWireAlias(string(cniArgs.K8S_POD_NAMESPACE), link.Uid)
++			if err := koko.EnsureVethWire(*myVeth, *peerVeth, alias); err != nil {
++				if peerNotReady(err, peerPod.NetNs) {
++					// The peer's sandbox vanished mid-wire (it is being
++					// recreated). Park this link like the peer-not-alive
++					// case: set the skip flag and move on; the peer
++					// completes the wire on its own next ADD.
++					log.Warnf("Add[%s]: parking link %s (link id %d): peer pod %s not ready: %v", string(cniArgs.K8S_POD_NAME), link.LocalIntf, link.Uid, peerPod.Name, err)
++					ok, serr := meshnetClient.Skip(ctx, &mpb.SkipQuery{
++						Pod:    localPod.Name,
++						Peer:   peerPod.Name,
++						LinkId: link.Uid,
++						KubeNs: string(cniArgs.K8S_POD_NAMESPACE),
++					})
++					if serr != nil {
++						log.Errorf("Add[%s]: Failed to set a skipped flag on peer %s: %v", string(cniArgs.K8S_POD_NAME), peerPod.Name, serr)
++						return linkOutcome{fatal: serr}
+ 					}
+-					log.Errorf("Add[%s]: Error ensuring VEth wire %s (link id %d) with koko: %s", string(cniArgs.K8S_POD_NAME), link.LocalIntf, link.Uid, err)
+-					linkErrs = append(linkErrs, fmt.Errorf("link %d (%s): %w", link.Uid, link.LocalIntf, err))
+-					continue
+-				}
+-				// Record only the local end for rollback: removing it removes
+-				// the pair, and this sandbox is abandoned on ADD failure
+-				// whether the wire was created or adopted.
+-				createdLinks = append(createdLinks, myVeth)
+-				if err := wireutil.SetTxChecksumOff(myVeth.LinkName, myVeth.NsName); err != nil {
+-					log.Errorf("Add[%s]: Error in setting tx checksum-off on interface %s, ns %s, pod %s: %v", string(cniArgs.K8S_POD_NAME), myVeth.LinkName, myVeth.NsName, localPod.Name, err)
+-					// not returning
+-				}
+-				if err := wireutil.SetTxChecksumOff(peerVeth.LinkName, peerVeth.NsName); err != nil {
+-					log.Errorf("Add[%s]: Error in setting tx checksum-off on interface %s, ns %s, pod %s: %v", string(cniArgs.K8S_POD_NAME), peerVeth.LinkName, peerVeth.NsName, peerPod.Name, err)
+-					// not returning
+-				}
+-
+-			} else { // This means we're on different hosts
+-				log.Infof("Add[%s]: %s@%s and %s@%s are on different hosts", string(cniArgs.K8S_POD_NAME), localPod.Name, localPod.SrcIp, peerPod.Name, peerPod.SrcIp)
+-				if interNodeLinkType == wireutil.INTER_NODE_LINK_GRPC {
+-					err = CreatGRPCChan(link, localPod, peerPod, meshnetClient, &cniArgs, ctx, n.FabricMTU)
+-					if err != nil {
+-						log.Errorf("Add[%s]: !! Failed to create grpc wire. err: %v", string(cniArgs.K8S_POD_NAME), err)
+-						return err
++					if !ok.Response {
++						log.Errorf("Add[%s]: Failed to set a skipped flag on peer %s", string(cniArgs.K8S_POD_NAME), peerPod.Name)
++						return linkOutcome{fatal: fmt.Errorf("could not set skipped flag on peer %s for link %d", peerPod.Name, link.Uid)}
+ 					}
+-					continue
+-				}
+-				vni := makeVxlanID(string(cniArgs.K8S_POD_NAMESPACE), link.Uid)
+-				// Creating koko's Vxlan struct
+-				vxlan := makeVxlan(srcIntf, peerPod.SrcIp, vni, n.FabricMTU)
+-				if err = koko.MakeVxLan(*myVeth, *vxlan); err != nil {
+-					log.Infof("Add[%s]: Error when creating a Vxlan interface with koko: %s", string(cniArgs.K8S_POD_NAME), err)
+-					return err
++					return linkOutcome{}
+ 				}
+-				createdLinks = append(createdLinks, myVeth)
+-
+-				// Now we need to make an API call to update the remote VTEP to point to us
+-				payload := &mpb.RemotePod{
+-					NetNs:    peerPod.NetNs,
+-					IntfName: link.PeerIntf,
+-					IntfIp:   link.PeerIp,
+-					PeerVtep: localPod.SrcIp,
+-					Vni:      int64(vni),
+-					KubeNs:   string(cniArgs.K8S_POD_NAMESPACE),
+-					NodeIntf: srcIntf,
+-				}
+-
+-				url := fmt.Sprintf("%s:%d", peerPod.SrcIp, wireutil.GRPCDefaultPort)
+-				log.Infof("Add[%s]: Trying to do a remote update on %s", string(cniArgs.K8S_POD_NAME), url)
++				log.Errorf("Add[%s]: Error ensuring VEth wire %s (link id %d) with koko: %s", string(cniArgs.K8S_POD_NAME), link.LocalIntf, link.Uid, err)
++				return linkOutcome{soft: fmt.Errorf("link %d (%s): %w", link.Uid, link.LocalIntf, err)}
++			}
++			// Record only the local end for rollback: removing it removes
++			// the pair, and this sandbox is abandoned on ADD failure
++			// whether the wire was created or adopted.
++			created = myVeth
++			if err := wireutil.SetTxChecksumOff(myVeth.LinkName, myVeth.NsName); err != nil {
++				log.Errorf("Add[%s]: Error in setting tx checksum-off on interface %s, ns %s, pod %s: %v", string(cniArgs.K8S_POD_NAME), myVeth.LinkName, myVeth.NsName, localPod.Name, err)
++				// not returning
++			}
++			if err := wireutil.SetTxChecksumOff(peerVeth.LinkName, peerVeth.NsName); err != nil {
++				log.Errorf("Add[%s]: Error in setting tx checksum-off on interface %s, ns %s, pod %s: %v", string(cniArgs.K8S_POD_NAME), peerVeth.LinkName, peerVeth.NsName, peerPod.Name, err)
++				// not returning
++			}
+ 
+-				remote, err := dialGRPC(ctx, url)
++		} else { // This means we're on different hosts
++			log.Infof("Add[%s]: %s@%s and %s@%s are on different hosts", string(cniArgs.K8S_POD_NAME), localPod.Name, localPod.SrcIp, peerPod.Name, peerPod.SrcIp)
++			if interNodeLinkType == wireutil.INTER_NODE_LINK_GRPC {
++				err = CreatGRPCChan(link, localPod, peerPod, meshnetClient, &cniArgs, ctx, n.FabricMTU)
+ 				if err != nil {
+-					log.Infof("Add[%s]: Failed to dial remote gRPC url %s: %v", string(cniArgs.K8S_POD_NAME), url, err)
+-					return err
+-				}
+-				remoteClient := mpb.NewRemoteClient(remote)
+-				ok, err := remoteClient.Update(ctx, payload)
+-				if err != nil || ok == nil || !ok.Response {
+-					// NEVER return a nil error here. When the daemon rejected the
+-					// update without a transport error, err is nil and !ok.Response
+-					// was the trigger -- so `return err` returned nil, cmdAdd
+-					// unwound WITHOUT calling types.PrintResult, skel.PluginMain
+-					// exited 0 with an EMPTY STDOUT, and multus surfaced it as
+-					// "failed to unmarshal raw result: unexpected end of JSON
+-					// input": a message that names no link, no peer and no reason.
+-					// A nil return from cmdAdd that never printed a result is
+-					// ALWAYS a bug; make the real cause travel instead.
+-					if err == nil {
+-						err = fmt.Errorf("remote meshnet daemon at %s rejected the update", url)
+-					}
+-					log.Infof("Add[%s]: Failed to do a remote update of link %d to %s: %v",
+-						string(cniArgs.K8S_POD_NAME), link.Uid, url, err)
+-					return fmt.Errorf("remote update for link %d to %s failed: %w", link.Uid, url, err)
++					log.Errorf("Add[%s]: !! Failed to create grpc wire. err: %v", string(cniArgs.K8S_POD_NAME), err)
++					return linkOutcome{fatal: err}
+ 				}
+-				log.Infof("Add[%s]: Successfully updated remote meshnet daemon", string(cniArgs.K8S_POD_NAME))
++				return linkOutcome{}
+ 			}
+-		} else { // This means that our peer pod hasn't come up yet
+-			// Since there's no way of telling if our peer is going to be on this host or another,
+-			// the only option is to do nothing, assuming that the peer POD will do all the plumbing when it comes up
+-			log.Infof("Add[%s]: Peer pod %s@%s (link id %d) isn't alive yet, continuing", string(cniArgs.K8S_POD_NAME), peerPod.Name, link.PeerIntf, link.Uid)
+-			// Here we need to set the skipped flag so that our peer can configure VEth interface when it comes up later
+-			ok, err := meshnetClient.Skip(ctx, &mpb.SkipQuery{
+-				Pod:    localPod.Name,
+-				Peer:   peerPod.Name,
+-				LinkId: link.Uid,
+-				KubeNs: string(cniArgs.K8S_POD_NAMESPACE),
+-			})
+-			if err != nil || !ok.Response {
+-				log.Errorf("Add[%s]: Failed to set a skipped flag on peer %s", string(cniArgs.K8S_POD_NAME), peerPod.Name)
+-				return err
++			vni := makeVxlanID(string(cniArgs.K8S_POD_NAMESPACE), link.Uid)
++			// Creating koko's Vxlan struct
++			vxlan := makeVxlan(srcIntf, peerPod.SrcIp, vni, n.FabricMTU)
++			if err = koko.MakeVxLan(*myVeth, *vxlan); err != nil {
++				log.Infof("Add[%s]: Error when creating a Vxlan interface with koko: %s", string(cniArgs.K8S_POD_NAME), err)
++				return linkOutcome{fatal: err}
++			}
++			created = myVeth
++
++			// Now we need to make an API call to update the remote VTEP to point to us
++			payload := &mpb.RemotePod{
++				NetNs:    peerPod.NetNs,
++				IntfName: link.PeerIntf,
++				IntfIp:   link.PeerIp,
++				PeerVtep: localPod.SrcIp,
++				Vni:      int64(vni),
++				KubeNs:   string(cniArgs.K8S_POD_NAMESPACE),
++				NodeIntf: srcIntf,
+ 			}
+-		}
+-	}
+ 
+-	if len(linkErrs) > 0 {
+-		return fmt.Errorf("meshnet CNI ADD for pod %s realized %d of %d links: %w", string(cniArgs.K8S_POD_NAME), len(links)-len(linkErrs), len(links), errors.Join(linkErrs...))
+-	}
++			url := fmt.Sprintf("%s:%d", peerPod.SrcIp, wireutil.GRPCDefaultPort)
++			log.Infof("Add[%s]: Trying to do a remote update on %s", string(cniArgs.K8S_POD_NAME), url)
+ 
+-	addSucceeded = true
+-	if n.KubeVirtSecondary {
+-		return printKubeVirtSecondaryResult(result, n.CNIVersion, requestedIntf)
++			remote, err := dialGRPC(ctx, url)
++			if err != nil {
++				log.Infof("Add[%s]: Failed to dial remote gRPC url %s: %v", string(cniArgs.K8S_POD_NAME), url, err)
++				return linkOutcome{fatal: err}
++			}
++			remoteClient := mpb.NewRemoteClient(remote)
++			ok, err := remoteClient.Update(ctx, payload)
++			if err != nil || ok == nil || !ok.Response {
++				// NEVER return a nil error here. When the daemon rejected the
++				// update without a transport error, err is nil and !ok.Response
++				// was the trigger -- so `return err` returned nil, cmdAdd
++				// unwound WITHOUT calling types.PrintResult, skel.PluginMain
++				// exited 0 with an EMPTY STDOUT, and multus surfaced it as
++				// "failed to unmarshal raw result: unexpected end of JSON
++				// input": a message that names no link, no peer and no reason.
++				// A nil return from cmdAdd that never printed a result is
++				// ALWAYS a bug; make the real cause travel instead.
++				if err == nil {
++					err = fmt.Errorf("remote meshnet daemon at %s rejected the update", url)
++				}
++				log.Infof("Add[%s]: Failed to do a remote update of link %d to %s: %v",
++					string(cniArgs.K8S_POD_NAME), link.Uid, url, err)
++				return linkOutcome{fatal: fmt.Errorf("remote update for link %d to %s failed: %w", link.Uid, url, err)}
++			}
++			log.Infof("Add[%s]: Successfully updated remote meshnet daemon", string(cniArgs.K8S_POD_NAME))
++		}
++	} else { // This means that our peer pod hasn't come up yet
++		// Since there's no way of telling if our peer is going to be on this host or another,
++		// the only option is to do nothing, assuming that the peer POD will do all the plumbing when it comes up
++		log.Infof("Add[%s]: Peer pod %s@%s (link id %d) isn't alive yet, continuing", string(cniArgs.K8S_POD_NAME), peerPod.Name, link.PeerIntf, link.Uid)
++		// Here we need to set the skipped flag so that our peer can configure VEth interface when it comes up later
++		ok, err := meshnetClient.Skip(ctx, &mpb.SkipQuery{
++			Pod:    localPod.Name,
++			Peer:   peerPod.Name,
++			LinkId: link.Uid,
++			KubeNs: string(cniArgs.K8S_POD_NAMESPACE),
++		})
++		if err == nil && (ok == nil || !ok.Response) {
++			// NEVER return a nil error from here. `return err` with a nil
++			// err used to abort the whole ADD without printing a result,
++			// which multus reports as "unexpected end of JSON input" --
++			// the same shape 0009 already fixed at the park site above.
++			err = fmt.Errorf("could not set skipped flag on peer %s for link %d", peerPod.Name, link.Uid)
++		}
++		if err != nil {
++			log.Errorf("Add[%s]: Failed to set a skipped flag on peer %s: %v", string(cniArgs.K8S_POD_NAME), peerPod.Name, err)
++			return linkOutcome{fatal: err}
++		}
+ 	}
+-	return types.PrintResult(result, n.CNIVersion)
++	return linkOutcome{created: created}
+ }
+ 
+ // -------------------------------------------------------------------------------------------------
+diff --git a/plugin/meshnet_parallel_test.go b/plugin/meshnet_parallel_test.go
+new file mode 100644
+index 0000000..dbc8740
+--- /dev/null
++++ b/plugin/meshnet_parallel_test.go
+@@ -0,0 +1,224 @@
++package main
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	koko "github.com/redhat-nfvpe/koko/api"
++
++	mpb "github.com/networkop/meshnet-cni/daemon/proto/meshnet/v1beta1"
++)
++
++func testLinks(n int) []*mpb.Link {
++	links := make([]*mpb.Link, n)
++	for i := range links {
++		links[i] = &mpb.Link{LocalIntf: fmt.Sprintf("eth%d", i+1), Uid: int64(i + 1)}
++	}
++	return links
++}
++
++// TestRunLinksKeepsOutcomeOrder: rollback order and the "realized N of M"
++// message both depend on outcomes lining up with links, and completion order
++// under concurrency does not.
++func TestRunLinksKeepsOutcomeOrder(t *testing.T) {
++	links := testLinks(8)
++	outcomes := runLinks(context.Background(), links, 4, func(ctx context.Context, link *mpb.Link) linkOutcome {
++		// Finish in reverse order of submission.
++		time.Sleep(time.Duration(10-link.Uid) * 2 * time.Millisecond)
++		return linkOutcome{created: &koko.VEth{LinkName: link.LocalIntf}}
++	})
++	if len(outcomes) != len(links) {
++		t.Fatalf("got %d outcomes for %d links", len(outcomes), len(links))
++	}
++	for i, o := range outcomes {
++		if o.created == nil || o.created.LinkName != links[i].LocalIntf {
++			t.Fatalf("outcome %d = %#v, want the outcome of %s", i, o.created, links[i].LocalIntf)
++		}
++	}
++}
++
++// TestRunLinksBoundsConcurrency is the POSITIVE CONTROL for the whole change:
++// it proves links overlap at all (limit 4 must reach 4 in flight) AND that the
++// bound is respected (never more than 4). With the old serial loop the peak
++// would be 1, and an unbounded fan-out would reach 12.
++func TestRunLinksBoundsConcurrency(t *testing.T) {
++	const total, limit = 12, 4
++	var inFlight, peak int64
++	var mu sync.Mutex
++	release := make(chan struct{})
++	entered := make(chan struct{}, total)
++
++	done := make(chan []linkOutcome, 1)
++	go func() {
++		done <- runLinks(context.Background(), testLinks(total), limit, func(ctx context.Context, link *mpb.Link) linkOutcome {
++			cur := atomic.AddInt64(&inFlight, 1)
++			mu.Lock()
++			if cur > peak {
++				peak = cur
++			}
++			mu.Unlock()
++			entered <- struct{}{}
++			<-release
++			atomic.AddInt64(&inFlight, -1)
++			return linkOutcome{}
++		})
++	}()
++
++	for i := 0; i < limit; i++ {
++		select {
++		case <-entered:
++		case <-time.After(5 * time.Second):
++			close(release)
++			t.Fatalf("only %d of %d links started; the phase is not running them concurrently", i, limit)
++		}
++	}
++	// Give an unbounded implementation every chance to overshoot: nothing has
++	// been released yet, so any worker beyond the limit that starts anyway
++	// lands in `entered` and is still there after this grace period.
++	time.Sleep(300 * time.Millisecond)
++	if extra := len(entered); extra != 0 {
++		close(release)
++		t.Fatalf("%d links started beyond the limit of %d: the bound is not enforced", extra, limit)
++	}
++	if got := atomic.LoadInt64(&inFlight); got != limit {
++		close(release)
++		t.Fatalf("%d links in flight, want exactly the limit %d", got, limit)
++	}
++	close(release)
++
++	select {
++	case outcomes := <-done:
++		if len(outcomes) != total {
++			t.Fatalf("got %d outcomes, want %d", len(outcomes), total)
++		}
++	case <-time.After(5 * time.Second):
++		t.Fatal("runLinks did not finish")
++	}
++
++	mu.Lock()
++	defer mu.Unlock()
++	if peak != limit {
++		t.Fatalf("peak concurrency = %d, want exactly the limit %d (below it means the phase is still serial)", peak, limit)
++	}
++}
++
++// TestRunLinksWithLimitOneIsStrictlySerial: the documented escape hatch has to
++// actually be an escape hatch.
++func TestRunLinksWithLimitOneIsStrictlySerial(t *testing.T) {
++	var inFlight, peak int64
++	runLinks(context.Background(), testLinks(6), 1, func(ctx context.Context, link *mpb.Link) linkOutcome {
++		cur := atomic.AddInt64(&inFlight, 1)
++		for {
++			p := atomic.LoadInt64(&peak)
++			if cur <= p || atomic.CompareAndSwapInt64(&peak, p, cur) {
++				break
++			}
++		}
++		time.Sleep(2 * time.Millisecond)
++		atomic.AddInt64(&inFlight, -1)
++		return linkOutcome{}
++	})
++	if peak != 1 {
++		t.Fatalf("peak concurrency with limit 1 = %d, want 1", peak)
++	}
++}
++
++// TestRunLinksFatalCancelsTheRest preserves the serial loop's "abort at the
++// first fatal error": the still-running links must be told to stop rather
++// than run to completion for a pod that is already lost.
++func TestRunLinksFatalCancelsTheRest(t *testing.T) {
++	fatal := errors.New("remote meshnet daemon rejected the update")
++	cancelled := make(chan struct{}, 8)
++
++	outcomes := runLinks(context.Background(), testLinks(4), 4, func(ctx context.Context, link *mpb.Link) linkOutcome {
++		if link.Uid == 1 {
++			return linkOutcome{fatal: fatal}
++		}
++		select {
++		case <-ctx.Done():
++			cancelled <- struct{}{}
++			return linkOutcome{}
++		case <-time.After(5 * time.Second):
++			return linkOutcome{}
++		}
++	})
++	if !errors.Is(outcomes[0].fatal, fatal) {
++		t.Fatalf("outcome 0 = %#v, want the fatal error", outcomes[0])
++	}
++	if len(cancelled) != 3 {
++		t.Fatalf("%d of 3 sibling links saw the cancellation", len(cancelled))
++	}
++}
++
++// TestRunLinksStillCollectsWhatACancelledSiblingCreated: a link that created
++// its local end before the fatal arrived must still be reported, or the ADD's
++// rollback leaks it.
++func TestRunLinksStillCollectsWhatACancelledSiblingCreated(t *testing.T) {
++	outcomes := runLinks(context.Background(), testLinks(2), 2, func(ctx context.Context, link *mpb.Link) linkOutcome {
++		if link.Uid == 2 {
++			time.Sleep(20 * time.Millisecond)
++			return linkOutcome{fatal: errors.New("boom")}
++		}
++		return linkOutcome{created: &koko.VEth{LinkName: link.LocalIntf, NsName: "/var/run/netns/cni-x"}}
++	})
++	if outcomes[0].created == nil || outcomes[0].created.LinkName != "eth1" {
++		t.Fatalf("the created link of the surviving worker was lost: %#v", outcomes[0])
++	}
++	if outcomes[1].fatal == nil {
++		t.Fatal("the fatal outcome was lost")
++	}
++}
++
++func TestRunLinksHandlesNoLinks(t *testing.T) {
++	if got := runLinks(context.Background(), nil, 4, func(context.Context, *mpb.Link) linkOutcome {
++		t.Fatal("wire called for an empty link set")
++		return linkOutcome{}
++	}); len(got) != 0 {
++		t.Fatalf("runLinks(nil) = %#v, want empty", got)
++	}
++}
++
++func TestLinkConcurrency(t *testing.T) {
++	cases := []struct {
++		name  string
++		conf  int
++		env   string
++		links int
++		want  int
++	}{
++		{"default", 0, "", 8, defaultLinkConcurrency},
++		{"conf wins over default", 2, "", 8, 2},
++		{"env wins over conf", 2, "6", 8, 6},
++		{"never exceeds the link count", 0, "", 2, 2},
++		{"one link is one worker", 0, "", 1, 1},
++		{"conf 1 restores serial", 1, "", 8, 1},
++		{"env 1 restores serial", 8, "1", 8, 1},
++		{"invalid env is ignored", 3, "banana", 8, 3},
++		{"negative env is ignored", 3, "-4", 8, 3},
++		{"zero links still yields at least one worker", 0, "", 0, 1},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			t.Setenv("MESHNET_LINK_CONCURRENCY", tc.env)
++			if got := linkConcurrency(&netConf{LinkConcurrency: tc.conf}, tc.links); got != tc.want {
++				t.Fatalf("linkConcurrency(conf=%d env=%q links=%d) = %d, want %d", tc.conf, tc.env, tc.links, got, tc.want)
++			}
++		})
++	}
++}
++
++func TestLoadConfReadsLinkConcurrency(t *testing.T) {
++	conf, _, err := loadConf([]byte(`{"cniVersion":"0.3.0","name":"meshnet","type":"meshnet","linkConcurrency":6}`))
++	if err != nil || conf.LinkConcurrency != 6 {
++		t.Fatalf("loadConf linkConcurrency = %d, %v; want 6, nil", conf.LinkConcurrency, err)
++	}
++	conf, _, err = loadConf([]byte(`{"cniVersion":"0.3.0","name":"meshnet","type":"meshnet"}`))
++	if err != nil || conf.LinkConcurrency != 0 {
++		t.Fatalf("absent linkConcurrency = %d, %v; want 0 (meaning the default), nil", conf.LinkConcurrency, err)
++	}
++}

@@ -1,0 +1,163 @@
+From 12e6ea5db720de8d6cd91525732934b9b41394b3 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Wed, 26 Aug 2026 18:35:55 -0500
+Subject: [PATCH] vxlan/daemon/plugin: see KubeVirt-renamed wires; stop losing
+ the error
+
+Cross-node meshnet links whose remote endpoint is a KubeVirt VM could wedge a
+pod in sandbox creation FOREVER, with multus reporting only
+
+  failed to unmarshal raw result: unexpected end of JSON input
+
+Three defects compose. The first is the fault; the other two destroy the
+diagnosis.
+
+1. daemon/vxlan: KubeVirt bridge binding RENAMES our wire. virt-launcher takes
+   podXXXX, renames it to XXXX-nic, enslaves it to bridge k6tXXXX and fronts it
+   with a tap. LinkByName(podXXXX) then fails, CreateOrUpdate concludes the wire
+   is absent and calls MakeVxLan, which fails EEXIST because the VNI is still
+   registered from the host netns. The VNI is deterministic (FNV-32a over
+   namespace+linkUID), so every kubelet retry recomputes the same VNI and hits
+   the same occupant: once lost, the race is lost permanently. Look for the
+   renamed form before believing the wire is absent, and return the LINK so the
+   caller still runs its normal attribute comparison -- a renamed wire with the
+   wrong VNI or remote is corrected, not silently accepted.
+
+2. daemon/meshnet/handler.go discarded the error (returned nil), leaving the
+   caller with Response=false and no reason.
+
+3. plugin/meshnet.go returned that nil err on !ok.Response, so cmdAdd unwound
+   WITHOUT calling types.PrintResult; skel.PluginMain exited 0 with an EMPTY
+   STDOUT, which is precisely the 'unexpected end of JSON input' multus
+   reported. A nil return from cmdAdd that never printed a result is always a
+   bug.
+---
+ daemon/meshnet/handler.go |  9 +++++--
+ daemon/vxlan/vxlan.go     | 53 +++++++++++++++++++++++++++++++++++++++
+ plugin/meshnet.go         | 19 +++++++++++---
+ 3 files changed, 76 insertions(+), 5 deletions(-)
+
+diff --git a/daemon/meshnet/handler.go b/daemon/meshnet/handler.go
+index 38d0a26..12783a4 100644
+--- a/daemon/meshnet/handler.go
++++ b/daemon/meshnet/handler.go
+@@ -507,8 +507,13 @@ func (m *Meshnet) IsSkipped(ctx context.Context, skip *mpb.SkipQuery) (*mpb.Bool
+ 
+ func (m *Meshnet) Update(ctx context.Context, pod *mpb.RemotePod) (*mpb.BoolResponse, error) {
+ 	if err := vxlan.CreateOrUpdate(pod); err != nil {
+-		mnetdLogger.Errorf("Failed to Update Vxlan")
+-		return &mpb.BoolResponse{Response: false}, nil
++		// Return the REAL error. Discarding it (returning nil) left the caller
++		// with only Response=false and no reason, which is how a vxlan EEXIST
++		// on a KubeVirt-renamed wire reached the CNI plugin as a bare "not ok"
++		// and from there reached multus as an empty stdout.
++		mnetdLogger.Errorf("Failed to Update Vxlan in netns %s (ns %s) intf %s vni %d peer %s: %v",
++			pod.NetNs, pod.KubeNs, pod.IntfName, pod.Vni, pod.PeerVtep, err)
++		return &mpb.BoolResponse{Response: false}, err
+ 	}
+ 	return &mpb.BoolResponse{Response: true}, nil
+ }
+diff --git a/daemon/vxlan/vxlan.go b/daemon/vxlan/vxlan.go
+index fffd6d3..3d5a14e 100644
+--- a/daemon/vxlan/vxlan.go
++++ b/daemon/vxlan/vxlan.go
+@@ -71,6 +71,34 @@ func CreateOrUpdate(v *mpb.RemotePod) error {
+ 	link := getLinkFromNS(veth.NsName, veth.LinkName)
+ 	vxLanOvrlyLogger.Infof("Retrieved %s link from %s Netns: %+v", veth.LinkName, veth.NsName, link)
+ 
++	// KUBEVIRT BRIDGE BINDING RENAMES OUR WIRE. When the peer pod is a KubeVirt
++	// VM using bridge binding, virt-launcher takes the interface we created
++	// ("podXXXX"), RENAMES it to "XXXX-nic", enslaves it to a new bridge
++	// "k6t-XXXX" and puts a tap in front. LinkByName("podXXXX") then fails, so
++	// the lookup above returns nil and the code below concludes the wire does
++	// not exist and calls MakeVxLan -- which fails EEXIST, because the VNI is
++	// still registered from this host netns. koko then scans for the conflict
++	// in the DAEMON's netns, cannot see an occupant that lives inside the pod,
++	// reports "unowned host vxlan conflict ... conflicts=[]" and fails closed.
++	//
++	// The plugin returns nil without printing a CNI result, so multus reports
++	// "failed to unmarshal raw result: unexpected end of JSON input" -- a
++	// message that names nothing. The VNI is deterministic (FNV-32a over
++	// namespace+linkUID), so every kubelet retry recomputes the same VNI, hits
++	// the same occupant, and the pod wedges in sandbox creation FOREVER. This
++	// is a race: it only bites when the peer VM finishes bridge binding before
++	// this end's CNI ADD runs, which is why only some cross-node VM-to-VM links
++	// are affected and why a delete/recreate reproduces it exactly.
++	//
++	// So: before believing the wire is absent, look for the renamed form.
++	if link == nil {
++		if renamed := kubevirtRenamedLink(veth.NsName, veth.LinkName); renamed != nil {
++			vxLanOvrlyLogger.Infof("Found KubeVirt-renamed wire for %s in %s: %s -- treating as existing",
++				veth.LinkName, veth.NsName, renamed.Attrs().Name)
++			link = renamed
++		}
++	}
++
+ 	// Check if interface already exists
+ 	vxlanLink, ok := link.(*netlink.Vxlan)
+ 	vxLanOvrlyLogger.Infof("Is link %+v a VXLAN?: %s", vxlanLink, strconv.FormatBool(ok))
+@@ -145,6 +173,31 @@ func getLinkFromNS(nsName string, linkName string) netlink.Link {
+ 	return result
+ }
+ 
++// kubevirtRenamedLink looks for the KubeVirt bridge-binding form of a meshnet
++// wire. virt-launcher renames "podXXXX" to "XXXX-nic" and enslaves it to
++// "k6t-XXXX". We return it only if it is genuinely a vxlan, so a same-named
++// veth cannot be mistaken for one.
++//
++// Returning the link (rather than "true") lets the caller run the SAME
++// attribute comparison it runs for an unrenamed wire, so a renamed link whose
++// VNI or remote is wrong is still corrected instead of silently accepted.
++func kubevirtRenamedLink(nsName string, linkName string) netlink.Link {
++	if !strings.HasPrefix(linkName, "pod") {
++		return nil
++	}
++	renamed := strings.TrimPrefix(linkName, "pod") + "-nic"
++	link := getLinkFromNS(nsName, renamed)
++	if link == nil {
++		return nil
++	}
++	if _, ok := link.(*netlink.Vxlan); !ok {
++		vxLanOvrlyLogger.Infof("link %s in %s exists but is not a vxlan (%T) -- not treating as our wire",
++			renamed, nsName, link)
++		return nil
++	}
++	return link
++}
++
+ // Uses netlink to query the IP and LinkName of the interface with default route
+ func getSource() (string, string, error) {
+ 	// Looking up a default route to get the intf and IP for vxlan
+diff --git a/plugin/meshnet.go b/plugin/meshnet.go
+index 9fc4601..471cac6 100644
+--- a/plugin/meshnet.go
++++ b/plugin/meshnet.go
+@@ -654,9 +654,22 @@ func cmdAdd(args *skel.CmdArgs) (retErr error) {
+ 				}
+ 				remoteClient := mpb.NewRemoteClient(remote)
+ 				ok, err := remoteClient.Update(ctx, payload)
+-				if err != nil || !ok.Response {
+-					log.Infof("Add[%s]: Failed to do a remote update", string(cniArgs.K8S_POD_NAME))
+-					return err
++				if err != nil || ok == nil || !ok.Response {
++					// NEVER return a nil error here. When the daemon rejected the
++					// update without a transport error, err is nil and !ok.Response
++					// was the trigger -- so `return err` returned nil, cmdAdd
++					// unwound WITHOUT calling types.PrintResult, skel.PluginMain
++					// exited 0 with an EMPTY STDOUT, and multus surfaced it as
++					// "failed to unmarshal raw result: unexpected end of JSON
++					// input": a message that names no link, no peer and no reason.
++					// A nil return from cmdAdd that never printed a result is
++					// ALWAYS a bug; make the real cause travel instead.
++					if err == nil {
++						err = fmt.Errorf("remote meshnet daemon at %s rejected the update", url)
++					}
++					log.Infof("Add[%s]: Failed to do a remote update of link %d to %s: %v",
++						string(cniArgs.K8S_POD_NAME), link.Uid, url, err)
++					return fmt.Errorf("remote update for link %d to %s failed: %w", link.Uid, url, err)
+ 				}
+ 				log.Infof("Add[%s]: Successfully updated remote meshnet daemon", string(cniArgs.K8S_POD_NAME))
+ 			}
+-- 
+2.55.0
+

@@ -1,0 +1,27 @@
+From ac254f1575aa51b6e70353824239e7e4a989f739 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Thu, 23 Jul 2026 19:04:51 -0500
+Subject: [PATCH 10/10] plugin: document endpoint-scoped koko locking
+
+Keep the meshnet CNI call-site contract aligned with koko: actors sharing an endpoint serialize, while disjoint same-node wires may now progress concurrently.
+---
+ plugin/meshnet.go | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/plugin/meshnet.go b/plugin/meshnet.go
+index ecd3e9f..1cbc083 100644
+--- a/plugin/meshnet.go
++++ b/plugin/meshnet.go
+@@ -557,7 +557,8 @@ func cmdAdd(args *skel.CmdArgs) (retErr error) {
+ 
+ 				// Idempotently realize the wire. Both directions of a link may
+ 				// attempt this concurrently (both pods' ADDs); koko serializes
+-				// all wire creators node-wide and either adopts a wire the
++				// creators sharing either endpoint while allowing disjoint
++				// wires to progress concurrently. It either adopts a wire the
+ 				// peer already realized correctly, replaces stale halves, or
+ 				// fails loudly when a different wire owns the name. This
+ 				// replaces the old check-then-MakeVeth branches, whose
+-- 
+2.55.0
+

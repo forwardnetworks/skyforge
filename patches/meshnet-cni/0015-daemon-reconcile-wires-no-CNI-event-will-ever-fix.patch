@@ -1,0 +1,1705 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sat, 5 Sep 2026 11:01:11 -0500
+Subject: [PATCH] daemon: reconcile wires no CNI event will ever fix
+
+meshnet only ever acts on CNI ADD and CNI DEL. Every wire exists because some
+pod's sandbox was created and is torn down because some pod's sandbox was
+destroyed. That model has one hole, and it is not a rare one: a pod that
+SURVIVES while its peer is recreated receives no event at all. Its half of
+the wire stays exactly as it was, pointing at a peer that no longer exists,
+and nothing in the system is looking at it again.
+
+Measured 2026-09-05 on example-lab. While the CNI was failing, KubeVirt crashed
+and recreated four VMs at the cdg site. The surviving pods kept stale wire
+state: siteB-lan-pc01 could not reach its gateway siteB-acc-sw01 -- 172.16.14.4
+answered !H at hop 1 -- while the SAME lan->core adjacency at the sfo and sea
+sites answered in under 1 ms. Nothing was in CrashLoopBackOff, nothing was
+Pending, and the analysis system collected the lab green over management throughout,
+because the analysis system collects over management and a dead fabric certifies green.
+Only something that looks at the WIRES finds this.
+
+WHAT THIS IS NOT BUILT ON. status.skipped is HISTORICAL: it is appended to
+and, apart from SkipReverse's own tuple removal, never cleared, so an entry
+means "at some point this peer was not ready" and nothing more. It is not a
+health signal and the reconciler does not read it.
+
+THE RULE THAT SHAPES THE REST. A reconciler that tears down healthy wires is
+far worse than the bug it fixes -- the bug costs one adjacency in one lab, a
+bad reconciler costs every adjacency on a node, during a demo. So every
+decision defaults to doing nothing, and a repair needs positive evidence
+confirmed twice:
+
+ 1. EVIDENCE. koko.InspectVethWire and the new vxlan.Inspect are read-only
+    and report `broken` only on a fact: an end ABSENT from a namespace that
+    was demonstrably enterable, two ends that are demonstrably not one veth
+    pair (reciprocal ifindex check), or a vxlan programmed for the wrong VNI
+    or the wrong remote VTEP. Everything unproven -- a namespace that cannot
+    be entered, a pair check that could not run, a non-veth or non-vxlan
+    occupant, a slot owned by another wire's alias -- is `unknown` or
+    `conflict` and is skipped, with the reason counted in the pass summary.
+    A link present under the KubeVirt bridge-binding form of its name
+    (0013's "podXXXX" -> "XXXX-nic") also stops the pass dead: the absence of
+    the name we asked for proves nothing when the renamed form is there.
+
+ 2. CORROBORATION. A wire is repaired only after N consecutive passes agree,
+    with the pod identity behind it (netns, container id, peer netns, peer
+    VTEP) unchanged in between. This is what keeps the reconciler from
+    fighting an in-flight CNI ADD or DEL: an ADD has a 90 s budget, a DEL
+    45 s, and a whole tick (default 5 min) separates passes, so a wire caught
+    mid-ADD settles long before it could be counted twice. A pod being
+    recreated changes its identity and restarts the count from zero.
+
+ 3. IDEMPOTENT REPAIR THROUGH THE SAME PATHS A CNI ADD USES --
+    koko.EnsureVethWire for a same-node veth, vxlan.CreateOrUpdate for our
+    end of a cross-node wire (0014 made its removal idempotent; this builds
+    on it). Both take koko's cross-process endpoint locks, so a repair that
+    does race a real ADD serializes behind it. Nothing here deletes a link
+    itself, and protected names (eth0, lo) are excluded before inspection.
+
+Bounded on every axis: first pass after 90 s (MESHNET_RECONCILE_INITIAL_DELAY),
+then every 5 min (MESHNET_RECONCILE_INTERVAL, 0 disables), 2 confirmations
+(MESHNET_RECONCILE_CONFIRMATIONS), at most 32 repairs per pass
+(MESHNET_RECONCILE_MAX_REPAIRS). Disabled outright under
+INTER_NODE_LINK_TYPE=GRPC, which has its own reconciler, and it SAYS so --
+a reconciler that silently does nothing is indistinguishable from a healthy
+node.
+
+Every pass logs its result, including the pass that changed nothing:
+"pods=79 wires=214 healthy=214 repaired=0 failed=0 pending=0 skipped=0" is a
+positive statement over a counted scope. Silence would not be.
+
+ONE MORE THING THIS FIXES. The VNI derivation moves to wireutil.VxlanID and
+plugin/meshnet.go's makeVxlanID becomes a wrapper over it. The daemon has to
+derive the SAME VNI the plugin chose for a wire nobody is currently adding,
+and a second copy that drifted by a byte would put the two ends of a link on
+different VNIs -- up from every angle except traffic. One definition, one
+behaviour; the plugin's existing tests still cover it.
+
+Why upstream wants this: the ADD/DEL-only model is upstream's, not ours, and
+the hole is in the model rather than in any one code path. A KubeVirt VM
+restart is only the way we hit it; any pod restart whose peer survives does
+the same thing on any substrate.
+
+Positive controls: a table over classifyWire, an exhaustive sweep of every
+combination of the boolean facts asserting `repair` is reachable ONLY with
+full positive evidence (and failing if the sweep never reaches a repair at
+all, so it cannot pass over an empty scope), the confirmer's four rules, and
+whole passes driven through fake inspectors -- including a healthy lab, which
+must change nothing and must say it changed nothing.
+
+Executed negative controls, each of which made the suite red:
+  * returning `due` on the first broken observation -> "first pass: ...
+    repaired=1 ..., want the wire pending and nothing repaired"
+  * treating `unknown` as broken -> "classifyWire() = repair (acting on
+    inconclusive evidence ...), want skip", plus the sweep
+  * removing the KubeVirt-rename guard -> "a KubeVirt-renamed wire was
+    repaired"
+  * removing the local-sandbox guard -> "repair without positive evidence
+    {LocalNetNSUsable:false ...}"
+---
+ daemon/main.go                    |   9 +
+ daemon/meshnet/reconcile.go       | 655 ++++++++++++++++++++++++++++++
+ daemon/meshnet/reconcile_probe.go |  70 ++++
+ daemon/meshnet/reconcile_test.go  | 537 ++++++++++++++++++++++++
+ daemon/vxlan/inspect.go           | 101 +++++
+ daemon/vxlan/inspect_test.go      |  73 ++++
+ plugin/meshnet.go                 |  20 +-
+ utils/wireutil/wire-util.go       |  27 ++
+ 8 files changed, 1478 insertions(+), 14 deletions(-)
+ create mode 100644 daemon/meshnet/reconcile.go
+ create mode 100644 daemon/meshnet/reconcile_probe.go
+ create mode 100644 daemon/meshnet/reconcile_test.go
+ create mode 100644 daemon/vxlan/inspect.go
+ create mode 100644 daemon/vxlan/inspect_test.go
+
+diff --git a/daemon/main.go b/daemon/main.go
+index 3fed3d9..a340173 100644
+--- a/daemon/main.go
++++ b/daemon/main.go
+@@ -1,6 +1,7 @@
+ package main
+ 
+ import (
++	"context"
+ 	"flag"
+ 	"os"
+ 	"strconv"
+@@ -58,6 +59,14 @@ func main() {
+ 		// generate error and continue
+ 	}
+ 
++	// meshnet only ever acts on CNI ADD/DEL, so a pod that SURVIVES while its
++	// peer is recreated keeps stale wire state and nothing looks at it again.
++	// StartWireReconciler closes that hole on a bounded tick; it is a
++	// goroutine and never blocks Serve.
++	ctx, cancelReconciler := context.WithCancel(context.Background())
++	defer cancelReconciler()
++	m.StartWireReconciler(ctx)
++
+ 	if err := m.Serve(); err != nil {
+ 		log.Errorf("daemon exited badly: %v", err)
+ 		os.Exit(1)
+diff --git a/daemon/meshnet/reconcile.go b/daemon/meshnet/reconcile.go
+new file mode 100644
+index 0000000..341e32b
+--- /dev/null
++++ b/daemon/meshnet/reconcile.go
+@@ -0,0 +1,655 @@
++package meshnet
++
++/*
++Wire reconciliation for pods the daemon never got a CNI event for.
++
++WHY THIS EXISTS. meshnet only ever acts on CNI ADD and CNI DEL. Every wire in
++a lab is created because some pod's sandbox was created, and torn down
++because some pod's sandbox was destroyed. That model has one hole, and it is
++not a rare one: a pod that SURVIVES while its peer is recreated gets no event
++at all. Its half of the wire stays exactly as it was, pointing at a peer that
++no longer exists, and nothing in the system is looking.
++
++Measured 2026-09-05 on example-lab. While the CNI was failing, KubeVirt crashed and
++recreated four VMs at the cdg site. The surviving pods kept stale wire state:
++siteB-lan-pc01 could not reach its gateway siteB-acc-sw01 (172.16.14.4 answered
++!H at hop 1) while the SAME lan->core adjacency at the sfo and sea sites
++answered in under 1 ms. Nothing was in CrashLoopBackOff, nothing was
++Pending, and the analysis system collected the lab green over management the whole time.
++A dead fabric certifies green; only a reconciler that looks at the wires
++finds this.
++
++WHAT IT IS NOT BUILT ON. The Topology CR's status.skipped is HISTORICAL. It
++is appended to and, apart from SkipReverse's own tuple removal, never
++cleared, so an entry there says only "at some point this peer was not ready".
++It is not a wire-health signal and nothing here reads it.
++
++THE RULE THAT SHAPES EVERYTHING ELSE. A reconciler that tears down healthy
++wires is far worse than the bug it fixes: the bug costs one adjacency in one
++lab, a bad reconciler costs every adjacency on the node, during a demo. So
++every decision here defaults to DOING NOTHING and repair requires positive
++evidence, confirmed twice:
++
++  1. Evidence. koko.InspectVethWire / vxlan.Inspect report `broken` only on a
++     fact -- an end absent from a namespace that WAS enterable, two ends that
++     are demonstrably not one veth pair (reciprocal ifindex check), a vxlan
++     programmed for the wrong VNI or the wrong remote VTEP. Anything that
++     could not be established is `unknown` and is skipped, loudly.
++  2. Corroboration. A wire is repaired only after N consecutive passes agree
++     it is broken AND the pod identity behind it (netns, container id, peer
++     netns, peer VTEP) has not changed in between. This is what keeps the
++     reconciler from fighting a CNI ADD or DEL that is in flight: an ADD gets
++     90 s of budget, a DEL 45 s, and a whole tick interval elapses between
++     passes, so a wire caught mid-ADD is already settled before it could ever
++     be counted twice.
++  3. Idempotent repair through the SAME code paths a CNI ADD uses --
++     koko.EnsureVethWire for a same-node veth, vxlan.CreateOrUpdate for our
++     end of a cross-node wire. Both are idempotent and both take koko's
++     cross-process endpoint locks, so a repair that does race a real ADD
++     serializes behind it rather than corrupting it. Nothing here deletes a
++     link directly.
++
++Every pass reports, including the pass that changed nothing: a no-op says so,
++with the counts that make it a positive statement rather than an absence.
++*/
++
++import (
++	"context"
++	"fmt"
++	"net"
++	"os"
++	"sort"
++	"strconv"
++	"strings"
++	"time"
++
++	koko "github.com/redhat-nfvpe/koko/api"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++
++	topologyv1 "github.com/networkop/meshnet-cni/api/types/v1beta1"
++	"github.com/networkop/meshnet-cni/daemon/vxlan"
++	"github.com/networkop/meshnet-cni/utils/wireutil"
++
++	mpb "github.com/networkop/meshnet-cni/daemon/proto/meshnet/v1beta1"
++)
++
++const (
++	// defaultReconcileInterval is the bounded tick. Long, on purpose: this
++	// exists to catch a wire nobody will otherwise ever look at, not to be a
++	// control loop. Set MESHNET_RECONCILE_INTERVAL=0 to disable entirely.
++	defaultReconcileInterval = 5 * time.Minute
++	// defaultReconcileInitialDelay keeps the first pass out of the node's
++	// busiest window. meshnetd restarts during a lab bringup, and at that
++	// moment half the wires legitimately do not exist yet.
++	defaultReconcileInitialDelay = 90 * time.Second
++	// defaultReconcileConfirmations is the number of consecutive passes that
++	// must agree before anything is repaired. Two is the minimum that can
++	// distinguish "broken" from "in flight".
++	defaultReconcileConfirmations = 2
++	// defaultReconcileMaxRepairs bounds the blast radius of one pass. A
++	// genuinely broken lab is a page, not something to rebuild in a burst.
++	defaultReconcileMaxRepairs = 32
++)
++
++// verdict is what one pass concluded about one wire.
++type verdict int
++
++const (
++	// verdictSkip: nothing was established, or nothing may be acted on.
++	verdictSkip verdict = iota
++	verdictHealthy
++	verdictRepair
++)
++
++func (v verdict) String() string {
++	switch v {
++	case verdictSkip:
++		return "skip"
++	case verdictHealthy:
++		return "healthy"
++	case verdictRepair:
++		return "repair"
++	}
++	return "invalid"
++}
++
++// wireHealth is the health vocabulary shared by both wire kinds, so
++// classifyWire is one function rather than two that can drift.
++type wireHealth int
++
++const (
++	healthUnknown wireHealth = iota
++	healthOK
++	healthBroken
++	healthConflict
++)
++
++// evidence is everything one pass knows about one link of one local pod.
++// Deliberately a plain struct with no methods: classifyWire is a pure
++// function of it and is unit-tested without a namespace, a cluster or root.
++type evidence struct {
++	// LocalNetNSUsable: our own pod's recorded netns path could be entered.
++	LocalNetNSUsable bool
++	// PeerAlive: the peer's Topology CR carries BOTH a src_ip and a net_ns,
++	// i.e. its CNI ADD has run. The same test the plugin uses.
++	PeerAlive bool
++	// PeerSameNode: the peer's src_ip equals this node's meshnet source.
++	PeerSameNode bool
++	// PeerNetNSUsable is meaningful only when PeerSameNode.
++	PeerNetNSUsable bool
++	// RenamedFormPresent: a link exists in our netns under the KubeVirt
++	// bridge-binding form of the expected name. The wire is there under a
++	// name we did not ask for, which is not the same as not being there.
++	RenamedFormPresent bool
++	// Health / HealthReason come from the read-only inspectors.
++	Health       wireHealth
++	HealthReason string
++	// ProbeErr is set when inspection itself failed.
++	ProbeErr error
++}
++
++// classifyWire is the decision core. Read it as a list of reasons to do
++// nothing, with exactly one way out at the bottom.
++func classifyWire(e evidence) (verdict, string) {
++	if !e.LocalNetNSUsable {
++		return verdictSkip, "local sandbox namespace is not usable"
++	}
++	if !e.PeerAlive {
++		// The peer has not been wired yet (or is being replaced). Its own
++		// CNI ADD completes this link; that is the design, not a fault.
++		return verdictSkip, "peer pod is not alive"
++	}
++	if e.PeerSameNode && !e.PeerNetNSUsable {
++		return verdictSkip, "peer sandbox namespace is not usable"
++	}
++	if e.ProbeErr != nil {
++		return verdictSkip, fmt.Sprintf("wire could not be inspected: %v", e.ProbeErr)
++	}
++	if e.Health == healthOK {
++		return verdictHealthy, e.HealthReason
++	}
++	if e.RenamedFormPresent {
++		// 0013: virt-launcher renames "podXXXX" to "XXXX-nic" and enslaves
++		// it. The absence of the name we asked for proves nothing when the
++		// renamed form is sitting right there.
++		return verdictSkip, "a link exists under the KubeVirt-renamed form of this name"
++	}
++	switch e.Health {
++	case healthConflict:
++		return verdictSkip, "another wire owns this interface name: " + e.HealthReason
++	case healthBroken:
++		return verdictRepair, e.HealthReason
++	default:
++		return verdictSkip, "wire state could not be established: " + e.HealthReason
++	}
++}
++
++// wireIdentity is the pod-and-peer state a repair verdict is only valid for.
++// If ANY of it changes between passes the confirmation count restarts: the
++// sandbox was replaced, so the previous pass observed a different wire.
++type wireIdentity struct {
++	LocalNetNS  string
++	ContainerID string
++	PeerNetNS   string
++	PeerSrcIP   string
++}
++
++type confirmation struct {
++	identity wireIdentity
++	count    int
++	seen     bool
++}
++
++// confirmer turns per-pass verdicts into "act now" by requiring `need`
++// consecutive, identity-stable repair verdicts. Anything else clears the
++// entry, so a wire that recovers on its own is forgotten immediately.
++type confirmer struct {
++	need    int
++	entries map[string]*confirmation
++}
++
++func newConfirmer(need int) *confirmer {
++	if need < 1 {
++		need = 1
++	}
++	return &confirmer{need: need, entries: map[string]*confirmation{}}
++}
++
++// observe records one pass's verdict and reports whether a repair is due.
++func (c *confirmer) observe(key string, id wireIdentity, v verdict) (bool, int) {
++	entry := c.entries[key]
++	if v != verdictRepair {
++		delete(c.entries, key)
++		return false, 0
++	}
++	if entry == nil || entry.identity != id {
++		entry = &confirmation{identity: id}
++		c.entries[key] = entry
++	}
++	entry.count++
++	entry.seen = true
++	return entry.count >= c.need, entry.count
++}
++
++// startPass marks every entry unseen; endPass drops the ones this pass did
++// not visit, so the map tracks live wires only.
++func (c *confirmer) startPass() {
++	for _, e := range c.entries {
++		e.seen = false
++	}
++}
++
++func (c *confirmer) endPass() {
++	for k, e := range c.entries {
++		if !e.seen {
++			delete(c.entries, k)
++		}
++	}
++}
++
++// repaired clears a wire's history after a repair was attempted, so the next
++// pass starts from a fresh observation instead of repairing again at once.
++func (c *confirmer) repaired(key string) {
++	delete(c.entries, key)
++}
++
++// passStats is one pass's report. It is printed on every pass, including the
++// pass that did nothing: "0 repaired" out of a counted, named scope is a
++// result; silence is not.
++type passStats struct {
++	Pods     int
++	Wires    int
++	Healthy  int
++	Repaired int
++	Failed   int
++	Skipped  map[string]int
++	Pending  int // broken, but not yet confirmed often enough to act
++}
++
++func newPassStats() passStats {
++	return passStats{Skipped: map[string]int{}}
++}
++
++func (s *passStats) skip(reason string) {
++	s.Skipped[reason]++
++}
++
++// summary renders the skip reasons in a stable order so successive passes are
++// diffable in a log.
++func (s passStats) summary() string {
++	total := 0
++	keys := make([]string, 0, len(s.Skipped))
++	for k, v := range s.Skipped {
++		keys = append(keys, k)
++		total += v
++	}
++	sort.Strings(keys)
++	parts := make([]string, 0, len(keys))
++	for _, k := range keys {
++		parts = append(parts, fmt.Sprintf("%s=%d", k, s.Skipped[k]))
++	}
++	skipped := "none"
++	if len(parts) > 0 {
++		skipped = strings.Join(parts, " ")
++	}
++	return fmt.Sprintf("pods=%d wires=%d healthy=%d repaired=%d failed=%d pending=%d skipped=%d [%s]",
++		s.Pods, s.Wires, s.Healthy, s.Repaired, s.Failed, s.Pending, total, skipped)
++}
++
++// reconcileDeps is the IO boundary. Production wires it to the real
++// inspectors and the real, idempotent repair paths; tests substitute fakes so
++// the pass logic is exercised without a namespace or a cluster.
++type reconcileDeps struct {
++	netNSUsable    func(nsName string) bool
++	renamedPresent func(nsName, linkName string) bool
++	inspectVeth    func(local, peer koko.VEth, alias string) (koko.WireHealth, string, error)
++	inspectVxlan   func(nsName, linkName string, vni int, peerVTEP net.IP) (vxlan.Health, string)
++	repairVeth     func(local, peer koko.VEth, alias string) error
++	repairVxlan    func(pod *mpb.RemotePod) error
++}
++
++func productionDeps() reconcileDeps {
++	return reconcileDeps{
++		netNSUsable:    netNSUsable,
++		renamedPresent: kubevirtRenamedFormPresent,
++		inspectVeth:    koko.InspectVethWire,
++		inspectVxlan:   vxlan.Inspect,
++		repairVeth:     koko.EnsureVethWire,
++		repairVxlan:    vxlan.CreateOrUpdate,
++	}
++}
++
++// reconciler holds the state that must survive between passes: the
++// confirmation counts. Everything else is derived fresh each pass, because a
++// cache of cluster state is one more thing that can be stale in a way nobody
++// notices.
++type reconciler struct {
++	m           *Meshnet
++	deps        reconcileDeps
++	confirm     *confirmer
++	maxRepairs  int
++	fabricMTU   int
++	interval    time.Duration
++	initialWait time.Duration
++}
++
++func envDuration(name string, def time.Duration) time.Duration {
++	raw := strings.TrimSpace(os.Getenv(name))
++	if raw == "" {
++		return def
++	}
++	secs, err := strconv.Atoi(raw)
++	if err != nil || secs < 0 {
++		mnetdLogger.Warnf("Ignoring invalid %s=%q, using default %s", name, raw, def)
++		return def
++	}
++	return time.Duration(secs) * time.Second
++}
++
++func newReconciler(m *Meshnet) *reconciler {
++	return &reconciler{
++		m:           m,
++		deps:        productionDeps(),
++		confirm:     newConfirmer(envInt("MESHNET_RECONCILE_CONFIRMATIONS", defaultReconcileConfirmations)),
++		maxRepairs:  envInt("MESHNET_RECONCILE_MAX_REPAIRS", defaultReconcileMaxRepairs),
++		fabricMTU:   envInt("MESHNET_FABRIC_MTU", defaultFabricMTU),
++		interval:    envDuration("MESHNET_RECONCILE_INTERVAL", defaultReconcileInterval),
++		initialWait: envDuration("MESHNET_RECONCILE_INITIAL_DELAY", defaultReconcileInitialDelay),
++	}
++}
++
++// StartWireReconciler runs the reconcile loop until ctx is done. It returns
++// immediately; the loop is a goroutine.
++//
++// It refuses to run in gRPC-wire mode: those wires are not veths or vxlans
++// and have their own reconciler (grpcwire.ReconGWires). Reporting that
++// refusal is the point -- a reconciler that silently does nothing on a node
++// is indistinguishable from a healthy one.
++func (m *Meshnet) StartWireReconciler(ctx context.Context) {
++	if os.Getenv("INTER_NODE_LINK_TYPE") == wireutil.INTER_NODE_LINK_GRPC {
++		mnetdLogger.Infof("Wire reconciler disabled: INTER_NODE_LINK_TYPE=%s has its own reconciler", wireutil.INTER_NODE_LINK_GRPC)
++		return
++	}
++	r := newReconciler(m)
++	if r.interval <= 0 {
++		mnetdLogger.Infof("Wire reconciler disabled by MESHNET_RECONCILE_INTERVAL=0")
++		return
++	}
++	mnetdLogger.Infof("Wire reconciler starting: first pass in %s, then every %s; %d consecutive confirmations required, at most %d repairs per pass",
++		r.initialWait, r.interval, r.confirm.need, r.maxRepairs)
++	go r.run(ctx)
++}
++
++func (r *reconciler) run(ctx context.Context) {
++	select {
++	case <-ctx.Done():
++		return
++	case <-time.After(r.initialWait):
++	}
++	ticker := time.NewTicker(r.interval)
++	defer ticker.Stop()
++	for {
++		stats := r.pass(ctx)
++		mnetdLogger.Infof("Wire reconcile pass complete: %s", stats.summary())
++		select {
++		case <-ctx.Done():
++			return
++		case <-ticker.C:
++		}
++	}
++}
++
++// pass runs one full reconcile over every Topology this node owns.
++func (r *reconciler) pass(ctx context.Context) passStats {
++	stats := newPassStats()
++
++	nodeIP, nodeIntf, err := r.m.nodeSourceForCurrentNode(ctx)
++	if err != nil {
++		mnetdLogger.Errorf("Wire reconcile: cannot resolve this node's meshnet source, skipping pass: %v", err)
++		stats.skip("node-source-unresolved")
++		return stats
++	}
++	if strings.TrimSpace(nodeIP) == "" {
++		mnetdLogger.Errorf("Wire reconcile: this node has no meshnet source IP, skipping pass")
++		stats.skip("node-source-empty")
++		return stats
++	}
++
++	list, err := r.m.tClient.Topology(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
++	if err != nil {
++		mnetdLogger.Errorf("Wire reconcile: cannot list topologies, skipping pass: %v", err)
++		stats.skip("topology-list-failed")
++		return stats
++	}
++
++	byKey := map[string]*topologyv1.Topology{}
++	for i := range list.Items {
++		t := &list.Items[i]
++		byKey[t.GetNamespace()+"/"+t.GetName()] = t
++	}
++
++	r.confirm.startPass()
++	defer r.confirm.endPass()
++
++	for i := range list.Items {
++		topo := &list.Items[i]
++		if strings.TrimSpace(topo.Status.SrcIP) != nodeIP {
++			continue // not ours; the owning node's daemon reconciles it
++		}
++		stats.Pods++
++		r.reconcilePod(topo, byKey, nodeIP, nodeIntf, &stats)
++	}
++	return stats
++}
++
++func (r *reconciler) reconcilePod(topo *topologyv1.Topology, byKey map[string]*topologyv1.Topology, nodeIP, nodeIntf string, stats *passStats) {
++	ns := topo.GetNamespace()
++	localNetNS := strings.TrimSpace(topo.Status.NetNS)
++	localUsable := localNetNS != "" && r.deps.netNSUsable(localNetNS)
++
++	for _, link := range topo.Spec.Links {
++		if link.PeerPod == "" || link.PeerPod == "localhost" {
++			// A macvlan attachment to a host interface: there is no peer pod
++			// to compare against and nothing here can verify it.
++			stats.skip("macvlan-or-hostlink")
++			continue
++		}
++		if protectedLinkName(link.LocalIntf) || protectedLinkName(link.PeerIntf) {
++			stats.skip("protected-interface-name")
++			continue
++		}
++		stats.Wires++
++
++		peer := byKey[ns+"/"+link.PeerPod]
++		ev := evidence{LocalNetNSUsable: localUsable}
++		var id wireIdentity
++		id.LocalNetNS = localNetNS
++		id.ContainerID = topo.Status.ContainerID
++
++		if peer != nil {
++			peerNetNS := strings.TrimSpace(peer.Status.NetNS)
++			peerSrcIP := strings.TrimSpace(peer.Status.SrcIP)
++			ev.PeerAlive = peerNetNS != "" && peerSrcIP != ""
++			ev.PeerSameNode = peerSrcIP == nodeIP
++			id.PeerNetNS = peerNetNS
++			id.PeerSrcIP = peerSrcIP
++			if ev.PeerAlive && ev.PeerSameNode {
++				ev.PeerNetNSUsable = r.deps.netNSUsable(peerNetNS)
++			}
++		}
++
++		key := ns + "/" + topo.GetName() + "#" + strconv.Itoa(link.UID)
++		repair := r.buildRepair(topo, peer, link, ns, nodeIntf)
++
++		if ev.LocalNetNSUsable && ev.PeerAlive && (!ev.PeerSameNode || ev.PeerNetNSUsable) {
++			ev.Health, ev.HealthReason, ev.ProbeErr = repair.inspect(r.deps)
++			if ev.Health != healthOK {
++				ev.RenamedFormPresent = r.deps.renamedPresent(localNetNS, link.LocalIntf)
++			}
++		}
++
++		v, reason := classifyWire(ev)
++		switch v {
++		case verdictHealthy:
++			stats.Healthy++
++			r.confirm.observe(key, id, v)
++			continue
++		case verdictSkip:
++			stats.skip(shortReason(reason))
++			r.confirm.observe(key, id, v)
++			mnetdLogger.Debugf("Wire reconcile: %s link %d (%s): skip -- %s", key, link.UID, link.LocalIntf, reason)
++			continue
++		}
++
++		due, count := r.confirm.observe(key, id, v)
++		if !due {
++			stats.Pending++
++			mnetdLogger.Infof("Wire reconcile: %s link %d (%s <-> %s@%s) looks broken (%s); confirmation %d of %d, taking no action yet",
++				key, link.UID, link.LocalIntf, link.PeerIntf, link.PeerPod, reason, count, r.confirm.need)
++			continue
++		}
++		if stats.Repaired+stats.Failed >= r.maxRepairs {
++			stats.skip("repair-budget-exhausted")
++			mnetdLogger.Warnf("Wire reconcile: repair budget of %d reached; %s link %d deferred to the next pass", r.maxRepairs, key, link.UID)
++			continue
++		}
++
++		mnetdLogger.Warnf("Wire reconcile: repairing %s link %d (%s <-> %s@%s): %s (confirmed on %d consecutive passes)",
++			key, link.UID, link.LocalIntf, link.PeerIntf, link.PeerPod, reason, count)
++		if err := repair.apply(r.deps); err != nil {
++			stats.Failed++
++			mnetdLogger.Errorf("Wire reconcile: repair of %s link %d failed: %v", key, link.UID, err)
++			continue
++		}
++		stats.Repaired++
++		r.confirm.repaired(key)
++	}
++}
++
++// wireRepair is one link's inspect/repair pair, built once so the two can
++// never disagree about which wire they are talking about.
++type wireRepair struct {
++	sameNode bool
++	// same-node veth
++	local koko.VEth
++	peer  koko.VEth
++	alias string
++	// cross-node vxlan (our end only; the peer node's daemon owns the other)
++	netNS    string
++	linkName string
++	vni      int
++	peerVTEP net.IP
++	remote   *mpb.RemotePod
++	// buildErr is set when the CR could not be turned into a wire at all.
++	buildErr error
++}
++
++func (w wireRepair) inspect(d reconcileDeps) (wireHealth, string, error) {
++	if w.buildErr != nil {
++		return healthUnknown, "wire could not be derived from the Topology CR", w.buildErr
++	}
++	if w.sameNode {
++		h, reason, err := d.inspectVeth(w.local, w.peer, w.alias)
++		switch h {
++		case koko.WireHealthOK:
++			return healthOK, reason, err
++		case koko.WireHealthBroken:
++			return healthBroken, reason, err
++		case koko.WireHealthConflict:
++			return healthConflict, reason, err
++		default:
++			return healthUnknown, reason, err
++		}
++	}
++	h, reason := d.inspectVxlan(w.netNS, w.linkName, w.vni, w.peerVTEP)
++	switch h {
++	case vxlan.HealthOK:
++		return healthOK, reason, nil
++	case vxlan.HealthBroken:
++		return healthBroken, reason, nil
++	default:
++		return healthUnknown, reason, nil
++	}
++}
++
++func (w wireRepair) apply(d reconcileDeps) error {
++	if w.buildErr != nil {
++		return w.buildErr
++	}
++	if w.sameNode {
++		return d.repairVeth(w.local, w.peer, w.alias)
++	}
++	return d.repairVxlan(w.remote)
++}
++
++func (r *reconciler) buildRepair(topo, peer *topologyv1.Topology, link topologyv1.Link, ns, nodeIntf string) wireRepair {
++	if peer == nil {
++		return wireRepair{buildErr: fmt.Errorf("peer topology %s/%s not found", ns, link.PeerPod)}
++	}
++	sameNode := strings.TrimSpace(peer.Status.SrcIP) == strings.TrimSpace(topo.Status.SrcIP)
++	if sameNode {
++		local, err := vethFor(topo.Status.NetNS, link.LocalIntf, link.LocalIP, r.fabricMTU)
++		if err != nil {
++			return wireRepair{buildErr: err}
++		}
++		remoteEnd, err := vethFor(peer.Status.NetNS, link.PeerIntf, link.PeerIP, r.fabricMTU)
++		if err != nil {
++			return wireRepair{buildErr: err}
++		}
++		return wireRepair{
++			sameNode: true,
++			local:    *local,
++			peer:     *remoteEnd,
++			alias:    koko.VethWireAlias(ns, int64(link.UID)),
++		}
++	}
++	vni := wireutil.VxlanID(ns, int64(link.UID))
++	peerVTEP := net.ParseIP(strings.TrimSpace(peer.Status.SrcIP))
++	if peerVTEP == nil {
++		return wireRepair{buildErr: fmt.Errorf("peer %s has unparseable src_ip %q", link.PeerPod, peer.Status.SrcIP)}
++	}
++	return wireRepair{
++		netNS:    topo.Status.NetNS,
++		linkName: link.LocalIntf,
++		vni:      vni,
++		peerVTEP: peerVTEP,
++		remote: &mpb.RemotePod{
++			NetNs:    topo.Status.NetNS,
++			IntfName: link.LocalIntf,
++			IntfIp:   link.LocalIP,
++			PeerVtep: strings.TrimSpace(peer.Status.SrcIP),
++			Vni:      int64(vni),
++			KubeNs:   ns,
++			NodeIntf: nodeIntf,
++		},
++	}
++}
++
++func vethFor(netNS, linkName, ip string, mtu int) (*koko.VEth, error) {
++	veth := koko.VEth{NsName: netNS, LinkName: linkName, MTU: mtu}
++	if ip == "" {
++		return &veth, nil
++	}
++	ipAddr, ipSubnet, err := net.ParseCIDR(ip)
++	if err != nil {
++		return nil, fmt.Errorf("failed to parse CIDR %s for %s: %w", ip, linkName, err)
++	}
++	veth.IPAddr = []net.IPNet{{IP: ipAddr, Mask: ipSubnet.Mask}}
++	return &veth, nil
++}
++
++// protectedLinkName mirrors the plugin's and koko's guard: these names are
++// never meshnet's to create, delete or re-own.
++func protectedLinkName(name string) bool {
++	name = strings.TrimSpace(name)
++	return name == "" || name == "eth0" || name == "lo"
++}
++
++// shortReason collapses a free-text reason to a stable label so the pass
++// summary aggregates instead of printing one bucket per wire.
++func shortReason(reason string) string {
++	if i := strings.IndexAny(reason, ":("); i > 0 {
++		reason = strings.TrimSpace(reason[:i])
++	}
++	return strings.ReplaceAll(strings.TrimSpace(reason), " ", "-")
++}
+diff --git a/daemon/meshnet/reconcile_probe.go b/daemon/meshnet/reconcile_probe.go
+new file mode 100644
+index 0000000..a86a091
+--- /dev/null
++++ b/daemon/meshnet/reconcile_probe.go
+@@ -0,0 +1,70 @@
++package meshnet
++
++import (
++	"strings"
++
++	"github.com/containernetworking/plugins/pkg/ns"
++	"github.com/vishvananda/netlink"
++)
++
++// netNSUsable reports whether a recorded network namespace path can actually
++// be entered right now.
++//
++// This is the precondition every "the link is absent" conclusion in the
++// reconciler rests on. An absent link in a namespace we COULD enter is a
++// fact; an absent link in a namespace we could not enter is nothing at all,
++// and treating the second as the first would make every pod with a departed
++// sandbox look like a lab full of dead wires.
++func netNSUsable(nsName string) bool {
++	nsName = strings.TrimSpace(nsName)
++	if nsName == "" {
++		return false
++	}
++	netNS, err := ns.GetNS(nsName)
++	if err != nil {
++		return false
++	}
++	_ = netNS.Close()
++	return true
++}
++
++// kubevirtRenamedName returns the KubeVirt bridge-binding form of a meshnet
++// wire name, or "" when the name cannot have one. virt-launcher renames
++// "podXXXX" to "XXXX-nic" and enslaves it to "k6t-XXXX" (see 0013).
++func kubevirtRenamedName(linkName string) string {
++	linkName = strings.TrimSpace(linkName)
++	if !strings.HasPrefix(linkName, "pod") || linkName == "pod" {
++		return ""
++	}
++	return strings.TrimPrefix(linkName, "pod") + "-nic"
++}
++
++// kubevirtRenamedFormPresent reports whether SOMETHING exists in nsName under
++// the KubeVirt-renamed form of linkName.
++//
++// Deliberately weaker than daemon/vxlan.kubevirtRenamedLink, which only
++// accepts a genuine vxlan: here the question is not "is this our wire?" but
++// "is the name we asked for absent because an external runtime renamed it?".
++// Any link under the renamed name is enough to make the absence of the
++// original name inconclusive, and inconclusive is the answer that stops the
++// reconciler from acting.
++func kubevirtRenamedFormPresent(nsName, linkName string) bool {
++	renamed := kubevirtRenamedName(linkName)
++	if renamed == "" || !netNSUsable(nsName) {
++		return false
++	}
++	netNS, err := ns.GetNS(nsName)
++	if err != nil {
++		return false
++	}
++	defer netNS.Close()
++
++	found := false
++	_ = netNS.Do(func(_ ns.NetNS) error {
++		if _, err := netlink.LinkByName(renamed); err == nil {
++			found = true
++		}
++		return nil
++	})
++	return found
++}
+diff --git a/daemon/meshnet/reconcile_test.go b/daemon/meshnet/reconcile_test.go
+new file mode 100644
+index 0000000..894fc5f
+--- /dev/null
++++ b/daemon/meshnet/reconcile_test.go
+@@ -0,0 +1,537 @@
++package meshnet
++
++import (
++	"errors"
++	"fmt"
++	"net"
++	"strings"
++	"testing"
++
++	koko "github.com/redhat-nfvpe/koko/api"
++
++	topologyv1 "github.com/networkop/meshnet-cni/api/types/v1beta1"
++	"github.com/networkop/meshnet-cni/daemon/vxlan"
++	"github.com/networkop/meshnet-cni/utils/wireutil"
++
++	mpb "github.com/networkop/meshnet-cni/daemon/proto/meshnet/v1beta1"
++)
++
++// ---------------------------------------------------------------------------
++// classifyWire: the decision core.
++//
++// The rows that carry the weight are the ones that must NOT repair. A
++// reconciler that tears down healthy wires is worse than the bug it fixes, so
++// every case where the evidence is short of proof has to come out as `skip`.
++// ---------------------------------------------------------------------------
++
++func healthyEvidence() evidence {
++	return evidence{
++		LocalNetNSUsable: true,
++		PeerAlive:        true,
++		PeerSameNode:     true,
++		PeerNetNSUsable:  true,
++		Health:           healthOK,
++		HealthReason:     "both ends verified as one veth pair",
++	}
++}
++
++func TestClassifyWire(t *testing.T) {
++	broken := func(mut func(*evidence)) evidence {
++		e := healthyEvidence()
++		e.Health = healthBroken
++		e.HealthReason = "peer end is absent while the local end exists"
++		if mut != nil {
++			mut(&e)
++		}
++		return e
++	}
++
++	cases := []struct {
++		name string
++		ev   evidence
++		want verdict
++	}{
++		{"a verified pair is healthy", healthyEvidence(), verdictHealthy},
++
++		// The measured siteB-lan-pc01 case: the pod survived, its peer VM was
++		// recreated, its half of the wire is still there pointing at nothing.
++		{"peer end gone while both sandboxes are live is a repair", broken(nil), verdictRepair},
++
++		// Everything below is a reason NOT to touch a wire.
++		{"our own sandbox is gone", broken(func(e *evidence) { e.LocalNetNSUsable = false }), verdictSkip},
++		{"peer has never been wired", broken(func(e *evidence) { e.PeerAlive = false }), verdictSkip},
++		{"peer sandbox is gone", broken(func(e *evidence) { e.PeerNetNSUsable = false }), verdictSkip},
++		{"inspection itself failed", broken(func(e *evidence) { e.ProbeErr = errors.New("netlink: operation not permitted") }), verdictSkip},
++		{"state could not be established", broken(func(e *evidence) {
++			e.Health = healthUnknown
++			e.HealthReason = "veth pair verification unavailable"
++		}), verdictSkip},
++		{"another wire owns the name", broken(func(e *evidence) {
++			e.Health = healthConflict
++			e.HealthReason = "local end is owned by a different wire alias"
++		}), verdictSkip},
++		{"KubeVirt renamed the wire out from under us", broken(func(e *evidence) { e.RenamedFormPresent = true }), verdictSkip},
++
++		// A healthy verdict must survive noise that only matters when broken.
++		{"a healthy wire is healthy even with a renamed sibling present", func() evidence {
++			e := healthyEvidence()
++			e.RenamedFormPresent = true
++			return e
++		}(), verdictHealthy},
++
++		// A cross-node peer has no local netns for us to enter, and that must
++		// not be mistaken for a missing sandbox.
++		{"cross-node peer is judged without a local peer netns", func() evidence {
++			e := broken(nil)
++			e.PeerSameNode = false
++			e.PeerNetNSUsable = false
++			return e
++		}(), verdictRepair},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			got, reason := classifyWire(tc.ev)
++			if got != tc.want {
++				t.Fatalf("classifyWire() = %v (%s), want %v", got, reason, tc.want)
++			}
++			if reason == "" {
++				t.Fatal("every verdict must carry a reason")
++			}
++		})
++	}
++}
++
++// TestClassifyWireNeverRepairsWithoutPositiveEvidence is the blanket
++// statement of the safety property, independent of the table above: over
++// every combination of the boolean facts, `repair` is reachable ONLY from
++// healthBroken with both sandboxes usable, the peer alive and no rename and
++// no probe error.
++func TestClassifyWireNeverRepairsWithoutPositiveEvidence(t *testing.T) {
++	bools := []bool{false, true}
++	healths := []wireHealth{healthUnknown, healthOK, healthBroken, healthConflict}
++	repairs := 0
++	for _, localNS := range bools {
++		for _, alive := range bools {
++			for _, sameNode := range bools {
++				for _, peerNS := range bools {
++					for _, renamed := range bools {
++						for _, probeFailed := range bools {
++							for _, h := range healths {
++								ev := evidence{
++									LocalNetNSUsable:   localNS,
++									PeerAlive:          alive,
++									PeerSameNode:       sameNode,
++									PeerNetNSUsable:    peerNS,
++									RenamedFormPresent: renamed,
++									Health:             h,
++									HealthReason:       "reason",
++								}
++								if probeFailed {
++									ev.ProbeErr = errors.New("probe failed")
++								}
++								v, reason := classifyWire(ev)
++								if v != verdictRepair {
++									continue
++								}
++								repairs++
++								if h != healthBroken {
++									t.Fatalf("repair from health %v (%s): %+v", h, reason, ev)
++								}
++								if !localNS || !alive || renamed || probeFailed {
++									t.Fatalf("repair without positive evidence (%s): %+v", reason, ev)
++								}
++								if sameNode && !peerNS {
++									t.Fatalf("repair with an unusable peer sandbox (%s): %+v", reason, ev)
++								}
++							}
++						}
++					}
++				}
++			}
++		}
++	}
++	if repairs == 0 {
++		// Absence is not health: a sweep that never reached the repair branch
++		// would prove nothing at all.
++		t.Fatal("the sweep never produced a repair verdict; it is asserting over an empty scope")
++	}
++}
++
++// ---------------------------------------------------------------------------
++// confirmer: the corroboration requirement that keeps the reconciler from
++// fighting an in-flight CNI ADD or DEL.
++// ---------------------------------------------------------------------------
++
++func TestConfirmerRequiresConsecutivePasses(t *testing.T) {
++	c := newConfirmer(2)
++	id := wireIdentity{LocalNetNS: "/var/run/netns/cni-a", ContainerID: "abc", PeerNetNS: "/var/run/netns/cni-b", PeerSrcIP: "10.0.0.1"}
++
++	if due, n := c.observe("w", id, verdictRepair); due || n != 1 {
++		t.Fatalf("first broken observation = (due %t, n %d), want (false, 1): one pass is not evidence", due, n)
++	}
++	if due, n := c.observe("w", id, verdictRepair); !due || n != 2 {
++		t.Fatalf("second consecutive broken observation = (due %t, n %d), want (true, 2)", due, n)
++	}
++}
++
++func TestConfirmerForgetsAWireThatRecovers(t *testing.T) {
++	c := newConfirmer(2)
++	id := wireIdentity{LocalNetNS: "a"}
++	c.observe("w", id, verdictRepair)
++	c.observe("w", id, verdictHealthy) // an in-flight ADD completed
++	if due, n := c.observe("w", id, verdictRepair); due || n != 1 {
++		t.Fatalf("after recovery = (due %t, n %d), want (false, 1): the count must restart", due, n)
++	}
++}
++
++func TestConfirmerRestartsWhenTheSandboxIsReplaced(t *testing.T) {
++	// A pod being recreated changes its netns and container id. The previous
++	// pass observed a DIFFERENT wire, so its verdict cannot be corroboration
++	// for this one -- otherwise a churning pod is repaired on its first
++	// observation, which is exactly the CNI ADD the reconciler must not fight.
++	c := newConfirmer(2)
++	first := wireIdentity{LocalNetNS: "/var/run/netns/cni-a", ContainerID: "abc"}
++	second := wireIdentity{LocalNetNS: "/var/run/netns/cni-z", ContainerID: "xyz"}
++	c.observe("w", first, verdictRepair)
++	if due, n := c.observe("w", second, verdictRepair); due || n != 1 {
++		t.Fatalf("after sandbox replacement = (due %t, n %d), want (false, 1)", due, n)
++	}
++}
++
++func TestConfirmerDropsWiresAPassDidNotVisit(t *testing.T) {
++	c := newConfirmer(2)
++	id := wireIdentity{LocalNetNS: "a"}
++	c.startPass()
++	c.observe("gone", id, verdictRepair)
++	c.endPass()
++
++	c.startPass() // this pass does not visit "gone" -- the lab was destroyed
++	c.endPass()
++	if len(c.entries) != 0 {
++		t.Fatalf("confirmer retained %d entries for wires that no longer exist", len(c.entries))
++	}
++}
++
++func TestConfirmerClearsAfterARepair(t *testing.T) {
++	c := newConfirmer(1)
++	id := wireIdentity{LocalNetNS: "a"}
++	if due, _ := c.observe("w", id, verdictRepair); !due {
++		t.Fatal("need=1 must be due on the first observation")
++	}
++	c.repaired("w")
++	if due, n := c.observe("w", id, verdictRepair); !due || n != 1 {
++		t.Fatalf("after repair = (due %t, n %d): the next pass must observe afresh", due, n)
++	}
++}
++
++// ---------------------------------------------------------------------------
++// A whole pass, driven through fake dependencies.
++// ---------------------------------------------------------------------------
++
++type fakeDeps struct {
++	usableNS   map[string]bool
++	vethHealth map[string]koko.WireHealth
++	vxlanState map[string]vxlan.Health
++	renamed    map[string]bool
++
++	vethRepairs  []string
++	vxlanRepairs []string
++	repairErr    error
++}
++
++func (f *fakeDeps) deps() reconcileDeps {
++	return reconcileDeps{
++		netNSUsable: func(nsName string) bool { return f.usableNS[nsName] },
++		renamedPresent: func(nsName, linkName string) bool {
++			return f.renamed[nsName+"/"+linkName]
++		},
++		inspectVeth: func(local, peer koko.VEth, alias string) (koko.WireHealth, string, error) {
++			h, ok := f.vethHealth[local.NsName+"/"+local.LinkName]
++			if !ok {
++				h = koko.WireHealthOK
++			}
++			return h, "fake veth verdict " + h.String(), nil
++		},
++		inspectVxlan: func(nsName, linkName string, vni int, peerVTEP net.IP) (vxlan.Health, string) {
++			h, ok := f.vxlanState[nsName+"/"+linkName]
++			if !ok {
++				h = vxlan.HealthOK
++			}
++			return h, fmt.Sprintf("fake vxlan verdict %s vni=%d peer=%s", h, vni, peerVTEP)
++		},
++		repairVeth: func(local, peer koko.VEth, alias string) error {
++			f.vethRepairs = append(f.vethRepairs, local.NsName+"/"+local.LinkName+" alias="+alias)
++			return f.repairErr
++		},
++		repairVxlan: func(pod *mpb.RemotePod) error {
++			f.vxlanRepairs = append(f.vxlanRepairs, fmt.Sprintf("%s/%s vni=%d peer=%s", pod.NetNs, pod.IntfName, pod.Vni, pod.PeerVtep))
++			return f.repairErr
++		},
++	}
++}
++
++func topo(name, ns, srcIP, netNS, containerID string, links ...topologyv1.Link) *topologyv1.Topology {
++	tp := &topologyv1.Topology{}
++	tp.SetName(name)
++	tp.SetNamespace(ns)
++	tp.Status.SrcIP = srcIP
++	tp.Status.NetNS = netNS
++	tp.Status.ContainerID = containerID
++	tp.Spec.Links = links
++	return tp
++}
++
++// runPod drives reconcilePod directly: the pass's cluster IO (node source
++// resolution and the Topology list) is the part a unit test cannot supply,
++// and the per-pod logic is all of the behaviour under test.
++func runPod(t *testing.T, f *fakeDeps, need int, local *topologyv1.Topology, peers ...*topologyv1.Topology) (*reconciler, passStats) {
++	t.Helper()
++	InitLogger()
++	r := &reconciler{
++		deps:       f.deps(),
++		confirm:    newConfirmer(need),
++		maxRepairs: defaultReconcileMaxRepairs,
++		fabricMTU:  1450,
++	}
++	byKey := map[string]*topologyv1.Topology{}
++	for _, p := range append(peers, local) {
++		byKey[p.GetNamespace()+"/"+p.GetName()] = p
++	}
++	stats := newPassStats()
++	r.confirm.startPass()
++	r.reconcilePod(local, byKey, "10.0.0.1", "bond0", &stats)
++	r.confirm.endPass()
++	return r, stats
++}
++
++const (
++	nsLocal = "/var/run/netns/cni-local"
++	nsPeer  = "/var/run/netns/cni-peer"
++)
++
++func TestReconcilePassIsANoOpOnAHealthyLab(t *testing.T) {
++	f := &fakeDeps{usableNS: map[string]bool{nsLocal: true, nsPeer: true}}
++	local := topo("siteB-lan-pc01", "example-lab", "10.0.0.1", nsLocal, "c1",
++		topologyv1.Link{LocalIntf: "eth1", PeerIntf: "eth3", PeerPod: "siteB-acc-sw01", UID: 14},
++		topologyv1.Link{LocalIntf: "eth2", PeerIntf: "eth1", PeerPod: "siteB-fw01", UID: 15})
++	peerA := topo("siteB-acc-sw01", "example-lab", "10.0.0.1", nsPeer, "c2")
++	peerB := topo("siteB-fw01", "example-lab", "10.0.0.2", "/var/run/netns/cni-remote", "c3")
++
++	_, stats := runPod(t, f, 2, local, peerA, peerB)
++
++	if stats.Wires != 2 || stats.Healthy != 2 {
++		t.Fatalf("healthy lab: %s, want 2 wires and 2 healthy", stats.summary())
++	}
++	if stats.Repaired != 0 || stats.Failed != 0 || stats.Pending != 0 {
++		t.Fatalf("healthy lab changed something: %s", stats.summary())
++	}
++	if len(f.vethRepairs)+len(f.vxlanRepairs) != 0 {
++		t.Fatalf("healthy lab triggered repairs: veth=%v vxlan=%v", f.vethRepairs, f.vxlanRepairs)
++	}
++	// ...and it SAYS so: the summary is a positive statement about a counted
++	// scope, not silence.
++	if !strings.Contains(stats.summary(), "wires=2 healthy=2 repaired=0") {
++		t.Fatalf("no-op pass did not report itself: %s", stats.summary())
++	}
++}
++
++func TestReconcileRepairsOnlyAfterTheSecondConfirmingPass(t *testing.T) {
++	f := &fakeDeps{
++		usableNS:   map[string]bool{nsLocal: true, nsPeer: true},
++		vethHealth: map[string]koko.WireHealth{nsLocal + "/eth1": koko.WireHealthBroken},
++	}
++	local := topo("siteB-lan-pc01", "example-lab", "10.0.0.1", nsLocal, "c1",
++		topologyv1.Link{LocalIntf: "eth1", PeerIntf: "eth3", PeerPod: "siteB-acc-sw01", UID: 14})
++	peer := topo("siteB-acc-sw01", "example-lab", "10.0.0.1", nsPeer, "c2")
++
++	r, stats := runPod(t, f, 2, local, peer)
++	if stats.Pending != 1 || stats.Repaired != 0 {
++		t.Fatalf("first pass: %s, want the wire pending and nothing repaired", stats.summary())
++	}
++	if len(f.vethRepairs) != 0 {
++		t.Fatalf("first pass repaired %v; one observation is not evidence", f.vethRepairs)
++	}
++
++	// Second pass over the same reconciler (same confirmation state).
++	byKey := map[string]*topologyv1.Topology{
++		"example-lab/siteB-lan-pc01": local,
++		"example-lab/siteB-acc-sw01": peer,
++	}
++	stats2 := newPassStats()
++	r.confirm.startPass()
++	r.reconcilePod(local, byKey, "10.0.0.1", "bond0", &stats2)
++	r.confirm.endPass()
++
++	if stats2.Repaired != 1 {
++		t.Fatalf("second pass: %s, want 1 repair", stats2.summary())
++	}
++	if len(f.vethRepairs) != 1 || !strings.Contains(f.vethRepairs[0], nsLocal+"/eth1") {
++		t.Fatalf("repair targeted %v, want the local end of eth1", f.vethRepairs)
++	}
++	if !strings.Contains(f.vethRepairs[0], koko.VethWireAlias("example-lab", 14)) {
++		t.Fatalf("repair used alias %v, want the topology-scoped wire alias", f.vethRepairs)
++	}
++}
++
++func TestReconcileRepairsACrossNodeEndThroughCreateOrUpdate(t *testing.T) {
++	f := &fakeDeps{
++		usableNS:   map[string]bool{nsLocal: true},
++		vxlanState: map[string]vxlan.Health{nsLocal + "/eth2": vxlan.HealthBroken},
++	}
++	local := topo("siteB-lan-pc01", "example-lab", "10.0.0.1", nsLocal, "c1",
++		topologyv1.Link{LocalIntf: "eth2", PeerIntf: "eth1", PeerPod: "siteB-fw01", UID: 15})
++	peer := topo("siteB-fw01", "example-lab", "10.0.0.2", "/var/run/netns/cni-remote", "c3")
++
++	r, _ := runPod(t, f, 1, local, peer)
++	_ = r
++	if len(f.vxlanRepairs) != 1 {
++		t.Fatalf("cross-node repairs = %v, want exactly one", f.vxlanRepairs)
++	}
++	// The VNI must be the one the plugin would have chosen for this
++	// (namespace, link uid) -- a second derivation that drifted would put the
++	// two ends on different VNIs.
++	if !strings.Contains(f.vxlanRepairs[0], fmt.Sprintf("vni=%d", wireVNI("example-lab", 15))) {
++		t.Fatalf("repair %v did not use the deterministic VNI %d", f.vxlanRepairs, wireVNI("example-lab", 15))
++	}
++	if !strings.Contains(f.vxlanRepairs[0], "peer=10.0.0.2") {
++		t.Fatalf("repair %v did not point at the peer's current VTEP", f.vxlanRepairs)
++	}
++}
++
++func TestReconcileSkipsAWireWhoseNameKubeVirtRenamed(t *testing.T) {
++	// The link the daemon asks for is absent, so the inspector says broken --
++	// but virt-launcher renamed it. Repairing here would delete a wire the VM
++	// is actively using.
++	f := &fakeDeps{
++		usableNS:   map[string]bool{nsLocal: true, nsPeer: true},
++		vethHealth: map[string]koko.WireHealth{nsLocal + "/pod980816f36b7": koko.WireHealthBroken},
++		renamed:    map[string]bool{nsLocal + "/pod980816f36b7": true},
++	}
++	local := topo("virt-launcher-siteB-cor-sw01", "example-lab", "10.0.0.1", nsLocal, "c1",
++		topologyv1.Link{LocalIntf: "pod980816f36b7", PeerIntf: "eth3", PeerPod: "siteB-fw01", UID: 21})
++	peer := topo("siteB-fw01", "example-lab", "10.0.0.1", nsPeer, "c2")
++
++	_, stats := runPod(t, f, 1, local, peer)
++	if stats.Repaired != 0 || len(f.vethRepairs) != 0 {
++		t.Fatalf("a KubeVirt-renamed wire was repaired: %s %v", stats.summary(), f.vethRepairs)
++	}
++	if stats.Wires != 1 {
++		t.Fatalf("the wire was not even counted: %s", stats.summary())
++	}
++}
++
++func TestReconcileNeverTouchesProtectedInterfaces(t *testing.T) {
++	f := &fakeDeps{
++		usableNS:   map[string]bool{nsLocal: true, nsPeer: true},
++		vethHealth: map[string]koko.WireHealth{nsLocal + "/eth0": koko.WireHealthBroken},
++	}
++	local := topo("p", "example-lab", "10.0.0.1", nsLocal, "c1",
++		topologyv1.Link{LocalIntf: "eth0", PeerIntf: "eth1", PeerPod: "q", UID: 1},
++		topologyv1.Link{LocalIntf: "eth1", PeerIntf: "lo", PeerPod: "q", UID: 2})
++	peer := topo("q", "example-lab", "10.0.0.1", nsPeer, "c2")
++
++	_, stats := runPod(t, f, 1, local, peer)
++	if len(f.vethRepairs) != 0 {
++		t.Fatalf("a protected interface was repaired: %v", f.vethRepairs)
++	}
++	if stats.Wires != 0 || stats.Skipped["protected-interface-name"] != 2 {
++		t.Fatalf("protected links were not excluded before inspection: %s", stats.summary())
++	}
++}
++
++func TestReconcileHonoursTheRepairBudget(t *testing.T) {
++	f := &fakeDeps{usableNS: map[string]bool{nsLocal: true, nsPeer: true}, vethHealth: map[string]koko.WireHealth{}}
++	links := []topologyv1.Link{}
++	for i := 0; i < 5; i++ {
++		name := fmt.Sprintf("eth%d", i+1)
++		links = append(links, topologyv1.Link{LocalIntf: name, PeerIntf: name, PeerPod: "q", UID: i + 1})
++		f.vethHealth[nsLocal+"/"+name] = koko.WireHealthBroken
++	}
++	local := topo("p", "example-lab", "10.0.0.1", nsLocal, "c1", links...)
++	peer := topo("q", "example-lab", "10.0.0.1", nsPeer, "c2")
++
++	InitLogger()
++	r := &reconciler{deps: f.deps(), confirm: newConfirmer(1), maxRepairs: 2, fabricMTU: 1450}
++	stats := newPassStats()
++	r.confirm.startPass()
++	r.reconcilePod(local, map[string]*topologyv1.Topology{"example-lab/p": local, "example-lab/q": peer}, "10.0.0.1", "bond0", &stats)
++	r.confirm.endPass()
++
++	if stats.Repaired != 2 || len(f.vethRepairs) != 2 {
++		t.Fatalf("repair budget not honoured: %s (%d repairs)", stats.summary(), len(f.vethRepairs))
++	}
++	if stats.Skipped["repair-budget-exhausted"] != 3 {
++		t.Fatalf("deferred wires were not reported: %s", stats.summary())
++	}
++}
++
++func TestReconcileReportsAFailedRepair(t *testing.T) {
++	f := &fakeDeps{
++		usableNS:   map[string]bool{nsLocal: true, nsPeer: true},
++		vethHealth: map[string]koko.WireHealth{nsLocal + "/eth1": koko.WireHealthBroken},
++		repairErr:  errors.New("EnsureVethWire: file exists"),
++	}
++	local := topo("p", "example-lab", "10.0.0.1", nsLocal, "c1",
++		topologyv1.Link{LocalIntf: "eth1", PeerIntf: "eth1", PeerPod: "q", UID: 1})
++	peer := topo("q", "example-lab", "10.0.0.1", nsPeer, "c2")
++
++	_, stats := runPod(t, f, 1, local, peer)
++	if stats.Failed != 1 || stats.Repaired != 0 {
++		t.Fatalf("a failed repair was not reported: %s", stats.summary())
++	}
++}
++
++func TestReconcileSkipsPodsWhoseSandboxIsGone(t *testing.T) {
++	f := &fakeDeps{
++		usableNS:   map[string]bool{nsPeer: true}, // our own netns is NOT usable
++		vethHealth: map[string]koko.WireHealth{nsLocal + "/eth1": koko.WireHealthBroken},
++	}
++	local := topo("p", "example-lab", "10.0.0.1", nsLocal, "c1",
++		topologyv1.Link{LocalIntf: "eth1", PeerIntf: "eth1", PeerPod: "q", UID: 1})
++	peer := topo("q", "example-lab", "10.0.0.1", nsPeer, "c2")
++
++	_, stats := runPod(t, f, 1, local, peer)
++	if len(f.vethRepairs) != 0 {
++		t.Fatalf("a pod with no usable sandbox was repaired: %v", f.vethRepairs)
++	}
++	if stats.Skipped["local-sandbox-namespace-is-not-usable"] != 1 {
++		t.Fatalf("skip reason not reported: %s", stats.summary())
++	}
++}
++
++// ---------------------------------------------------------------------------
++// helpers
++// ---------------------------------------------------------------------------
++
++func wireVNI(ns string, uid int64) int {
++	return wireutil.VxlanID(ns, uid)
++}
++
++func TestKubevirtRenamedName(t *testing.T) {
++	if got := kubevirtRenamedName("pod980816f36b7"); got != "980816f36b7-nic" {
++		t.Fatalf("kubevirtRenamedName() = %q, want 980816f36b7-nic", got)
++	}
++	for _, name := range []string{"eth1", "", "pod"} {
++		if got := kubevirtRenamedName(name); got != "" {
++			t.Fatalf("kubevirtRenamedName(%q) = %q, want empty", name, got)
++		}
++	}
++}
++
++func TestNetNSUsableRejectsAbsentPaths(t *testing.T) {
++	for _, p := range []string{"", "   ", "/var/run/netns/absent-0015"} {
++		if netNSUsable(p) {
++			t.Fatalf("netNSUsable(%q) = true", p)
++		}
++	}
++}
++
++func TestShortReasonAggregates(t *testing.T) {
++	if got := shortReason("wire could not be inspected: netlink: operation not permitted"); got != "wire-could-not-be-inspected" {
++		t.Fatalf("shortReason() = %q", got)
++	}
++	if got := shortReason("peer pod is not alive"); got != "peer-pod-is-not-alive" {
++		t.Fatalf("shortReason() = %q", got)
++	}
++}
+diff --git a/daemon/vxlan/inspect.go b/daemon/vxlan/inspect.go
+new file mode 100644
+index 0000000..fb187fd
+--- /dev/null
++++ b/daemon/vxlan/inspect.go
+@@ -0,0 +1,101 @@
++package vxlan
++
++import (
++	"fmt"
++	"net"
++	"strings"
++
++	"github.com/containernetworking/plugins/pkg/ns"
++	"github.com/vishvananda/netlink"
++)
++
++// Health is the read-only verdict about one vxlan wire end.
++//
++// CreateOrUpdate answers "make this end correct" and is free to delete and
++// rebuild whatever it finds. A reconciler must first answer "IS it correct?",
++// and its default has to be the opposite one: against a live lab, tearing
++// down a wire whose state could not be established is worse than the fault
++// being looked for. So HealthBroken requires positive evidence and everything
++// unproven is HealthUnknown, which the caller must not act on.
++type Health int
++
++const (
++	// HealthUnknown: the wire's state could NOT be established. Not broken.
++	HealthUnknown Health = iota
++	// HealthOK: a vxlan with the desired VNI and remote VTEP occupies the slot.
++	HealthOK
++	// HealthBroken: positive evidence -- the slot is empty, or holds a vxlan
++	// programmed for a different VNI or a different remote VTEP.
++	HealthBroken
++)
++
++func (h Health) String() string {
++	switch h {
++	case HealthUnknown:
++		return "unknown"
++	case HealthOK:
++		return "ok"
++	case HealthBroken:
++		return "broken"
++	}
++	return "invalid"
++}
++
++// classifyLink is the pure decision core of Inspect: given whatever occupies
++// the slot (nil when nothing does), say whether the desired wire is realized.
++//
++// found == nil is BROKEN and not UNKNOWN only because Inspect has already
++// established that the namespace is enterable -- an absent link in a
++// namespace we could enter is a fact, an absent link in a namespace we could
++// not enter is nothing at all.
++//
++// An occupant that is not a vxlan is UNKNOWN, deliberately. CreateOrUpdate
++// deletes such an occupant because a CNI ADD owns the name outright; a
++// reconciler does not know why a veth (or a KubeVirt tap) is sitting there
++// and must say so rather than guess.
++func classifyLink(found netlink.Link, wantVNI int, wantVTEP net.IP) (Health, string) {
++	if found == nil {
++		return HealthBroken, "no link occupies the slot"
++	}
++	existing, ok := found.(*netlink.Vxlan)
++	if !ok {
++		return HealthUnknown, fmt.Sprintf("slot is occupied by a %T, not a vxlan", found)
++	}
++	if existing.VxlanId != wantVNI {
++		return HealthBroken, fmt.Sprintf("vxlan has VNI %d, want %d", existing.VxlanId, wantVNI)
++	}
++	if !existing.Group.Equal(wantVTEP) {
++		return HealthBroken, fmt.Sprintf("vxlan points at remote VTEP %s, want %s", existing.Group, wantVTEP)
++	}
++	return HealthOK, fmt.Sprintf("vxlan vni=%d remote=%s is realized", wantVNI, wantVTEP)
++}
++
++// Inspect reports the health of ONE end of a cross-node wire -- the end that
++// lives in nsName -- without modifying anything.
++//
++// It looks for the KubeVirt bridge-binding form of the name as well
++// (0013/0014): virt-launcher renames "podXXXX" to "XXXX-nic" and enslaves it,
++// so the original name being absent is emphatically not evidence the wire is
++// gone.
++//
++// A namespace that cannot be entered yields HealthUnknown: the sandbox is
++// going away or has not been created, and neither says anything about the
++// wire.
++func Inspect(nsName, linkName string, wantVNI int, wantVTEP net.IP) (Health, string) {
++	if strings.TrimSpace(nsName) == "" {
++		return HealthUnknown, "no network namespace recorded for the pod"
++	}
++	netNS, err := ns.GetNS(nsName)
++	if err != nil {
++		return HealthUnknown, fmt.Sprintf("network namespace %s is not usable: %v", nsName, err)
++	}
++	_ = netNS.Close()
++
++	found := getLinkFromNS(nsName, linkName)
++	if found == nil {
++		if renamed := kubevirtRenamedLink(nsName, linkName); renamed != nil {
++			found = renamed
++		}
++	}
++	return classifyLink(found, wantVNI, wantVTEP)
++}
+diff --git a/daemon/vxlan/inspect_test.go b/daemon/vxlan/inspect_test.go
+new file mode 100644
+index 0000000..96d5836
+--- /dev/null
++++ b/daemon/vxlan/inspect_test.go
+@@ -0,0 +1,73 @@
++package vxlan
++
++import (
++	"net"
++	"testing"
++
++	"github.com/vishvananda/netlink"
++)
++
++func vxlanLink(name string, vni int, group string) netlink.Link {
++	return &netlink.Vxlan{
++		LinkAttrs: netlink.LinkAttrs{Name: name},
++		VxlanId:   vni,
++		Group:     net.ParseIP(group),
++	}
++}
++
++// TestClassifyLink pins the evidence rules the reconciler is allowed to act
++// on. The rows that matter most are the two UNKNOWN ones: a reconciler that
++// treated either as broken would delete a wire it does not understand.
++func TestClassifyLink(t *testing.T) {
++	want := net.ParseIP("10.10.0.7")
++	cases := []struct {
++		name   string
++		found  netlink.Link
++		health Health
++	}{
++		{"desired vxlan is healthy", vxlanLink("eth1", 4242, "10.10.0.7"), HealthOK},
++		{"empty slot is broken", nil, HealthBroken},
++		{"wrong VNI is broken", vxlanLink("eth1", 9999, "10.10.0.7"), HealthBroken},
++		{"stale remote VTEP is broken (the peer moved)", vxlanLink("eth1", 4242, "10.10.0.9"), HealthBroken},
++		{"a veth in the slot is unknown, not broken",
++			&netlink.Veth{LinkAttrs: netlink.LinkAttrs{Name: "eth1"}}, HealthUnknown},
++		{"a bridge in the slot is unknown, not broken",
++			&netlink.Bridge{LinkAttrs: netlink.LinkAttrs{Name: "eth1"}}, HealthUnknown},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			got, reason := classifyLink(tc.found, 4242, want)
++			if got != tc.health {
++				t.Fatalf("classifyLink() = %v (%s), want %v", got, reason, tc.health)
++			}
++			if reason == "" {
++				t.Fatal("every verdict must name its evidence")
++			}
++		})
++	}
++}
++
++// TestInspectTreatsAnUnusableNamespaceAsUnknown is the guard on the ONE
++// precondition classifyLink's "nil means broken" rule depends on. Without it,
++// every pod whose sandbox had gone away would read as a lab full of dead
++// wires and the reconciler would try to rebuild all of them.
++func TestInspectTreatsAnUnusableNamespaceAsUnknown(t *testing.T) {
++	InitLogger()
++	for _, nsName := range []string{"", "   ", "/var/run/netns/absent-0015"} {
++		got, reason := Inspect(nsName, "eth1", 4242, net.ParseIP("10.10.0.7"))
++		if got != HealthUnknown {
++			t.Fatalf("Inspect(%q) = %v (%s), want unknown", nsName, got, reason)
++		}
++	}
++}
++
++func TestHealthStringsAreDistinct(t *testing.T) {
++	seen := map[string]bool{}
++	for _, h := range []Health{HealthUnknown, HealthOK, HealthBroken} {
++		s := h.String()
++		if s == "" || s == "invalid" || seen[s] {
++			t.Fatalf("Health(%d).String() = %q is empty or not distinct", h, s)
++		}
++		seen[s] = true
++	}
++}
+diff --git a/plugin/meshnet.go b/plugin/meshnet.go
+index 471cac6..d160ee6 100644
+--- a/plugin/meshnet.go
++++ b/plugin/meshnet.go
+@@ -2,11 +2,9 @@ package main
+ 
+ import (
+ 	"context"
+-	"encoding/binary"
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
+-	"hash/fnv"
+ 	"net"
+ 	"os"
+ 	"runtime"
+@@ -28,10 +26,8 @@ import (
+ )
+ 
+ const (
+-	vxlanBaseMin = 4096
+-	vxlanBaseMax = 1<<24 - 1
+-	localhost    = "localhost"
+-	macvlanMode  = netlink.MACVLAN_MODE_BRIDGE
++	localhost   = "localhost"
++	macvlanMode = netlink.MACVLAN_MODE_BRIDGE
+ 
+ 	// rpcTimeout bounds the daemon dial and every individual RPC so a wedged
+ 	// meshnetd (or API server) cannot stall a CNI command indefinitely.
+@@ -209,15 +205,11 @@ func makeVeth(netNS, linkName string, ip string, mtu int) (*koko.VEth, error) {
+ // -------------------------------------------------------------------------------------------------
+ // Creates a deterministic topology-scoped VNI so active topologies do not
+ // collide just because they reuse the same low link UID values.
++// The implementation lives in utils/wireutil so the daemon's reconciler
++// derives the identical VNI; see wireutil.VxlanID for why there must be
++// exactly one copy.
+ func makeVxlanID(namespace string, idx int64) int {
+-	h := fnv.New32a()
+-	_, _ = h.Write([]byte(namespace))
+-	_, _ = h.Write([]byte{0})
+-	var uidBytes [8]byte
+-	binary.LittleEndian.PutUint64(uidBytes[:], uint64(idx))
+-	_, _ = h.Write(uidBytes[:])
+-
+-	return vxlanBaseMin + int(h.Sum32()%uint32(vxlanBaseMax-vxlanBaseMin))
++	return wireutil.VxlanID(namespace, idx)
+ }
+ 
+ // Creates koko.Vxlan from ParentIF, destination IP and VNI
+diff --git a/utils/wireutil/wire-util.go b/utils/wireutil/wire-util.go
+index cfd1114..ac5c306 100644
+--- a/utils/wireutil/wire-util.go
++++ b/utils/wireutil/wire-util.go
+@@ -1,7 +1,9 @@
+ package wireutil
+ 
+ import (
++	"encoding/binary"
+ 	"fmt"
++	"hash/fnv"
+ 
+ 	"github.com/containernetworking/plugins/pkg/ns"
+ 	"github.com/safchain/ethtool"
+@@ -11,8 +13,33 @@ const (
+ 	GRPCDefaultPort       = 51111
+ 	INTER_NODE_LINK_VXLAN = "VXLAN"
+ 	INTER_NODE_LINK_GRPC  = "GRPC"
++
++	// VxlanBaseMin / VxlanBaseMax bound the VNI space 0006 hashes into.
++	VxlanBaseMin = 4096
++	VxlanBaseMax = 1<<24 - 1
+ )
+ 
++// VxlanID returns the deterministic, topology-scoped VNI for one link.
++//
++// THIS MUST HAVE EXACTLY ONE DEFINITION. 0006 made the VNI a pure function of
++// (topology namespace, link uid) so that both ends of a wire, and every
++// kubelet retry, compute the same value. That property only holds while there
++// is one implementation: the CNI plugin picks the VNI on ADD, the daemon must
++// derive the SAME one when it reconciles a wire nobody is currently adding,
++// and a second copy that drifted by a byte would put the two ends on
++// different VNIs -- a fabric that is up from every angle except traffic.
++// plugin/meshnet.go's makeVxlanID is a thin wrapper over this.
++func VxlanID(namespace string, uid int64) int {
++	h := fnv.New32a()
++	_, _ = h.Write([]byte(namespace))
++	_, _ = h.Write([]byte{0})
++	var uidBytes [8]byte
++	binary.LittleEndian.PutUint64(uidBytes[:], uint64(uid))
++	_, _ = h.Write(uidBytes[:])
++
++	return VxlanBaseMin + int(h.Sum32()%uint32(VxlanBaseMax-VxlanBaseMin))
++}
++
+ func SetTxChecksumOff(intfName, nsName string) error {
+ 	var vethNs ns.NetNS
+ 	var err error

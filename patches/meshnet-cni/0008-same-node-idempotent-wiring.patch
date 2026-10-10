@@ -1,0 +1,237 @@
+From 04889f001ca7d25e17bf0f12cfa39effc347e0ba Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sat, 18 Jul 2026 08:19:48 -0500
+Subject: [PATCH 8/9] plugin: idempotent same-node wiring via
+ koko.EnsureVethWire; rollback
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Same-node fabric links were realized by check-then-create: two
+IsExistLinkInNS probes chose between do-nothing / remove-then-create /
+skip-or-priority-gated MakeVeth. This was broken twice over. First,
+IsExistLinkInNS always returned false (fixed in the koko series), so every
+branch except 'neither exists' was dead and any link that actually existed
+was blindly re-created — a fatal 'failed to rename link kokoNNN -> ethN:
+file exists' for the WHOLE multi-link ADD. Second, even with working
+probes the sequence is a TOCTOU race against the peer pod's concurrent ADD
+wiring the same link from the other direction (MakeVeth creates BOTH ends,
+including into our netns). On a hub pod this produced permanent
+sandbox-creation retry loops: each kubelet retry re-ran a full ADD, the
+peer's churning ADD re-planted the interface into each fresh netns, and
+the collision recurred every ~3s.
+
+Replace the branch soup with koko.EnsureVethWire under the symmetric
+per-link alias: adopt a correct existing wire no matter which side created
+it, replace stale halves, fail loudly on foreign ownership — serialized
+node-wide inside koko, so both sides may attempt the same link safely. The
+IsSkipped/higher-priority gate is no longer needed on the alive path (both
+sides ensuring is now benign); Skip bookkeeping remains for the
+peer-not-alive path.
+
+A failed ADD now unwinds: only the local-namespace ends this invocation
+realized are recorded (removing one veth end removes the pair; peer
+namespaces are never touched directly in rollback), and protectedIfName
+guards eth0/lo/empty names in every removal path as defense in depth.
+
+Upstreamable together with the koko series.
+---
+ plugin/meshnet.go           | 115 +++++++++++++++++-------------------
+ plugin/meshnet_wire_test.go |  16 +++++
+ 2 files changed, 70 insertions(+), 61 deletions(-)
+ create mode 100644 plugin/meshnet_wire_test.go
+
+diff --git a/plugin/meshnet.go b/plugin/meshnet.go
+index 47a7c34..53c6783 100644
+--- a/plugin/meshnet.go
++++ b/plugin/meshnet.go
+@@ -16,7 +16,6 @@ import (
+ 	"github.com/containernetworking/cni/pkg/types"
+ 	"github.com/containernetworking/cni/pkg/types/current"
+ 	"github.com/containernetworking/cni/pkg/version"
+-	"github.com/davecgh/go-spew/spew"
+ 	koko "github.com/redhat-nfvpe/koko/api"
+ 	log "github.com/sirupsen/logrus"
+ 	"github.com/vishvananda/netlink"
+@@ -341,6 +340,34 @@ func printKubeVirtSecondaryResult(result *current.Result, version, ifName string
+ 	return types.PrintResult(result, version)
+ }
+ 
++// protectedIfName reports whether an interface name must never be removed by
++// meshnet: eth0 belongs to the delegated/primary CNI chain and lo to the
++// kernel. Topology links never legitimately use these names; the guard is
++// defense in depth for every retry/rollback/cleanup path.
++func protectedIfName(name string) bool {
++	name = strings.TrimSpace(name)
++	return name == "" || name == "eth0" || name == "lo"
++}
++
++// rollbackCreatedLinks removes the local ends of fabric links realized by a
++// failed CNI ADD so the next attempt starts from a clean slate. Only
++// local-namespace ends are recorded by cmdAdd: removing one veth end removes
++// its pair peer as well, and the peer pod's namespace is never touched
++// directly here. Delegated interfaces are never removed.
++func rollbackCreatedLinks(podName string, links []*koko.VEth) {
++	for i := len(links) - 1; i >= 0; i-- {
++		link := links[i]
++		if link == nil || protectedIfName(link.LinkName) || strings.TrimSpace(link.NsName) == "" {
++			continue
++		}
++		if err := link.RemoveVethLink(); err != nil {
++			log.Warnf("Add[%s]: rollback could not remove link %s in netns %s after failed CNI ADD: %v", podName, link.LinkName, link.NsName, err)
++			continue
++		}
++		log.Infof("Add[%s]: rolled back link %s in netns %s after failed CNI ADD", podName, link.LinkName, link.NsName)
++	}
++}
++
+ func isKubeVirtLauncherDefaultCNI(podName, ifName string, kubeVirtSecondary bool) bool {
+ 	if kubeVirtSecondary {
+ 		return false
+@@ -434,6 +461,13 @@ func cmdAdd(args *skel.CmdArgs) (retErr error) {
+ 		log.Errorf("Add[%s]: Failed to set pod alive status", string(cniArgs.K8S_POD_NAME))
+ 		return err
+ 	}
++	addSucceeded := false
++	createdLinks := []*koko.VEth{}
++	defer func() {
++		if !addSucceeded {
++			rollbackCreatedLinks(string(cniArgs.K8S_POD_NAME), createdLinks)
++		}
++	}()
+ 
+ 	links, err := linksForCNIRequest(localPod.Links, requestedIntf, n.KubeVirtSecondary)
+ 	if err != nil {
+@@ -459,6 +493,7 @@ func cmdAdd(args *skel.CmdArgs) (retErr error) {
+ 				log.Errorf("Failed to add macvlan interface")
+ 				return err
+ 			}
++			createdLinks = append(createdLinks, myVeth)
+ 			log.Infof("macvlan interface %s@%s has been added", link.LocalIntf, link.PeerIntf)
+ 			continue
+ 		}
+@@ -499,67 +534,23 @@ func cmdAdd(args *skel.CmdArgs) (retErr error) {
+ 					return err
+ 				}
+ 
+-				// Checking if interfaces already exist
+-				iExist, _ := koko.IsExistLinkInNS(myVeth.NsName, myVeth.LinkName)
+-				pExist, _ := koko.IsExistLinkInNS(peerVeth.NsName, peerVeth.LinkName)
+-
+-				log.Infof("Add[%s]: Does the link already exist? Local:%t, Peer:%t", string(cniArgs.K8S_POD_NAME), iExist, pExist)
+-				if iExist && pExist { // If both link exist, we don't need to do anything
+-					log.Infof("Add[%s]: Both interfaces already exist in namespace", string(cniArgs.K8S_POD_NAME))
+-				} else if !iExist && pExist { // If only peer link exists, we need to destroy it first
+-					log.Infof("Add[%s]: Only peer link exists, removing it first", string(cniArgs.K8S_POD_NAME))
+-					if err := peerVeth.RemoveVethLink(); err != nil {
+-						log.Errorf("Add[%s]: Failed to remove a stale interface %s of my peer %s", string(cniArgs.K8S_POD_NAME), peerVeth.LinkName, link.PeerPod)
+-						return err
+-					}
+-					log.Infof("Add[%s]: Adding the new veth link to both pods", string(cniArgs.K8S_POD_NAME))
+-					if err = koko.MakeVeth(*myVeth, *peerVeth); err != nil {
+-						log.Errorf("Add[%s]: Error creating VEth pair after peer link remove: %s", string(cniArgs.K8S_POD_NAME), err)
+-						return err
+-					}
+-				} else if iExist && !pExist { // If only local link exists, we need to destroy it first
+-					log.Infof("Add[%s]: Only local link exists, removing it first", string(cniArgs.K8S_POD_NAME))
+-					if err := myVeth.RemoveVethLink(); err != nil {
+-						log.Errorf("Add[%s]: Failed to remove a local stale VEth interface %s for pod %s", string(cniArgs.K8S_POD_NAME), myVeth.LinkName, localPod.Name)
+-						return err
+-					}
+-					log.Infof("Add[%s]: Adding the new veth link to both pods", string(cniArgs.K8S_POD_NAME))
+-					if err = koko.MakeVeth(*myVeth, *peerVeth); err != nil {
+-						log.Errorf("Add[%s]: Error creating VEth pair after local link remove: %s", string(cniArgs.K8S_POD_NAME), err)
+-						return err
+-					}
+-				} else { // if neither link exists, we have two options
+-					log.Infof("Add[%s]: Neither link exists. Checking if we've been skipped for interface %s (link id %d)", string(cniArgs.K8S_POD_NAME), link.LocalIntf, link.Uid)
+-					isSkipped, err := meshnetClient.IsSkipped(ctx, &mpb.SkipQuery{
+-						Pod:    localPod.Name,
+-						Peer:   peerPod.Name,
+-						LinkId: link.Uid,
+-						KubeNs: string(cniArgs.K8S_POD_NAMESPACE),
+-					})
+-					if err != nil {
+-						log.Errorf("Add[%s]: Failed to read skipped status from our peer", string(cniArgs.K8S_POD_NAME))
+-						return err
+-					}
+-					log.Infof("Add[%s]: Have we been skipped for %s (link id %d) by our peer %s? %t", string(cniArgs.K8S_POD_NAME), link.LocalIntf, link.Uid, peerPod.Name, isSkipped.Response)
+-
+-					// Comparing names to determine higher priority
+-					higherPrio := localPod.Name > peerPod.Name
+-					log.Infof("Add[%s]: Do we have a higher priority? %t", string(cniArgs.K8S_POD_NAME), higherPrio)
+-
+-					if isSkipped.Response || higherPrio { // If peer POD skipped us (booted before us) or we have a higher priority
+-						log.Infof("Add[%s]: Peer POD has skipped us for %s (link id %d) or we have a higher priority", string(cniArgs.K8S_POD_NAME), link.LocalIntf, link.Uid)
+-						if err = koko.MakeVeth(*myVeth, *peerVeth); err != nil {
+-							log.Errorf("Add[%s]: Error when creating a new VEth pair with koko: %s", string(cniArgs.K8S_POD_NAME), err)
+-							log.Infof("Add[%s]: MY VETH STRUCT: %+v", string(cniArgs.K8S_POD_NAME), spew.Sdump(myVeth))
+-							log.Infof("Add[%s]: PEER STRUCT: %+v", string(cniArgs.K8S_POD_NAME), spew.Sdump(peerVeth))
+-							return err
+-						}
+-					} else { // peerPod has higherPrio and hasn't skipped us
+-						// In this case we do nothing, since the pod with a higher IP is supposed to connect veth pair
+-						log.Infof("Add[%s]: Doing nothing, expecting peer pod %s to connect veth pair", string(cniArgs.K8S_POD_NAME), peerPod.Name)
+-						continue
+-					}
++				// Idempotently realize the wire. Both directions of a link may
++				// attempt this concurrently (both pods' ADDs); koko serializes
++				// all wire creators node-wide and either adopts a wire the
++				// peer already realized correctly, replaces stale halves, or
++				// fails loudly when a different wire owns the name. This
++				// replaces the old check-then-MakeVeth branches, whose
++				// existence checks were racy and whose rename collisions were
++				// fatal to the entire multi-link ADD.
++				alias := koko.VethWireAlias(string(cniArgs.K8S_POD_NAMESPACE), link.Uid)
++				if err := koko.EnsureVethWire(*myVeth, *peerVeth, alias); err != nil {
++					log.Errorf("Add[%s]: Error ensuring VEth wire %s (link id %d) with koko: %s", string(cniArgs.K8S_POD_NAME), link.LocalIntf, link.Uid, err)
++					return err
+ 				}
++				// Record only the local end for rollback: removing it removes
++				// the pair, and this sandbox is abandoned on ADD failure
++				// whether the wire was created or adopted.
++				createdLinks = append(createdLinks, myVeth)
+ 				if err := wireutil.SetTxChecksumOff(myVeth.LinkName, myVeth.NsName); err != nil {
+ 					log.Errorf("Add[%s]: Error in setting tx checksum-off on interface %s, ns %s, pod %s: %v", string(cniArgs.K8S_POD_NAME), myVeth.LinkName, myVeth.NsName, localPod.Name, err)
+ 					// not returning
+@@ -586,6 +577,7 @@ func cmdAdd(args *skel.CmdArgs) (retErr error) {
+ 					log.Infof("Add[%s]: Error when creating a Vxlan interface with koko: %s", string(cniArgs.K8S_POD_NAME), err)
+ 					return err
+ 				}
++				createdLinks = append(createdLinks, myVeth)
+ 
+ 				// Now we need to make an API call to update the remote VTEP to point to us
+ 				payload := &mpb.RemotePod{
+@@ -632,6 +624,7 @@ func cmdAdd(args *skel.CmdArgs) (retErr error) {
+ 		}
+ 	}
+ 
++	addSucceeded = true
+ 	if n.KubeVirtSecondary {
+ 		return printKubeVirtSecondaryResult(result, n.CNIVersion, requestedIntf)
+ 	}
+diff --git a/plugin/meshnet_wire_test.go b/plugin/meshnet_wire_test.go
+new file mode 100644
+index 0000000..253a40c
+--- /dev/null
++++ b/plugin/meshnet_wire_test.go
+@@ -0,0 +1,16 @@
++package main
++
++import "testing"
++
++func TestProtectedIfName(t *testing.T) {
++	for _, name := range []string{"", "   ", "eth0", "lo"} {
++		if !protectedIfName(name) {
++			t.Fatalf("protectedIfName(%q) = false, want true", name)
++		}
++	}
++	for _, name := range []string{"eth1", "eth10", "e1-1", "net1"} {
++		if protectedIfName(name) {
++			t.Fatalf("protectedIfName(%q) = true, want false", name)
++		}
++	}
++}
+-- 
+2.55.0
+

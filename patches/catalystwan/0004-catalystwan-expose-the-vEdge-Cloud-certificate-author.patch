@@ -1,0 +1,132 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Fri, 5 Sep 2026 01:20:00 -0500
+Subject: [PATCH] catalystwan: expose the vEdge Cloud certificate authority
+
+vManage keeps TWO certificate-authority settings and this module only ever
+exposed one:
+
+  /settings/configuration/certificate   -> the CONTROLLERS (vManage/vBond/vSmart)
+  /settings/configuration/vedgecloud    -> vEdge Cloud, i.e. VIRTUAL EDGES
+
+Measured on a live 20.18.4 fabric that our own lane had just brought up, with
+all three controller certificates installed against an enterprise root CA:
+
+    certificate  certificate_signing  = 'enterprise'   <- our lane sets this
+    vedgecloud   certificateauthority = 'cisco'        <- nothing sets this
+    enterprise root CA: installed, control_connection_up: True
+
+So a fabric we deliberately moved onto an enterprise CA was still telling any
+virtual edge to expect CISCO-signed certificates. That is not a preference, it
+is an inconsistency in a fabric we configure end to end, and it is invisible
+because no surface reports it.
+
+The SDK has had both halves all along -- `get_vedge_cloud` / `edit_vedge_cloud`
+and the one-field `VEdgeCloud` model -- so this exposes the capability rather
+than adding one. Same shape as 0003: the endpoint existed, the module did not
+surface it.
+
+HONEST SCOPE. Setting this to `enterprise` does NOT, by itself, let a virtual
+edge into the WAN edge list. Measured immediately after flipping it, both
+inventory lanes refused exactly as before:
+
+    .csv     -> 'Virtual Platform is not allowed in CSV Upload.'  (VELIST0001)
+    .viptela -> 'Disallowed ENG cert. Failed to verify signature.'(VELIST0001)
+
+Those are lane restrictions and a Cisco engineering signature respectively, and
+neither is governed by this setting. This patch fixes a real misconfiguration;
+it does not claim to onboard an edge.
+
+Controls (the module source, against the installed SDK):
+
+  PASS argspec has vedge_cloud          PASS uses SDK edit_vedge_cloud
+  PASS option certificate_authority     PASS uses SDK get_vedge_cloud
+  PASS VEdgeCloud imported              PASS modify flag initialised
+  PASS controllers path untouched  (edit_certificates still called exactly once)
+
+  SDK: get_vedge_cloud True, edit_vedge_cloud True, VEdgeCloud fields
+       ['certificateauthority']
+
+The comparison follows the existing read-then-diff pattern, so an already
+correct fabric reports no change rather than re-writing the setting every run.
+
+UPSTREAM ASK: FILE. A plain capability gap against
+cisco-en-programmability/ansible-collection-catalystwan.
+
+---
+diff --git a/plugins/modules/administration_settings.py b/plugins/modules/administration_settings.py
+--- a/plugins/modules/administration_settings.py
++++ b/plugins/modules/administration_settings.py
+@@ -206,6 +206,7 @@
+ 
+ from catalystwan.endpoints.configuration_settings import (
+     Certificate,
++    VEdgeCloud,
+     Device,
+     OnOffMode,
+     Organization,
+@@ -248,6 +249,22 @@
+                 port=dict(type="str"),
+             ),
+         ),
++        vedge_cloud=dict(
++            # The VIRTUAL-edge certificate authority, which is a DIFFERENT
++            # setting from `certificates` above. `certificates` governs the
++            # CONTROLLERS (vManage/vBond/vSmart); this one governs vEdge Cloud
++            # devices, and vManage keeps them independently -- measured on a
++            # live 20.18.4 fabric whose controllers were already 'enterprise'
++            # while this still read 'cisco'.
++            type="dict",
++            aliases=["vedge_cloud_certificate_authorization"],
++            options=dict(
++                certificate_authority=dict(
++                    type="str",
++                    choices=["cisco", "manual", "enterprise"],
++                ),
++            ),
++        ),
+         certificates=dict(
+             type="dict",
+             aliases=["cca", "controler_certificate_authorization"],
+@@ -313,6 +330,7 @@
+     modify_vbond = False
+     modify_org = False
+     modify_certificates = False
++    modify_vedge_cloud = False
+     modify_enterprise_root_ca = False
+     modify_smart_account_credentials = False
+     modify_pnp_sync = False
+@@ -359,6 +377,15 @@
+         ).single_or_default()
+         modify_certificates = True if certificates_data != certificates_payload else False
+ 
++    if module.params.get("vedge_cloud"):
++        vedge_cloud_payload = VEdgeCloud(
++            certificateauthority=module.params.get("vedge_cloud").get("certificate_authority")
++        )
++        vedge_cloud_data = module.get_response_safely(
++            module.session.endpoints.configuration_settings.get_vedge_cloud
++        ).single_or_default()
++        modify_vedge_cloud = True if vedge_cloud_data != vedge_cloud_payload else False
++
+     if module.params.get("enterprise_root_ca"):
+         if not HAS_ENTERPRISE_ROOT_CA_ENDPOINT:
+             module.fail_json(
+@@ -431,6 +458,15 @@
+             response_key="certificates",
+         )
+ 
++    if modify_vedge_cloud:
++        module.send_request_safely(
++            result,
++            action_name="Administration Settings: vEdge Cloud Certificate Authorization",
++            send_func=module.session.endpoints.configuration_settings.edit_vedge_cloud,
++            payload=vedge_cloud_payload,
++            response_key="vedge_cloud",
++        )
++
+     if modify_enterprise_root_ca:
+         module.send_request_safely(
+             result,
+-- 
+2.51.0

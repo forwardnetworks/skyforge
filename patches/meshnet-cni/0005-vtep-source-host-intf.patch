@@ -1,0 +1,252 @@
+From 7bfc9f176678bfc05e5b8425a99865eefd07a9c5 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sat, 18 Jul 2026 08:15:24 -0500
+Subject: [PATCH 5/9] vtep: explicit HOST_INTF wins for source selection,
+ plugin and daemon
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Routed clusters can carry the Kubernetes hostIP on an interface that is not
+the one fabric traffic must use (e.g. a tunnel). The old getVxlanSource
+only honoured HOST_INTF if it stumbled on it while scanning addresses, and
+returned whatever address family it hit first.
+
+- plugin getVxlanSource: an explicit HOST_INTF now short-circuits — resolve
+  the interface's first non-loopback IPv4 address and use it as the VTEP
+  source; HOST_IP scanning remains the fallback.
+- meshnetd Get: resolve the same way (nodeSource) before answering pod
+  queries, so NodeIp/NodeIntf handed to the plugin already reflect the
+  configured source interface; falls back to HOST_IP with a warning when
+  the interface cannot be resolved.
+
+Upstreamable.
+---
+ daemon/meshnet/handler.go   | 57 +++++++++++++++++++++++++++++++++
+ plugin/meshnet.go           | 63 +++++++++++++++++++++++++++++--------
+ plugin/meshnet_vtep_test.go | 41 ++++++++++++++++++++++++
+ 3 files changed, 148 insertions(+), 13 deletions(-)
+ create mode 100644 plugin/meshnet_vtep_test.go
+
+diff --git a/daemon/meshnet/handler.go b/daemon/meshnet/handler.go
+index 7a452f3..8eeb72b 100644
+--- a/daemon/meshnet/handler.go
++++ b/daemon/meshnet/handler.go
+@@ -2,7 +2,10 @@ package meshnet
+ 
+ import (
+ 	"context"
++	"fmt"
++	"net"
+ 	"os"
++	"strings"
+ 
+ 	"github.com/networkop/meshnet-cni/api/types/v1beta1"
+ 	"github.com/networkop/meshnet-cni/daemon/grpcwire"
+@@ -17,6 +20,59 @@ import (
+ 	mpb "github.com/networkop/meshnet-cni/daemon/proto/meshnet/v1beta1"
+ )
+ 
++func ipv4FromAddr(addr net.Addr) net.IP {
++	var ip net.IP
++	switch v := addr.(type) {
++	case *net.IPNet:
++		ip = v.IP
++	case *net.IPAddr:
++		ip = v.IP
++	}
++	if ip == nil {
++		return nil
++	}
++	return ip.To4()
++}
++
++func nodeSourceFromInterface(nodeIntf string) (string, error) {
++	nodeIntf = strings.TrimSpace(nodeIntf)
++	if nodeIntf == "" {
++		return "", fmt.Errorf("node interface is empty")
++	}
++	iface, err := net.InterfaceByName(nodeIntf)
++	if err != nil {
++		return "", fmt.Errorf("lookup node interface %q: %w", nodeIntf, err)
++	}
++	addrs, err := iface.Addrs()
++	if err != nil {
++		return "", fmt.Errorf("read addresses for node interface %q: %w", nodeIntf, err)
++	}
++	for _, addr := range addrs {
++		ip := ipv4FromAddr(addr)
++		if ip != nil && !ip.IsLoopback() {
++			return ip.String(), nil
++		}
++	}
++	return "", fmt.Errorf("node interface %q has no non-loopback IPv4 address", nodeIntf)
++}
++
++func nodeSource(nodeIP, nodeIntf string) (string, string) {
++	nodeIP = strings.TrimSpace(nodeIP)
++	nodeIntf = strings.TrimSpace(nodeIntf)
++	if nodeIntf == "" {
++		return nodeIP, nodeIntf
++	}
++	srcIP, err := nodeSourceFromInterface(nodeIntf)
++	if err != nil {
++		mnetdLogger.Warnf("HOST_INTF=%s could not be resolved, falling back to HOST_IP=%s: %v", nodeIntf, nodeIP, err)
++		return nodeIP, nodeIntf
++	}
++	if srcIP != nodeIP {
++		mnetdLogger.Infof("Resolved meshnet node source from HOST_INTF=%s: HOST_IP=%s source_ip=%s", nodeIntf, nodeIP, srcIP)
++	}
++	return srcIP, nodeIntf
++}
++
+ func (m *Meshnet) getPod(ctx context.Context, name, ns string) (*unstructured.Unstructured, error) {
+ 	mnetdLogger.Infof("Reading pod %s from K8s", name)
+ 	return m.tClient.Topology(ns).Unstructured(ctx, name, metav1.GetOptions{})
+@@ -65,6 +121,7 @@ func (m *Meshnet) Get(ctx context.Context, pod *mpb.PodQuery) (*mpb.Pod, error)
+ 	containerId, _, _ := unstructured.NestedString(result.Object, "status", "container_id")
+ 	nodeIP := os.Getenv("HOST_IP")
+ 	nodeIntf := os.Getenv("HOST_INTF")
++	nodeIP, nodeIntf = nodeSource(nodeIP, nodeIntf)
+ 
+ 	return &mpb.Pod{
+ 		Name:        pod.Name,
+diff --git a/plugin/meshnet.go b/plugin/meshnet.go
+index 5051fde..3b9f6e1 100644
+--- a/plugin/meshnet.go
++++ b/plugin/meshnet.go
+@@ -7,6 +7,7 @@ import (
+ 	"net"
+ 	"os"
+ 	"runtime"
++	"strings"
+ 	"time"
+ 
+ 	"github.com/containernetworking/cni/pkg/skel"
+@@ -95,15 +96,56 @@ func loadConf(bytes []byte) (*netConf, *current.Result, error) {
+ 	return n, result, nil
+ }
+ 
+-// getVxlanSource uses netlink to get the iface reliably given an IP address.
+-// when IP and Interface both are present then Interface is going to take preference
+-// nodeIntf is specified by the user and it's not auto discovered. The user has to be careful that the peer is reachable though this interface otherwise, VxLAN may not work.
+-// daemonset.yaml meshnet container env required for host_intf override
+-//
+-//	       env:
+-//	         - name: HOST_INTF
+-//			value: breth2
++func ipv4FromAddr(addr net.Addr) net.IP {
++	var ip net.IP
++	switch v := addr.(type) {
++	case *net.IPNet:
++		ip = v.IP
++	case *net.IPAddr:
++		ip = v.IP
++	}
++	if ip == nil {
++		return nil
++	}
++	return ip.To4()
++}
++
++func vxlanSourceFromInterface(nodeIntf string) (string, string, error) {
++	nodeIntf = strings.TrimSpace(nodeIntf)
++	if nodeIntf == "" {
++		return "", "", fmt.Errorf("node interface is empty")
++	}
++	iface, err := net.InterfaceByName(nodeIntf)
++	if err != nil {
++		return "", "", fmt.Errorf("lookup node interface %q: %w", nodeIntf, err)
++	}
++	addrs, err := iface.Addrs()
++	if err != nil {
++		return "", "", fmt.Errorf("read addresses for node interface %q: %w", nodeIntf, err)
++	}
++	for _, addr := range addrs {
++		ip := ipv4FromAddr(addr)
++		if ip != nil && !ip.IsLoopback() {
++			return ip.String(), nodeIntf, nil
++		}
++	}
++	return "", "", fmt.Errorf("node interface %q has no non-loopback IPv4 address", nodeIntf)
++}
++
++// getVxlanSource selects the VTEP source address. Explicit HOST_INTF wins over
++// Kubernetes hostIP because routed clusters can use a node IP that is reachable
++// only through a tunnel interface.
+ func getVxlanSource(nodeIP string, nodeIntf string) (string, string, error) {
++	nodeIP = strings.TrimSpace(nodeIP)
++	nodeIntf = strings.TrimSpace(nodeIntf)
++	if nodeIntf != "" {
++		srcIP, srcIntf, err := vxlanSourceFromInterface(nodeIntf)
++		if err != nil {
++			return "", "", err
++		}
++		log.Infof("Using configured meshnet source interface %s with address %s instead of HOST_IP=%s", srcIntf, srcIP, nodeIP)
++		return srcIP, srcIntf, nil
++	}
+ 	if nodeIntf == "" && nodeIP == "" {
+ 		return "", "", fmt.Errorf("meshnetd provided no HOST_IP address: %s or HOST_INTF: %s", nodeIP, nodeIntf)
+ 	}
+@@ -122,11 +164,6 @@ func getVxlanSource(nodeIP string, nodeIntf string) (string, string, error) {
+ 			case *net.IPAddr:
+ 				ip = v.IP
+ 			}
+-			if nodeIntf != "" {
+-				if i.Name == nodeIntf {
+-					return ip.String(), nodeIntf, nil
+-				}
+-			}
+ 			if nIP != nil && nIP.Equal(ip) {
+ 				log.Infof("Found iface %s for address %s", i.Name, nodeIP)
+ 				return nodeIP, i.Name, nil
+diff --git a/plugin/meshnet_vtep_test.go b/plugin/meshnet_vtep_test.go
+new file mode 100644
+index 0000000..6190580
+--- /dev/null
++++ b/plugin/meshnet_vtep_test.go
+@@ -0,0 +1,41 @@
++package main
++
++import (
++	"net"
++	"testing"
++)
++
++func TestIPv4FromAddrSkipsIPv6OnlyAddress(t *testing.T) {
++	addr := &net.IPNet{IP: net.ParseIP("2001:db8::1"), Mask: net.CIDRMask(64, 128)}
++	if got := ipv4FromAddr(addr); got != nil {
++		t.Fatalf("ipv4FromAddr() = %v, want nil for IPv6-only address", got)
++	}
++}
++
++func TestGetVxlanSourcePrefersConfiguredInterface(t *testing.T) {
++	ifaces, err := net.Interfaces()
++	if err != nil {
++		t.Fatalf("net.Interfaces(): %v", err)
++	}
++	for _, iface := range ifaces {
++		addrs, err := iface.Addrs()
++		if err != nil {
++			continue
++		}
++		for _, addr := range addrs {
++			ip := ipv4FromAddr(addr)
++			if ip == nil || ip.IsLoopback() {
++				continue
++			}
++			gotIP, gotIntf, err := getVxlanSource("192.0.2.1", iface.Name)
++			if err != nil {
++				t.Fatalf("getVxlanSource() returned error for interface %s: %v", iface.Name, err)
++			}
++			if gotIP != ip.String() || gotIntf != iface.Name {
++				t.Fatalf("getVxlanSource() = %s/%s, want %s/%s", gotIP, gotIntf, ip.String(), iface.Name)
++			}
++			return
++		}
++	}
++	t.Skip("no non-loopback IPv4 interface available")
++}
+-- 
+2.55.0
+

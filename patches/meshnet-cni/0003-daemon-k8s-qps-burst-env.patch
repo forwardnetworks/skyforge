@@ -1,0 +1,79 @@
+From 1fde5e414110e2fa2202550bcb6c1a6e0e8bbae9 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sat, 18 Jul 2026 08:13:09 -0500
+Subject: [PATCH 3/9] daemon: raise Kubernetes client rate limits, tunable via
+ env
+
+client-go's defaults (5 QPS, burst 10) are far too low for meshnetd: one
+N-link pod ADD triggers a couple dozen Topology API calls through the
+daemon, so a burst of pod creations serializes behind the node-wide token
+bucket and stalls CNI ADDs until kubelet's timeout (observed as node-wide
+sandbox-creation wedges on lab bringup). Default to QPS=50 burst=100 and
+allow override via MESHNET_K8S_QPS / MESHNET_K8S_BURST (invalid or
+non-positive values fall back to defaults with a warning).
+
+Upstreamable.
+---
+ daemon/meshnet/meshnet.go | 32 ++++++++++++++++++++++++++++++++
+ 1 file changed, 32 insertions(+)
+
+diff --git a/daemon/meshnet/meshnet.go b/daemon/meshnet/meshnet.go
+index a0e317d..fbadd02 100644
+--- a/daemon/meshnet/meshnet.go
++++ b/daemon/meshnet/meshnet.go
+@@ -6,6 +6,8 @@ import (
+ 	"net"
+ 	"os"
+ 	"path/filepath"
++	"strconv"
++	"strings"
+ 
+ 	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
+ 	grpc_ctxtags "github.com/grpc-ecosystem/go-grpc-middleware/tags"
+@@ -32,6 +34,31 @@ type Config struct {
+ 	GRPCOpts []grpc.ServerOption
+ }
+ 
++// Default client-side Kubernetes API rate limits. client-go's defaults (5 QPS,
++// burst 10) are far too low for meshnetd: a single N-link pod ADD triggers a
++// couple of dozen Topology API calls, so a burst of pod creations serializes
++// behind the node-wide token bucket and stalls CNI ADDs until kubelet's
++// timeout. Override with MESHNET_K8S_QPS / MESHNET_K8S_BURST.
++const (
++	defaultK8sQPS   = 50
++	defaultK8sBurst = 100
++)
++
++// envInt returns the integer value of the named environment variable, or def
++// when the variable is unset, empty or invalid.
++func envInt(name string, def int) int {
++	v := strings.TrimSpace(os.Getenv(name))
++	if v == "" {
++		return def
++	}
++	i, err := strconv.Atoi(v)
++	if err != nil || i <= 0 {
++		mnetdLogger.Warnf("Ignoring invalid %s=%q, using default %d", name, v, def)
++		return def
++	}
++	return i
++}
++
+ type Meshnet struct {
+ 	mpb.UnimplementedLocalServer
+ 	mpb.UnimplementedRemoteServer
+@@ -66,6 +93,11 @@ func restConfig() (*rest.Config, error) {
+ 			return nil, err
+ 		}
+ 	}
++	qps := envInt("MESHNET_K8S_QPS", defaultK8sQPS)
++	burst := envInt("MESHNET_K8S_BURST", defaultK8sBurst)
++	rCfg.QPS = float32(qps)
++	rCfg.Burst = burst
++	mnetdLogger.Infof("Kubernetes client rate limits: QPS=%d Burst=%d", qps, burst)
+ 	return rCfg, nil
+ }
+ 
+-- 
+2.55.0
+

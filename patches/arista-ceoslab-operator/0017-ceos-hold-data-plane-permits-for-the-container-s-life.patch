@@ -1,0 +1,627 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 18:25:12 -0500
+Subject: [PATCH] ceos: hold data-plane permits for the container's life, not
+ its first 5 minutes
+
+Every EOS INPUT permit (0002 mgmt CIDRs, 0009/0015 default-netns data
+devices, 0010/0015 VRF netns) was asserted only inside the bounded PostStart
+retry loop: SKYFORGE_MGMT_RETURN_ROUTE_RETRIES x _INTERVAL = 60 x 5s, about
+five minutes. That covers boot, but netlab creates VRFs by a config deploy
+long after the pod is Ready, and cEOS only creates the ns-<vrf> netns (with
+its own INPUT policy DROP + "-j EOS_INPUT" and no ACCEPT) at that point.
+
+Measured 2026-09-22 on user-skyforge-demo-estate-13-fu-798b2b0d: on
+siteA-dc1-veos-wanleaf1 /var/run/netns/default is 20:52:38 and
+ns-VRF_DB/ns-VRF_WWW are 21:04:51, twelve minutes after boot and seven after
+the loop had exited. Every ns-* on all 43 cEOS nodes had policy DROP and no
+ACCEPT: VRF OSPF/BGP/ICMP dead lab-wide while the default-VRF fabric looked
+healthy. Applying the permits by hand took the wanleaf1 VRF OSPF adjacency to
+FULL and VRF pings from 100% loss to 0%. The permit logic was right; it was
+simply no longer running when the thing it protects was created.
+
+After the boot phase the script now stays in a steady-state loop:
+- inotifywait on /var/run/netns wakes it when EOS creates a VRF netns, then a
+  short burst of fast passes follows (EOS moves the SVIs/ports in AFTER it
+  creates the netns);
+- a 30s timer (SKYFORGE_DATAPLANE_PERMIT_STEADY_INTERVAL) is the correctness
+  floor: the netns event cannot see an SVI moved into an existing VRF or EOS
+  rewriting a chain, and inotifywait may be absent from other cEOS images.
+  30s is below the OSPF dead interval (40s) and the BGP hold time (90s);
+- steady passes read each chain once (iptables -S) and insert only what is
+  missing or has fallen behind the "-j EOS_INPUT" jump; a present permit is
+  never deleted and reinserted, so there is no drop window and no
+  xtables-lock churn. Measured on wanleaf1 (3 netns, 47 devices): ~200ms
+  per pass, vs ~620ms for a per-device iptables -C;
+- 0 is the kill switch (pre-0017 behaviour exactly).
+
+VRF exclusion set stays eth0 + lo, identical to the default netns (0015), and
+the comment now says why: eth0 is load-bearing (a management VRF moves eth0
+into ns-MGMT), while tunl0/sit0/ip6tnl0 only receive decapsulated payload of
+an outer packet already permitted on its real device, and fwd0 has been
+permitted in the default netns since 0015.
+
+Observability: a per-netns status file
+(/tmp/skyforge-dataplane-permits.status, "netns=ns-VRF_DB devices=8
+failed=none"), rewritten by path each pass, and a syslog line for each
+steady-state re-assert. It is rewritten rather than held open because systemd
+mounts a tmpfs over /tmp after PostStart starts: the existing boot log,
+opened once, lives in the hidden lower /tmp and is unreadable on every running
+cEOS. Deliberately not part of the 0008 readiness gate, since Ready gates the
+mgmt Service endpoints and a VRF created at minute 12 must not cut
+management.
+
+Tests: TestLifecyclePermitsVRFCreatedAfterBootWindow EXECUTES the rendered
+script against stubbed ip/iptables and creates the VRF netns only after the
+boot loop's last pass. It fails on the pre-0017 script (ns-VRF_DB keeps only
+"-A INPUT -j EOS_INPUT") and passes now. It also covers: no churn once
+converged, repair after EOS rewrites the chain, eth0/lo never permitted,
+and the status and syslog signals. TestLifecyclePermitsSteadyKillSwitch pins
+the 0 kill switch.
+
+---
+ controllers/ceoslabdevice_controller.go       | 192 +++++++++++-
+ .../ceoslabdevice_controller_unit_test.go     |  13 +
+ .../ceoslabdevice_permits_lifecycle_test.go   | 281 ++++++++++++++++++
+ 3 files changed, 476 insertions(+), 10 deletions(-)
+ create mode 100644 controllers/ceoslabdevice_permits_lifecycle_test.go
+
+diff --git a/controllers/ceoslabdevice_controller.go b/controllers/ceoslabdevice_controller.go
+index fa2a716..8e0a6df 100644
+--- a/controllers/ceoslabdevice_controller.go
++++ b/controllers/ceoslabdevice_controller.go
+@@ -1295,6 +1295,11 @@ apply_permits() {
+   for cidr in ${cidrs}; do
+     cidr="$(printf '%s' "${cidr}" | tr -d '[:space:]')"
+     [ -n "${cidr}" ] || continue
++    # Steady state (see the loop at the bottom): leave a present permit alone.
++    if [ "${_steady}" = 1 ]; then
++      iptables -C INPUT -s "${cidr}" -j ACCEPT 2>/dev/null && continue
++      note_reassert mgmt "${cidr}"
++    fi
+     iptables -D INPUT -s "${cidr}" -j ACCEPT 2>/dev/null || true
+     iptables -I INPUT 1 -s "${cidr}" -j ACCEPT || true
+   done
+@@ -1333,14 +1338,29 @@ apply_permits() {
+ # modeled topology's own wires and their logical children land here. lo is
+ # skipped because EOS owns its loopback rules.
+ apply_dataplane_permits() {
++  # Steady state reads the chain ONCE and only counts a permit as present if
++  # it sits AHEAD of EOS's "-j EOS_INPUT" jump (the head of the chain).
++  _rules=""
++  if [ "${_steady}" = 1 ]; then
++    _rules="$(iptables -S INPUT 2>/dev/null || true)"
++    _rules="${_rules%%"-A INPUT -j EOS_INPUT"*}"
++  fi
++  _n=0
++  _bad=""
+   for _ifpath in /sys/class/net/*; do
+     [ -e "${_ifpath}" ] || continue
+     intf="${_ifpath##*/}"
+     [ "${intf}" = "eth0" ] && continue
+     [ "${intf}" = "lo" ] && continue
++    _n=$((_n + 1))
++    if [ "${_steady}" = 1 ]; then
++      case "${_rules}" in *"-A INPUT -i ${intf} -j ACCEPT"*) continue ;; esac
++      note_reassert default "${intf}"
++    fi
+     iptables -D INPUT -i "${intf}" -j ACCEPT 2>/dev/null || true
+-    iptables -I INPUT 1 -i "${intf}" -j ACCEPT || true
++    iptables -I INPUT 1 -i "${intf}" -j ACCEPT || _bad="${_bad},${intf}"
+   done
++  note_netns default "${_n}" "${_bad#,}"
+ }
+ # cEOS implements VRFs as Linux network namespaces named "ns-<vrf>" (e.g.
+ # ns-corporate, ns-payments), NOT l3mdev. When an L3 interface is placed in a VRF,
+@@ -1359,36 +1379,188 @@ apply_dataplane_permits() {
+ # 'ip netns exec ns-corporate iptables -I INPUT 1 -i eth2 -j ACCEPT' took that one
+ # session Connect->Established immediately (kernel ping 0%->100% on the same rule).
+ # Mirror the trusted-fabric permit into every VRF netns. The netns appear only
+-# after EOS processes the VRF config (slightly after the fabric interfaces are
+-# wired), so this is re-asserted every pass in the same retry loop below; the
++# after EOS processes the VRF config, and the VRF config can arrive MUCH later
++# than boot: netlab pushes it as a config deploy long after the pod is Ready.
++# So this runs for the container's whole life (see the steady-state loop at the
++# bottom), not only in the bounded boot-time retry window; the
+ # delete-then-insert keeps exactly one ACCEPT per interface ahead of the DROP.
++#
++# EXCLUSION SET INSIDE ns-*: eth0 and lo, exactly as in the default netns
++# (0015), so the two paths cannot drift. Measured 2026-09-22 on a leaf
++# (siteA-dc1-veos-wanleaf1): a VRF netns holds lo, tunl0, sit0, ip6tnl0, fwd0,
++# the SVIs moved into the VRF (vlan101, vlan103, vlan4098) and any routed
++# port (eth4). On a leaf the VRF netns has NO eth[1-9] at all, only vlanNNNN,
++# so any eth-only match leaves the VRF dark. Why the rest are permitted and
++# not excluded:
++#   - lo: EOS owns its loopback rules (same reasoning as 0015).
++#   - eth0: NOT belt and braces. A management VRF ("vrf instance MGMT" +
++#     "interface Management0 / vrf MGMT") moves eth0 into ns-MGMT, and a
++#     blanket interface permit there would open the whole control plane to
++#     every source on the pod network. eth0 stays source-scoped everywhere.
++#   - tunl0 / sit0 / ip6tnl0: the kernel's per-netns fallback tunnel devices.
++#     A packet only "arrives" on them after an outer IPIP/SIT/IP6-in-IP6
++#     packet addressed to this VRF was decapsulated, and that outer packet
++#     already had to pass INPUT on its real (permitted) data device, so a
++#     permit here opens nothing the wire permit did not. Excluding them would
++#     silently break a tunnel terminated in a VRF. The default netns has
++#     permitted them since 0015 (visible live: -A INPUT -i tunl0 -j ACCEPT).
++#   - fwd0: an EOS-created device EOS places in every VRF netns; the default
++#     netns has permitted its own fwd0 since 0015 with no ill effect.
++# Everything else in ns-* is by construction a data-plane device EOS moved
++# into that VRF, which is the trust argument 0009/0015 already make.
+ apply_vrf_dataplane_permits() {
+   for _ns in $(ip netns list 2>/dev/null | awk '{print $1}'); do
+     case "${_ns}" in ns-*) ;; *) continue ;; esac
++    _rules=""
++    if [ "${_steady}" = 1 ]; then
++      _rules="$(ip netns exec "${_ns}" iptables -S INPUT 2>/dev/null || true)"
++      _rules="${_rules%%"-A INPUT -j EOS_INPUT"*}"
++    fi
++    _n=0
++    _bad=""
+     for _vifpath in $(ip netns exec "${_ns}" ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | sed 's/@.*//'); do
+-      # Same rule as the default netns: every device in a VRF namespace is data
+-      # plane (an SVI moved into a VRF is vlanNNNN there too); only eth0 and lo
+-      # are excluded. A VRF never holds eth0, the check is belt and braces.
+       case "${_vifpath}" in eth0|lo) continue ;; esac
++      _n=$((_n + 1))
++      if [ "${_steady}" = 1 ]; then
++        case "${_rules}" in *"-A INPUT -i ${_vifpath} -j ACCEPT"*) continue ;; esac
++        note_reassert "${_ns}" "${_vifpath}"
++      fi
+       ip netns exec "${_ns}" iptables -D INPUT -i "${_vifpath}" -j ACCEPT 2>/dev/null || true
+-      ip netns exec "${_ns}" iptables -I INPUT 1 -i "${_vifpath}" -j ACCEPT || true
++      ip netns exec "${_ns}" iptables -I INPUT 1 -i "${_vifpath}" -j ACCEPT || _bad="${_bad},${_vifpath}"
+     done
++    note_netns "${_ns}" "${_n}" "${_bad#,}"
+   done
+ }
++# Bookkeeping for the steady-state phase and its status file (see below).
++note_reassert() {
++  _reasserts=$((_reasserts + 1))
++  _pass_notes="${_pass_notes} ${1}/${2}"
++}
++note_netns() {
++  _status_body="${_status_body}netns=${1} devices=${2} failed=${3:-none}
++"
++}
++# One pass over all three permit families, then an OVERWRITTEN status file:
++# the positive, per-netns proof that every VRF netns carries its permits
++# ("netns=ns-VRF_DB devices=8 failed=none"), readable with
++# "cat /tmp/skyforge-dataplane-permits.status" in the ceos container. A missing
++# ns-* line for a VRF that "show vrf" lists is itself the signal. The file is
++# rewritten by path on every pass, NOT held open: systemd mounts a fresh tmpfs
++# on /tmp AFTER PostStart has started (measured 2026-09-22: the boot-time log
++# below, opened once at PostStart, lives in the lower /tmp that tmpfs then
++# hides, so "cat /tmp/skyforge-mgmt-permits.log" reports No such file on every
++# running cEOS). Re-asserts found in steady state also go to the EOS syslog
++# ("show logging" on the device), because a steady-state re-assert means
++# something removed a permit, which is worth seeing where the device is read.
++permit_pass() {
++  _pass_notes=""
++  _status_body=""
++  apply_permits
++  apply_dataplane_permits
++  apply_vrf_dataplane_permits
++  if [ -n "${_pass_notes}" ]; then
++    _last_reassert="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)${_pass_notes}"
++    if [ "${_steady}" = 1 ]; then
++      logger -t skyforge-permits "re-asserted missing permit(s):${_pass_notes}" 2>/dev/null || true
++    fi
++  fi
++  _st=/tmp/skyforge-dataplane-permits.status
++  {
++    echo "updated=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown) phase=${_phase} reasserted_total=${_reasserts} last_reassert=${_last_reassert}"
++    printf '%s' "${_status_body}"
++  } >"${_st}.tmp" 2>/dev/null && mv -f "${_st}.tmp" "${_st}" 2>/dev/null || true
++}
++# Block until a network namespace is created (a new VRF) or the timeout
++# elapses. Returns 0 on a namespace event, 1 on timeout / no event source.
++wait_for_netns_change() {
++  if command -v inotifywait >/dev/null 2>&1 && [ -d /var/run/netns ]; then
++    _rc=0
++    inotifywait -qq -t "${1}" -e create -e moved_to /var/run/netns >/dev/null 2>&1 || _rc=$?
++    case "${_rc}" in
++      0) return 0 ;;
++      2) return 1 ;;
++    esac
++    # Any other status (inotify instance limit, dir vanished) falls through to
++    # the plain timer so the loop can never spin.
++  fi
++  sleep "${1}"
++  return 1
++}
++_steady=0
++_phase=boot
++_reasserts=0
++_last_reassert=never
++_pass_notes=""
++_status_body=""
+ apply_permits
+ apply_dataplane_permits
+ apply_vrf_dataplane_permits
++# PERMITS MUST HOLD FOR THE CONTAINER'S LIFE, NOT ITS FIRST FIVE MINUTES.
++#
++# Until patch 0017 every permit above was asserted only inside the bounded
++# retry loop (SKYFORGE_MGMT_RETURN_ROUTE_RETRIES x _INTERVAL, 60 x 5s = ~5 min
++# from PostStart). That covers boot, when meshnet wires the fabric and EOS
++# reprograms its chains, but NOT the VRFs: netlab creates them by a config
++# deploy that runs long after the pod is Ready, and the ns-<vrf> netns (with
++# its own INPUT policy DROP + "-j EOS_INPUT" and no ACCEPT) appears only then.
++# Measured 2026-09-22 on user-skyforge-demo-estate-13-fu-798b2b0d: on
++# siteA-dc1-veos-wanleaf1 /var/run/netns/default is 20:52:38 and ns-VRF_DB /
++# ns-VRF_WWW are 21:04:51, twelve minutes later and seven after the loop had
++# exited; EVERY ns-* on all 43 cEOS nodes had policy DROP with no ACCEPT, so
++# VRF OSPF/BGP/ICMP was dead lab-wide while the default-VRF fabric looked
++# healthy. Applying the same permits by hand took the wanleaf1 VRF OSPF
++# adjacency to FULL and VRF pings from 100% loss to 0%. Nothing was wrong
++# with the permit logic (0010/0015 are right); it simply was not running
++# any more when the thing it protects was created.
++#
++# So after the fast boot phase, stay in a steady-state loop for life:
++#   - EVENT: inotifywait on /var/run/netns wakes the loop the moment EOS
++#     creates a VRF netns, then a short burst of fast passes follows, because
++#     EOS moves the VRF's SVIs/ports into the netns AFTER creating it.
++#   - TIMER (30s, SKYFORGE_DATAPLANE_PERMIT_STEADY_INTERVAL): the correctness
++#     floor, not a fallback. The netns event cannot see an SVI moved into an
++#     EXISTING VRF by a later config push, nor EOS rewriting a chain, and
++#     inotifywait is not guaranteed in every cEOS image. 30s is under the OSPF
++#     dead interval (40s) and the BGP hold time (90s), so a permit removed
++#     under a live adjacency is back before the adjacency drops.
++#   - CHEAP AND QUIET: steady passes read each netns's INPUT chain ONCE
++#     (iptables -S) and only insert what is missing or has fallen behind the
++#     "-j EOS_INPUT" jump. A present permit is never deleted-and-reinserted,
++#     so there is no per-pass window in which a packet can hit the DROP and no
++#     xtables-lock churn against EOS's own programming. Measured on wanleaf1
++#     (3 netns, 47 devices): ~200ms wall per pass this way vs ~620ms for a
++#     per-device "iptables -C".
++# SKYFORGE_DATAPLANE_PERMIT_STEADY_INTERVAL=0 is the kill switch and restores
++# the pre-0017 behavior exactly (the loop ends after the boot phase).
++#
++# Deliberately NOT part of the readiness gate (0008): Ready gates the KNE mgmt
++# Service endpoints the collector dials, and a VRF created at minute 12 would
++# flip a healthy, reachable device NotReady and cut management for a
++# data-plane fact. The status file is the observable proof instead.
+ (
+   i=0
+   max="${SKYFORGE_MGMT_RETURN_ROUTE_RETRIES:-60}"
+   interval="${SKYFORGE_MGMT_RETURN_ROUTE_INTERVAL:-5}"
++  steady="${SKYFORGE_DATAPLANE_PERMIT_STEADY_INTERVAL:-30}"
+   while [ "${i}" -lt "${max}" ]; do
+-    apply_permits
+-    apply_dataplane_permits
+-    apply_vrf_dataplane_permits
++    permit_pass || true
+     i=$((i + 1))
+     sleep "${interval}"
+   done
++  case "${steady}" in ''|0|*[!0-9]*) exit 0 ;; esac
++  _steady=1
++  _phase=steady
++  while :; do
++    if wait_for_netns_change "${steady}"; then
++      j=0
++      while [ "${j}" -lt 6 ]; do
++        permit_pass || true
++        j=$((j + 1))
++        sleep "${interval}"
++      done
++    fi
++    permit_pass || true
++  done
+ ) >/tmp/skyforge-mgmt-permits.log 2>&1 &
+ `)},
+ 			},
+diff --git a/controllers/ceoslabdevice_controller_unit_test.go b/controllers/ceoslabdevice_controller_unit_test.go
+index 5a941f7..be31030 100644
+--- a/controllers/ceoslabdevice_controller_unit_test.go
++++ b/controllers/ceoslabdevice_controller_unit_test.go
+@@ -221,6 +221,19 @@ func TestGetPodAddsManagementReturnRouteLifecycle(t *testing.T) {
+ 		"apply_vrf_dataplane_permits",
+ 		"ip netns list",
+ 		`ip netns exec "${_ns}" iptables -I INPUT 1 -i`,
++		// Patch 0017: the permits must hold for the container's LIFE. netlab
++		// creates VRFs by a config deploy long after the ~5 min boot loop has
++		// exited (2026-09-22: every ns-* on 43 cEOS nodes had no ACCEPT), so a
++		// steady-state loop follows the boot phase, woken early by netns
++		// creation and bounded by a timer, and writes a per-netns status file.
++		// The behavior itself is executed in
++		// TestLifecyclePermitsVRFCreatedAfterBootWindow.
++		"SKYFORGE_DATAPLANE_PERMIT_STEADY_INTERVAL",
++		"wait_for_netns_change",
++		"inotifywait -qq -t",
++		"/var/run/netns",
++		"/tmp/skyforge-dataplane-permits.status",
++		`_rules="${_rules%%"-A INPUT -j EOS_INPUT"*}"`,
+ 	} {
+ 		if !strings.Contains(script, want) {
+ 			t.Fatalf("lifecycle script missing %q: %s", want, script)
+diff --git a/controllers/ceoslabdevice_permits_lifecycle_test.go b/controllers/ceoslabdevice_permits_lifecycle_test.go
+new file mode 100644
+index 0000000..a0379f2
+--- /dev/null
++++ b/controllers/ceoslabdevice_permits_lifecycle_test.go
+@@ -0,0 +1,281 @@
++package controllers
++
++import (
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"syscall"
++	"testing"
++	"time"
++)
++
++// permitHarness EXECUTES the real PostStart lifecycle script (not a string
++// match) against stubbed ip/iptables/sleep/inotifywait/logger, with the
++// script's fixed paths (/sys/class/net, /var/run/netns, /tmp) redirected into a
++// temp dir. The stubs keep one INPUT chain per netns in rules/<netns>, so the
++// test can observe exactly what a cEOS INPUT chain would hold over time.
++type permitHarness struct {
++	t     *testing.T
++	state string
++	cmd   *exec.Cmd
++}
++
++func writeStub(t *testing.T, path, body string) {
++	t.Helper()
++	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body), 0o755); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func startPermitHarness(t *testing.T, env map[string]string) *permitHarness {
++	t.Helper()
++	shPath, err := exec.LookPath("sh")
++	if err != nil {
++		t.Skip("no sh on PATH")
++	}
++	realSleep, err := exec.LookPath("sleep")
++	if err != nil {
++		t.Skip("no sleep on PATH")
++	}
++	state := t.TempDir()
++	bin := filepath.Join(state, "bin")
++	for _, d := range []string{"bin", "sys/class/net", "netns", "links", "rules"} {
++		if err := os.MkdirAll(filepath.Join(state, d), 0o755); err != nil {
++			t.Fatal(err)
++		}
++	}
++	// Default netns: mgmt eth0, fabric eth1/eth2, an SVI, a port-channel,
++	// the kernel fallback tunnel and lo -- the 0015 shape.
++	for _, d := range []string{"eth0", "eth1", "eth2", "lo", "vlan4094", "po1", "tunl0"} {
++		if err := os.WriteFile(filepath.Join(state, "sys/class/net", d), nil, 0o644); err != nil {
++			t.Fatal(err)
++		}
++	}
++	// EOS creates /var/run/netns/default itself at boot.
++	if err := os.WriteFile(filepath.Join(state, "netns", "default"), nil, 0o644); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(state, "rules", "default"), []byte("-A INPUT -j EOS_INPUT\n"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	writeStub(t, filepath.Join(bin, "ip"), `S="$STUB_STATE"
++if [ "$1" = netns ] && [ "$2" = list ]; then
++  for f in "$S"/netns/*; do [ -e "$f" ] || continue; echo "${f##*/} (id: 1)"; done
++  exit 0
++fi
++if [ "$1" = netns ] && [ "$2" = exec ]; then
++  ns="$3"; shift 3
++  STUB_NS="$ns" exec "$@"
++fi
++if [ "$1" = -o ] && [ "$2" = link ]; then
++  n=1
++  for d in $(cat "$S/links/${STUB_NS:-default}" 2>/dev/null); do
++    echo "$n: $d: <BROADCAST,UP> mtu 1500"; n=$((n+1))
++  done
++  exit 0
++fi
++exit 0
++`)
++	writeStub(t, filepath.Join(bin, "iptables"), `S="$STUB_STATE"; ns="${STUB_NS:-default}"; f="$S/rules/$ns"
++[ -e "$f" ] || : >"$f"
++op="$1"; shift
++[ "$1" = INPUT ] && shift
++case "$op" in
++  -S) echo "-P INPUT DROP"; cat "$f"; exit 0 ;;
++  -C) grep -qxF -- "-A INPUT $*" "$f"; exit $? ;;
++  -D) grep -qxF -- "-A INPUT $*" "$f" || exit 1
++      echo "$ns -D $*" >>"$S/mutations"
++      grep -vxF -- "-A INPUT $*" "$f" >"$f.new"; mv "$f.new" "$f"; exit 0 ;;
++  -I) [ "$1" = 1 ] && shift
++      echo "$ns -I $*" >>"$S/mutations"
++      { echo "-A INPUT $*"; cat "$f"; } >"$f.new"; mv "$f.new" "$f"; exit 0 ;;
++esac
++exit 0
++`)
++	writeStub(t, filepath.Join(bin, "sleep"), `echo x >>"$STUB_STATE/sleeps"; exec `+realSleep+" 0.01\n")
++	// Always a timeout (exit 2): the TIMER path alone must converge; the
++	// event path is an accelerator, never the correctness floor.
++	writeStub(t, filepath.Join(bin, "inotifywait"), realSleep+" 0.02; exit 2\n")
++	writeStub(t, filepath.Join(bin, "logger"), `echo "$*" >>"$STUB_STATE/logger"`+"\n")
++
++	lc := getLifecycleAPI(map[string]string{"SKYFORGE_MGMT_RETURN_CIDRS": "100.64.0.0/10"})
++	if lc == nil {
++		t.Fatal("no lifecycle rendered")
++	}
++	script := lc.PostStart.Exec.Command[2]
++	script = strings.ReplaceAll(script, "/sys/class/net/", filepath.Join(state, "sys/class/net")+"/")
++	script = strings.ReplaceAll(script, "/var/run/netns", filepath.Join(state, "netns"))
++	script = strings.ReplaceAll(script, "/tmp/skyforge-", filepath.Join(state, "tmp-skyforge-"))
++
++	cmd := exec.Command(shPath, "-ceu", script)
++	cmd.Env = []string{
++		"PATH=" + bin + ":/usr/bin:/bin",
++		"STUB_STATE=" + state,
++		"SKYFORGE_MGMT_RETURN_CIDRS=100.64.0.0/10",
++		"SKYFORGE_MGMT_RETURN_ROUTE_RETRIES=2",
++		"SKYFORGE_MGMT_RETURN_ROUTE_INTERVAL=0",
++	}
++	for k, v := range env {
++		cmd.Env = append(cmd.Env, k+"="+v)
++	}
++	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
++	if out, err := cmd.CombinedOutput(); err != nil {
++		t.Fatalf("PostStart script failed: %v\n%s", err, out)
++	}
++	h := &permitHarness{t: t, state: state, cmd: cmd}
++	// The script backgrounds its loop; kill the whole process group at the end.
++	t.Cleanup(func() { _ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) })
++	return h
++}
++
++func (h *permitHarness) read(rel string) string {
++	b, _ := os.ReadFile(filepath.Join(h.state, rel))
++	return string(b)
++}
++
++func (h *permitHarness) write(rel, body string) {
++	h.t.Helper()
++	if err := os.WriteFile(filepath.Join(h.state, rel), []byte(body), 0o644); err != nil {
++		h.t.Fatal(err)
++	}
++}
++
++// aheadOfJump reports whether every wanted ACCEPT is in the netns's INPUT
++// chain AND sits before EOS's "-j EOS_INPUT" jump (behind it, it is dead).
++func (h *permitHarness) aheadOfJump(ns string, devs ...string) (bool, string) {
++	rules := h.read("rules/" + ns)
++	lines := strings.Split(rules, "\n")
++	jump := len(lines)
++	for i, l := range lines {
++		if l == "-A INPUT -j EOS_INPUT" {
++			jump = i
++			break
++		}
++	}
++	for _, d := range devs {
++		want := "-A INPUT -i " + d + " -j ACCEPT"
++		found := false
++		for i := 0; i < jump; i++ {
++			if lines[i] == want {
++				found = true
++			}
++		}
++		if !found {
++			return false, rules
++		}
++	}
++	return true, rules
++}
++
++func (h *permitHarness) waitFor(what string, d time.Duration, cond func() (bool, string)) {
++	h.t.Helper()
++	deadline := time.Now().Add(d)
++	var last string
++	for time.Now().Before(deadline) {
++		var ok bool
++		if ok, last = cond(); ok {
++			return
++		}
++		time.Sleep(20 * time.Millisecond)
++	}
++	h.t.Fatalf("%s: not reached within %s; last state:\n%s", what, d, last)
++}
++
++// waitBootPhaseOver waits until the bounded boot loop (RETRIES=2) has slept
++// twice, i.e. its LAST pass is done: anything created after this is invisible
++// to a script that only permits during the boot window.
++func (h *permitHarness) waitBootPhaseOver() {
++	h.waitFor("boot phase to finish", 5*time.Second, func() (bool, string) {
++		n := strings.Count(h.read("sleeps"), "x")
++		return n >= 2, h.read("sleeps")
++	})
++	time.Sleep(100 * time.Millisecond)
++}
++
++// createVRF models what EOS does when netlab's config deploy creates a VRF: a
++// new ns-<vrf> netns with its own INPUT policy DROP + "-j EOS_INPUT" and NO
++// accept, holding lo, the kernel fallback tunnels, fwd0 and the SVIs/ports
++// moved into it. Device set measured on siteA-dc1-veos-wanleaf1 2026-09-22.
++func (h *permitHarness) createVRF(ns string, devs string) {
++	h.write("rules/"+ns, "-A INPUT -j EOS_INPUT\n")
++	h.write("links/"+ns, devs)
++	h.write("netns/"+ns, "")
++}
++
++// POSITIVE CONTROL for patch 0017. Measured 2026-09-22
++// (user-skyforge-demo-estate-13-fu-798b2b0d): netlab created the VRFs ~12
++// minutes after boot, ~7 minutes after the bounded retry loop had exited, and
++// every ns-* netns on all 43 cEOS nodes sat at policy DROP with no ACCEPT.
++// This test creates the VRF netns only AFTER the boot loop's last pass. It
++// FAILS on the pre-0017 script (the VRF is never permitted: the loop is gone)
++// and passes once the permits are held for the container's life.
++func TestLifecyclePermitsVRFCreatedAfterBootWindow(t *testing.T) {
++	h := startPermitHarness(t, map[string]string{"SKYFORGE_DATAPLANE_PERMIT_STEADY_INTERVAL": "1"})
++
++	// Boot phase: default-netns permits land (0009/0015 shape), eth0/lo never.
++	h.waitFor("default netns permits", 5*time.Second, func() (bool, string) {
++		return h.aheadOfJump("default", "eth1", "eth2", "vlan4094", "po1", "tunl0")
++	})
++	h.waitBootPhaseOver()
++
++	// A leaf's VRF netns holds NO eth[1-9]: only SVIs (and here one routed
++	// port and one port-channel), plus lo/tunl0/sit0/ip6tnl0/fwd0.
++	h.createVRF("ns-VRF_DB", "lo tunl0@NONE sit0@NONE ip6tnl0@NONE fwd0 vlan102@if6 vlan4097@if7 eth5@if1506963 po7")
++	// A management VRF moves eth0 into its own netns; it must stay unpermitted.
++	h.createVRF("ns-MGMT", "lo eth0@if1506586")
++
++	vrfDevs := []string{"vlan102", "vlan4097", "eth5", "po7", "tunl0", "sit0", "ip6tnl0", "fwd0"}
++	h.waitFor("VRF created after the boot window gets its permits", 3*time.Second, func() (bool, string) {
++		return h.aheadOfJump("ns-VRF_DB", vrfDevs...)
++	})
++	for _, ns := range []string{"ns-VRF_DB", "ns-MGMT", "default"} {
++		rules := h.read("rules/" + ns)
++		for _, banned := range []string{"-A INPUT -i lo -j ACCEPT", "-A INPUT -i eth0 -j ACCEPT"} {
++			if strings.Contains(rules, banned) {
++				t.Fatalf("%s: %q must never be permitted (eth0 stays source-scoped, EOS owns lo):\n%s", ns, banned, rules)
++			}
++		}
++	}
++
++	// Steady state is QUIET: once converged, passes insert/delete nothing, so a
++	// present permit is never removed under live traffic.
++	time.Sleep(150 * time.Millisecond)
++	before := h.read("mutations")
++	time.Sleep(400 * time.Millisecond)
++	if after := h.read("mutations"); after != before {
++		t.Fatalf("steady state churned the chain:\n%s", strings.TrimPrefix(after, before))
++	}
++
++	// EOS reprograms the chain later (config push): our permits vanish, and the
++	// one survivor ends up BEHIND the EOS_INPUT jump. Both must be repaired.
++	h.write("rules/ns-VRF_DB", "-A INPUT -j EOS_INPUT\n-A INPUT -i vlan102 -j ACCEPT\n")
++	h.waitFor("permits re-asserted ahead of the jump after EOS rewrote the chain", 3*time.Second, func() (bool, string) {
++		return h.aheadOfJump("ns-VRF_DB", vrfDevs...)
++	})
++
++	// Observable proof: per-netns status line, and the re-assert logged.
++	h.waitFor("status file names the VRF netns", 3*time.Second, func() (bool, string) {
++		st := h.read("tmp-skyforge-dataplane-permits.status")
++		return strings.Contains(st, "netns=ns-VRF_DB devices=8 failed=none") && strings.Contains(st, "phase=steady"), st
++	})
++	if lg := h.read("logger"); !strings.Contains(lg, "ns-VRF_DB/vlan102") {
++		t.Fatalf("steady-state re-assert was not logged to syslog: %q", lg)
++	}
++}
++
++// The kill switch restores pre-0017 behavior exactly: no steady loop, so a VRF
++// created after the boot window stays unpermitted. This also shows the harness
++// can tell the two behaviors apart (it is not green by construction).
++func TestLifecyclePermitsSteadyKillSwitch(t *testing.T) {
++	h := startPermitHarness(t, map[string]string{"SKYFORGE_DATAPLANE_PERMIT_STEADY_INTERVAL": "0"})
++	h.waitFor("default netns permits", 5*time.Second, func() (bool, string) {
++		return h.aheadOfJump("default", "eth1")
++	})
++	h.waitBootPhaseOver()
++	h.createVRF("ns-VRF_DB", "lo vlan102@if6")
++	time.Sleep(500 * time.Millisecond)
++	if ok, rules := h.aheadOfJump("ns-VRF_DB", "vlan102"); ok {
++		t.Fatalf("kill switch 0 still permitted a post-boot VRF:\n%s", rules)
++	}
++}
+-- 
+2.55.0
+

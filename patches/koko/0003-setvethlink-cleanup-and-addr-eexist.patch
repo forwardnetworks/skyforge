@@ -1,0 +1,163 @@
+From fbb7883e33d5b1d4730228b6fe5fb312559e51c5 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sat, 18 Jul 2026 08:08:07 -0500
+Subject: [PATCH 3/5] api: clean up half-moved links on SetVethLink failure;
+ tolerate re-added addresses
+
+SetVethLink failures after the link had been moved into the target
+namespace (rename collision, set-up failure, ipv6 sysctl, address add)
+used to leave the moved link behind under its staging or final name and
+return an error, leaking a half-configured end into the pod namespace.
+Delete the moved link on every post-move failure path; removing one veth
+end removes the whole pair, so a failed wire never survives partially.
+
+AddrAdd now tolerates EEXIST so re-driving configuration over an already
+addressed link (idempotent re-ADD) is not an error.
+
+MakeVeth's own failure cleanup used netlink.LinkDel on handles captured
+before the move; after LinkSetNsFd those handles address freed ifindexes in
+the current namespace (ENODEV at best, the wrong device at worst). Replace
+them with name-based removal in the current and target namespaces via the
+new removeLinkIfExists/removeLinkInNSIfExists helpers, which also covers
+the post-move lookup-failure path that previously leaked the staging link.
+
+Upstreamable.
+---
+ api/koko_api.go | 75 ++++++++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 71 insertions(+), 4 deletions(-)
+
+diff --git a/api/koko_api.go b/api/koko_api.go
+index f853cb5..8a49612 100644
+--- a/api/koko_api.go
++++ b/api/koko_api.go
+@@ -6,9 +6,11 @@ package api
+ import (
+ 	cryptorand "crypto/rand"
+ 	"encoding/binary"
++	"errors"
+ 	"fmt"
+ 	"net"
+ 	"os"
++	"strings"
+ 	"syscall"
+ 	"time"
+ 
+@@ -430,16 +432,21 @@ func (veth *VEth) SetVethLink(link netlink.Link) (err error) {
+ 			return fmt.Errorf("failed to lookup %q in %q: %v",
+ 				veth.LinkName, vethNs.Path(), err)
+ 		}
++		cleanupMovedLink := func() {
++			_ = netlink.LinkDel(link)
++		}
+ 
+ 		if veth.LinkName != vethLinkName {
+-			if err = netlink.LinkSetName(link, veth.LinkName); err != nil {
++			if renameErr := netlink.LinkSetName(link, veth.LinkName); renameErr != nil {
++				cleanupMovedLink()
+ 				return fmt.Errorf(
+ 					"failed to rename link %s -> %s: %v",
+-					vethLinkName, veth.LinkName, err)
++					vethLinkName, veth.LinkName, renameErr)
+ 			}
+ 		}
+ 
+ 		if err = netlink.LinkSetUp(link); err != nil {
++			cleanupMovedLink()
+ 			return fmt.Errorf("failed to set %q up: %v",
+ 				veth.LinkName, err)
+ 		}
+@@ -451,6 +458,7 @@ func (veth *VEth) SetVethLink(link netlink.Link) (err error) {
+ 				ipv6SysctlName := fmt.Sprintf("net.ipv6.conf.%s.disable_ipv6",
+ 					veth.LinkName)
+ 				if _, err := sysctl.Sysctl(ipv6SysctlName, "0"); err != nil {
++					cleanupMovedLink()
+ 					return fmt.Errorf("failed to set ipv6.disable to 0 at %s: %v",
+ 						veth.LinkName, err)
+ 				}
+@@ -458,6 +466,10 @@ func (veth *VEth) SetVethLink(link netlink.Link) (err error) {
+ 			}
+ 			addr := &netlink.Addr{IPNet: &veth.IPAddr[i], Label: ""}
+ 			if err = netlink.AddrAdd(link, addr); err != nil {
++				if errors.Is(err, syscall.EEXIST) || strings.Contains(err.Error(), "file exists") {
++					continue
++				}
++				cleanupMovedLink()
+ 				return fmt.Errorf(
+ 					"failed to add IP addr %v to %q: %v",
+ 					addr, veth.LinkName, err)
+@@ -623,15 +635,70 @@ func MakeVeth(veth1 VEth, veth2 VEth) error {
+ 	}
+ 
+ 	if err = veth1.SetVethLink(link1); err != nil {
+-		netlink.LinkDel(link1)
++		// The pre-move handles are stale here: SetVethLink moves the link
++		// into the target namespace (and its own failure cleanup deletes it
++		// there), so LinkDel by the original handle addresses a freed ifindex
++		// in this namespace. Clean up by staging name instead — in the current
++		// namespace for pre-move failures and in the target namespace for the
++		// odd post-move case where SetVethLink could not clean up itself.
++		// Removing one veth end removes its pair peer as well.
++		_ = removeLinkIfExists(tempLinkName1)
++		_ = removeLinkInNSIfExists(veth1.NsName, tempLinkName1)
++		_ = removeLinkIfExists(tempLinkName2)
+ 		return err
+ 	}
+ 	if err = veth2.SetVethLink(link2); err != nil {
+-		netlink.LinkDel(link2)
++		_ = removeLinkIfExists(tempLinkName2)
++		_ = removeLinkInNSIfExists(veth2.NsName, tempLinkName2)
+ 	}
+ 	return err
+ }
+ 
++// removeLinkIfExists deletes a link by name in the current namespace,
++// treating an absent link as success.
++func removeLinkIfExists(linkName string) error {
++	link, err := netlink.LinkByName(linkName)
++	if err != nil {
++		if _, notFound := err.(netlink.LinkNotFoundError); notFound {
++			return nil
++		}
++		return err
++	}
++	return netlink.LinkDel(link)
++}
++
++// removeLinkInNSIfExists deletes a link by name inside the given network
++// namespace ("" means the current one), treating an absent link as success.
++func removeLinkInNSIfExists(nsName, linkName string) error {
++	linkName = strings.TrimSpace(linkName)
++	if linkName == "" {
++		return nil
++	}
++	var vethNs ns.NetNS
++	var err error
++	if nsName == "" {
++		if vethNs, err = ns.GetCurrentNS(); err != nil {
++			return err
++		}
++	} else {
++		if vethNs, err = ns.GetNS(nsName); err != nil {
++			return err
++		}
++	}
++	defer vethNs.Close()
++
++	return vethNs.Do(func(_ ns.NetNS) error {
++		link, err := netlink.LinkByName(linkName)
++		if err != nil {
++			if _, notFound := err.(netlink.LinkNotFoundError); notFound {
++				return nil
++			}
++			return err
++		}
++		return netlink.LinkDel(link)
++	})
++}
++
+ // MakeVxLan makes vxlan interface and put it into container namespace
+ func MakeVxLan(veth1 VEth, vxlan VxLan) (err error) {
+ 	var link netlink.Link
+-- 
+2.55.0
+

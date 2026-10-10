@@ -1,0 +1,162 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Thu, 10 Sep 2026 20:50:00 -0500
+Subject: [PATCH] plugin: an unadmitted peer must not cost the whole wait
+
+The KubeVirt secondary path deliberately waits for its peer before wiring --
+correct, a VM's secondary interface cannot be built without the other end. But
+the wait did not distinguish the only two situations that reach it:
+
+  peer REGISTERED but not alive  -> it is coming; waiting is the whole point
+  peer ABSENT from meshnet       -> it has not been admitted at all
+
+MEASURED 2026-09-10 on example-lab: siteB-acc-sw01 was created at 00:51:12 and its
+peer siteB-dis-sw01 at 01:36:08, FORTY-FIVE MINUTES later, against a 180s wait.
+Unwinnable. It burned the full budget, failed the sandbox, and relied on
+kubelet's retry -- 24 FailedCreatePodSandBox events in one bring-up.
+
+Now an absent peer returns after a short grace instead of the whole budget.
+Recovery gets FASTER, not slower: kubelet retries with backoff and the attempt
+that lands is the one where the peer exists. A registered peer still gets the
+full wait, so nothing recoverable is given up. The grace absorbs a transient
+RPC blip before concluding "not admitted".
+
+This is deliberately NOT "raise the timeout to cover the pacing window" --
+that holds a CNI call open for the better part of an hour and is still a
+guess. The real coupling is fixed on the admission side by kne 0060, which
+admits linked peers together. This is the guard for whatever pacing cannot
+co-locate.
+
+Verified with both controls: an unadmitted peer returns in 20s rather than
+180s and the error names the cause; a registered-but-not-yet-alive peer is
+still waited for and returns the live pod.
+diff --color -ruN '--exclude=.git' '--exclude=_localdeps' '--exclude=*.orig' a/plugin/meshnet.go b/plugin/meshnet.go
+--- a/plugin/meshnet.go	2026-09-10 20:45:23.896008770 -0500
++++ b/plugin/meshnet.go	2026-09-10 20:45:44.452849263 -0500
+@@ -270,6 +270,36 @@
+ 		wait = kubeVirtSecondaryWaitDuration(0)
+ 	}
+ 	deadline := time.Now().Add(wait)
++	// FAIL FAST WHEN THE PEER IS NOT ADMITTED YET, rather than burning the whole
++	// wait on a pod that cannot possibly arrive inside it.
++	//
++	// Two different situations reach this loop and only one is worth waiting for:
++	//
++	//   peer REGISTERED but not alive -> it is coming; wait, that is the point
++	//   peer ABSENT from meshnet      -> it has not been admitted at all, and the
++	//                                    heavy lane starts 2 VMs at a time, so it
++	//                                    may be tens of minutes away
++	//
++	// MEASURED 2026-09-10 on example-lab: siteB-acc-sw01 was created at 00:51:12 and its
++	// peer siteB-dis-sw01 at 01:36:08 -- FORTY-FIVE MINUTES later. The wait is 180s,
++	// so it could never have succeeded; it burned the full budget, failed the
++	// sandbox, and relied on kubelet's retry. 24 FailedCreatePodSandBox events in
++	// one bring-up came from this.
++	//
++	// Returning early makes recovery FASTER, not slower: kubelet retries the
++	// sandbox with backoff, and the attempt that finally lands is the one where
++	// the peer actually exists. Nothing is given up -- a peer that IS registered
++	// still gets the full wait.
++	//
++	// This is deliberately NOT "raise the timeout to cover the pacing window".
++	// That would hold a CNI call open for the better part of an hour and still
++	// be guessing. The real coupling is fixed on the admission side, by pacing
++	// linked peers together; this makes the CNI honest while that holds.
++	absentGrace := 20 * time.Second
++	if absentGrace > wait {
++		absentGrace = wait
++	}
++	absentDeadline := time.Now().Add(absentGrace)
+ 	var lastErr error
+ 	for {
+ 		peerPod, err := meshnetClient.Get(ctx, &mpb.PodQuery{
+@@ -282,6 +312,12 @@
+ 		if err != nil {
+ 			lastErr = err
+ 		}
++		// A short grace absorbs a transient RPC blip; past it, an unregistered
++		// peer means NOT ADMITTED, and waiting the rest of the budget is waste.
++		if err != nil && time.Now().After(absentDeadline) {
++			return nil, fmt.Errorf("kubevirt secondary interface %s on pod %s: peer pod %s is not registered with meshnet after %.0fs, so it has not been admitted yet -- failing fast for a sandbox retry rather than holding the CNI for the remaining %.0fs: %w",
++				localIntf, localPodName, podName, absentGrace.Seconds(), time.Until(deadline).Seconds(), lastErr)
++		}
+ 		if time.Now().After(deadline) {
+ 			if lastErr != nil {
+ 				return nil, fmt.Errorf("kubevirt secondary interface %s on pod %s timed out waiting %.0fs for peer pod %s topology/alive metadata: %w", localIntf, localPodName, wait.Seconds(), podName, lastErr)
+diff --color -ruN '--exclude=.git' '--exclude=_localdeps' '--exclude=*.orig' a/plugin/meshnet_peerwait_test.go b/plugin/meshnet_peerwait_test.go
+--- a/plugin/meshnet_peerwait_test.go	1969-12-31 18:00:00.000000000 -0600
++++ b/plugin/meshnet_peerwait_test.go	2026-09-10 20:46:35.222619598 -0500
+@@ -0,0 +1,73 @@
++package main
++
++import (
++	"context"
++	"fmt"
++	"strings"
++	"testing"
++	"time"
++
++	mpb "github.com/networkop/meshnet-cni/daemon/proto/meshnet/v1beta1"
++	"google.golang.org/grpc"
++)
++
++// fakeLocal answers Get() the way the daemon does in each of the two
++// situations that reach waitForPeerPodAlive.
++type fakeLocal struct {
++	mpb.LocalClient
++	absent   bool // peer not registered at all (not admitted)
++	aliveAt  time.Time
++	getCalls int
++}
++
++func (f *fakeLocal) Get(ctx context.Context, in *mpb.PodQuery, _ ...grpc.CallOption) (*mpb.Pod, error) {
++	f.getCalls++
++	if f.absent {
++		return nil, fmt.Errorf("rpc error: code = NotFound desc = pod %q not found", in.GetName())
++	}
++	if time.Now().Before(f.aliveAt) {
++		// registered, but not alive yet
++		return &mpb.Pod{Name: in.GetName()}, nil
++	}
++	return &mpb.Pod{Name: in.GetName(), SrcIp: "10.0.0.1", NetNs: "/proc/1/ns/net"}, nil
++}
++
++// AN UNADMITTED PEER MUST NOT BURN THE WHOLE BUDGET.
++// example-lab measured a peer created 45 minutes after its partner against a 180s
++// wait: unwinnable, and it cost the full timeout before the sandbox retry.
++func TestPeerWaitFailsFastWhenPeerIsNotAdmitted(t *testing.T) {
++	f := &fakeLocal{absent: true}
++	start := time.Now()
++	_, err := waitForPeerPodAlive(context.Background(), f, "siteB-dis-sw01", "ns", "siteB-acc-sw01", "eth1", 180*time.Second)
++	elapsed := time.Since(start)
++
++	if err == nil {
++		t.Fatal("expected an error for an unadmitted peer")
++	}
++	if !strings.Contains(err.Error(), "has not been admitted yet") {
++		t.Fatalf("error does not name the cause: %v", err)
++	}
++	// the whole point: it returns in ~the grace, not the full 180s
++	if elapsed > 45*time.Second {
++		t.Fatalf("waited %v -- did not fail fast (budget was 180s)", elapsed)
++	}
++	t.Logf("failed fast in %v instead of 180s", elapsed.Round(time.Second))
++}
++
++// CONTROL: a peer that IS registered still gets waited for. The fix must not
++// turn a recoverable wait into a spurious failure.
++func TestPeerWaitStillWaitsForARegisteredPeer(t *testing.T) {
++	f := &fakeLocal{absent: false, aliveAt: time.Now().Add(6 * time.Second)}
++	start := time.Now()
++	pod, err := waitForPeerPodAlive(context.Background(), f, "peer", "ns", "local", "eth1", 60*time.Second)
++	if err != nil {
++		t.Fatalf("registered peer should have been waited for, got: %v", err)
++	}
++	if !isPodAlive(pod) {
++		t.Fatal("returned a pod that is not alive")
++	}
++	if time.Since(start) < 4*time.Second {
++		t.Fatal("returned before the peer could plausibly have come alive")
++	}
++	t.Logf("waited %v for a registered peer, as intended", time.Since(start).Round(time.Second))
++}

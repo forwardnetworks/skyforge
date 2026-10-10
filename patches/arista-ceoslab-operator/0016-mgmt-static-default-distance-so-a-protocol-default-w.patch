@@ -1,0 +1,121 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sat, 19 Sep 2026 12:44:22 -0500
+Subject: [PATCH] mgmt-static: raise the seeded 0.0.0.0/0 route's distance to
+ 250
+
+MEASURED live on example-lab-shared (2026-09-19, task 210829): siteC-dc-leaf01
+correctly originates a static default toward the DC firewall and
+redistributes it into BGP (bgp.import: {static: {}}). siteC-dc-spine01's own
+BGP table shows that route received, valid, and best-path from leaf01. But
+spine01's RIB (`show ip route 0.0.0.0/0`) still shows `S 0.0.0.0/0 directly
+connected, Management0` as gateway of last resort -- the BGP-best route
+never installs, because the mgmt-runtime-seeded static (0007) carries the
+default administrative distance for a static route (1), which always beats
+a protocol-learned default (eBGP 20, OSPF 110) for the identical prefix.
+Confirmed via `show running-config section ip route`: `ip route 0.0.0.0/0
+Management0`, no distance argument. Same on siteC-dc-leaf02/03/04 and
+spine02. Only siteC-dc-leaf01 has a working default route, and only because
+it happens to carry its OWN competing local static at the same prefix --
+not because the mechanism is correct, but by coincidence of collision.
+Live impact: three of four DC-fabric hosts (behind leaf02/03/04) have no
+Internet reachability; only the host behind leaf01 does.
+
+This is not a new failure mode invented by this fix -- it's the exact
+shape 0008's readiness gate already has a proven-correct fallback for.
+0008's SKYFORGE_MGMT_RETURN_CIDRS-anchored clause (`proto gated`, no via)
+is what already lets siteC-dc-leaf01 go Ready today, precisely because its
+own local static displaced the mgmt default. Raising the seeded static's
+distance to 250 (worse than any protocol AD, still better than no route)
+makes every OTHER cEOS node take that SAME already-proven fallback path
+whenever the lab's own design gives it a protocol default, instead of
+only the node whose local config happens to collide with the seeded
+prefix. A node with no protocol default at all is unaffected: the seeded
+static remains the only default present and is still installed.
+
+Considered and rejected: scoping the seeded route to
+SKYFORGE_MGMT_RETURN_CIDRS only (dropping the blanket 0.0.0.0/0 line
+entirely). patches/netlab/09-kne-config-lanes-and-quirks.patch:1229-1241
+records a related VRF/prefix-separation attempt that broke a different
+(MLAG host-role) bring-up case measured 2026-09-12 -- prefix/VRF
+separation for this exact mechanism has prior-attempt risk. Distance is
+the narrower lever: it changes nothing about which routes exist, only
+which one wins when both are present.
+
+
+---
+ controllers/ceoslabdevice_controller.go       | 21 ++++++++++++++++++-
+ .../ceoslabdevice_controller_unit_test.go     | 11 +++++++++-
+ 2 files changed, 30 insertions(+), 2 deletions(-)
+
+diff --git a/controllers/ceoslabdevice_controller.go b/controllers/ceoslabdevice_controller.go
+index 466753d..fa2a716 100644
+--- a/controllers/ceoslabdevice_controller.go
++++ b/controllers/ceoslabdevice_controller.go
+@@ -1745,6 +1745,25 @@ func mgmtRuntimeConfigEnabled(device *ceoslabv1alpha1.CEosLabDevice, envVarsMap
+ //     an earlier one on replay. The block is appended LAST so EOS installing the
+ //     address/routes also witnesses that the entire seeded config replayed.
+ //
++//     The 0.0.0.0/0 line carries an explicit distance (default 250, override
++//     via SKYFORGE_MGMT_DEFAULT_DISTANCE), NOT the static default of 1.
++//     MEASURED live on example-lab-shared (2026-09-19): a cEOS fabric node whose
++//     lab design originates and correctly BGP-redistributes its own default
++//     route (proven received and best-path on a downstream node's BGP table)
++//     never had it installed in the RIB, because this mgmt static — AD 1 —
++//     always wins the same 0.0.0.0/0 slot over a protocol-learned default
++//     (eBGP AD 20, OSPF 110). Only a node with its OWN competing local static
++//     happened to work, purely by coincidence of prefix collision. Distance
++//     250 makes a protocol default win whenever the lab actually has one,
++//     while this line remains the last-resort default (still installed, still
++//     read by the readiness gate below) on any node with no protocol default
++//     at all. The readiness gate's SKYFORGE_MGMT_RETURN_CIDRS-anchored
++//     fallback clause already exists to certify management reachability on
++//     exactly this "protocol default displaced the mgmt default" shape (see
++//     the sibling readiness-gate script) — this change makes every routed
++//     cEOS node take that same already-proven path, not just the ones that
++//     happen to carry a locally-conflicting static.
++//
+ // Address prefix length (canary br1, cEOS 4.34.2f, 2026-07-18): EOS REJECTS a
+ // /32 interface address ("% Prefix length must be less than 32") — and a
+ // rejected line would abort config replay. The prefix is therefore derived at
+@@ -1817,7 +1836,7 @@ if [ -n "${SKYFORGE_MGMT_EOS_INTF:-}" ]; then
+       printf 'interface %s\n' "${SKYFORGE_MGMT_EOS_INTF}"
+       if [ -n "${mtu}" ]; then printf '   mtu %s\n' "${mtu}"; fi
+       printf '   ip address %s/%s\n' "${ip}" "${pfx}"
+-      printf 'ip route 0.0.0.0/0 %s\n' "${SKYFORGE_MGMT_EOS_INTF}"
++      printf 'ip route 0.0.0.0/0 %s %s\n' "${SKYFORGE_MGMT_EOS_INTF}" "${SKYFORGE_MGMT_DEFAULT_DISTANCE:-250}"
+       _oldifs="${IFS}"
+       IFS=','
+       for cidr in ${SKYFORGE_MGMT_RETURN_CIDRS:-}; do
+diff --git a/controllers/ceoslabdevice_controller_unit_test.go b/controllers/ceoslabdevice_controller_unit_test.go
+index eafacd5..5a941f7 100644
+--- a/controllers/ceoslabdevice_controller_unit_test.go
++++ b/controllers/ceoslabdevice_controller_unit_test.go
+@@ -319,6 +319,10 @@ func TestGetPodSeedInitMaterializesMgmtRuntime(t *testing.T) {
+ 		"if [ \"${cidr}\" = \"${addr_cidr}\" ]; then continue; fi",
+ 		// interface-form routes: no gateway to embed, EOS ARPs per destination
+ 		"ip route 0.0.0.0/0 %s",
++		// distance 250, not the static default of 1 -- see the startupSeedScript
++		// doc comment (2026-09-19 fix): an AD-1 mgmt default always wins the RIB
++		// over a protocol-learned default on the same prefix.
++		"SKYFORGE_MGMT_DEFAULT_DISTANCE:-250",
+ 		// observed-MTU materialization (runtime truth, like the IP)
+ 		"/sys/class/net/eth0/mtu",
+ 	} {
+@@ -378,7 +382,12 @@ func TestStartupSeedScriptCIDRMath(t *testing.T) {
+ 	for _, want := range []string{
+ 		"hostname leaf1\n",
+ 		"   ip address 198.18.0.132/15\n",
+-		"ip route 0.0.0.0/0 Management0\n",
++		// Distance 250, not the static default of 1: MEASURED live on
++		// example-lab-shared (2026-09-19) that an AD-1 mgmt default always wins
++		// the RIB over a protocol-learned default on the same prefix, even
++		// when the protocol route is correctly received and best-path in
++		// BGP -- see the doc comment on startupSeedScript above.
++		"ip route 0.0.0.0/0 Management0 250\n",
+ 		"ip route 100.64.0.0/10 Management0\n",
+ 	} {
+ 		if !strings.Contains(got, want) {
+--
+2.43.0
+

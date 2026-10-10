@@ -1,0 +1,152 @@
+From ad90eaad72e9ac7bfe07e27ee12aaba809c2bb9a Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Wed, 26 Aug 2026 18:35:55 -0500
+Subject: [PATCH] api: scope vxlan conflict search to the target netns, not
+ just the host
+
+hostVxLanConflicts scanned netlink.LinkList() in the CALLER'S netns only --
+for the meshnet daemon, the host netns. A vxlan created from the host and then
+MOVED INTO A POD keeps its VNI registered in the host's vxlan socket table, so
+a re-create still fails EEXIST, but it is no longer visible to LinkList() here.
+The scan returned empty, the caller concluded the occupant was 'unowned', and
+MakeVxLan failed closed with
+
+  vxlan add failed: unowned host vxlan conflict for id=11864976 parent=eno1
+  peer=192.0.2.60 owner=... : Failed to add vxlan kokoNNN: file exists; conflicts=[]
+
+whose own evidence field is EMPTY -- the tell that this is a VISIBILITY problem,
+not an ownership one.
+
+This is how KubeVirt bridge binding wedged cross-node VM-to-VM meshnet links
+permanently: virt-launcher renames the wire to <suffix>-nic and enslaves it to
+a k6t- bridge inside the pod netns, so the occupant is real, ours, and
+invisible from the daemon.
+
+hostVxLanConflictsInNS takes the netns the wire is expected to live in; the
+existing hostVxLanConflicts keeps host-only behaviour for every other caller.
+Inside a pod netns the parent ifindex is netns-relative and no longer names the
+host uplink, so the in-netns pass matches on VNI alone -- matching parent there
+would discard every real occupant.
+---
+ api/koko_api.go | 86 ++++++++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 74 insertions(+), 12 deletions(-)
+
+diff --git a/api/koko_api.go b/api/koko_api.go
+index 30386f1..5448046 100644
+--- a/api/koko_api.go
++++ b/api/koko_api.go
+@@ -896,29 +896,91 @@ func configureLinkInNS(veth VEth) error {
+ 	})
+ }
+ 
++// hostVxLanConflicts finds vxlans already holding this VNI.
++//
++// SCOPE WARNING, learned the hard way. This scans netlink.LinkList() in the
++// CALLER'S current network namespace -- for the meshnet daemon, the host netns.
++// A vxlan created from here and then MOVED INTO A POD keeps its VNI registered
++// in the host's vxlan socket table (so a re-create still fails EEXIST) but is
++// NO LONGER VISIBLE to LinkList() here. The scan then returns an empty slice,
++// the caller concludes the occupant is "unowned", and fails closed with
++// "unowned host vxlan conflict ... conflicts=[]" -- a message whose own
++// evidence field is empty, which is the tell that this is a VISIBILITY
++// problem, not an ownership one.
++//
++// That is not hypothetical: it is how KubeVirt bridge binding wedged
++// cross-node VM-to-VM meshnet links permanently. virt-launcher renames the
++// wire and enslaves it to a k6t- bridge inside the pod netns, so the occupant
++// is real, ours, and invisible from here.
++//
++// searchNetNS lets a caller that KNOWS where the wire should live (meshnet
++// passes the target pod netns) look there too. Empty means host-only, which
++// preserves the previous behaviour for every existing caller.
+ func hostVxLanConflicts(vxlan VxLan, requestedName string) ([]*netlink.Vxlan, error) {
++	return hostVxLanConflictsInNS(vxlan, requestedName, "")
++}
++
++func hostVxLanConflictsInNS(vxlan VxLan, requestedName string, searchNetNS string) ([]*netlink.Vxlan, error) {
+ 	parentIF, err := netlink.LinkByName(vxlan.ParentIF)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to get %s: %w", vxlan.ParentIF, err)
+ 	}
++	parentIndex := parentIF.Attrs().Index
+ 	udpPort := normalizedVXLANPort(vxlan.UDPPort)
+-	links, err := netlink.LinkList()
+-	if err != nil {
+-		return nil, err
+-	}
++
+ 	conflicts := []*netlink.Vxlan{}
+-	for _, link := range links {
+-		existing, _ := link.(*netlink.Vxlan)
+-		if !isConflictingHostVxLan(existing, vxlan.ID, parentIF.Attrs().Index, udpPort, requestedName) {
+-			continue
++	collect := func(matchParent bool) error {
++		links, err := netlink.LinkList()
++		if err != nil {
++			return err
+ 		}
+-		conflicts = append(conflicts, existing)
++		for _, link := range links {
++			existing, _ := link.(*netlink.Vxlan)
++			if existing == nil {
++				continue
++			}
++			// Inside a pod netns the parent ifindex is netns-relative and no
++			// longer refers to the host uplink, so matching on it there would
++			// discard every real occupant. The VNI is what actually collides.
++			if matchParent {
++				if !isConflictingHostVxLan(existing, vxlan.ID, parentIndex, udpPort, requestedName) {
++					continue
++				}
++			} else {
++				if existing.VxlanId != vxlan.ID || existing.Attrs().Name == requestedName {
++					continue
++				}
++			}
++			conflicts = append(conflicts, existing)
++		}
++		return nil
++	}
++
++	if err := collect(true); err != nil {
++		return nil, err
++	}
++	if searchNetNS == "" {
++		return conflicts, nil
++	}
++	podNs, err := ns.GetNS(searchNetNS)
++	if err != nil {
++		// The netns being gone is not an error for a conflict SEARCH -- it just
++		// means there is nothing there to find. Report what the host scan saw.
++		logger.Warnf("koko: could not open netns %s for vxlan conflict search: %+v", searchNetNS, err)
++		return conflicts, nil
++	}
++	defer podNs.Close()
++	if err := podNs.Do(func(_ ns.NetNS) error { return collect(false) }); err != nil {
++		logger.Warnf("koko: vxlan conflict search inside netns %s failed: %+v", searchNetNS, err)
+ 	}
+ 	return conflicts, nil
+ }
+ 
+-func removeOwnedConflictingVxLanIfExists(vxlan VxLan, requestedName, ownerKey string) (bool, error) {
+-	conflicts, err := hostVxLanConflicts(vxlan, requestedName)
++// searchNetNS is the netns the wire is EXPECTED to live in (may be ""). Passing
++// it is what lets cleanup see an occupant that has already been moved into a
++// pod -- e.g. one KubeVirt renamed and enslaved to a k6t- bridge.
++func removeOwnedConflictingVxLanIfExists(vxlan VxLan, requestedName, ownerKey, searchNetNS string) (bool, error) {
++	conflicts, err := hostVxLanConflictsInNS(vxlan, requestedName, searchNetNS)
+ 	if err != nil {
+ 		return false, err
+ 	}
+@@ -1058,7 +1120,7 @@ func MakeVxLan(veth1 VEth, vxlan VxLan) (err error) {
+ 		if err = addVxLanInterface(vxlan, tempLinkName1, ownerAlias); err != nil {
+ 			_ = removeLinkIfExists(tempLinkName1)
+ 			if errors.Is(err, syscall.EEXIST) || strings.Contains(err.Error(), "file exists") {
+-				cleaned, cleanupErr := removeOwnedConflictingVxLanIfExists(vxlan, tempLinkName1, ownerKey)
++				cleaned, cleanupErr := removeOwnedConflictingVxLanIfExists(vxlan, tempLinkName1, ownerKey, veth1.NsName)
+ 				if cleanupErr != nil {
+ 					logger.Warnf(
+ 						"koko: failed conflicting vxlan cleanup for id=%d parent=%s temp=%s peer=%s: %+v",
+-- 
+2.55.0
+

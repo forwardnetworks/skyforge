@@ -1,0 +1,642 @@
+From 9a3345b1241d2df727393b389a07f98c4869c329 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 18:24:55 -0500
+Subject: [PATCH] api: do not bind a cross-node vxlan to the underlay device
+
+A vxlan created with a lower device (VtepDevIndex, `dev eno1`) is capped
+by the kernel at lower MTU - 50, forever (vxlan_change_mtu; the lower
+device is resolved in the netns the vxlan was created in, so the cap
+follows the wire into the pod). A NOS that owns the interface cannot
+raise it. cEOS raises a routed port's kernel ethN to 10240 when it moves
+the port into a VRF (macvlan passthru into ns-<vrf> at the IP MTU); on a
+cross-node wire that fails EINVAL and the port never enters its VRF.
+
+Measured 2026-09-22, user-skyforge-demo-estate-13-fu-798b2b0d, one lab,
+one config shape:
+  siteA-dc1-veos-wanleaf1 eth4: veth (same node), mtu 10240; ns-VRF_WWW
+    holds eth4 macvlan passthru mtu 8950, 10.254.2.17/30.
+  siteF-dc1-veos-wanleaf1 eth4/eth5: vxlan with a lower dev, mtu 8950;
+    ns-VRF_WWW/ns-VRF_DB hold no eth4/eth5; EOS says "VRF_WWW" while
+    `show vrf` lists neither port.
+
+Create the wire UNBOUND when the path is proven: the kernel route to the
+peer VTEP leaves via the underlay interface and that interface has an
+IPv4 address. The source is then pinned (IFLA_VXLAN_LOCAL) to that
+address -- the VTEP meshnet already advertises -- so the outer header is
+what the bound form sent. The wire is still created at the requested
+fabric MTU (0007); with none requested it gets lower MTU - 50 (what the
+bound form defaulted to), and a request above that is clamped (what the
+bound form's kernel did). Anything unproven (no route, a route via
+another device, IPv6, multicast, no address) falls back to the upstream
+bound form, logged with the reason.
+
+Compatibility, so a rollout rebuilds nothing:
+- Both forms emit identical packets; a wire with one bound and one
+  unbound end works (proven in netns: DF ping at 8922 across a mixed
+  pair, then through a cEOS-style macvlan passthru after raising the
+  unbound end to 10240).
+- Form is not part of sameVxLanSpec, so legacy bound wires are adopted.
+- sameVxLanSpec treats the fabric MTU as a floor: a wire above it (the
+  NOS raised it) matches; below it (stale 1450) still does not.
+- configureLinkInNS (vxlan and veth adopt paths) raises to the fabric
+  MTU but never lowers an MTU the device owner raised (mtuToSet).
+- isConflictingHostVxLan counts an unbound (VtepDevIndex 0) occupant:
+  the kernel's IPv4 VNI check ignores the lower device, so it collides.
+
+Tests: pure decision/builder tests plus kernel tests gated on
+KOKO_KERNEL_TESTS=1 under `unshare -rn`. Positive control: before this
+change TestKernelUnboundWireAcceptsANOSRaisedMTU failed "invalid
+argument" (vtepdev=2) and the conflict scan found 0 unbound occupants.
+---
+ api/koko_api.go                 |  54 +++----
+ api/koko_kubevirt_adopt_test.go |   2 +-
+ api/koko_vxlan_underlay.go      | 213 ++++++++++++++++++++++++++
+ api/koko_vxlan_underlay_test.go | 256 ++++++++++++++++++++++++++++++++
+ 4 files changed, 499 insertions(+), 26 deletions(-)
+ create mode 100644 api/koko_vxlan_underlay.go
+ create mode 100644 api/koko_vxlan_underlay_test.go
+
+diff --git a/api/koko_api.go b/api/koko_api.go
+index 4b230e5..9b2db91 100644
+--- a/api/koko_api.go
++++ b/api/koko_api.go
+@@ -196,24 +196,19 @@ func addVxLanInterface(vxlan VxLan, devName, ownerAlias string) (err error) {
+ 		UDPPort = vxlan.UDPPort
+ 	}
+ 
+-	vxlanconf := netlink.Vxlan{
+-		LinkAttrs: netlink.LinkAttrs{
+-			Name:   devName,
+-			TxQLen: 1000,
+-			Alias:  ownerAlias,
+-		},
+-		VxlanId:      vxlan.ID,
+-		VtepDevIndex: parentIF.Attrs().Index,
+-		Group:        vxlan.IPAddr,
+-		Port:         UDPPort,
+-		Learning:     true,
+-		L2miss:       true,
+-		L3miss:       true,
+-	}
+-	if vxlan.MTU != 0 {
+-		vxlanconf.LinkAttrs.MTU = vxlan.MTU
++	// Bound to the underlay only when the path to the peer cannot be proven
++	// to leave through it; see koko_vxlan_underlay.go for why binding is what
++	// stopped a NOS from raising a cross-node interface's MTU.
++	underlay := resolveVxlanUnderlay(parentIF, vxlan)
++	if underlay.bindParent {
++		logger.Warnf("koko: vxlan %s id=%d peer=%s: legacy form, bound to %s: %s",
++			devName, vxlan.ID, vxlan.IPAddr, vxlan.ParentIF, underlay.reason)
++	} else {
++		logger.Infof("koko: vxlan %s id=%d peer=%s: unbound form, local=%s mtu=%d: %s",
++			devName, vxlan.ID, vxlan.IPAddr, underlay.local, underlay.mtu, underlay.reason)
+ 	}
+-	err = netlink.LinkAdd(&vxlanconf)
++	vxlanconf := buildVxlanConf(vxlan, devName, ownerAlias, UDPPort, underlay)
++	err = netlink.LinkAdd(vxlanconf)
+ 
+ 	if err != nil {
+ 		return fmt.Errorf("Failed to add vxlan %s: %w", devName, err)
+@@ -798,7 +793,12 @@ func sameVxLanSpec(existing *netlink.Vxlan, vxlan VxLan, parentIndex int) bool {
+ 	if !sameIP(existing.Group, vxlan.IPAddr) {
+ 		return false
+ 	}
+-	if vxlan.MTU != 0 && existing.Attrs().MTU != 0 && existing.Attrs().MTU != vxlan.MTU {
++	// The fabric MTU is a floor, not a ceiling: below it the wire is stale
++	// (the 2026-09-08 example-lab 1450 wires); above it the NOS raised it (cEOS
++	// lifts a routed port to 10240 to put it in a VRF). Neither the MTU above
++	// the floor nor the wire's form (bound/unbound, koko_vxlan_underlay.go) is
++	// part of the spec, so an existing wire is adopted as-is.
++	if vxlan.MTU != 0 && existing.Attrs().MTU != 0 && existing.Attrs().MTU < vxlan.MTU {
+ 		return false
+ 	}
+ 	return true
+@@ -877,12 +877,13 @@ func configureLinkInNS(veth VEth) error {
+ 		if err != nil {
+ 			return err
+ 		}
+-		mtu := veth.MTU
+-		if mtu <= 0 {
+-			mtu = 1450
+-		}
+-		if err := netlink.LinkSetMTU(link, mtu); err != nil {
+-			return fmt.Errorf("set %s MTU %d: %w", veth.LinkName, mtu, err)
++		// Raise to the fabric MTU, never lower: an end above it was raised
++		// by the device's owner, and lowering it undoes the NOS's own
++		// configuration underneath it (mtuToSet).
++		if mtu, change := mtuToSet(link.Attrs().MTU, veth.MTU); change {
++			if err := netlink.LinkSetMTU(link, mtu); err != nil {
++				return fmt.Errorf("set %s MTU %d: %w", veth.LinkName, mtu, err)
++			}
+ 		}
+ 		if err := netlink.LinkSetUp(link); err != nil {
+ 			return err
+@@ -1162,7 +1163,10 @@ func isConflictingHostVxLan(existing *netlink.Vxlan, vni, parentIndex, udpPort i
+ 	if existing.VxlanId != vni {
+ 		return false
+ 	}
+-	if existing.VtepDevIndex != parentIndex {
++	// 0 = an unbound wire (koko_vxlan_underlay.go). The kernel's IPv4 VNI
++	// ownership check ignores the lower device, so an unbound occupant holds
++	// the VNI against a bound request and vice versa.
++	if existing.VtepDevIndex != 0 && existing.VtepDevIndex != parentIndex {
+ 		return false
+ 	}
+ 	if normalizedVXLANPort(existing.Port) != normalizedVXLANPort(udpPort) {
+diff --git a/api/koko_kubevirt_adopt_test.go b/api/koko_kubevirt_adopt_test.go
+index fdb6469..a73c4d6 100644
+--- a/api/koko_kubevirt_adopt_test.go
++++ b/api/koko_kubevirt_adopt_test.go
+@@ -21,7 +21,7 @@ func TestKubeVirtBridgeNameMatchesVirtLauncherNotMeshnet(t *testing.T) {
+ 	}{
+ 		{"pod980816f36b7", "k6t-980816f36b7"},
+ 		{"pod151b6d47576", "k6t-151b6d47576"},
+-		{"eth0", ""},        // not a name meshnet gives a KubeVirt pod
++		{"eth0", ""}, // not a name meshnet gives a KubeVirt pod
+ 		{"", ""},
+ 		{"pod", ""}, // the bare prefix with nothing after it is not an ID
+ 	}
+diff --git a/api/koko_vxlan_underlay.go b/api/koko_vxlan_underlay.go
+new file mode 100644
+index 0000000..2ccd8e1
+--- /dev/null
++++ b/api/koko_vxlan_underlay.go
+@@ -0,0 +1,213 @@
++package api
++
++import (
++	"fmt"
++	"net"
++
++	"github.com/vishvananda/netlink"
++)
++
++// A cross-node wire must not be BOUND to its underlay device.
++//
++// Upstream koko created every vxlan with VtepDevIndex = the parent (underlay)
++// interface -- `ip link add ... type vxlan ... dev eno1`. Binding does two
++// things. The one we want: every encapsulated packet is routed out of that
++// device. The one nobody asked for: the kernel caps the vxlan's MTU at
++// (lower device MTU - encap overhead), forever, in vxlan_change_mtu(). The
++// lower device is looked up in the netns the vxlan was CREATED in (the host),
++// so the cap follows the wire into the pod.
++//
++// A NOS that owns the interface may legitimately raise its MTU. cEOS does
++// exactly that when it moves a routed port into a VRF: it raises the kernel
++// ethN to 10240 and hangs a macvlan passthru at the configured IP MTU off it
++// inside ns-<vrf>. On a same-node veth that works (a veth's max MTU is
++// 65535). On a cross-node wire it fails EINVAL at 8951 and above, the
++// interface never enters its VRF, and EOS reports it as "in VRF_WWW" while
++// `show vrf` lists no such interface and nothing forwards.
++//
++// MEASURED 2026-09-22, user-skyforge-demo-estate-13-fu-798b2b0d, same lab,
++// same config shape:
++//
++//	siteA-dc1-veos-wanleaf1 eth4  veth (same node)  mtu 10240, ns-VRF_WWW holds
++//	                            eth4 macvlan passthru mtu 8950 10.254.2.17/30
++//	siteF-dc1-veos-wanleaf1 eth4  vxlan dev <eno1>  mtu 8950, ns-VRF_WWW holds
++//	                            no eth4 at all; 10.254.1.17/30 is nowhere
++//
++// An UNBOUND vxlan has no such cap (max_mtu 65535). What binding bought us
++// is kept by other means:
++//
++//   - The source address is pinned explicitly (IFLA_VXLAN_LOCAL) to the
++//     underlay interface's IPv4 address -- the same address meshnet already
++//     advertises to the peer as this node's VTEP (HOST_INTF / the
++//     meshnet-underlay-interface label), so the outer header is byte-for-byte
++//     what the bound form sent.
++//   - The egress path is PROVEN before the unbound form is chosen: the kernel
++//     route to the peer VTEP must leave through the underlay interface. If it
++//     does not (a peer reachable only through a tunnel, a policy route, a
++//     missing route), the wire is built in the legacy bound form, exactly as
++//     before, and the reason is logged. Nothing that works today stops
++//     working; it only fails to gain the new capability.
++//   - The wire is still CREATED at the fabric MTU (MESHNET_FABRIC_MTU, 0007),
++//     and when the caller asks for none the underlay-derived value the bound
++//     form would have produced (lower MTU - overhead) is used, not the
++//     kernel's 1500 default for an unbound vxlan. A request above what the
++//     underlay can carry is clamped to it, as the bound form's kernel clamp
++//     did. Only a NOS raising the MTU afterwards can exceed it.
++//
++// Both forms put identical packets on the wire (same VNI, UDP port, outer
++// source and destination), so a wire with one bound end and one unbound end
++// works. That is what makes rollout safe: existing wires are never rebuilt to
++// change form, and nothing compares the form.
++//
++// The kernel's VNI ownership check (vxlan_vni_in_use) does not consider the
++// lower device for IPv4, so a bound and an unbound vxlan with the same VNI and
++// port collide EEXIST. isConflictingHostVxLan treats an unbound occupant as a
++// conflict accordingly.
++
++// vxlanIPv4Overhead is the outer-header byte count the kernel
++// subtracts from a bound vxlan's lower device MTU (vxlan_headroom()).
++const (
++	vxlanIPv4Overhead = 50
++)
++
++// vxlanUnderlay is how one cross-node wire attaches to the underlay.
++type vxlanUnderlay struct {
++	// bindParent: legacy upstream form, VtepDevIndex = parentIndex.
++	bindParent  bool
++	parentIndex int
++	// local is the pinned outer source address (unbound form only).
++	local net.IP
++	// mtu to create the wire at; 0 leaves it to the kernel (bound form only).
++	mtu    int
++	reason string
++}
++
++func (u vxlanUnderlay) form() string {
++	if u.bindParent {
++		return "bound"
++	}
++	return "unbound"
++}
++
++// chooseVxlanUnderlay is the pure decision: given what the host says about the
++// underlay interface and the route to the peer, pick the wire's form.
++//
++// routeLinkIndex is the egress ifindex of the kernel route to peer (0 if
++// none); routeErr is the lookup error, if any.
++func chooseVxlanUnderlay(parentIndex, parentMTU int, parentAddr, peer net.IP,
++	routeLinkIndex int, routeErr error, wantMTU int) vxlanUnderlay {
++
++	bound := func(reason string) vxlanUnderlay {
++		// Exactly the pre-existing behaviour: bind, set the MTU only when asked
++		// (the kernel clamps to lower-overhead and defaults to it).
++		return vxlanUnderlay{bindParent: true, parentIndex: parentIndex, mtu: wantMTU, reason: reason}
++	}
++
++	switch {
++	case peer == nil || peer.IsUnspecified():
++		return bound("no unicast peer VTEP")
++	case peer.To4() == nil:
++		return bound("peer VTEP is not IPv4")
++	case peer.IsMulticast():
++		return bound("peer is a multicast group, which needs a bound device")
++	case parentAddr == nil || parentAddr.To4() == nil:
++		return bound("underlay interface has no IPv4 address to pin as the source")
++	case routeErr != nil:
++		return bound(fmt.Sprintf("route to peer %s could not be resolved: %v", peer, routeErr))
++	case routeLinkIndex == 0 || routeLinkIndex != parentIndex:
++		return bound(fmt.Sprintf("route to peer %s leaves via ifindex %d, not the underlay ifindex %d", peer, routeLinkIndex, parentIndex))
++	}
++
++	ceiling := parentMTU - vxlanIPv4Overhead
++	mtu := wantMTU
++	reason := fmt.Sprintf("route to peer %s leaves via the underlay (ifindex %d)", peer, parentIndex)
++	if parentMTU > 0 {
++		if mtu == 0 {
++			mtu = ceiling
++		} else if mtu > ceiling {
++			reason += fmt.Sprintf("; requested MTU %d clamped to underlay ceiling %d", mtu, ceiling)
++			mtu = ceiling
++		}
++	}
++	return vxlanUnderlay{parentIndex: parentIndex, local: parentAddr.To4(), mtu: mtu, reason: reason}
++}
++
++// buildVxlanConf renders the netlink request for one wire. Pure.
++func buildVxlanConf(vxlan VxLan, devName, ownerAlias string, udpPort int, u vxlanUnderlay) *netlink.Vxlan {
++	conf := &netlink.Vxlan{
++		LinkAttrs: netlink.LinkAttrs{
++			Name:   devName,
++			TxQLen: 1000,
++			Alias:  ownerAlias,
++		},
++		VxlanId:  vxlan.ID,
++		Group:    vxlan.IPAddr,
++		Port:     udpPort,
++		Learning: true,
++		L2miss:   true,
++		L3miss:   true,
++	}
++	if u.bindParent {
++		conf.VtepDevIndex = u.parentIndex
++	} else {
++		conf.SrcAddr = u.local
++	}
++	if u.mtu != 0 {
++		conf.LinkAttrs.MTU = u.mtu
++	}
++	return conf
++}
++
++// firstIPv4 returns the first non-loopback IPv4 address on link, or nil.
++func firstIPv4(link netlink.Link) net.IP {
++	addrs, err := netlink.AddrList(link, netlink.FAMILY_V4)
++	if err != nil {
++		return nil
++	}
++	for _, a := range addrs {
++		if a.IPNet == nil {
++			continue
++		}
++		if ip := a.IP.To4(); ip != nil && !ip.IsLoopback() {
++			return ip
++		}
++	}
++	return nil
++}
++
++// resolveVxlanUnderlay gathers the host facts chooseVxlanUnderlay needs.
++// It runs in the netns the wire is created in (the host), which is also the
++// netns whose routing table the encapsulated packets will use.
++func resolveVxlanUnderlay(parentIF netlink.Link, vxlan VxLan) vxlanUnderlay {
++	attrs := parentIF.Attrs()
++	var routeIndex int
++	var routeErr error
++	if vxlan.IPAddr != nil && vxlan.IPAddr.To4() != nil && !vxlan.IPAddr.IsMulticast() {
++		routes, err := netlink.RouteGet(vxlan.IPAddr)
++		switch {
++		case err != nil:
++			routeErr = err
++		case len(routes) == 0:
++			routeErr = fmt.Errorf("no route")
++		default:
++			routeIndex = routes[0].LinkIndex
++		}
++	}
++	return chooseVxlanUnderlay(attrs.Index, attrs.MTU, firstIPv4(parentIF), vxlan.IPAddr, routeIndex, routeErr, vxlan.MTU)
++}
++
++// mtuToSet decides whether configuring an EXISTING (adopted) wire end should
++// touch its MTU. The fabric MTU is a floor meshnet guarantees, not a ceiling
++// it enforces: an end below it is stale and is raised (the 2026-09-08 example-lab
++// 1450 wires), an end above it was raised by the device's owner -- cEOS lifts
++// a routed port to 10240 to put it in a VRF -- and lowering it back would undo
++// the NOS's own configuration underneath it. want <= 0 means koko's default.
++func mtuToSet(current, want int) (int, bool) {
++	if want <= 0 {
++		want = 1450
++	}
++	if current >= want {
++		return 0, false
++	}
++	return want, true
++}
+diff --git a/api/koko_vxlan_underlay_test.go b/api/koko_vxlan_underlay_test.go
+new file mode 100644
+index 0000000..ef72c23
+--- /dev/null
++++ b/api/koko_vxlan_underlay_test.go
+@@ -0,0 +1,256 @@
++package api
++
++import (
++	"errors"
++	"net"
++	"os"
++	"runtime"
++	"testing"
++
++	"github.com/vishvananda/netlink"
++)
++
++func TestChooseVxlanUnderlayUnboundWhenRouteLeavesViaUnderlay(t *testing.T) {
++	u := chooseVxlanUnderlay(2, 9000, net.ParseIP("192.0.2.203"), net.ParseIP("192.0.2.60"), 2, nil, 8950)
++	if u.bindParent {
++		t.Fatalf("route via the underlay must yield the unbound form, got bound: %s", u.reason)
++	}
++	if !u.local.Equal(net.ParseIP("192.0.2.203")) {
++		t.Fatalf("unbound form must pin the underlay address as the source, got %v", u.local)
++	}
++	if u.mtu != 8950 {
++		t.Fatalf("wire must still be created at the fabric MTU 8950, got %d", u.mtu)
++	}
++}
++
++func TestChooseVxlanUnderlayDerivesMTUWhenCallerAsksForNone(t *testing.T) {
++	// An unbound vxlan otherwise comes up at the kernel default 1500, where the
++	// bound form came up at lower-50. Keep the bound form's value.
++	u := chooseVxlanUnderlay(2, 9000, net.ParseIP("10.0.0.1"), net.ParseIP("10.0.0.2"), 2, nil, 0)
++	if u.bindParent || u.mtu != 8950 {
++		t.Fatalf("want unbound at 8950, got bound=%v mtu=%d", u.bindParent, u.mtu)
++	}
++}
++
++func TestChooseVxlanUnderlayClampsLikeTheKernelDidForBound(t *testing.T) {
++	// The bound form's kernel silently clamped a create-time MTU to lower-50.
++	u := chooseVxlanUnderlay(2, 1500, net.ParseIP("10.0.0.1"), net.ParseIP("10.0.0.2"), 2, nil, 8950)
++	if u.bindParent || u.mtu != 1450 {
++		t.Fatalf("want unbound clamped to 1450, got bound=%v mtu=%d", u.bindParent, u.mtu)
++	}
++}
++
++func TestChooseVxlanUnderlayFallsBackToBoundWhenPathIsNotProven(t *testing.T) {
++	src := net.ParseIP("10.0.0.1")
++	peer := net.ParseIP("10.0.0.2")
++	cases := map[string]vxlanUnderlay{
++		"route via another device": chooseVxlanUnderlay(2, 9000, src, peer, 9, nil, 8950),
++		"no route":                 chooseVxlanUnderlay(2, 9000, src, peer, 0, nil, 8950),
++		"route error":              chooseVxlanUnderlay(2, 9000, src, peer, 0, errors.New("network unreachable"), 8950),
++		"no underlay address":      chooseVxlanUnderlay(2, 9000, nil, peer, 2, nil, 8950),
++		"ipv6 peer":                chooseVxlanUnderlay(2, 9000, src, net.ParseIP("2001:db8::2"), 2, nil, 8950),
++		"multicast group":          chooseVxlanUnderlay(2, 9000, src, net.ParseIP("239.1.1.1"), 2, nil, 8950),
++		"no peer":                  chooseVxlanUnderlay(2, 9000, src, nil, 2, nil, 8950),
++	}
++	for name, u := range cases {
++		if !u.bindParent || u.parentIndex != 2 {
++			t.Errorf("%s: want legacy bound form on ifindex 2, got bound=%v idx=%d (%s)", name, u.bindParent, u.parentIndex, u.reason)
++		}
++		if u.mtu != 8950 {
++			t.Errorf("%s: bound fallback must pass the requested MTU through unchanged, got %d", name, u.mtu)
++		}
++		if u.reason == "" {
++			t.Errorf("%s: a fallback must say why", name)
++		}
++	}
++}
++
++func TestBuildVxlanConfForms(t *testing.T) {
++	vx := VxLan{ParentIF: "eno1", ID: 4242, IPAddr: net.ParseIP("10.0.0.2"), MTU: 8950}
++
++	unbound := buildVxlanConf(vx, "koko1", "koko:vxlan:x", 4789,
++		chooseVxlanUnderlay(2, 9000, net.ParseIP("10.0.0.1"), vx.IPAddr, 2, nil, vx.MTU))
++	if unbound.VtepDevIndex != 0 {
++		t.Fatalf("unbound wire must carry no lower device (that is what caps its MTU), got VtepDevIndex=%d", unbound.VtepDevIndex)
++	}
++	if !unbound.SrcAddr.Equal(net.ParseIP("10.0.0.1")) || unbound.MTU != 8950 {
++		t.Fatalf("unbound wire: want local 10.0.0.1 mtu 8950, got %v %d", unbound.SrcAddr, unbound.MTU)
++	}
++
++	bound := buildVxlanConf(vx, "koko1", "koko:vxlan:x", 4789,
++		chooseVxlanUnderlay(2, 9000, net.ParseIP("10.0.0.1"), vx.IPAddr, 9, nil, vx.MTU))
++	if bound.VtepDevIndex != 2 || bound.SrcAddr != nil || bound.MTU != 8950 {
++		t.Fatalf("bound fallback must be the upstream form: dev=2 no local mtu 8950, got dev=%d local=%v mtu=%d",
++			bound.VtepDevIndex, bound.SrcAddr, bound.MTU)
++	}
++	for _, c := range []*netlink.Vxlan{unbound, bound} {
++		if c.VxlanId != 4242 || c.Port != 4789 || !c.Learning || !c.L2miss || !c.L3miss || c.TxQLen != 1000 || c.Alias != "koko:vxlan:x" {
++			t.Fatalf("common attributes changed: %+v", c)
++		}
++	}
++}
++
++// --- existing comparisons, relaxed for an MTU the device owner raised -----
++
++func TestSameVxLanSpecAcceptsAnMTUTheNOSRaised(t *testing.T) {
++	desired := VxLan{ParentIF: "eno1", ID: 12345, IPAddr: net.ParseIP("192.0.2.10"), UDPPort: 4789, MTU: 8950}
++	link := func(mtu int) *netlink.Vxlan {
++		return &netlink.Vxlan{
++			LinkAttrs: netlink.LinkAttrs{Name: "eth4", MTU: mtu},
++			VxlanId:   12345, Port: 4789, Group: net.ParseIP("192.0.2.10"),
++		}
++	}
++	if !sameVxLanSpec(link(10240), desired, 7) {
++		t.Fatalf("a wire the NOS raised to 10240 is still the desired 8950 wire and must be adopted, not torn down")
++	}
++	if !sameVxLanSpec(link(8950), desired, 7) {
++		t.Fatalf("a wire at exactly the fabric MTU must match")
++	}
++	if sameVxLanSpec(link(1450), desired, 7) {
++		t.Fatalf("a wire BELOW the fabric MTU is stale (the 2026-09-08 example-lab defect) and must not match")
++	}
++}
++
++func TestSameVxLanSpecAdoptsBothFormsSoRolloutRebuildsNothing(t *testing.T) {
++	desired := VxLan{ParentIF: "eno1", ID: 12345, IPAddr: net.ParseIP("192.0.2.10"), MTU: 8950}
++	legacy := &netlink.Vxlan{LinkAttrs: netlink.LinkAttrs{MTU: 8950}, VxlanId: 12345, VtepDevIndex: 7, Group: net.ParseIP("192.0.2.10")}
++	unbound := &netlink.Vxlan{LinkAttrs: netlink.LinkAttrs{MTU: 8950}, VxlanId: 12345, Group: net.ParseIP("192.0.2.10")}
++	if !sameVxLanSpec(legacy, desired, 7) || !sameVxLanSpec(unbound, desired, 7) {
++		t.Fatalf("form (bound/unbound) must not be part of the spec: legacy=%v unbound=%v",
++			sameVxLanSpec(legacy, desired, 7), sameVxLanSpec(unbound, desired, 7))
++	}
++}
++
++func TestIsConflictingHostVxLanSeesAnUnboundOccupant(t *testing.T) {
++	// The kernel rejects a second IPv4 vxlan with the same VNI+port whether or
++	// not either is bound (vxlan_vni_in_use ignores the lower device), so an
++	// unbound occupant is a conflict for a bound request and vice versa.
++	unbound := &netlink.Vxlan{LinkAttrs: netlink.LinkAttrs{Name: "left"}, VxlanId: 12345, Port: 4789}
++	if !isConflictingHostVxLan(unbound, 12345, 7, 4789, "koko-new") {
++		t.Fatalf("an unbound vxlan holding the VNI must be seen as the conflict it is")
++	}
++	if isConflictingHostVxLan(unbound, 12346, 7, 4789, "koko-new") {
++		t.Fatalf("a different VNI is not a conflict")
++	}
++}
++
++func TestMTUToSetNeverLowersAnOwnerRaisedMTU(t *testing.T) {
++	cases := []struct {
++		current, want, set int
++		change             bool
++	}{
++		{1450, 8950, 8950, true}, // stale low: heal upward
++		{1500, 8950, 8950, true}, // kernel default: heal upward
++		{8950, 8950, 0, false},   // already right
++		{10240, 8950, 0, false},  // NOS raised: leave it
++		{8950, 0, 0, false},      // caller asked for the default (1450): do not lower
++		{1400, 0, 1450, true},    // below the default: raise to it
++	}
++	for _, c := range cases {
++		set, change := mtuToSet(c.current, c.want)
++		if set != c.set || change != c.change {
++			t.Errorf("mtuToSet(%d,%d) = (%d,%v), want (%d,%v)", c.current, c.want, set, change, c.set, c.change)
++		}
++	}
++}
++
++// --- kernel positive control ----------------------------------------------
++//
++// Runs only with CAP_NET_ADMIN in a THROWAWAY netns; run it as
++//
++//	unshare -rn go test ./api -run TestKernel -v
++//
++// It creates a 9000-MTU dummy underlay and asks koko for a wire at 8950,
++// then does what cEOS does: raise the wire to 10240. Before this change
++// koko built the wire bound to the underlay and the raise failed EINVAL.
++
++func requireThrowawayNetNS(t *testing.T) {
++	t.Helper()
++	if os.Getenv("KOKO_KERNEL_TESTS") != "1" {
++		t.Skip("kernel test: set KOKO_KERNEL_TESTS=1 and run under `unshare -rn` (it creates links in the current netns)")
++	}
++}
++
++func kernelUnderlay(t *testing.T) netlink.Link {
++	t.Helper()
++	runtime.LockOSThread()
++	ul := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "kokoul0", MTU: 9000}}
++	if err := netlink.LinkAdd(ul); err != nil {
++		t.Fatalf("add underlay: %v", err)
++	}
++	link, _ := netlink.LinkByName("kokoul0")
++	addr, _ := netlink.ParseAddr("10.99.0.1/24")
++	if err := netlink.AddrAdd(link, addr); err != nil {
++		t.Fatalf("addr: %v", err)
++	}
++	if err := netlink.LinkSetUp(link); err != nil {
++		t.Fatalf("up: %v", err)
++	}
++	t.Cleanup(func() { _ = netlink.LinkDel(link) })
++	return link
++}
++
++func TestKernelUnboundWireAcceptsANOSRaisedMTU(t *testing.T) {
++	requireThrowawayNetNS(t)
++	kernelUnderlay(t)
++	vx := VxLan{ParentIF: "kokoul0", ID: 4242, IPAddr: net.ParseIP("10.99.0.2"), MTU: 8950}
++	if err := AddVxLanInterface(vx, "kokovx0"); err != nil {
++		t.Fatalf("create: %v", err)
++	}
++	link, err := netlink.LinkByName("kokovx0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer netlink.LinkDel(link)
++	v := link.(*netlink.Vxlan)
++	t.Logf("created: mtu=%d vtepdev=%d local=%v", v.MTU, v.VtepDevIndex, v.SrcAddr)
++	if v.MTU != 8950 {
++		t.Fatalf("wire must come up at the fabric MTU 8950, got %d", v.MTU)
++	}
++	if err := netlink.LinkSetMTU(link, 10240); err != nil {
++		t.Fatalf("NOS raise to 10240 refused (this is the sjc wanleaf VRF failure): %v", err)
++	}
++}
++
++func TestKernelUnprovenPathKeepsTheBoundForm(t *testing.T) {
++	requireThrowawayNetNS(t)
++	kernelUnderlay(t)
++	// 10.98.0.2 has no route at all: the path cannot be proven.
++	vx := VxLan{ParentIF: "kokoul0", ID: 4243, IPAddr: net.ParseIP("10.98.0.2"), MTU: 8950}
++	if err := AddVxLanInterface(vx, "kokovx1"); err != nil {
++		t.Fatalf("create: %v", err)
++	}
++	link, _ := netlink.LinkByName("kokovx1")
++	defer netlink.LinkDel(link)
++	v := link.(*netlink.Vxlan)
++	ul, _ := netlink.LinkByName("kokoul0")
++	if v.VtepDevIndex != ul.Attrs().Index || v.MTU != 8950 {
++		t.Fatalf("want legacy bound form at 8950, got vtepdev=%d mtu=%d", v.VtepDevIndex, v.MTU)
++	}
++}
++
++func TestKernelUnboundOccupantIsSeenByTheConflictScan(t *testing.T) {
++	requireThrowawayNetNS(t)
++	kernelUnderlay(t)
++	// An unbound wire (the new form) already holds VNI 4244.
++	occupant := &netlink.Vxlan{LinkAttrs: netlink.LinkAttrs{Name: "kokovx2"}, VxlanId: 4244,
++		SrcAddr: net.ParseIP("10.99.0.1"), Group: net.ParseIP("10.99.0.3"), Port: 4789}
++	if err := netlink.LinkAdd(occupant); err != nil {
++		t.Fatal(err)
++	}
++	defer netlink.LinkDel(occupant)
++	// The kernel refuses the same VNI again, bound or not...
++	err := AddVxLanInterface(VxLan{ParentIF: "kokoul0", ID: 4244, IPAddr: net.ParseIP("10.98.0.2"), MTU: 8950}, "kokovx3")
++	if err == nil {
++		if l, e := netlink.LinkByName("kokovx3"); e == nil {
++			_ = netlink.LinkDel(l)
++		}
++		t.Fatalf("kernel accepted a bound vxlan reusing an unbound vxlan's VNI; the conflict model is wrong")
++	}
++	t.Logf("kernel: %v", err)
++	// ...so the scan that decides whether koko may clean it up must see it.
++	got, scanErr := hostVxLanConflicts(VxLan{ParentIF: "kokoul0", ID: 4244, IPAddr: net.ParseIP("10.99.0.2")}, "kokovx3")
++	if scanErr != nil || len(got) != 1 || got[0].Attrs().Name != "kokovx2" {
++		t.Fatalf("conflict scan must name the unbound occupant, got %d (%v)", len(got), scanErr)
++	}
++}
+-- 
+2.55.0
+

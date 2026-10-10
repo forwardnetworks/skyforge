@@ -1,0 +1,517 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 05:20:00 -0500
+Subject: [PATCH] ceos: give cEOS pods the same soft placement KNE gives every
+ container pod
+
+MEASURED 2026-09-23 on DemoEstate (user-skyforge-demo-estate-13-fu-798b2b0d):
+all 63 of its cEOS pods -- and all 72 cEOS pods cluster-wide -- sat on
+worker-a, while the same lab's KNE-built pods spread
+101/33/34/33 across worker-a and sm-node-b/c/d. The operator-built cEOS pod
+spec carried `affinity` and `topologySpreadConstraints` both empty and only
+the skyforge.example.com/labs=true nodeSelector, so the scheduler's
+default scoring sent every cEOS to the node with the most allocatable CPU
+(95 cores vs 30). That node is also the only disk-class=ssd node -- the one
+kne 0058 reserves for KubeVirt VMs that must unpack ~28 GB on first boot --
+and the node whose cilium endpoint count kne 0062 showed throttling pod
+creation for the whole lab.
+
+A KNE-built IOL pod in the same lab carries (kubectl get pod
+siteA-bldg1-ios-csw01 -o jsonpath='{.spec.affinity}'):
+
+  nodeAffinity.preferred[weight 100]:
+      skyforge.example.com/disk-class NotIn [ssd]      (kne 0063)
+  podAntiAffinity.preferred[weight 100]:
+      topo In [<namespace>], topologyKey kubernetes.io/hostname (kne 0059/0062)
+
+cEOS pods are built by this operator, not by KNE's CreatePod or its four
+vendor copies, so none of kne 0059/0062/0063 ever reached them -- a sixth
+pod-building site the same fix class missed.
+
+getPod now sets pod.Spec.Affinity from getSkyforgeSoftPlacement(), which
+renders exactly those two terms:
+
+- SSD-avoid, from SKYFORGE_KNE_IO_HEAVY_NODE_LABELS_JSON -- the SAME policy
+  input kne 0058 (VMs onto) and 0063 (containers away) read, NotIn per label
+  in sorted key order in one preferred term, weight 100. Read from the
+  device's envvars first (the path every getSkyforgePlacement input takes;
+  kne 0024 forwards them in arista.CreateCRD) and then the operator's
+  process env. Fails open: unset, blank, `{}` or unparseable -> no node
+  affinity.
+- Same-lab spread on `topo`, weight 100, topologyKey kubernetes.io/hostname.
+  The value is read from the label map getPod stamps on this very pod, so
+  selector and label agree by construction (the kne 0059 defect was a
+  selector on a value no pod carried). getLabels() defaults topo to the
+  namespace -- the value KNE's own pods carry -- so cEOS and IOL of one lab
+  repel each other, not just their own kind. Unconditional, as in KNE.
+
+PREFERRED ONLY, NEVER REQUIRED: a lab must never fail to schedule because
+the preferred node is full, cordoned or absent.
+
+NEW PODS ONLY. Reconcile's drift chain (configmap status, labels, env,
+image, resources, args, init args/image, services, startup-probe agents)
+never compares Affinity, so rolling this operator deletes and recreates
+nothing; a running lab keeps its placement until its pods are recreated for
+some other reason (stop/start, redeploy, a real drift). Labels ARE compared,
+but getLabels() is unchanged, so no in-place label update fires either.
+
+TESTS (controllers/ceoslabdevice_soft_placement_test.go), written against
+getPod/Reconcile only so the file compiles on the pre-change operator:
+- TestGetPodSoftPlacementMatchesLiveKNEContainerPod: DeepEqual against the
+  live IOL affinity JSON copied from the cluster, not a hand-written copy.
+- TestGetPodSoftPlacementIsNeverRequired.
+- TestGetPodSoftPlacementSelectorMatchesOwnTopoLabel: selector matches the
+  pod's own labels, with and without KNE's CR labels.
+- TestGetPodSoftPlacementNodePolicySources: unset/blank/{}/malformed fail
+  open; operator env; device env; device `{}` overrides operator env.
+  Positive control: all four FAIL on the 0001-0018 operator ("got
+  (*v1.Affinity)(nil)") and pass with this patch.
+- TestReconcileDoesNotRecreateRunningPodForAffinity: drives Reconcile on a
+  fake client holding a pod with Affinity nil (a pre-change pod) after the
+  policy is set; the pod survives five reconciles with its marker annotation
+  and nil affinity, and the device reaches state "success" (the end of the
+  drift chain, so survival is not an early return). In-harness positive
+  control: an image change deletes the pod. Mutation control: inserting an
+  Affinity DeepEqual drift check into Reconcile makes it FAIL ("running pod
+  was RECREATED (marker lost)").
+
+NOT PROVEN HERE: that cEOS pods actually land off worker-a. A preference ranks,
+it does not guarantee. The check is the next DemoEstate bring-up.
+
+WIRING: the operator Deployment carries only SKYFORGE_MAX_CONCURRENT_BRINGUP
+today, so the SSD-avoid half stays dormant (fail-open) until either the
+chart passes SKYFORGE_KNE_IO_HEAVY_NODE_LABELS_JSON to the manager
+container or kne's arista.CreateCRD forwards it into the device envvars.
+The same-lab spread needs no wiring.
+---
+ controllers/ceoslabdevice_controller.go       | 124 ++++++++
+ .../ceoslabdevice_soft_placement_test.go      | 275 ++++++++++++++++++
+ 2 files changed, 399 insertions(+)
+ create mode 100644 controllers/ceoslabdevice_soft_placement_test.go
+
+diff --git a/controllers/ceoslabdevice_controller.go b/controllers/ceoslabdevice_controller.go
+index 0e6ea06..432e306 100644
+--- a/controllers/ceoslabdevice_controller.go
++++ b/controllers/ceoslabdevice_controller.go
+@@ -1192,6 +1192,127 @@ func getSkyforgePlacement(env map[string]string) (map[string]string, []corev1.To
+ 	return selector, tolerations, strings.TrimSpace(env["SKYFORGE_KNE_PRIORITY_CLASS_NAME"]), nil
+ }
+ 
++const (
++	// ioHeavyNodeLabelsEnv is the SAME policy input KNE reads for both halves of
++	// its IO-heavy placement (kne 0058 KNEIOHeavyNodeAffinity steers KubeVirt VMs
++	// ONTO the labelled nodes, kne 0063 KNEContainerNodeAffinity steers container
++	// pods AWAY from them). One input, so cEOS and the rest of the lab can never
++	// be steered by two different ideas of which node is "the SSD node".
++	ioHeavyNodeLabelsEnv = "SKYFORGE_KNE_IO_HEAVY_NODE_LABELS_JSON"
++	// kneTopoLabel is the label KNE puts on every pod of a lab (value: the lab
++	// namespace) and that getLabels() puts on every cEOS pod by default.
++	kneTopoLabel = "topo"
++	// softPlacementWeight matches KNE's container-pod terms exactly (kne 0059/
++	// 0062 anti-affinity, kne 0063 node affinity), so a cEOS pod and an IOL pod
++	// of the same lab are ranked by the same rule with the same strength.
++	softPlacementWeight = 100
++)
++
++// getSkyforgeSoftPlacement gives a cEOS pod the SAME two soft placement terms
++// KNE gives every other container-backed lab pod (generic CreatePod plus the
++// cisco/juniper/forward/alpine copies). MEASURED 2026-09-23 on DemoEstate
++// (user-skyforge-demo-estate-13-fu-798b2b0d): every one of its 63 cEOS pods,
++// and all 72 cluster-wide, sat on worker-a, while its IOL/linux
++// pods spread 101/33/34/33 across the four lab nodes. The cEOS pod spec had
++// `affinity` and `topologySpreadConstraints` both empty and only the
++// skyforge.example.com/labs=true selector, so default scoring sent
++// every cEOS to the node with the most allocatable CPU (95 vs 30) -- which is
++// also the only disk-class=ssd node, the one kne 0058 reserves for the
++// KubeVirt VMs that must unpack ~28 GB on first boot.
++//
++// Rendered, the result is identical to a live KNE-built IOL pod's affinity:
++//
++//	nodeAffinity.preferred[weight 100]: <label> NotIn [<value>]  (per ioHeavyNodeLabelsEnv entry)
++//	podAntiAffinity.preferred[weight 100]: topo In [<namespace>], topologyKey kubernetes.io/hostname
++//
++// PREFERRED ONLY, NEVER REQUIRED. Same contract as kne 0058/0063/0064: a lab
++// must never fail to schedule because the preferred node is full, cordoned or
++// absent. A preference ranks; it cannot refuse.
++//
++// THE ANTI-AFFINITY SELECTS THE LABEL THE POD ACTUALLY CARRIES. kne 0059/0062
++// exist because upstream KNE labelled pods topo=<namespace> and selected
++// topo In [<pod name>] -- a term that matched nothing, eleven lines apart.
++// Here the value is read from the label map getPod stamps on this very pod,
++// so the selector and the label agree by construction. getLabels() defaults
++// topo to the namespace, which is exactly the value KNE's own pods carry, so
++// cEOS and IOL of one lab repel EACH OTHER, not just their own kind.
++//
++// FAILS OPEN on the node half: an unset, empty, `{}` or unparseable policy
++// yields no node affinity (the anti-affinity is unconditional, as in KNE).
++// The policy is read from the device's envvars first -- the path every other
++// placement input in getSkyforgePlacement takes (kne 0024 forwards them from
++// the kne_cli env in arista.CreateCRD) -- and then from the operator's own
++// process env, so either wiring works and a per-device value is authoritative.
++//
++// NEW PODS ONLY. Pod affinity is not in the Reconcile drift checks (and is
++// immutable on a scheduled pod anyway), so rolling an operator that carries
++// this recreates nothing: a running lab keeps its placement until its pods are
++// recreated for some other reason (stop/start, redeploy, a real drift).
++func getSkyforgeSoftPlacement(podLabels map[string]string, env map[string]string) *corev1.Affinity {
++	affinity := &corev1.Affinity{NodeAffinity: getIOHeavyAvoidNodeAffinity(env)}
++	if topo := podLabels[kneTopoLabel]; topo != "" {
++		affinity.PodAntiAffinity = &corev1.PodAntiAffinity{
++			PreferredDuringSchedulingIgnoredDuringExecution: []corev1.WeightedPodAffinityTerm{{
++				Weight: softPlacementWeight,
++				PodAffinityTerm: corev1.PodAffinityTerm{
++					LabelSelector: &metav1.LabelSelector{
++						MatchExpressions: []metav1.LabelSelectorRequirement{{
++							Key:      kneTopoLabel,
++							Operator: metav1.LabelSelectorOpIn,
++							Values:   []string{topo},
++						}},
++					},
++					TopologyKey: "kubernetes.io/hostname",
++				},
++			}},
++		}
++	}
++	if affinity.NodeAffinity == nil && affinity.PodAntiAffinity == nil {
++		return nil
++	}
++	return affinity
++}
++
++// getIOHeavyAvoidNodeAffinity is the operator-side twin of kne 0063's
++// KNEContainerNodeAffinity: the complement (NotIn) of the IO-heavy node labels,
++// one expression per label in sorted key order, in ONE preferred term.
++func getIOHeavyAvoidNodeAffinity(env map[string]string) *corev1.NodeAffinity {
++	raw := strings.TrimSpace(env[ioHeavyNodeLabelsEnv])
++	if raw == "" {
++		raw = strings.TrimSpace(os.Getenv(ioHeavyNodeLabelsEnv))
++	}
++	if raw == "" {
++		return nil
++	}
++	labels := map[string]string{}
++	if err := json.Unmarshal([]byte(raw), &labels); err != nil {
++		kLog.Log.Error(err, "ignoring invalid "+ioHeavyNodeLabelsEnv+"; cEOS pods get no node preference")
++		return nil
++	}
++	if len(labels) == 0 {
++		return nil
++	}
++	keys := make([]string, 0, len(labels))
++	for k := range labels {
++		keys = append(keys, k)
++	}
++	sort.Strings(keys)
++	exprs := make([]corev1.NodeSelectorRequirement, 0, len(keys))
++	for _, k := range keys {
++		exprs = append(exprs, corev1.NodeSelectorRequirement{
++			Key:      k,
++			Operator: corev1.NodeSelectorOpNotIn,
++			Values:   []string{labels[k]},
++		})
++	}
++	return &corev1.NodeAffinity{
++		PreferredDuringSchedulingIgnoredDuringExecution: []corev1.PreferredSchedulingTerm{{
++			Weight:     softPlacementWeight,
++			Preference: corev1.NodeSelectorTerm{MatchExpressions: exprs},
++		}},
++	}
++}
++
+ // Pods
+ 
+ func getPod(pod *corev1.Pod, device *ceoslabv1alpha1.CEosLabDevice, secretsAndConfigMaps map[string]client.Object, useStartupPersistence bool) error {
+@@ -1279,6 +1400,9 @@ func getPod(pod *corev1.Pod, device *ceoslabv1alpha1.CEosLabDevice, secretsAndCo
+ 		Tolerations:        tolerations,
+ 		PriorityClassName:  priorityClassName,
+ 		Volumes:            volumes,
++		// Soft placement parity with KNE's container pods. Preferred only, and
++		// not in the drift checks, so only newly created pods get it.
++		Affinity: getSkyforgeSoftPlacement(labels, envVarsMap),
+ 	}
+ 	return nil
+ }
+diff --git a/controllers/ceoslabdevice_soft_placement_test.go b/controllers/ceoslabdevice_soft_placement_test.go
+new file mode 100644
+index 0000000..578462d
+--- /dev/null
++++ b/controllers/ceoslabdevice_soft_placement_test.go
+@@ -0,0 +1,275 @@
++package controllers
++
++import (
++	"context"
++	"encoding/json"
++	"reflect"
++	"testing"
++
++	ceoslabv1alpha1 "github.com/aristanetworks/arista-ceoslab-operator/v2/api/v1alpha1"
++	corev1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/api/errors"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/labels"
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/types"
++	ctrl "sigs.k8s.io/controller-runtime"
++	"sigs.k8s.io/controller-runtime/pkg/client/fake"
++)
++
++// These tests exercise getPod and Reconcile only -- no helper added by the
++// soft-placement change -- so the file compiles against the pre-change
++// operator and the parity tests FAIL there (positive control), then pass.
++
++const (
++	softPlacementNS     = "user-skyforge-demo-estate-13-fu-798b2b0d"
++	softPlacementPolicy = `{"skyforge.example.com/disk-class":"ssd"}`
++	// liveIOLAffinity is the affinity of a KNE-built IOL pod in the same lab,
++	// copied verbatim from the cluster on 2026-09-23:
++	//   kubectl -n user-skyforge-demo-estate-13-fu-798b2b0d get pod siteA-bldg1-ios-csw01 -o jsonpath='{.spec.affinity}'
++	liveIOLAffinity = `{"nodeAffinity":{"preferredDuringSchedulingIgnoredDuringExecution":[{"preference":{"matchExpressions":[{"key":"skyforge.example.com/disk-class","operator":"NotIn","values":["ssd"]}]},"weight":100}]},"podAntiAffinity":{"preferredDuringSchedulingIgnoredDuringExecution":[{"podAffinityTerm":{"labelSelector":{"matchExpressions":[{"key":"topo","operator":"In","values":["user-skyforge-demo-estate-13-fu-798b2b0d"]}]},"topologyKey":"kubernetes.io/hostname"},"weight":100}]}}`
++)
++
++// softPlacementDevice mirrors what KNE's arista node creates: the CR carries
++// topo=<namespace> plus model/os/vendor labels (read off the live
++// siteA-dc1-veos-leaf1 CEosLabDevice, 2026-09-23).
++func softPlacementDevice(env map[string]string) *ceoslabv1alpha1.CEosLabDevice {
++	return &ceoslabv1alpha1.CEosLabDevice{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      "siteA-dc1-veos-leaf1",
++			Namespace: softPlacementNS,
++			Labels: map[string]string{
++				"app": "siteA-dc1-veos-leaf1", "model": "ceos", "os": "eos",
++				"topo": softPlacementNS, "vendor": "ARISTA",
++			},
++		},
++		Spec: ceoslabv1alpha1.CEosLabDeviceSpec{
++			Image:         "ceos:4.34.1F",
++			NumInterfaces: 2,
++			EnvVar:        env,
++		},
++	}
++}
++
++func buildSoftPlacementPod(t *testing.T, device *ceoslabv1alpha1.CEosLabDevice) *corev1.Pod {
++	t.Helper()
++	pod := &corev1.Pod{}
++	if err := getPod(pod, device, nil, false); err != nil {
++		t.Fatalf("getPod() failed: %v", err)
++	}
++	return pod
++}
++
++// THE cEOS POD CARRIES EXACTLY WHAT KNE PUTS ON AN IOL POD OF THE SAME LAB.
++// Compared against the LIVE rendered IOL affinity rather than a hand-written
++// expectation, so "same soft placement as KNE" is checked against KNE's
++// actual output, not against our reading of it.
++func TestGetPodSoftPlacementMatchesLiveKNEContainerPod(t *testing.T) {
++	t.Setenv(ioHeavyNodeLabelsEnvForTest, softPlacementPolicy)
++	pod := buildSoftPlacementPod(t, softPlacementDevice(nil))
++
++	want := &corev1.Affinity{}
++	if err := json.Unmarshal([]byte(liveIOLAffinity), want); err != nil {
++		t.Fatal(err)
++	}
++	if !reflect.DeepEqual(pod.Spec.Affinity, want) {
++		got, _ := json.Marshal(pod.Spec.Affinity)
++		t.Fatalf("cEOS affinity does not match the live KNE IOL pod\n got: %s\nwant: %s", got, liveIOLAffinity)
++	}
++}
++
++// NEVER REQUIRED: a lab must never fail to schedule because a preferred node
++// is full or absent. Pinned separately so a future "just make it required"
++// fails with the reason attached.
++func TestGetPodSoftPlacementIsNeverRequired(t *testing.T) {
++	t.Setenv(ioHeavyNodeLabelsEnvForTest, softPlacementPolicy)
++	a := buildSoftPlacementPod(t, softPlacementDevice(nil)).Spec.Affinity
++	if a == nil || a.NodeAffinity == nil || a.PodAntiAffinity == nil {
++		t.Fatalf("expected both soft terms, got %#v", a)
++	}
++	if a.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution != nil {
++		t.Fatal("node affinity is REQUIRED -- a busy SSD node would refuse the lab")
++	}
++	if len(a.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution) != 0 {
++		t.Fatal("pod anti-affinity is REQUIRED -- a lab larger than the node count would never schedule")
++	}
++	if a.PodAffinity != nil {
++		t.Fatalf("unexpected pod affinity %#v", a.PodAffinity)
++	}
++}
++
++// THE SELECTOR MUST SELECT THE POD'S OWN LABEL (the kne 0059/0062 defect: a
++// term keyed on a value no pod carries repels nothing). Checked against the
++// labels getPod actually stamped, for a CR whose topo label is present and
++// for one without any labels (getLabels defaults topo to the namespace).
++func TestGetPodSoftPlacementSelectorMatchesOwnTopoLabel(t *testing.T) {
++	t.Setenv(ioHeavyNodeLabelsEnvForTest, "")
++	bare := softPlacementDevice(nil)
++	bare.Labels = nil
++	for name, device := range map[string]*ceoslabv1alpha1.CEosLabDevice{
++		"kne-labelled": softPlacementDevice(nil),
++		"unlabelled":   bare,
++	} {
++		t.Run(name, func(t *testing.T) {
++			pod := buildSoftPlacementPod(t, device)
++			if pod.Spec.Affinity == nil || pod.Spec.Affinity.PodAntiAffinity == nil {
++				t.Fatalf("no pod anti-affinity: %#v", pod.Spec.Affinity)
++			}
++			terms := pod.Spec.Affinity.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution
++			if len(terms) != 1 || terms[0].Weight != 100 || terms[0].PodAffinityTerm.TopologyKey != "kubernetes.io/hostname" {
++				t.Fatalf("anti-affinity terms = %#v", terms)
++			}
++			sel, err := metav1.LabelSelectorAsSelector(terms[0].PodAffinityTerm.LabelSelector)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if !sel.Matches(labels.Set(pod.Labels)) {
++				t.Fatalf("selector %q does not select the pod's own labels %v -- the term repels nothing", sel, pod.Labels)
++			}
++			if pod.Labels["topo"] != softPlacementNS {
++				t.Fatalf("topo label = %q, want the namespace %q (the value KNE's own pods carry)", pod.Labels["topo"], softPlacementNS)
++			}
++		})
++	}
++}
++
++// FAIL OPEN: no/empty/malformed policy -> no node affinity (the anti-affinity
++// is unconditional, as in KNE). A per-device envvar is authoritative over the
++// operator env, including a `{}` that disables it for that device.
++func TestGetPodSoftPlacementNodePolicySources(t *testing.T) {
++	for _, tc := range []struct {
++		name, processEnv string
++		deviceEnv        map[string]string
++		wantAvoidSSD     bool
++	}{
++		{name: "unset", processEnv: ""},
++		{name: "blank", processEnv: "   "},
++		{name: "empty object", processEnv: "{}"},
++		{name: "malformed", processEnv: "{not json"},
++		{name: "operator env", processEnv: softPlacementPolicy, wantAvoidSSD: true},
++		{name: "device env only", deviceEnv: map[string]string{ioHeavyNodeLabelsEnvForTest: softPlacementPolicy}, wantAvoidSSD: true},
++		{name: "device env disables", processEnv: softPlacementPolicy, deviceEnv: map[string]string{ioHeavyNodeLabelsEnvForTest: "{}"}},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			t.Setenv(ioHeavyNodeLabelsEnvForTest, tc.processEnv)
++			a := buildSoftPlacementPod(t, softPlacementDevice(tc.deviceEnv)).Spec.Affinity
++			if a == nil || a.PodAntiAffinity == nil {
++				t.Fatalf("pod anti-affinity must be unconditional, got %#v", a)
++			}
++			if !tc.wantAvoidSSD {
++				if a.NodeAffinity != nil {
++					t.Fatalf("expected no node affinity (fail open), got %#v", a.NodeAffinity)
++				}
++				return
++			}
++			if a.NodeAffinity == nil {
++				t.Fatal("expected the SSD-avoid node preference")
++			}
++			terms := a.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution
++			want := []corev1.PreferredSchedulingTerm{{Weight: 100, Preference: corev1.NodeSelectorTerm{
++				MatchExpressions: []corev1.NodeSelectorRequirement{{
++					Key: "skyforge.example.com/disk-class", Operator: corev1.NodeSelectorOpNotIn, Values: []string{"ssd"},
++				}},
++			}}}
++			if !reflect.DeepEqual(terms, want) {
++				t.Fatalf("node affinity terms = %#v", terms)
++			}
++		})
++	}
++}
++
++// ROLLING THE OPERATOR MUST NOT RECREATE A RUNNING cEOS POD. Drive Reconcile
++// against a fake API server holding a pod shaped like one the pre-change
++// operator created (Affinity nil), with the SSD policy now set so the desired
++// affinity differs from the running pod's as much as it can. The pod must
++// survive every reconcile untouched. POSITIVE CONTROL in the same harness: a
++// real drift (an image change) is seen and the pod IS deleted, so a survival
++// here is not the harness failing to observe deletes.
++func TestReconcileDoesNotRecreateRunningPodForAffinity(t *testing.T) {
++	scheme := runtime.NewScheme()
++	if err := corev1.AddToScheme(scheme); err != nil {
++		t.Fatal(err)
++	}
++	if err := ceoslabv1alpha1.AddToScheme(scheme); err != nil {
++		t.Fatal(err)
++	}
++	ctx := context.Background()
++	device := softPlacementDevice(nil)
++	key := types.NamespacedName{Name: device.Name, Namespace: device.Namespace}
++	r := &CEosLabDeviceReconciler{
++		Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(device).Build(),
++		Scheme: scheme,
++	}
++	defer bringupAdmissions.release(key)
++	reconcileN := func(n int) {
++		t.Helper()
++		for i := 0; i < n; i++ {
++			if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
++				t.Fatalf("Reconcile #%d: %v", i, err)
++			}
++		}
++	}
++
++	// 1. The operator creates the pod, with no policy configured.
++	t.Setenv(ioHeavyNodeLabelsEnvForTest, "")
++	reconcileN(5)
++	pod := &corev1.Pod{}
++	if err := r.Get(ctx, key, pod); err != nil {
++		t.Fatalf("operator did not create the pod: %v", err)
++	}
++
++	// 2. Make it a PRE-CHANGE pod: no affinity at all, and a marker that a
++	//    delete+recreate would not carry over.
++	pod.Spec.Affinity = nil
++	if pod.Annotations == nil {
++		pod.Annotations = map[string]string{}
++	}
++	pod.Annotations["test/generation"] = "original"
++	if err := r.Update(ctx, pod); err != nil {
++		t.Fatal(err)
++	}
++
++	// 3. Roll to an operator with the policy set; reconcile repeatedly.
++	t.Setenv(ioHeavyNodeLabelsEnvForTest, softPlacementPolicy)
++	reconcileN(5)
++	after := &corev1.Pod{}
++	if err := r.Get(ctx, key, after); err != nil {
++		t.Fatalf("running pod was DELETED on reconcile after the affinity change: %v", err)
++	}
++	if after.Annotations["test/generation"] != "original" {
++		t.Fatalf("running pod was RECREATED (marker lost): %v", after.Annotations)
++	}
++	if after.Spec.Affinity != nil {
++		t.Fatalf("running pod's affinity was rewritten in place: %#v", after.Spec.Affinity)
++	}
++	// Survival only counts if Reconcile walked the WHOLE drift chain and did
++	// not bail out early: "success" is set only after the last drift check.
++	reconciled := &ceoslabv1alpha1.CEosLabDevice{}
++	if err := r.Get(ctx, key, reconciled); err != nil {
++		t.Fatal(err)
++	}
++	if reconciled.Status.State != SUCCESS_STATE {
++		t.Fatalf("Reconcile never reached the end of the drift checks (state=%q, reason=%q) -- survival proves nothing",
++			reconciled.Status.State, reconciled.Status.Reason)
++	}
++
++	// 4. Positive control: a real drift IS acted on by this same harness.
++	current := &ceoslabv1alpha1.CEosLabDevice{}
++	if err := r.Get(ctx, key, current); err != nil {
++		t.Fatal(err)
++	}
++	current.Spec.Image = "ceos:4.35.0F"
++	if err := r.Update(ctx, current); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
++		t.Fatal(err)
++	}
++	if err := r.Get(ctx, key, &corev1.Pod{}); !errors.IsNotFound(err) {
++		t.Fatalf("positive control: an image change must delete the pod, got err=%v", err)
++	}
++}
++
++// Spelled out here rather than referencing the production constant so this
++// file compiles against the pre-change operator (the positive control).
++const ioHeavyNodeLabelsEnvForTest = "SKYFORGE_KNE_IO_HEAVY_NODE_LABELS_JSON"
+-- 
+2.55.0
+

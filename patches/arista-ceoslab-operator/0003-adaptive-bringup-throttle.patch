@@ -1,0 +1,176 @@
+From 157c22ca54dd4378e1bce6f49c2f42727723f77b Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Fri, 17 Jul 2026 18:27:12 -0500
+Subject: [PATCH 3/9] skyforge(bringup): adaptive bringup throttle to stop
+ CNI-burst node wedge
+
+Defer (not fail) creating a device pod when the node is visibly backing up on
+sandbox creation: back off when any pod is stuck Pending past the sandbox
+deadline with no container started, or as a catastrophe backstop when the
+in-flight count hits a high ceiling. Prevents a large topology from bursting
+meshnet/containerd and wedging the node NotReady (task#40/#47).
+---
+ controllers/ceoslabdevice_controller.go | 126 ++++++++++++++++++++++++
+ 1 file changed, 126 insertions(+)
+
+diff --git a/controllers/ceoslabdevice_controller.go b/controllers/ceoslabdevice_controller.go
+index 2d109b3..0f90c54 100644
+--- a/controllers/ceoslabdevice_controller.go
++++ b/controllers/ceoslabdevice_controller.go
+@@ -27,6 +27,7 @@ import (
+ 	"encoding/pem"
+ 	"fmt"
+ 	"math/big"
++	"os"
+ 	"reflect"
+ 	"regexp"
+ 	"runtime"
+@@ -65,6 +66,26 @@ const (
+ 	startupPersistenceVolumeName = "startup-config-persistence"
+ 	startupPersistenceSeedDir    = "/var/run/ceos/startup-seed"
+ 	startupPersistenceActiveDir  = "/var/run/ceos/startup-active"
++
++	// Bringup pacing (ADAPTIVE): a large topology otherwise creates every CEosLab pod
++	// at once; the burst of per-pod meshnet CNI-ADD + veth wiring overwhelms containerd's
++	// sandbox creation (FailedCreatePodSandBox / DeadlineExceeded -> the CRI wedges and
++	// the node goes NotReady). Rather than a fixed low cap (which needlessly slows every
++	// deploy), the operator lets bringup run at high concurrency and DEFERS new pods only
++	// when the node is visibly backing up on sandbox creation — so a deploy of any size
++	// succeeds AND small/medium deploys aren't throttled.
++	defaultMaxConcurrentBringup = 16               // high ceiling / catastrophe backstop; tunable via SKYFORGE_MAX_CONCURRENT_BRINGUP
++	bringupSandboxDeadline      = 45 * time.Second // a cEOS pod Pending this long with no sandbox/init started => CNI is backing up
++	bringupRequeueAfter         = 10 * time.Second // how soon to retry a deferred device
++
++	// ceosLabDeviceKind is the owner Kind SetControllerReference stamps on every pod the
++	// operator creates. The bringup throttle counts ONLY pods carrying this owner ref —
++	// the cEOS devices it actually paces. It must NOT count the meshnet-gated linux host
++	// pods (brNhN) that KNE/meshnet create: those sit Pending (Init:0/N) precisely BECAUSE
++	// their cEOS peer does not exist yet, so counting them makes the gate hold cEOS pod
++	// creation against pods that cannot progress until that cEOS exists — a self-inflicted
++	// deadlock previously broken only by a stale timeout (task#79).
++	ceosLabDeviceKind = "CEosLabDevice"
+ )
+ 
+ var (
+@@ -287,6 +308,16 @@ func (r *CEosLabDeviceReconciler) Reconcile(ctx context.Context, req ctrl.Reques
+ 	// EOS ssdinit, stalling Sysdb past the startup-probe budget (task #77).
+ 	startupPersistenceEnabled := startupConfigResourceVersion != nil
+ 
++	// Adaptive bringup pacing: defer (don't fail) creating this device's pod when the
++	// node is backing up on sandbox creation, so a topology of any size comes up instead
++	// of bursting meshnet/containerd and wedging the node (see task#40/#47).
++	if throttled, reason, err := r.bringupThrottled(ctx, device); err != nil {
++		return noRequeue, err
++	} else if throttled {
++		r.updateDeviceReconciling(ctx, device, reason)
++		return ctrl.Result{RequeueAfter: bringupRequeueAfter}, nil
++	}
++
+ 	// Pods
+ 
+ 	devicePod := &corev1.Pod{}
+@@ -688,6 +719,101 @@ func (r *CEosLabDeviceReconciler) getOrCreateObject(ctx context.Context, device
+ 	return nil
+ }
+ 
++// maxConcurrentBringup returns the cap on how many pods may be in the sandbox/init
++// (Pending) window in a namespace before new CEosLab pods are deferred. Tunable via
++// the SKYFORGE_MAX_CONCURRENT_BRINGUP operator env var; a non-positive/unparseable
++// value falls back to the default.
++func maxConcurrentBringup() int {
++	if v := strings.TrimSpace(os.Getenv("SKYFORGE_MAX_CONCURRENT_BRINGUP")); v != "" {
++		if n, err := strconv.Atoi(v); err == nil && n > 0 {
++			return n
++		}
++	}
++	return defaultMaxConcurrentBringup
++}
++
++// podSandboxStarted reports whether a pod has progressed past sandbox creation — any
++// init or main container has started (Running or Terminated). A Pending pod with no
++// started container is still in the CNI/sandbox-creation window (ContainerCreating);
++// once a container has started, the sandbox exists (e.g. a cEOS init-wait container
++// blocking on interfaces is normal, not backpressure).
++func podSandboxStarted(p *corev1.Pod) bool {
++	for _, cs := range p.Status.InitContainerStatuses {
++		if cs.State.Running != nil || cs.State.Terminated != nil {
++			return true
++		}
++	}
++	for _, cs := range p.Status.ContainerStatuses {
++		if cs.State.Running != nil || cs.State.Terminated != nil {
++			return true
++		}
++	}
++	return false
++}
++
++// ownedByCEosLabDevice reports whether a pod was created by this operator — it carries a
++// controller OwnerReference to a CEosLabDevice. The bringup throttle counts ONLY these
++// pods: they are the cEOS devices the operator paces. The linux host pods KNE/meshnet
++// create (brNhN) carry no such owner ref and are themselves gated ON their cEOS peer
++// (Pending Init:0/N until the peer pod exists); counting them against the bringup budget
++// would make the throttle hold cEOS creation on pods that cannot start until that cEOS
++// exists — a deadlock (task#79).
++func ownedByCEosLabDevice(p *corev1.Pod) bool {
++	for i := range p.OwnerReferences {
++		if p.OwnerReferences[i].Kind == ceosLabDeviceKind {
++			return true
++		}
++	}
++	return false
++}
++
++// bringupThrottled decides whether creating device's pod should be DEFERRED (not failed).
++// It only gates a device whose pod does not yet exist, and reasons ONLY over the cEOS pods
++// this operator owns (never the meshnet-gated host pods — see ownedByCEosLabDevice). It
++// backs off when the node is visibly backing up on sandbox creation — any owned cEOS pod
++// stuck Pending past bringupSandboxDeadline with no sandbox/init started (adaptive
++// backpressure) — or, as a catastrophe backstop, when the number of owned cEOS pods still
++// coming up hits the high ceiling. Admission of the next device is released by real
++// progress: a paced cEOS pod stops counting the moment it leaves Pending (sandbox created
++// and boot underway), so the gate is readiness-driven, not timer-driven — there is no
++// stale timeout because there is no host-pod miscount left to deadlock on. Returns a
++// human-readable reason when throttling.
++func (r *CEosLabDeviceReconciler) bringupThrottled(ctx context.Context, device *ceoslabv1alpha1.CEosLabDevice) (bool, string, error) {
++	existing := &corev1.Pod{}
++	err := r.Get(ctx, types.NamespacedName{Name: device.Name, Namespace: device.Namespace}, existing)
++	if err == nil {
++		return false, "", nil // pod already exists; never throttle
++	}
++	if !errors.IsNotFound(err) {
++		return false, "", err
++	}
++	podList := &corev1.PodList{}
++	if err := r.List(ctx, podList, client.InNamespace(device.Namespace)); err != nil {
++		return false, "", err
++	}
++	inflight, stuckCreating := 0, 0
++	for i := range podList.Items {
++		p := &podList.Items[i]
++		if !ownedByCEosLabDevice(p) {
++			continue // only pace the cEOS pods we own; never count the host pods gated on us
++		}
++		if p.Status.Phase != corev1.PodPending {
++			continue // a cEOS pod that has left Pending has cleared the sandbox/init window
++		}
++		inflight++
++		if time.Since(p.CreationTimestamp.Time) > bringupSandboxDeadline && !podSandboxStarted(p) {
++			stuckCreating++ // still in the CNI/sandbox window past the deadline => backpressure
++		}
++	}
++	if stuckCreating > 0 {
++		return true, fmt.Sprintf("node is backing up on sandbox creation (%d cEOS pod(s) stuck in ContainerCreating in namespace %s); deferring pod creation", stuckCreating, device.Namespace), nil
++	}
++	if inflight >= maxConcurrentBringup() {
++		return true, fmt.Sprintf("bringup ceiling reached (%d cEOS pods still initializing in namespace %s); deferring pod creation", inflight, device.Namespace), nil
++	}
++	return false, "", nil
++}
++
+ func (r *CEosLabDeviceReconciler) ensureCEosConfigMap(ctx context.Context, device *ceoslabv1alpha1.CEosLabDevice, name string, data string, configMap *corev1.ConfigMap) error {
+ 	log := kLog.FromContext(ctx)
+ 	desired := map[string]string{"ceos-config": data}
+-- 
+2.55.0
+

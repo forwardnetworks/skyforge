@@ -1,0 +1,473 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sat, 5 Sep 2026 10:54:10 -0500
+Subject: [PATCH] api: shard the vxlan create lock by target slot and host VNI
+ tuple
+
+MakeVxLan took ONE process-global mutex plus ONE global flock file for the
+whole of observe -> create -> move-into-netns -> configure. That is correct
+and far stronger than the invariant it protects, and it is the last global
+serialization point left on the vxlan path after 0006 sharded the veth one.
+
+What the critical section actually owns is two things, and only two:
+
+  * the TARGET SLOT (netns, ifname). ensureExistingVxLan() reads it,
+    SetVethLink() writes it and removeLinkInNSIfExists() deletes from it, so
+    every actor programming that exact slot must be serialized.
+  * the HOST VNI TUPLE (vni, lower device, UDP port). Linux refuses a second
+    host VXLAN with that tuple, and isConflictingHostVxLan() matches
+    candidates on exactly it, so the EEXIST -> clean -> retry dance is only
+    ever contended between creators that share it. Note the remote VTEP is
+    deliberately NOT part of the key: two wires to different peers with the
+    same VNI on the same parent DO collide.
+
+Nothing else in MakeVxLan is shared. The staging name is crypto-random
+(0002), so temp-name collisions are not a concern, and the conflict scan is
+already scoped to the target netns (0008) and only ever deletes a link whose
+IFLA_IFALIAS carries OUR owner key (0004), so a creator with a different VNI
+cannot be touched by another's cleanup. Sharding by those two keys therefore
+narrows the lock to the collision domain without widening any scope.
+
+Both layers are kept, because koko runs in two processes at once (the meshnet
+daemon and the CNI plugin binary kubelet execs): a refcounted in-process
+mutex per key, and an flock(2) on a per-key file. Keys are acquired in sorted
+order, which is the deadlock argument; MakeVxLan is never called while a veth
+endpoint lock is held, so there is no lock-order inversion with 0006.
+
+KOKO_VXLAN_LOCK keeps working and keeps selecting WHERE the lock files live:
+vxlanLockPaths() is untouched (its two existing tests still pass unchanged,
+which is the evidence the path contract did not move) and vxlanLockDirs()
+takes the directory half of it.
+
+Why upstream wants this: it is a pure concurrency win with no API change and
+no behaviour change for a single creator, and it is the exact companion to
+0006 -- the same argument, applied to the other half of koko's wire surface.
+
+Positive control: TestVxlanCreateLockSerializesOverlapOnly holds one wire's
+locks and proves a disjoint creator proceeds while a creator sharing EITHER
+the target slot or the host tuple blocks, then acquires on release. Executed
+negative control: forcing vxlanCreateLockKeys() to return a single constant
+key reproduces the old global lock and the test fails with "a disjoint vxlan
+creator was blocked: the lock is still global".
+---
+ api/koko_api.go             |  77 ++++++++++++------
+ api/koko_shard_lock.go      | 136 ++++++++++++++++++++++++++++++++
+ api/koko_vxlan_lock_test.go | 151 ++++++++++++++++++++++++++++++++++++
+ 3 files changed, 342 insertions(+), 22 deletions(-)
+ create mode 100644 api/koko_shard_lock.go
+ create mode 100644 api/koko_vxlan_lock_test.go
+
+diff --git a/api/koko_api.go b/api/koko_api.go
+index 77473d3..8cc5faf 100644
+--- a/api/koko_api.go
++++ b/api/koko_api.go
+@@ -11,8 +11,9 @@ import (
+ 	"hash/fnv"
+ 	"net"
+ 	"os"
++	"path/filepath"
++	"sort"
+ 	"strings"
+-	"sync"
+ 	"syscall"
+ 	"time"
+ 
+@@ -70,7 +71,10 @@ type MacVLan struct {
+ 	Mode     netlink.MacvlanMode // MacVlan mode
+ }
+ 
+-var vxlanCreateMu sync.Mutex
++// vxlanCreateLocks shards the vxlan creation lock by the resources one
++// MakeVxLan actually owns (see vxlanCreateLockKeys). It replaces the single
++// process-global mutex this line used to declare.
++var vxlanCreateLocks = newShardLockTable()
+ 
+ // getRandomIFName generates random string for unique interface name
+ func getRandomIFName() string {
+@@ -1125,30 +1129,59 @@ func vxlanLockPaths() []string {
+ 	return []string{"/opt/cni/bin/.koko-vxlan-create.lock", "/var/run/netns/.koko-vxlan-create.lock", "/run/koko-vxlan-create.lock"}
+ }
+ 
+-func acquireVXLANCreateLock() func() {
+-	vxlanCreateMu.Lock()
+-	var lastErr error
++// vxlanLockDirs is where the per-shard lock files live: the DIRECTORY half of
++// vxlanLockPaths(), so KOKO_VXLAN_LOCK keeps selecting the location while the
++// files themselves are now per-shard rather than one global file.
++func vxlanLockDirs() []string {
++	seen := map[string]bool{}
++	dirs := make([]string, 0, 3)
+ 	for _, path := range vxlanLockPaths() {
+-		lockFile, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+-		if err != nil {
+-			lastErr = err
+-			continue
+-		}
+-		if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+-			lastErr = err
+-			_ = lockFile.Close()
++		dir := filepath.Dir(path)
++		if dir == "" || seen[dir] {
+ 			continue
+ 		}
+-		return func() {
+-			_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+-			_ = lockFile.Close()
+-			vxlanCreateMu.Unlock()
+-		}
++		seen[dir] = true
++		dirs = append(dirs, dir)
+ 	}
+-	logger.Warnf("koko: continuing without vxlan create file lock: %+v", lastErr)
+-	return func() {
+-		vxlanCreateMu.Unlock()
++	return dirs
++}
++
++// vxlanTargetLockKey names the slot the new wire will occupy: one (netns,
++// ifname) pair. ensureExistingVxLan reads it, SetVethLink writes it, and
++// removeLinkInNSIfExists deletes from it -- so every actor programming that
++// exact slot must be serialized, and no actor programming a different slot
++// needs to be.
++func vxlanTargetLockKey(veth VEth) string {
++	return "vxlan-target\x00" + veth.NsName + "\x00" + veth.LinkName
++}
++
++// vxlanHostLockKey names the HOST-side ownership tuple the kernel enforces.
++// Linux refuses a second VXLAN with the same (vni, lower device, UDP port),
++// and isConflictingHostVxLan() matches candidates on exactly that tuple, so
++// the EEXIST-then-clean-then-retry dance is only ever contended between
++// creators that share it. The parent is keyed by NAME because that is what
++// the caller supplies; it resolves to the index the conflict scan compares.
++func vxlanHostLockKey(vxlan VxLan) string {
++	return fmt.Sprintf("vxlan-host\x00%s\x00%d\x00%d", vxlan.ParentIF, vxlan.ID, normalizedVXLANPort(vxlan.UDPPort))
++}
++
++// vxlanCreateLockKeys returns the unique keys one MakeVxLan owns, in
++// canonical order. Sorting is what makes multi-key acquisition deadlock-free
++// across concurrent creators.
++func vxlanCreateLockKeys(veth VEth, vxlan VxLan) []string {
++	keys := []string{vxlanTargetLockKey(veth), vxlanHostLockKey(vxlan)}
++	sort.Strings(keys)
++	if keys[0] == keys[1] {
++		return keys[:1]
+ 	}
++	return keys
++}
++
++// acquireVXLANCreateLock serializes only the creators that can actually
++// collide: those programming the same target slot, and those competing for
++// the same host VNI tuple. Disjoint wires proceed in parallel.
++func acquireVXLANCreateLock(veth VEth, vxlan VxLan) func() {
++	return acquireShardedLocks(vxlanCreateLocks, "vxlan-create", vxlanCreateLockKeys(veth, vxlan), vxlanLockDirs())
+ }
+ 
+ // MakeVxLan makes vxlan interface and put it into container namespace
+@@ -1157,7 +1190,7 @@ func MakeVxLan(veth1 VEth, vxlan VxLan) (err error) {
+ 	tempLinkName1 := veth1.LinkName
+ 	const maxVXLANAttempts = 5
+ 
+-	unlockVXLANCreate := acquireVXLANCreateLock()
++	unlockVXLANCreate := acquireVXLANCreateLock(veth1, vxlan)
+ 	defer unlockVXLANCreate()
+ 
+ 	parentIF, err := netlink.LinkByName(vxlan.ParentIF)
+diff --git a/api/koko_shard_lock.go b/api/koko_shard_lock.go
+new file mode 100644
+index 0000000..63cc8ca
+--- /dev/null
++++ b/api/koko_shard_lock.go
+@@ -0,0 +1,136 @@
++/*
++Keyed (sharded) creation locks.
++
++A creation lock exists to make "observe -> delete stale state -> create ->
++configure" atomic for every actor that can touch the same kernel resource.
++Making that lock GLOBAL is the easy way to get correctness and the expensive
++way to get throughput: it also serializes actors that can never collide.
++
++This file holds the generic half of the sharded-lock pattern koko already uses
++for veth endpoints, so a caller can name exactly the resources its critical
++section owns and let disjoint work proceed in parallel. Two layers, because
++koko runs in two processes at once (the meshnet daemon and the CNI plugin
++binary kubelet execs):
++
++  - an in-process refcounted mutex per key, and
++  - an flock(2) on a per-key file in a directory shared by both processes.
++
++Keys are always acquired in sorted order by the caller, which is what makes
++multi-key acquisition deadlock-free.
++*/
++package api
++
++import (
++	"crypto/sha256"
++	"fmt"
++	"os"
++	"path/filepath"
++	"sync"
++	"syscall"
++)
++
++type shardLock struct {
++	mu   sync.Mutex
++	refs int
++}
++
++// shardLockTable is a refcounted map of per-key mutexes. Entries are dropped
++// when the last holder releases, so a long-lived process does not accumulate
++// one mutex per interface name it has ever wired.
++type shardLockTable struct {
++	mu    sync.Mutex
++	byKey map[string]*shardLock
++}
++
++func newShardLockTable() *shardLockTable {
++	return &shardLockTable{byKey: map[string]*shardLock{}}
++}
++
++func (t *shardLockTable) acquire(key string) func() {
++	t.mu.Lock()
++	entry := t.byKey[key]
++	if entry == nil {
++		entry = &shardLock{}
++		t.byKey[key] = entry
++	}
++	entry.refs++
++	t.mu.Unlock()
++
++	entry.mu.Lock()
++	return func() {
++		entry.mu.Unlock()
++		t.mu.Lock()
++		entry.refs--
++		if entry.refs == 0 && t.byKey[key] == entry {
++			delete(t.byKey, key)
++		}
++		t.mu.Unlock()
++	}
++}
++
++// shardLockFileName is the per-key lock file name. The key is hashed so any
++// key shape (a netns path, an interface name, a VNI tuple) yields a legal,
++// bounded filename.
++func shardLockFileName(prefix, key string) string {
++	digest := sha256.Sum256([]byte(key))
++	return fmt.Sprintf(".koko-%s-%x.lock", prefix, digest[:16])
++}
++
++// acquireShardFileLock takes an exclusive flock on the per-key file in the
++// first directory that accepts it. A failure to lock is reported, never
++// silently swallowed: the caller decides whether to continue with in-process
++// serialization only.
++func acquireShardFileLock(prefix, key string, dirs []string) (*os.File, error) {
++	name := shardLockFileName(prefix, key)
++	var lastErr error
++	for _, dir := range dirs {
++		lockFile, err := os.OpenFile(filepath.Join(dir, name), os.O_CREATE|os.O_RDWR, 0600)
++		if err != nil {
++			lastErr = err
++			continue
++		}
++		if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
++			lastErr = err
++			_ = lockFile.Close()
++			continue
++		}
++		return lockFile, nil
++	}
++	if lastErr == nil {
++		lastErr = fmt.Errorf("no lock directory available in %v", dirs)
++	}
++	return nil, lastErr
++}
++
++type heldShardLock struct {
++	file          *os.File
++	unlockProcess func()
++}
++
++// acquireShardedLocks locks every key in keys, in the order given, across
++// goroutines and across processes. Callers MUST pass keys in a canonical
++// (sorted) order: that global ordering is the deadlock argument.
++//
++// It returns a single release function that unlocks in reverse order.
++func acquireShardedLocks(table *shardLockTable, prefix string, keys, dirs []string) func() {
++	held := make([]heldShardLock, 0, len(keys))
++	for _, key := range keys {
++		h := heldShardLock{unlockProcess: table.acquire(key)}
++		file, err := acquireShardFileLock(prefix, key, dirs)
++		if err != nil {
++			logger.Warnf("koko: continuing without cross-process %s lock for key %q: %+v", prefix, key, err)
++		} else {
++			h.file = file
++		}
++		held = append(held, h)
++	}
++	return func() {
++		for i := len(held) - 1; i >= 0; i-- {
++			if held[i].file != nil {
++				_ = syscall.Flock(int(held[i].file.Fd()), syscall.LOCK_UN)
++				_ = held[i].file.Close()
++			}
++			held[i].unlockProcess()
++		}
++	}
++}
+diff --git a/api/koko_vxlan_lock_test.go b/api/koko_vxlan_lock_test.go
+new file mode 100644
+index 0000000..a9d3c16
+--- /dev/null
++++ b/api/koko_vxlan_lock_test.go
+@@ -0,0 +1,151 @@
++package api
++
++import (
++	"net"
++	"testing"
++	"time"
++)
++
++// These tests are the POSITIVE CONTROL for sharding the vxlan create lock.
++// Before this change MakeVxLan took ONE process-global mutex plus ONE global
++// flock file, so every vxlan creation on a node -- in the daemon AND in every
++// concurrently executed CNI plugin process -- ran strictly one at a time.
++// TestVxlanCreateLockSerializesOverlapOnly fails against that behaviour: with
++// a single global lock, the disjoint creator below cannot acquire while the
++// first one is held.
++
++func vxlanFor(vni int, parent string) VxLan {
++	return VxLan{ParentIF: parent, ID: vni, IPAddr: net.ParseIP("192.0.2.7")}
++}
++
++func TestVxlanCreateLockKeysCoverTargetSlotAndHostTuple(t *testing.T) {
++	veth := VEth{NsName: "/var/run/netns/cni-a", LinkName: "eth1"}
++	keys := vxlanCreateLockKeys(veth, vxlanFor(4242, "bond0"))
++	if len(keys) != 2 {
++		t.Fatalf("vxlanCreateLockKeys() = %q, want one target key and one host key", keys)
++	}
++	// Canonical order: the same two keys must come back in the same order for
++	// every caller, which is the deadlock argument.
++	again := vxlanCreateLockKeys(veth, vxlanFor(4242, "bond0"))
++	if keys[0] != again[0] || keys[1] != again[1] {
++		t.Fatalf("key order is not canonical: %q vs %q", keys, again)
++	}
++}
++
++func TestVxlanHostLockKeyIgnoresTheRemoteVTEPButNotTheTuple(t *testing.T) {
++	// The host tuple Linux enforces is (vni, lower device, UDP port). The
++	// remote VTEP is NOT part of it: two wires to different peers with the
++	// same VNI on the same parent DO collide and must share a lock.
++	a := VxLan{ParentIF: "bond0", ID: 4242, IPAddr: net.ParseIP("192.0.2.1")}
++	b := VxLan{ParentIF: "bond0", ID: 4242, IPAddr: net.ParseIP("198.51.100.1")}
++	if vxlanHostLockKey(a) != vxlanHostLockKey(b) {
++		t.Fatal("same (vni,parent,port) with different peers must share the host lock")
++	}
++	c := VxLan{ParentIF: "bond0", ID: 4243, IPAddr: net.ParseIP("192.0.2.1")}
++	if vxlanHostLockKey(a) == vxlanHostLockKey(c) {
++		t.Fatal("different VNIs must not share the host lock")
++	}
++	d := VxLan{ParentIF: "eth0", ID: 4242, IPAddr: net.ParseIP("192.0.2.1")}
++	if vxlanHostLockKey(a) == vxlanHostLockKey(d) {
++		t.Fatal("different parent interfaces must not share the host lock")
++	}
++	// UDPPort 0 means 4789; the key must normalize so the two spellings of
++	// the same port do not shard apart and race each other.
++	e := VxLan{ParentIF: "bond0", ID: 4242, UDPPort: 4789, IPAddr: net.ParseIP("192.0.2.1")}
++	if vxlanHostLockKey(a) != vxlanHostLockKey(e) {
++		t.Fatal("UDPPort 0 and 4789 are the same port and must share the host lock")
++	}
++}
++
++func TestVxlanTargetLockKeySeparatesSlots(t *testing.T) {
++	a := VEth{NsName: "/var/run/netns/cni-a", LinkName: "eth1"}
++	b := VEth{NsName: "/var/run/netns/cni-a", LinkName: "eth2"}
++	c := VEth{NsName: "/var/run/netns/cni-b", LinkName: "eth1"}
++	if vxlanTargetLockKey(a) == vxlanTargetLockKey(b) {
++		t.Fatal("different ifnames in one netns must not share the target lock")
++	}
++	if vxlanTargetLockKey(a) == vxlanTargetLockKey(c) {
++		t.Fatal("the same ifname in different netns must not share the target lock")
++	}
++	if vxlanTargetLockKey(a) != vxlanTargetLockKey(VEth{NsName: a.NsName, LinkName: a.LinkName, MTU: 9000}) {
++		t.Fatal("the target lock must key on (netns, ifname) only")
++	}
++}
++
++func TestVxlanCreateLockSerializesOverlapOnly(t *testing.T) {
++	// Point the cross-process flock files at a temp dir so this test does not
++	// touch /opt/cni/bin and cannot be perturbed by a real meshnetd.
++	t.Setenv("KOKO_VXLAN_LOCK", t.TempDir()+"/koko-vxlan-create.lock")
++
++	held := VEth{NsName: "/var/run/netns/cni-a", LinkName: "eth1"}
++	heldVx := vxlanFor(4242, "bond0")
++
++	release := acquireVXLANCreateLock(held, heldVx)
++
++	// Disjoint: a different pod, a different interface, a different VNI.
++	// Under the old global lock this could not proceed.
++	disjoint := make(chan struct{})
++	go func() {
++		unlock := acquireVXLANCreateLock(VEth{NsName: "/var/run/netns/cni-b", LinkName: "eth3"}, vxlanFor(9999, "bond0"))
++		unlock()
++		close(disjoint)
++	}()
++
++	// Overlapping on the TARGET slot only (same netns+ifname, different VNI).
++	sameTarget := make(chan struct{})
++	go func() {
++		unlock := acquireVXLANCreateLock(held, vxlanFor(9999, "bond0"))
++		unlock()
++		close(sameTarget)
++	}()
++
++	// Overlapping on the HOST tuple only (different slot, same VNI+parent).
++	sameHost := make(chan struct{})
++	go func() {
++		unlock := acquireVXLANCreateLock(VEth{NsName: "/var/run/netns/cni-c", LinkName: "eth9"}, heldVx)
++		unlock()
++		close(sameHost)
++	}()
++
++	select {
++	case <-disjoint:
++	case <-time.After(3 * time.Second):
++		release()
++		t.Fatal("a disjoint vxlan creator was blocked: the lock is still global")
++	}
++
++	select {
++	case <-sameTarget:
++		release()
++		t.Fatal("a creator of the SAME target slot acquired while it was locked")
++	case <-time.After(150 * time.Millisecond):
++	}
++	select {
++	case <-sameHost:
++		release()
++		t.Fatal("a creator of the SAME host VNI tuple acquired while it was locked")
++	case <-time.After(150 * time.Millisecond):
++	}
++
++	release()
++
++	for name, ch := range map[string]chan struct{}{"same target slot": sameTarget, "same host tuple": sameHost} {
++		select {
++		case <-ch:
++		case <-time.After(3 * time.Second):
++			t.Fatalf("%s creator did not acquire after release", name)
++		}
++	}
++}
++
++func TestVxlanLockDirsDeriveFromLockPaths(t *testing.T) {
++	t.Setenv("KOKO_VXLAN_LOCK", "")
++	dirs := vxlanLockDirs()
++	if len(dirs) == 0 || dirs[0] != "/opt/cni/bin" {
++		t.Fatalf("vxlanLockDirs() = %q, want the shared /opt/cni/bin host path first", dirs)
++	}
++	t.Setenv("KOKO_VXLAN_LOCK", "/tmp/custom.lock")
++	if dirs := vxlanLockDirs(); len(dirs) != 1 || dirs[0] != "/tmp" {
++		t.Fatalf("vxlanLockDirs() = %q, want only the override's directory", dirs)
++	}
++}
