@@ -21,6 +21,10 @@ This repository is the start of an open-source release. For now it contains one 
 
 [`UPSTREAM.md`](UPSTREAM.md) lists the exact upstream version each series applies to and what the series is for.
 
+## Talks
+
+- [NANOG 98: What Building a Network Emulation Platform Taught Me About Digital Twins](docs/talks/nanog98/README.md): slides, speaker notes and run of show.
+
 ## Why patches, not forks
 
 Each series is a set of small, reviewable patches on a pinned upstream version. A patch that fixes a general bug is a candidate for upstream. A patch that is specific to how we run labs says so in its header. Nothing here has been accepted upstream yet.
