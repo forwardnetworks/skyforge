@@ -54,15 +54,27 @@ DELIVERY 00:30–01:30 (60 seconds).
 
 
 
-After the title, a puzzle before the thesis. The ticket: tidy the export policy on ce-svc, a router in a small MPLS VPN lab. The services block is 10.20.30.0/24. Here is the policy before, and the one line after: the same prefix-list, with le 32 taken off. It reads like a tidy-up. Ask for a show of hands: safe to apply? Give them ten seconds.
+After the title, a puzzle before the thesis. A routing change on one router, in a small MPLS VPN lab. Build it a piece at a time, and ask for a show of hands at the end of click 3: safe to apply?
 
 
 
-CLICK 1: Not safe. The service is advertised as two /25s, 10.20.30.0/25 and 10.20.30.128/25. With le 32, the /24 line matches them. Without it, the line matches only the /24 itself, and neither /25 does. So ce-svc stops advertising the service. One line on one router, and the routes for that service are withdrawn from the VPN.
+CLICK 1: The ticket. Tidy the export policy on ce-svc. The services block is 10.20.30.0/24. Say what ce-svc is: the router that advertises the services toward the provider.
 
 
 
-CLICK 2: The BGP session is still up, so an adjacency check passes. The service is gone anyway. I will show you the evidence for this one in a few minutes, from the lab and from the model. Nothing on the page tells you, you need the network.
+CLICK 2: The current policy, one prefix-list line. It permits the /24 and anything more specific, le 32.
+
+
+
+CLICK 3: The proposed change: the same line with le 32 taken off. It reads like a tidy-up. Pause. Hands up: safe to apply? Give them ten seconds.
+
+
+
+CLICK 4: Not safe. The service is advertised as two /25s, 10.20.30.0/25 and 10.20.30.128/25. With le 32, the /24 line matches them. Without it, the line matches only the /24 itself, and neither /25 does. So ce-svc stops advertising the service. One line on one router, and the routes for that service are withdrawn from the VPN.
+
+
+
+CLICK 5: The BGP session is still up, so an adjacency check passes. The service is gone anyway. I will show you the evidence for this one in a few minutes, from the lab and from the model. Nothing on the page tells you, you need the network.
 
 
 
@@ -72,9 +84,15 @@ Then the stake: To find out whether it is safe, I could read it, run it in a lab
 
 CLICK CUES
 
-1. On click: Not safe. + Without le 32, neither /25 that ce-svc advertise.
+1. On click: The ticket: tidy the export policy on ce-svc. Th.
 
-2. On click: The BGP session stays up. The service is gone. A.
+2. On click: Current:   ip prefix-list SVC-OUT-ipv4 seq 100 p.
+
+3. On click: Proposed:  ip prefix-list SVC-OUT-ipv4 seq 100 p.
+
+4. On click: Not safe. + Without le 32, neither /25 that ce-svc advertise.
+
+5. On click: The BGP session stays up. The service is gone. A.
 
 
 
