@@ -44,7 +44,7 @@ First, one puzzle.
 
 ---
 
-## 2. Which one is wrong?
+## 2. Safe to apply?
 
 ![slide 2](slides/s-02.png)
 
@@ -54,27 +54,27 @@ DELIVERY 00:30–01:30 (60 seconds).
 
 
 
-After the title, one slide before the thesis. Two firewall rules. Same source, same action, deny the inside LAN. They differ by one digit in the destination. Read both out, then pause and let the room look.
+After the title, a puzzle before the thesis. The ticket: tidy the export policy on ce-svc, a router in a small MPLS VPN lab. The services block is 10.20.30.0/24. Here is the policy before, and the one line after: the same prefix-list, with le 32 taken off. It reads like a tidy-up. Ask for a show of hands: safe to apply? Give them ten seconds.
 
 
 
-CLICK 1: 'Both pass review.' and the answer. A is the change I meant to make: retire a range that nothing uses. B is the fault I planted. B covers the lower half, where the one host that matters lives, so it shadows the permit for exactly the flow I care about. I did not catch that by reading it. I'll show you what did.
+CLICK 1: Not safe. The service is advertised as two /25s, 10.20.30.0/25 and 10.20.30.128/25. With le 32, the /24 line matches them. Without it, the line matches only the /24 itself, and neither /25 does. So ce-svc stops advertising the service. One line on one router, and the routes for that service are withdrawn from the VPN.
 
 
 
-CLICK 2: 'Ask me how I know.' Let it land.
+CLICK 2: The BGP session is still up, so an adjacency check passes. The service is gone anyway. I will show you the evidence for this one in a few minutes, from the lab and from the model. Nothing on the page tells you, you need the network.
 
 
 
-Then the stake: To find out which one is wrong, I could read it, run it in a lab, or ask a model of the network. Each tells me something different. This talk is about what each of them can and can't tell me, and what I learned building the lab.
+Then the stake: To find out whether it is safe, I could read it, run it in a lab, or ask a model of the network. Each tells me something different. This talk is about what each of them can and can not tell me, and what I learned building the lab.
 
 
 
 CLICK CUES
 
-1. On click: Both pass review. + A is the change I meant. B is the planted fault:.
+1. On click: Not safe. + Without le 32, neither /25 that ce-svc advertise.
 
-2. On click: Ask me how I know..
+2. On click: The BGP session stays up. The service is gone. A.
 
 
 
@@ -96,6 +96,10 @@ DELIVERY 01:30–03:00 (90 seconds).
 
 
 
+Bridge from the puzzle first: there were three ways to find out whether that edit was safe. Reading it did not catch it. The other two are an emulator and a digital twin, and they answer different questions. That is this talk.
+
+
+
 Here is the thesis in one line. An emulator is not a digital twin. They are different kinds of thing, and building an emulator is what made that visible to me.
 
 
@@ -104,7 +108,7 @@ Let me define the two words once, because I will use them all talk. An emulator 
 
 
 
-Neither is a better version of the other. The question I am asking decides the evidence I need. The strip at the bottom is the arc. Why I built it and how it is built. What the lab and the twin each tell me. Then how I run a change now: the lab proves the machinery works, and the twin judges the change. I need both.
+Neither is a better version of the other. The question I am asking decides the evidence I need. The strip at the bottom is the arc of the talk: why I built Skyforge and how it works, what building an emulator taught me, one change examined by both machines, and how I would run a change now.
 
 
 
@@ -428,7 +432,7 @@ Seen that way, the two are complementary. The next slides show them side by side
 
 
 
-Back to rule B from the first slide: it reads fine, and a lab can run it. Only a model of the whole network shows which flow it breaks, and that is the question I asked at the start.
+Back to the prefix-list from the first slide: it reads fine, and a lab can run it. Only a model of the whole network shows which paths it takes away, and that is the question I asked at the start.
 
 
 
@@ -601,6 +605,10 @@ Public documentation describes BGP/routing change analysis. Exact version/featur
 <details><summary>Speaker notes</summary>
 
 DELIVERY 14:30–15:40 (70 seconds).
+
+
+
+This is the prefix-list from the first slide: the one line with le 32 taken off. Now you can see what each machine says about it.
 
 
 
@@ -842,7 +850,7 @@ Now watch it happen.
 
 ---
 
-## 19. A one-digit mistake, held and undone
+## 19. The wrong half of the range, held and undone
 
 ![slide 19](slides/s-19.png)
 
@@ -852,7 +860,7 @@ DELIVERY 22:10–28:50 (400 seconds).
 
 
 
-Callback first: this is rule B from the first slide, the one that read fine. Here is what caught it, and what did not.
+Callback first: the first slide was a routing edit that read fine. This is a different kind of change, a firewall rule, with the same problem: it reads fine and it breaks a flow. Here is what caught it, and what did not.
 
 
 
@@ -1294,7 +1302,7 @@ BACKUP (not presented).
 
 
 
-Backup. This is the firewall change from demo 3 written as one intent, from the design draft. The one-digit fault is a one-line patch: the break variant overrides dst with the lower half of the range. The reachable and path entries are where the checks and the Predict probes would be derived from. Two honesty points. The firewall policy plugin is ours, not stock netlab, so those names are netlab-style but not upstream. And the position field, and the idea of removal, are names I had to invent because netlab has no equivalent. This is designed and prototyped, not shipped.
+Backup. This is the firewall change from demo 3 written as one intent, from the design draft. The planted fault is a one-line patch: the break variant overrides dst with the lower half of the range. The reachable and path entries are where the checks and the Predict probes would be derived from. Two honesty points. The firewall policy plugin is ours, not stock netlab, so those names are netlab-style but not upstream. And the position field, and the idea of removal, are names I had to invent because netlab has no equivalent. This is designed and prototyped, not shipped.
 
 
 

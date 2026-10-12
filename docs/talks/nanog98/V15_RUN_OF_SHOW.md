@@ -5,7 +5,7 @@
 | # | time | s | builds | slide |
 |---|---|---|---|---|
 | 1 | 00:00-00:30 | 30 | 0 | What Building a Network Emulation Platform Taught Me About Digital Twins |
-| 2 | 00:30-01:30 | 60 | 2 | Which one is wrong? |
+| 2 | 00:30-01:30 | 60 | 2 | Safe to apply? |
 | 3 | 01:30-03:00 | 90 | 5 | An emulator is not a digital twin |
 | 4 | 03:00-04:25 | 85 | 5 | Why I built Skyforge |
 | 5 | 04:25-05:10 | 45 | 6 | One declaration, a running network |
@@ -22,7 +22,7 @@
 | 16 | 16:10-16:40 | 30 | 4 | I reach for a model when scope matters |
 | 17 | 16:40-19:30 | 170 | 7 | A change waits until the twin has judged it |
 | 18 | 19:30-22:10 | 160 | 5 | Forward asks three things |
-| 19 | 22:10-28:50 | 400 | 2 | A one-digit mistake, held and undone |
+| 19 | 22:10-28:50 | 400 | 2 | The wrong half of the range, held and undone |
 | 20 | 28:50-31:05 | 135 | 6 | A firewall can’t undo itself, so the platform does |
 | 21 | 31:05-33:00 | 115 | 6 | Say the change once: designed and prototyped |
 | 22 | 33:00-35:20 | 140 | 5 | The twin judged it right. The machinery broke. |
