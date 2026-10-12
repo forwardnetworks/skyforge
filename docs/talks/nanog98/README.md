@@ -66,7 +66,7 @@ CLICK 2: 'Ask me how I know.' Let it land.
 
 
 
-Then: This talk is about how I got from an emulator to a twin, and what I do when a change looks fine.
+Then the stake: To find out which one is wrong, I could read it, run it in a lab, or ask a model of the network. Each tells me something different. This talk is about what each of them can and can't tell me, and what I learned building the lab.
 
 
 
@@ -425,6 +425,10 @@ A digital twin's source of truth is configuration and state collected from the r
 
 
 Seen that way, the two are complementary. The next slides show them side by side on one change.
+
+
+
+Back to rule B from the first slide: it reads fine, and a lab can run it. Only a model of the whole network shows which flow it breaks, and that is the question I asked at the start.
 
 
 
@@ -845,6 +849,10 @@ Now watch it happen.
 <details><summary>Speaker notes</summary>
 
 DELIVERY 22:10–28:50 (400 seconds).
+
+
+
+Callback first: this is rule B from the first slide, the one that read fine. Here is what caught it, and what did not.
 
 
 
