@@ -1,10 +1,10 @@
 # NANOG 98: What Building a Network Emulation Platform Taught Me About Digital Twins
 
-Monday 2026-10-19, 2:00 PM Eastern, Versailles. 45 minutes including Q&A. Deck v14 (final slides). 25 presented slides (39:00), Questions (6:00), and an appendix that is not presented.
+Monday 2026-10-19, 2:00 PM Eastern, Versailles. 45 minutes including Q&A. Deck v15: 25 presented slides (39:00), Questions (6:00), and an appendix that is not presented.
 
 Each slide below is the rendered slide followed by its speaker notes. Click cues are listed at the end of the notes. The source is the v14 deck; the demo clip on slide 19 is not embedded here.
 
-Labels used in the talk: *proven live*, *off by default*, *designed and prototyped*. 
+Labels used in the talk: *proven live*, *off by default*, *designed and prototyped*. See the open-items doc in `docs/drafts/napalm/` for what is built and what is not.
 
 ---
 
@@ -962,7 +962,7 @@ How I'd like to write changes.
 
 ---
 
-## 21. Say the change once: designed and prototyped
+## 21. Say the change once: built, run on one change
 
 ![slide 21](slides/s-21.png)
 
@@ -976,7 +976,7 @@ First, what I mean by intent, because the word gets stretched. Intent here is a 
 
 
 
-Now two things on this slide, and I want to keep them apart: what exists, and what is only designed.
+Now two things on this slide, and I want to keep them apart: what is in use, and what has run once.
 
 
 
@@ -984,7 +984,7 @@ What exists: the deployment pack. Each change in it states its device config, it
 
 
 
-What's designed: say the change once. One vendor-neutral intent, in netlab's own attribute names. The expected outcomes are written once: who must reach what, which path rides ring-d, which adjacency is meant to disappear. The checks, the probes and the per-vendor config are derived from that. A planted fault is a small patch over the base, the break variant on the slide is two lines. Raw CLI that Forward can't model goes through a marked escape hatch.
+What's built: say the change once. One vendor-neutral intent, in netlab's own attribute names. The expected outcomes are written once: who must reach what, which path rides ring-d, which adjacency is meant to disappear. The checks, the probes and the per-vendor config are derived from that. A planted fault is a small patch over the base, the break variant on the slide is two lines. Raw CLI that Forward can't model goes through a marked escape hatch.
 
 
 
@@ -992,7 +992,7 @@ Why it matters: the same intent drives the lab and the twin. What I apply and wh
 
 
 
-Status, exactly: designed and prototyped. A compiler for two changes reproduces the pack byte for byte. Intents are not in the pack, and the product doesn't read them. Earlier, a throwaway prototype compiled the six fleet40 changes and compared its output with the pack that exists today: 59 of 60 comparisons matched, 83 of 88 per-device deltas byte-identical. The one failure was a real finding: two hand-written packs ordered their stanzas differently. If someone asks whether it's in use, the answer is no.
+Status, exactly: built, and run once. The pack loader accepts an intent. When someone runs the change, the server reads the firewall's own running config for the zones and rule names the compiler checks against, and refuses if the read is missing, stale, or the intent names something the firewall does not have. The intent for the firewall change compiled to the same delta as the old form, for the good version and the planted fault. The planted fault was held by the Predict pre-flight before any device was touched. The good version was applied and Forward confirmed it: 118 of 118 checks, no regressions. The live run is 394f25f2-4260-45c2-a576-3492c420bf89. It ran from a deployment's own pack. The shared pack still uses the old form. Earlier, a throwaway prototype compiled the six fleet40 changes and compared its output with the pack of the day: 59 of 60 comparisons matched, 83 of 88 per-device deltas byte-identical; the one failure was a real finding: two hand-written packs ordered their stanzas differently. If someone asks whether it's in use: one change, once. It is not how the pack works yet.
 
 
 
@@ -1008,7 +1008,7 @@ CLICK CUES
 
 5. On click: Raw CLI / Marked, and Predict can’t model it..
 
-6. On click: Designed, prototyped. A compiler for two changes.
+6. On click: Built, run once. One firewall change ran live fr.
 
 
 
