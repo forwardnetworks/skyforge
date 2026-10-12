@@ -1,11 +1,11 @@
-# v14 run of show
+# v15 run of show
 
 25 presented slides = 39:00, then Questions 6:00. The 8-slide appendix is not presented and adds no time. "Builds" is the number of clicks on the slide (see V14_ANIMATIONS.md).
 
 | # | time | s | builds | slide |
 |---|---|---|---|---|
-| 1 | 00:00-01:00 | 60 | 2 | Which one is wrong? |
-| 2 | 01:00-01:30 | 30 | 0 | What Building a Network Emulation Platform Taught Me About Digital Twins |
+| 1 | 00:00-00:30 | 30 | 0 | What Building a Network Emulation Platform Taught Me About Digital Twins |
+| 2 | 00:30-01:30 | 60 | 2 | Which one is wrong? |
 | 3 | 01:30-03:00 | 90 | 5 | An emulator is not a digital twin |
 | 4 | 03:00-04:25 | 85 | 5 | Why I built Skyforge |
 | 5 | 04:25-05:10 | 45 | 6 | One declaration, a running network |

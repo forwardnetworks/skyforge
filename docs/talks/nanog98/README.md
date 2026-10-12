@@ -8,17 +8,53 @@ Labels used in the talk: *proven live*, *off by default*, *designed and prototyp
 
 ---
 
-## 1. Which one is wrong?
+## 1. What Building a Network Emulation Platform Taught Me About Digital Twins
 
 ![slide 1](slides/s-01.png)
 
 <details><summary>Speaker notes</summary>
 
-DELIVERY 00:00–01:00 (60 seconds).
+DELIVERY 00:00–00:30 (30 seconds).
 
 
 
-Before the title, one slide. Two firewall rules. Same source, same action, deny the inside LAN. They differ by one digit in the destination. Read both out, then pause and let the room look.
+I built Skyforge because I wanted disposable networks that were useful for real engineering. I wanted to run different network operating systems, test automation and repeat a failure without rebuilding everything by hand. The interesting part of this talk is what happened when I started asking that lab questions about production.
+
+
+
+I am a Principal Architect at Forward Networks. I work with commercial digital twins, and I will show where Predict fits. The story starts with the platform I built and ends with a workflow that does not depend on a particular vendor.
+
+
+
+The useful distinction is between evidence from executing a particular implementation and evidence computed from a supported representation. I will use one routing change to make that distinction concrete. The point is a change decision, not a contest between products.
+
+
+
+CLICK CUES
+
+Static slide. Advance after the transition.
+
+
+
+TRANSITION
+
+First, one puzzle.
+
+</details>
+
+---
+
+## 2. Which one is wrong?
+
+![slide 2](slides/s-02.png)
+
+<details><summary>Speaker notes</summary>
+
+DELIVERY 00:30–01:30 (60 seconds).
+
+
+
+After the title, one slide before the thesis. Two firewall rules. Same source, same action, deny the inside LAN. They differ by one digit in the destination. Read both out, then pause and let the room look.
 
 
 
@@ -44,43 +80,7 @@ CLICK CUES
 
 TRANSITION
 
-The title, then.
-
-</details>
-
----
-
-## 2. What Building a Network Emulation PlatformTaught Me About Digital Twins
-
-![slide 2](slides/s-02.png)
-
-<details><summary>Speaker notes</summary>
-
-DELIVERY 01:00–01:30 (30 seconds).
-
-
-
-I built Skyforge because I wanted disposable networks that were useful for real engineering. I wanted to run different network operating systems, test automation and repeat a failure without rebuilding everything by hand. The interesting part of this talk is what happened when I started asking that lab questions about production.
-
-
-
-I am a Principal Architect at Forward Networks. I work with commercial digital twins, and I will show where Predict fits. The story starts with the platform I built and ends with a workflow that does not depend on a particular vendor.
-
-
-
-The useful distinction is between evidence from executing a particular implementation and evidence computed from a supported representation. I will use one routing change to make that distinction concrete. The point is a change decision, not a contest between products.
-
-
-
-CLICK CUES
-
-Static slide. Advance after the transition.
-
-
-
-TRANSITION
-
-Why I built it.
+The thesis.
 
 </details>
 
