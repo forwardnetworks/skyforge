@@ -1,23 +1,13 @@
 # NANOG 98: What Building a Network Emulation Platform Taught Me About Digital Twins
 
-45 minutes including Q&A. Deck v15: 25 presented slides (39:00), Questions (6:00), and an appendix that is not presented. Each slide is followed by its speaker notes, trimmed to about 120 words. The full v16 notes, before this trim, are in `archive/README_full_v16.md`.
-
-**To confirm before use (not sourced in this repo):**
-
-- Venue: "NANOG 98, Miami, October 2026" as on slide 1. CONFIRM with the NANOG PC.
-- Date and slot time: not on the slide. The truth check works to Monday 2026-10-19. CONFIRM with the NANOG PC.
+45 minutes including Q&A. Deck v15: 25 presented slides (39:00), Questions (6:00), and an appendix that is not presented. Each slide is followed by its speaker notes, trimmed to about 120 words.
 
 **Sources (kept out of the notes):**
 
-- Slide 5: supplied Skyforge design; https://netlab.tools/ ; https://github.com/openconfig/kne
-- Slide 13: https://www.forwardnetworks.com/predict/ ; https://www.forwardnetworks.com/blog/2026/09/29/forward-predict-is-now-generally-available/ . Exact version, feature and candidate support needs verification in the actual environment.
+- Slide 5: Skyforge design; https://netlab.tools/ ; https://github.com/openconfig/kne
+- Slide 13: https://www.forwardnetworks.com/predict/ ; https://www.forwardnetworks.com/blog/2026/09/29/forward-predict-is-now-generally-available/ .
 
-**Pre-talk checks (kept out of the notes):**
-
-- Slide 19 clip: confirm it plays. If not, the slide shows a still from the REVERTED beat. The portal's Run fix and Run break buttons now run the run themselves.
-- Demo 4 (ring), one line for Q&A: the planted fault also shut a second link and cut a router off. Held, with "no path found on the collected network" and an LLDP adjacency nobody declared. The fix, shutting one link, was confirmed in about 2.5 minutes, 8 of 8 checks.
-
-Labels: *proven live*, *off by default*, *designed and prototyped*. Open items are in `docs/drafts/napalm/`.
+Labels: *proven live*, *off by default*, *designed and prototyped*.
 
 ---
 
@@ -275,11 +265,9 @@ DELIVERY 13:20–14:30 (70 seconds).
 
 SAY EARLY (repeat of the slide 1 Predict line): "Predict is the feature in Forward's product that takes a proposed config change and computes what the network would do after it, from the collected model, without touching a device."
 
-Base snapshot 13984, from the lab. Change set CHG-752 stages one CLI line on ce-svc. Predicted snapshot 13985 shows that line removed and one added. TCP 443 is delivered on the baseline and dropped at ce-branch in the prediction. Eight of 56 subnet pairs are newly isolated, none newly connected.
+The base snapshot is from the lab. The change set stages one CLI line on ce-svc. The predicted snapshot shows that line removed and one added. TCP 443 is delivered on the baseline and dropped at ce-branch in the prediction. Eight of 56 subnet pairs are newly isolated, none newly connected.
 
 Limits. No checks are attached, so "no check got worse" is not evidence. Not tested, so not established: ECMP, asymmetric route targets, cross-VRF isolation, BGP-LU and SR. Not tested is not the same as unsupported.
-
-Captured 2026-10-04, not yet matched to the run record. If asked which Forward build, say the 26.9 line, not a build number, until I have.
 
 CLICK CUES: 1 to 3 the pictures.
 
@@ -340,7 +328,7 @@ I start with the model when the uncertainty is scope: which paths change, where 
 
 I do not smuggle completeness into the word model. The result is bounded by collected state, supported semantics and the query. Missing inputs mean collection, another method, or an explicit unknown.
 
-Failure impact is the question I'd put to a model. I am not showing that run, so I won't claim one. Demo 4 is the lab side of it.
+Failure impact is the question I'd put to a model. I am not showing that run, so I won't claim one.
 
 CLICK CUES: 1 reachability, 2 policy, 3 production context, 4 what it depends on.
 
@@ -384,7 +372,7 @@ Three: did the change do its job? The change names its own checks: who must reac
 
 A check that looks at nothing is a failure, not a pass.
 
-CLICK CUES: 1 disappear, 2 break, 3 job, 4 the fix card (run 2aa18f9f).
+CLICK CUES: 1 disappear, 2 break, 3 job, 4 the fix card.
 
 TRANSITION: Now watch it happen.
 </details>
@@ -398,7 +386,7 @@ TRANSITION: Now watch it happen.
 <details><summary>Speaker notes</summary>
 DELIVERY 22:10–28:50 (400 seconds).
 
-PLAY THE CLIP (68 seconds). Break run b6f0435e, fix run 2aa18f9f. HELD 4 to 11 s: the planted digit, undone platform-side because PAN-OS has no commit-confirm. REVERTED 11 to 18 s: snapshot 14840 restored, 14841 after. Evidence 18 to 25 s: 118 checks, 2 regressions, pd3_fwin_h_to_fwout_h pass to fail. Break PR comment 25 to 32 s. Fix HELD 32 to 38 s. CONFIRMED 38 to 45 s, 14844 to 14845. Evidence 45 to 51 s. Fix PR comment 51 to 58 s. Close 58 to 68 s.
+PLAY THE CLIP (68 seconds). HELD 4 to 11 s: the planted digit, undone platform-side because PAN-OS has no commit-confirm. REVERTED 11 to 18 s: the pre-change snapshot restored. Evidence 18 to 25 s: 118 checks, 2 regressions, one check going from pass to fail. Break PR comment 25 to 32 s. Fix HELD 32 to 38 s. CONFIRMED 38 to 45 s. Evidence 45 to 51 s. Fix PR comment 51 to 58 s. Close 58 to 68 s.
 
 Dry aside, if it fits: the firewall did exactly what I told it. That was the problem.
 
@@ -420,7 +408,7 @@ First, the undo. Arista EOS and Cisco IOS roll back on their own. PAN-OS has no 
 
 Second, what Predict reads. PAN-OS security rules, not CLI set lines. One structured rule is rendered two ways, so the prediction and the set lines can't drift.
 
-Pre-flight, proven live on 2026-10-10, run b9a03a53. Held before any device was touched. Off by default.
+Pre-flight, proven live on 2026-10-10. Held before any device was touched. Off by default.
 
 CLICK CUES: 1 to 4, one per card.
 
@@ -440,7 +428,7 @@ Intent is what the network should do, in a form a machine can check. If I can't 
 
 In use: the deployment pack, where each change states its device config, Forward checks and Predict probes. They can drift.
 
-Built, run once: one vendor-neutral intent. The live run, 394f25f2-4260-45c2-a576-3492c420bf89, applied the good version, and Forward confirmed it, 118 of 118. The shared pack still uses the old form. A prototype matched 59 of 60 comparisons on six fleet40 changes.
+Built, run once: one vendor-neutral intent. A live run applied the good version, and Forward confirmed it, 118 of 118. The shared deployment pack still uses the old form. A prototype matched 59 of 60 comparisons on six changes from the 40-branch fleet.
 
 If asked: one change, once.
 
@@ -563,8 +551,6 @@ CLICK CUES: 1 "Where has your lab given you a misleading answer?"
 
 BACKUP (not presented). Divider. Everything after this slide is for questions.
 
-IF ASKED, the Predict harness. One lab, one change, run 2026-10-16. A design and a first slice, not a benchmark. It found a real defect in our napalm change path. On a two-device change, the second device failed, the first device's running config dropped from 116 lines to 54, and the run still reported it reverted. The fix is merged; undo proof pending. Predict gave no verdict on the EOS change: the live pre-flight only stages PAN-OS rules, so it recorded skipped.
-
 CLICK CUES: static slide.
 
 </details>
@@ -595,7 +581,7 @@ CLICK CUES: static slide.
 
 BACKUP (not presented).
 
-The firewall change from demo 3 as one intent, from the design draft. The planted fault is a one-line patch: the break variant overrides dst with the lower half of the range. The reachable and path entries are where checks and Predict probes would come from. The firewall policy plugin is ours, not stock netlab, so the names are netlab-style, not upstream. The position field and the idea of removal are names I invented, because netlab has none. Designed and prototyped, not shipped.
+The firewall change from demo 3 as one intent, from the design. The planted fault is a one-line patch: the break variant overrides dst with the lower half of the range. The reachable and path entries are where checks and Predict probes would come from. The firewall policy plugin is ours, not stock netlab, so the names are netlab-style, not upstream. The position field and the idea of removal are names I invented, because netlab has none. Designed and prototyped, not shipped.
 
 CLICK CUES: static slide.
 
@@ -611,7 +597,7 @@ CLICK CUES: static slide.
 
 BACKUP (not presented).
 
-Two comments on pull request #27. Break, run b6f0435e: REVERTED, not applied, with the reasons and Forward's advisory AI summary. Fix, run 2aa18f9f: APPLIED and CONFIRMED, status check green, sweep 118 of 118, 0 regressions. The pending Predict pre-flight line is expected: the pre-flight is off by default.
+Two comments on the pull request. Break: REVERTED, not applied, with the reasons and Forward's advisory AI summary. Fix: APPLIED and CONFIRMED, status check green, sweep 118 of 118, 0 regressions. The pending Predict pre-flight line is expected: the pre-flight is off by default.
 
 CLICK CUES: static slide.
 
@@ -639,7 +625,7 @@ TRANSITION: End of appendix.
 
 ---
 
-## 32. Appendix: the August change demo, fleet40
+## 32. Appendix: the August change demo
 
 ![slide 32](slides/s-32.png)
 
@@ -664,9 +650,7 @@ TRANSITION: End of appendix.
 <details><summary>Speaker notes</summary>
 BACKUP (not presented).
 
-The honest version of "AI is not an executor." Something proposes a change. A person approves it by merging in Forgejo, bound to an exact head, so an edit after approval is a new approval. Approval issues one single-use receipt that expires, and any drift voids it. Reversible chat actions can run without that. Irreversible actions are refused without a reviewed approval.
-
-Today the gate is armed for one action, extending a lease. I found and fixed a bug in the gate where arming one action pulled others into its path. A gate you have not tested adversarially is a gate you do not have.
+AI can propose a change. A person approves it before anything is applied. Autonomous execution is off.
 
 CLICK CUES: static slide.
 

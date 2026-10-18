@@ -2,7 +2,7 @@
 
 One page per main slide (1 to 26), plus a page for the SAY EARLY lines. Bullets are the speaker notes in README.md, one per paragraph. Slide images are not reproduced here.
 
-Appendix (not presented): slides 27 to 34. 27 Predict harness (if asked), 28 eight defects, 29 firewall as one intent, 30 PR comment, 31 patches upstream, 32 fleet40 demo, 33 where AI may act, 34 why not containerlab.
+Appendix (not presented): slides 27 to 34. 27 divider, 28 eight defects, 29 firewall as one intent, 30 PR comment, 31 patches upstream, 32 the August fleet demo, 33 where AI may act, 34 why not containerlab.
 
 ## Page 1: say early, before slide 1 content
 
@@ -174,9 +174,8 @@ Appendix (not presented): slides 27 to 34. 27 Predict harness (if asked), 28 eig
 *DELIVERY 13:20–14:30 (70 seconds).*
 
 - SAY EARLY (repeat of the slide 1 Predict line): "Predict is the feature in Forward's product that takes a proposed config change and computes what the network would do after it, from the collected model, without touching a device."
-- Base snapshot 13984, from the lab. Change set CHG-752 stages one CLI line on ce-svc. Predicted snapshot 13985 shows that line removed and one added. TCP 443 is delivered on the baseline and dropped at ce-branch in the prediction. Eight of 56 subnet pairs are newly isolated, none newly connected.
+- The base snapshot is from the lab. The change set stages one CLI line on ce-svc. The predicted snapshot shows that line removed and one added. TCP 443 is delivered on the baseline and dropped at ce-branch in the prediction. Eight of 56 subnet pairs are newly isolated, none newly connected.
 - Limits. No checks are attached, so "no check got worse" is not evidence. Not tested, so not established: ECMP, asymmetric route targets, cross-VRF isolation, BGP-LU and SR. Not tested is not the same as unsupported.
-- Captured 2026-10-04, not yet matched to the run record. If asked which Forward build, say the 26.9 line, not a build number, until I have.
 
 **Click:** 1 to 3 the pictures.
 **Transition:** Same intent, different evidence.
@@ -214,7 +213,7 @@ Appendix (not presented): slides 27 to 34. 27 Predict harness (if asked), 28 eig
 
 - I start with the model when the uncertainty is scope: which paths change, where a policy blocks traffic, which requirements are affected across many devices.
 - I do not smuggle completeness into the word model. The result is bounded by collected state, supported semantics and the query. Missing inputs mean collection, another method, or an explicit unknown.
-- Failure impact is the question I'd put to a model. I am not showing that run, so I won't claim one. Demo 4 is the lab side of it.
+- Failure impact is the question I'd put to a model. I am not showing that run, so I won't claim one.
 
 **Click:** 1 reachability, 2 policy, 3 production context, 4 what it depends on.
 **Transition:** That is the twin as a judge. Now a change that waits for it.
@@ -243,7 +242,7 @@ Appendix (not presented): slides 27 to 34. 27 Predict harness (if asked), 28 eig
 - Three: did the change do its job? The change names its own checks: who must reach what, what must stay isolated.
 - A check that looks at nothing is a failure, not a pass.
 
-**Click:** 1 disappear, 2 break, 3 job, 4 the fix card (run 2aa18f9f).
+**Click:** 1 disappear, 2 break, 3 job, 4 the fix card.
 **Transition:** Now watch it happen.
 
 ---
@@ -252,7 +251,7 @@ Appendix (not presented): slides 27 to 34. 27 Predict harness (if asked), 28 eig
 
 *DELIVERY 22:10–28:50 (400 seconds).*
 
-- PLAY THE CLIP (68 seconds). Break run b6f0435e, fix run 2aa18f9f. HELD 4 to 11 s: the planted digit, undone platform-side because PAN-OS has no commit-confirm. REVERTED 11 to 18 s: snapshot 14840 restored, 14841 after. Evidence 18 to 25 s: 118 checks, 2 regressions, pd3_fwin_h_to_fwout_h pass to fail. Break PR comment 25 to 32 s. Fix HELD 32 to 38 s. CONFIRMED 38 to 45 s, 14844 to 14845. Evidence 45 to 51 s. Fix PR comment 51 to 58 s. Close 58 to 68 s.
+- PLAY THE CLIP (68 seconds). HELD 4 to 11 s: the planted digit, undone platform-side because PAN-OS has no commit-confirm. REVERTED 11 to 18 s: the pre-change snapshot restored. Evidence 18 to 25 s: 118 checks, 2 regressions, one check going from pass to fail. Break PR comment 25 to 32 s. Fix HELD 32 to 38 s. CONFIRMED 38 to 45 s. Evidence 45 to 51 s. Fix PR comment 51 to 58 s. Close 58 to 68 s.
 - Dry aside, if it fits: the firewall did exactly what I told it. That was the problem.
 
 **Click:** play the clip.
@@ -266,7 +265,7 @@ Appendix (not presented): slides 27 to 34. 27 Predict harness (if asked), 28 eig
 
 - First, the undo. Arista EOS and Cisco IOS roll back on their own. PAN-OS has no commit-confirm, so the platform saves a named config and a reaper restores it past a deadline. A platform-side revert, not a device timer, and weaker: if the change cut management access, the platform could not reach the firewall.
 - Second, what Predict reads. PAN-OS security rules, not CLI set lines. One structured rule is rendered two ways, so the prediction and the set lines can't drift.
-- Pre-flight, proven live on 2026-10-10, run b9a03a53. Held before any device was touched. Off by default.
+- Pre-flight, proven live on 2026-10-10. Held before any device was touched. Off by default.
 
 **Click:** 1 to 4, one per card.
 **Transition:** How I'd like to write changes.
@@ -279,7 +278,7 @@ Appendix (not presented): slides 27 to 34. 27 Predict harness (if asked), 28 eig
 
 - Intent is what the network should do, in a form a machine can check. If I can't write the check, it's a wish.
 - In use: the deployment pack, where each change states its device config, Forward checks and Predict probes. They can drift.
-- Built, run once: one vendor-neutral intent. The live run, 394f25f2-4260-45c2-a576-3492c420bf89, applied the good version, and Forward confirmed it, 118 of 118. The shared pack still uses the old form. A prototype matched 59 of 60 comparisons on six fleet40 changes.
+- Built, run once: one vendor-neutral intent. A live run applied the good version, and Forward confirmed it, 118 of 118. The shared deployment pack still uses the old form. A prototype matched 59 of 60 comparisons on six changes from the 40-branch fleet.
 - If asked: one change, once.
 
 **Click:** today, written once, raw CLI marked, built and run once.

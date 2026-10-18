@@ -23,7 +23,7 @@ This repository is the start of an open-source release. For now it contains one 
 
 ## Talks
 
-- [NANOG 98: What Building a Network Emulation Platform Taught Me About Digital Twins](docs/talks/nanog98/README.md): slides, speaker notes and run of show.
+- [NANOG 98: What Building a Network Emulation Platform Taught Me About Digital Twins](docs/talks/nanog98/README.md): slides and speaker notes.
 
 ## Why patches, not forks
 
