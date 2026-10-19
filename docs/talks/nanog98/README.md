@@ -145,7 +145,7 @@ TRANSITION: How big does it get?
 <details><summary>Speaker notes</summary>
 DELIVERY 06:45–08:00 (75 seconds).
 
-On 9 October I built a two-node AWS island and ran real Arista cEOS on it. 100 pods Ready in 374 seconds. At 250 it stalled at 220, and the nodes were nowhere near their limits. The cEOS operator was killed for memory 26 times and pinned on CPU. It generates a 4096-bit key for every device. With more CPU and memory, 500 of 500 were Ready in 925 seconds.
+On 9 October I built a two-node cloud lab and ran real Arista cEOS on it. 100 pods Ready in 374 seconds. At 250 it stalled at 220, and the nodes were nowhere near their limits. The cEOS operator was killed for memory 26 times and pinned on CPU. It generates a 4096-bit key for every device. With more CPU and memory, 500 of 500 were Ready in 925 seconds.
 
 Tested to 500 on two nodes. Bigger is planned, not run. The lesson: fix the operator before buying more nodes. Routers don't care about our capacity planning spreadsheet.
 
@@ -428,7 +428,7 @@ Intent is what the network should do, in a form a machine can check. If I can't 
 
 In use: the deployment pack, where each change states its device config, Forward checks and Predict probes. They can drift.
 
-Built, run once: one vendor-neutral intent. A live run applied the good version, and Forward confirmed it, 118 of 118. The shared deployment pack still uses the old form. A prototype matched 59 of 60 comparisons on six changes from the 40-branch fleet.
+Built, run once: one vendor-neutral intent. A live run applied the good version, and Forward confirmed it, 118 of 118. The shared deployment pack still uses the old form. A prototype matched 59 of 60 comparisons on six changes from a multi-branch lab.
 
 If asked: one change, once.
 
@@ -535,7 +535,7 @@ Open Q&A. I'd like to hear where a lab result misled someone, what was missing, 
 
 Prompts if needed: How do you record snapshot freshness? Which features still need hardware? What makes an unknown acceptable for a change?
 
-Stay in scope. This is not a benchmark: one lab, one change, run twice on 2026-10-04, and the model covers only supported behavior.
+Stay in scope. This is not a benchmark: one lab, one change, run twice, and the model covers only supported behavior.
 
 CLICK CUES: 1 "Where has your lab given you a misleading answer?"
 
@@ -545,7 +545,7 @@ CLICK CUES: 1 "Where has your lab given you a misleading answer?"
 
 ## 27. Appendix: for questions only
 
-![slide 27](slides/s-27.png)
+_Slide 27 image not published in the public repo._
 
 <details><summary>Speaker notes</summary>
 
@@ -575,7 +575,7 @@ CLICK CUES: static slide.
 
 ## 29. Appendix: the firewall change as one intent
 
-![slide 29](slides/s-29.png)
+_Slide 29 image not published in the public repo._
 
 <details><summary>Speaker notes</summary>
 
@@ -625,7 +625,7 @@ TRANSITION: End of appendix.
 
 ---
 
-## 32. Appendix: the August change demo
+## 32. Appendix: the change demo
 
 _Slide 32 image not published in the public repo._
 
@@ -633,7 +633,7 @@ _Slide 32 image not published in the public repo._
 
 BACKUP (not presented).
 
-Measured 16 and 17 August on a 40-branch fleet. Predict said proceed on the intended change: 82 requirements pass, none fail. A second person approved it, and the live gate read the devices: 82 pass. The planted fault: Predict said hold, 2 pass and 80 fail. I applied it anyway, as an operator overriding the warning, and the live gate said the same. That is the older path. The loop in the main talk is the newer one.
+Measured on a multi-branch lab. Predict said proceed on the intended change: 82 requirements pass, none fail. A second person approved it, and the live gate read the devices: 82 pass. The planted fault: Predict said hold, 2 pass and 80 fail. I applied it anyway, as an operator overriding the warning, and the live gate said the same. That is the older path. The loop in the main talk is the newer one.
 
 CLICK CUES: static slide.
 

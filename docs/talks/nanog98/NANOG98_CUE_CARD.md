@@ -2,7 +2,7 @@
 
 One page per main slide (1 to 26), plus a page for the SAY EARLY lines. Bullets are the speaker notes in README.md, one per paragraph. Slide images are not reproduced here.
 
-Appendix (not presented): slides 27 to 34. 27 divider, 28 eight defects, 29 firewall as one intent, 30 PR comment, 31 patches upstream, 32 the August fleet demo, 33 where AI may act, 34 why not containerlab.
+Appendix (not presented): slides 27 to 34. 27 divider, 28 eight defects, 29 firewall as one intent, 30 PR comment, 31 patches upstream, 32 the change demo, 33 where AI may act, 34 why not containerlab.
 
 ## Page 1: say early, before slide 1 content
 
@@ -96,7 +96,7 @@ Appendix (not presented): slides 27 to 34. 27 divider, 28 eight defects, 29 fire
 
 *DELIVERY 06:45–08:00 (75 seconds).*
 
-- On 9 October I built a two-node AWS island and ran real Arista cEOS on it. 100 pods Ready in 374 seconds. At 250 it stalled at 220, and the nodes were nowhere near their limits. The cEOS operator was killed for memory 26 times and pinned on CPU. It generates a 4096-bit key for every device. With more CPU and memory, 500 of 500 were Ready in 925 seconds.
+- On 9 October I built a two-node cloud lab and ran real Arista cEOS on it. 100 pods Ready in 374 seconds. At 250 it stalled at 220, and the nodes were nowhere near their limits. The cEOS operator was killed for memory 26 times and pinned on CPU. It generates a 4096-bit key for every device. With more CPU and memory, 500 of 500 were Ready in 925 seconds.
 - Tested to 500 on two nodes. Bigger is planned, not run. The lesson: fix the operator before buying more nodes. Routers don't care about our capacity planning spreadsheet.
 
 **Click:** 1 measured, 2 limits, 3 cloud bursting.
@@ -278,7 +278,7 @@ Appendix (not presented): slides 27 to 34. 27 divider, 28 eight defects, 29 fire
 
 - Intent is what the network should do, in a form a machine can check. If I can't write the check, it's a wish.
 - In use: the deployment pack, where each change states its device config, Forward checks and Predict probes. They can drift.
-- Built, run once: one vendor-neutral intent. A live run applied the good version, and Forward confirmed it, 118 of 118. The shared deployment pack still uses the old form. A prototype matched 59 of 60 comparisons on six changes from the 40-branch fleet.
+- Built, run once: one vendor-neutral intent. A live run applied the good version, and Forward confirmed it, 118 of 118. The shared deployment pack still uses the old form. A prototype matched 59 of 60 comparisons on six changes from a multi-branch lab.
 - If asked: one change, once.
 
 **Click:** today, written once, raw CLI marked, built and run once.
@@ -345,7 +345,7 @@ Appendix (not presented): slides 27 to 34. 27 divider, 28 eight defects, 29 fire
 
 - Open Q&A. I'd like to hear where a lab result misled someone, what was missing, and which evidence eventually explained it.
 - Prompts if needed: How do you record snapshot freshness? Which features still need hardware? What makes an unknown acceptable for a change?
-- Stay in scope. This is not a benchmark: one lab, one change, run twice on 2026-10-04, and the model covers only supported behavior.
+- Stay in scope. This is not a benchmark: one lab, one change, run twice, and the model covers only supported behavior.
 
 **Click:** 1 "Where has your lab given you a misleading answer?"
 
