@@ -258,7 +258,7 @@ TRANSITION: Now the same baseline and edit in the model.
 
 ## 13. Predict: the evidence I need
 
-![slide 13](slides/s-13.png)
+_Slide 13 image not published in the public repo._
 
 <details><summary>Speaker notes</summary>
 DELIVERY 13:20–14:30 (70 seconds).
@@ -359,7 +359,7 @@ TRANSITION: So what does Forward ask?
 
 ## 18. Forward asks three things
 
-![slide 18](slides/s-18.png)
+_Slide 18 image not published in the public repo._
 
 <details><summary>Speaker notes</summary>
 DELIVERY 19:30–22:10 (160 seconds).
@@ -381,7 +381,7 @@ TRANSITION: Now watch it happen.
 
 ## 19. The wrong half of the range, held and undone
 
-![slide 19](slides/s-19.png)
+_Slide 19 image not published in the public repo._
 
 <details><summary>Speaker notes</summary>
 DELIVERY 22:10–28:50 (400 seconds).
@@ -399,7 +399,7 @@ TRANSITION: Firewalls are different.
 
 ## 20. A firewall can’t undo itself, so the platform does
 
-![slide 20](slides/s-20.png)
+_Slide 20 image not published in the public repo._
 
 <details><summary>Speaker notes</summary>
 DELIVERY 28:50–31:05 (135 seconds).
@@ -559,7 +559,7 @@ CLICK CUES: static slide.
 
 ## 28. Appendix: all eight defects from the first firewall run
 
-![slide 28](slides/s-28.png)
+_Slide 28 image not published in the public repo._
 
 <details><summary>Speaker notes</summary>
 
@@ -591,7 +591,7 @@ CLICK CUES: static slide.
 
 ## 30. Appendix: the comment on the pull request
 
-![slide 30](slides/s-30.png)
+_Slide 30 image not published in the public repo._
 
 <details><summary>Speaker notes</summary>
 
@@ -627,7 +627,7 @@ TRANSITION: End of appendix.
 
 ## 32. Appendix: the August change demo
 
-![slide 32](slides/s-32.png)
+_Slide 32 image not published in the public repo._
 
 <details><summary>Speaker notes</summary>
 
