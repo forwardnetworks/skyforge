@@ -35,10 +35,10 @@ index 1a0abf7..c5268af 100644
  
 diff --git a/tests/test_plugin_sort_extra_config.py b/tests/test_plugin_sort_extra_config.py
 new file mode 100644
-index 0000000..d79bc68
+index 0000000..1c88f81
 --- /dev/null
 +++ b/tests/test_plugin_sort_extra_config.py
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,65 @@
 +#!/usr/bin/env python3
 +"""sort_extra_config() must not depend on Python's per-process string-hash seed.
 +
@@ -75,8 +75,35 @@ index 0000000..d79bc68
 +    assert len(set(results.values())) == 1, results
 +
 +
++NODE_ORDERS = (
++    ("zeta", "alpha", "mike"),
++    ("mike", "bravo", "yankee"),
++    ("charlie", "alpha", "xray"),
++)
++
++
++def _keeps_every_node_order(names: list) -> bool:
++    return all(
++        names.index(before) < names.index(after)
++        for order in NODE_ORDERS
++        for before, after in zip(order, order[1:])
++    )
++
++
++def test_sort_extra_config_keeps_every_node_order():
++    # The contract: if a node lists config A before config B, A is applied before B.
++    for seed in ("0", "5", "42"):
++        names = _run(seed).split(",")
++        assert sorted(names) == sorted({n for order in NODE_ORDERS for n in order}), names
++        assert _keeps_every_node_order(names), (seed, names)
++
++
 +def test_sort_extra_config_is_first_seen_order():
-+    assert _run("5") == "zeta,alpha,mike,bravo,yankee,charlie,xray"
++    # Dependency layers, and first-seen order inside each layer. Plain first-seen order
++    # (zeta,alpha,mike,bravo,yankee,charlie,xray) is NOT a valid answer: node d needs
++    # charlie before alpha.
++    assert not _keeps_every_node_order("zeta,alpha,mike,bravo,yankee,charlie,xray".split(","))
++    assert _run("5") == "zeta,charlie,alpha,mike,xray,bravo,yankee"
 -- 
 2.56.0
 

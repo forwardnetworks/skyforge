@@ -125,10 +125,25 @@ index 14832cb..459f4d4 100644
    node:
      kind: nxos
 diff --git a/tests/test_a10_deploy_and_vip_advertise.py b/tests/test_a10_deploy_and_vip_advertise.py
-index 279f63c..9372534 100644
+index dbd030f..780cb94 100644
 --- a/tests/test_a10_deploy_and_vip_advertise.py
 +++ b/tests/test_a10_deploy_and_vip_advertise.py
-@@ -106,7 +106,7 @@ def test_every_a10_module_template_is_delivered_over_netmiko(tmp_path: Path, mon
+@@ -32,9 +32,14 @@ def init_log(raise_error: bool = False) -> None:
+ 
+ 
+ def write_topology(tmp_path: Path, advertise: str) -> Path:
++  # defaults.netmiko.installed is netlab's own "netmiko is available" switch (augment/nodes.py
++  # check_netmiko_config_mode). Without it, a venv without netmiko drops netlab_config_mode: netmiko
++  # and falls back to Ansible (upstream #4004), so the delivery test would judge the venv, not a10.yml.
++  # The runtime image installs netmiko.
+   topo_file = tmp_path / 'topology.yml'
+   topo_file.write_text(textwrap.dedent(f"""
+     provider: kne
++    defaults.netmiko.installed: True
+     plugin: [ loadbalancer ]
+     module: [ ospf ]
+     nodes:
+@@ -106,7 +111,7 @@ def test_every_a10_module_template_is_delivered_over_netmiko(tmp_path: Path, mon
    assert set(lb.netlab_ansible_skip_module) >= set(modules)   # nothing left for the Ansible lane
  
    device = yaml.safe_load((NETSIM / 'devices' / 'a10.yml').read_text())

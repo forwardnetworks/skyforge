@@ -322,7 +322,7 @@ index 957d12b..b5c9884 100644
 +        `redistribute vip only-flagged`; unflagged VIPs stay local.
 diff --git a/tests/test_a10_deploy_and_vip_advertise.py b/tests/test_a10_deploy_and_vip_advertise.py
 new file mode 100644
-index 0000000..279f63c
+index 0000000..dbd030f
 --- /dev/null
 +++ b/tests/test_a10_deploy_and_vip_advertise.py
 @@ -0,0 +1,127 @@
@@ -368,7 +368,7 @@ index 0000000..279f63c
 +    nodes:
 +      lb:
 +        device: a10
-+        module: [ ospf ]              # the demo-lab A10s list their modules too
++        module: [ ospf ]              # real A10 labs list their modules too
 +        ospf.router_id: 10.254.2.6
 +        loadbalancer:
 +          pools:

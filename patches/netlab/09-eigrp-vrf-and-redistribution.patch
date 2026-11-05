@@ -324,10 +324,10 @@ index e74b07d..4e50704 100644
    inactive: True
 diff --git a/tests/test_eigrp_redistribution.py b/tests/test_eigrp_redistribution.py
 new file mode 100644
-index 0000000..6b79b9a
+index 0000000..65f99ed
 --- /dev/null
 +++ b/tests/test_eigrp_redistribution.py
-@@ -0,0 +1,133 @@
+@@ -0,0 +1,144 @@
 +#!/usr/bin/env python3
 +
 +import textwrap
@@ -341,18 +341,29 @@ index 0000000..6b79b9a
 +from netsim.utils import read as _read
 +
 +
++@pytest.fixture(autouse=True)
++def restore_log_state():
++  """Leave netlab's log module as this test found it.
++
++  init_log() sets process-wide flags (raise_error, quiet, ...) and the error tests leave entries in the
++  global error log. A later test module that calls log.exit_on_error() would then abort on errors it never
++  made, so snapshot the flags before each test, restore them after it, and clear the error log.
++  """
++  saved = log.set_flag()
++  yield
++  log.init_log_system(header=False)
++  log.set_flag(
++    debug=saved['debug'],
++    quiet=saved['quiet'],
++    verbose=saved['verbose'],
++    logging=saved['logging'],
++    warning=saved['warning'],
++    raise_error=saved['raise_on_error'])
++
++
 +def init_log(raise_error: bool = False) -> None:
 +  log.init_log_system(header=False)
 +  log.set_flag(quiet=True,raise_error=raise_error,warning=False,logging=False,verbose=0)
-+
-+
-+@pytest.fixture(autouse=True)
-+def _reset_log_after_test():
-+  # These tests leave netlab's module-global error log and flags set on purpose; reset them so a later
-+  # test module that calls log.exit_on_error() (test_initial_overlap_lanes) does not inherit the errors.
-+  yield
-+  log.init_log_system(header=False)
-+  log.set_flag(raise_error=False)
 +
 +
 +def write_topology(tmp_path: Path, topology: str) -> Path:
