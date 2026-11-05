@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 12:00:00 +0000
+Subject: [PATCH] asa: firewall.policy.mgmt_security_level sets Management0/0's
+ security-level
+
+SKYFORGE-SPECIFIC: platform behaviour; not for upstream.
+
+---
+diff --git a/netsim/ansible/templates/initial/asa.j2 b/netsim/ansible/templates/initial/asa.j2
+index 38dc225..1f435c1 100644
+--- a/netsim/ansible/templates/initial/asa.j2
++++ b/netsim/ansible/templates/initial/asa.j2
+@@ -21,7 +21,15 @@ aaa authorization exec LOCAL auto-enable
+ interface Management0/0
+  management-only
+  nameif management
+- security-level 0
++{#
++   Management0/0's security-level is 0 unless the node declares
++   firewall.policy.mgmt_security_level. The ASA derives its implicit
++   `<nameif>_same-security-level` / `_different-security-level` deny rows from the
++   levels of EVERY nameif, this one included, so a seed ASA whose Management0/0 sits
++   at 100 (demo-lab atl-bldg1-fw01: `nameif Mgmt` / `security-level 100`) only
++   matches the collector's view of it when the lab's management interface does too.
++#}
++ security-level {{ ((firewall|default({})).policy|default({})).mgmt_security_level|default(0) }}
+  ip address dhcp setroute
+  no shutdown
+ !
+diff --git a/netsim/extra/firewall/policy/defaults.yml b/netsim/extra/firewall/policy/defaults.yml
+index 0782777..bb670bc 100644
+--- a/netsim/extra/firewall/policy/defaults.yml
++++ b/netsim/extra/firewall/policy/defaults.yml
+@@ -56,6 +56,10 @@ attributes:
+       # ASA only: interfaces at EQUAL security levels cannot talk without this.
+       # It is a node-wide switch on the platform, not a per-rule one.
+       same_security_traffic: bool
++      # ASA only: security-level of Management0/0 (day-0 default 0). The ASA's
++      # implicit same/different-security-level deny entries are computed from every
++      # nameif's level, the management one included.
++      mgmt_security_level: { type: int, min_value: 0, max_value: 100 }
+       # ASA only: protocol inspection engines enabled in the factory
+       # global_policy / inspection_default class (MPF). `icmp` is what lets
+       # echo-reply, time-exceeded and unreachable come back through a lower
+-- 
+2.56.0
+

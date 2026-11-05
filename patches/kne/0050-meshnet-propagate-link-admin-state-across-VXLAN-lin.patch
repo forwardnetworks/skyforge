@@ -1,0 +1,1552 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 13:40:30 -0600
+Subject: [PATCH] meshnet: propagate link admin state across VXLAN links
+ (carrier follows the peer)
+
+SKYFORGE-SPECIFIC: platform behaviour; not for upstream.
+
+---
+diff --git a/third_party/meshnet/README.md b/third_party/meshnet/README.md
+index 76fc85a..7e6c2c3 100644
+--- a/third_party/meshnet/README.md
++++ b/third_party/meshnet/README.md
+@@ -102,8 +102,18 @@ administratively up. Running `ip link set eth1 down` in one pod therefore shows
+   peer node's `meshnetd` (`Remote.SetWireCarrier`), which sets the carrier of
+   its TAP with `TUNSETCARRIER` (Linux 5.0 or later). A TAP keeps carrier until
+   the peer first reports its state.
+-- **vxlan** (different nodes): not supported. The carrier of a vxlan link does
+-  not follow its peer. Use the gRPC link type when link state matters.
++- **vxlan** (different nodes): the same `Remote.SetWireCarrier` RPC carries the
++  admin state of each end to the peer node's `meshnetd`. A vxlan end has no
++  wire interface id, so the request names the receiver's pod network namespace,
++  interface and VNI. The receiver sets the carrier of its vxlan interface with
++  protodown (`IFLA_PROTO_DOWN`), which leaves the admin state untouched. The
++  watch reports admin state only, so the carrier it sets does not echo back.
++  `meshnetd` re-sends the state after a restart or when it re-creates a link,
++  and asks the peer to send its own state back. A peer without the vxlan form of
++  the RPC ignores it. The receiver acts only on a link end it has registered
++  itself, with the same VNI. KubeVirt VM ends take no part in either direction:
++  the VM NIC is a bridge port under a renamed link, so the guest's admin state
++  is not visible in the pod and carrier would not reach the guest.
+ 
+ ## Local Demo
+ 
+diff --git a/third_party/meshnet/daemon/meshnet/controller.go b/third_party/meshnet/daemon/meshnet/controller.go
+index 3adc5e0..8f60b52 100644
+--- a/third_party/meshnet/daemon/meshnet/controller.go
++++ b/third_party/meshnet/daemon/meshnet/controller.go
+@@ -28,9 +28,6 @@ import (
+ 	topologyclientv1 "github.com/openconfig/kne/third_party/meshnet/api/clientset/v1beta1"
+ )
+ 
+-// vxlanCarrierWarning logs once that VXLAN links do not propagate link state.
+-var vxlanCarrierWarning sync.Once
+-
+ // isNetNSValid returns true if the netns path exists on the host filesystem.
+ func isNetNSValid(netNS string) bool {
+ 	if netNS == "" {
+@@ -386,9 +383,6 @@ func (m *Meshnet) reconcilePodLinksInternal(ctx context.Context, topo *unstructu
+ 					LocalPodIp:         link.PeerIP,
+ 				})
+ 			} else {
+-				vxlanCarrierWarning.Do(func() {
+-					mnetdLogger.Warnf("ReconcilePodLinks: cross-node links use VXLAN, so the carrier of a link will not follow the admin state of its peer; use INTER_NODE_LINK_TYPE=GRPC for link-state propagation")
+-				})
+ 				remotePod := &mpb.RemotePod{
+ 					NetNs:    netNS,
+ 					IntfName: link.LocalIntf,
+@@ -405,11 +399,23 @@ func (m *Meshnet) reconcilePodLinksInternal(ctx context.Context, topo *unstructu
+ 					topo.GetName(), link.LocalIntf, link.PeerPodName, peerSrcIP, remotePod.Vni)
+ 				peerEnds = append(peerEnds, peerEnd{localPod: topo.GetName(), linkUID: int64(link.LinkUID), peerNs: link.PeerKubeNs, peerPod: link.PeerPodName, peerIP: peerSrcIP, peerNet: peerNetNS})
+ 				podName := topo.GetName()
++				carrierEnd := vxlan.LinkEnd{
++					NetNs:     netNS,
++					IntfName:  link.LocalIntf,
++					Vni:       remotePod.Vni,
++					LinkUID:   int64(link.LinkUID),
++					KubeNs:    link.KubeNs,
++					PeerIP:    peerSrcIP,
++					PeerNetNs: peerNetNS,
++					PeerIntf:  link.PeerIntf,
++				}
+ 				vxlanJobs = append(vxlanJobs, func() error {
+ 					if err := vxlan.CreateOrUpdate(remotePod); err != nil {
+ 						mnetdLogger.Errorf("ReconcilePodLinks: failed to create VXLAN for pod %s: %v", podName, err)
+ 						return err
+ 					}
++					// Lift the admin state of this end to the peer's daemon (carrier.go).
++					vxlan.Carriers.Ensure(carrierEnd)
+ 					return nil
+ 				})
+ 			}
+diff --git a/third_party/meshnet/daemon/meshnet/handler.go b/third_party/meshnet/daemon/meshnet/handler.go
+index 24615a1..f202570 100644
+--- a/third_party/meshnet/daemon/meshnet/handler.go
++++ b/third_party/meshnet/daemon/meshnet/handler.go
+@@ -575,9 +575,16 @@ func (m *Meshnet) GRPCWireDownRemote(ctx context.Context, wireDef *mpb.WireDef)
+ }
+ 
+ // ---------------------------------------------------------------------------------------------------------------
+-// SetWireCarrier sets the carrier of the local end of a grpc-wire to the admin state of the peer's end.
++// SetWireCarrier sets the carrier of the local end of a grpc-wire or VXLAN link to the admin state of the peer's end.
+ func (m *Meshnet) SetWireCarrier(ctx context.Context, req *mpb.WireCarrier) (*mpb.BoolResponse, error) {
+-	applied, err := grpcwire.SetWireCarrier(req)
++	var applied bool
++	var err error
++	if req.GetWireIfId() == 0 && req.GetIntfName() != "" {
++		// A VXLAN link has no wire interface id; the request names the interface (vxlan/carrier.go).
++		applied, err = vxlan.Carriers.SetLinkCarrier(req)
++	} else {
++		applied, err = grpcwire.SetWireCarrier(req)
++	}
+ 	if err != nil {
+ 		mnetdLogger.Errorf("SetWireCarrier for wire id %d (link %d) failed: %v", req.GetWireIfId(), req.GetLinkUid(), err)
+ 		return &mpb.BoolResponse{Response: false}, err
+diff --git a/third_party/meshnet/daemon/meshnet/handler_test.go b/third_party/meshnet/daemon/meshnet/handler_test.go
+index 1f38c1c..6b67cc3 100644
+--- a/third_party/meshnet/daemon/meshnet/handler_test.go
++++ b/third_party/meshnet/daemon/meshnet/handler_test.go
+@@ -7,6 +7,7 @@ import (
+ 	fakeTopology "github.com/openconfig/kne/third_party/meshnet/api/clientset/v1beta1/fake"
+ 	topologyv1 "github.com/openconfig/kne/third_party/meshnet/api/types/v1beta1"
+ 	mpb "github.com/openconfig/kne/third_party/meshnet/daemon/proto/meshnet/v1beta1"
++	"github.com/openconfig/kne/third_party/meshnet/daemon/vxlan"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ )
+ 
+@@ -134,3 +135,16 @@ func TestAddGRPCWiresRemoteBatch_InvalidNetNS(t *testing.T) {
+ 		t.Fatalf("expected response false for invalid netns")
+ 	}
+ }
++
++// A SetWireCarrier request that names a VXLAN interface (wire_if_id 0) is a
++// request about a link of this node, not a grpc-wire lookup: for a netns that
++// does not exist it is simply not applied, and it is not an error.
++func TestSetWireCarrier_VxlanRequestForUnknownNetns(t *testing.T) {
++	InitLogger()
++	vxlan.InitLogger()
++	m := &Meshnet{}
++	resp, err := m.SetWireCarrier(context.Background(), &mpb.WireCarrier{NetNs: "/proc/does-not-exist/ns/net", IntfName: "eth1", Vni: 5001})
++	if err != nil || resp.GetResponse() {
++		t.Errorf("SetWireCarrier = %v, %v; want false, nil", resp, err)
++	}
++}
+diff --git a/third_party/meshnet/daemon/proto/meshnet/v1beta1/meshnet.pb.go b/third_party/meshnet/daemon/proto/meshnet/v1beta1/meshnet.pb.go
+index 1c069bb..19f3afa 100644
+--- a/third_party/meshnet/daemon/proto/meshnet/v1beta1/meshnet.pb.go
++++ b/third_party/meshnet/daemon/proto/meshnet/v1beta1/meshnet.pb.go
+@@ -870,7 +870,18 @@ type WireCarrier struct {
+ 	// When set, the receiver pushes its own current admin state back to the
+ 	// sender. A daemon sets this after it re-creates its end of a wire, for
+ 	// example after a restart, when its end has lost the peer's state.
+-	RequestSync   bool `protobuf:"varint,5,opt,name=request_sync,json=requestSync,proto3" json:"request_sync,omitempty"`
++	RequestSync bool `protobuf:"varint,5,opt,name=request_sync,json=requestSync,proto3" json:"request_sync,omitempty"`
++	// The next three fields address a VXLAN link, which has no wire interface
++	// id: wire_if_id is then 0 and the receiver's end is named by its pod netns
++	// and interface. The receiver sets the carrier of that VXLAN interface
++	// (IFLA_PROTO_DOWN) to peer_admin_up.
++	// The network namespace of the receiver's pod, as a path on its node.
++	NetNs string `protobuf:"bytes,6,opt,name=net_ns,json=netNs,proto3" json:"net_ns,omitempty"`
++	// The name of the receiver's pod-side VXLAN interface.
++	IntfName string `protobuf:"bytes,7,opt,name=intf_name,json=intfName,proto3" json:"intf_name,omitempty"`
++	// The VNI of the link, used to reject an end that has been re-created for
++	// another link.
++	Vni           int64 `protobuf:"varint,8,opt,name=vni,proto3" json:"vni,omitempty"`
+ 	unknownFields protoimpl.UnknownFields
+ 	sizeCache     protoimpl.SizeCache
+ }
+@@ -940,6 +951,27 @@ func (x *WireCarrier) GetRequestSync() bool {
+ 	return false
+ }
+ 
++func (x *WireCarrier) GetNetNs() string {
++	if x != nil {
++		return x.NetNs
++	}
++	return ""
++}
++
++func (x *WireCarrier) GetIntfName() string {
++	if x != nil {
++		return x.IntfName
++	}
++	return ""
++}
++
++func (x *WireCarrier) GetVni() int64 {
++	if x != nil {
++		return x.Vni
++	}
++	return 0
++}
++
+ type GenerateNodeInterfaceNameRequest struct {
+ 	state         protoimpl.MessageState `protogen:"open.v1"`
+ 	PodIntfName   string                 `protobuf:"bytes,1,opt,name=pod_intf_name,json=podIntfName,proto3" json:"pod_intf_name,omitempty"`
+@@ -1162,14 +1194,17 @@ const file_daemon_proto_meshnet_v1beta1_meshnet_proto_rawDesc = "" +
+ 	"\bresponse\x18\x01 \x01(\bR\bresponse\"B\n" +
+ 	"\x06Packet\x12\"\n" +
+ 	"\rremot_intf_id\x18\x01 \x01(\x03R\vremotIntfId\x12\x14\n" +
+-	"\x05frame\x18\x02 \x01(\fR\x05frame\"\xa6\x01\n" +
++	"\x05frame\x18\x02 \x01(\fR\x05frame\"\xec\x01\n" +
+ 	"\vWireCarrier\x12\x1c\n" +
+ 	"\n" +
+ 	"wire_if_id\x18\x01 \x01(\x03R\bwireIfId\x12\x19\n" +
+ 	"\blink_uid\x18\x02 \x01(\x03R\alinkUid\x12\x17\n" +
+ 	"\atopo_ns\x18\x03 \x01(\tR\x06topoNs\x12\"\n" +
+ 	"\rpeer_admin_up\x18\x04 \x01(\bR\vpeerAdminUp\x12!\n" +
+-	"\frequest_sync\x18\x05 \x01(\bR\vrequestSync\"a\n" +
++	"\frequest_sync\x18\x05 \x01(\bR\vrequestSync\x12\x15\n" +
++	"\x06net_ns\x18\x06 \x01(\tR\x05netNs\x12\x1b\n" +
++	"\tintf_name\x18\a \x01(\tR\bintfName\x12\x10\n" +
++	"\x03vni\x18\b \x01(\x03R\x03vni\"a\n" +
+ 	" GenerateNodeInterfaceNameRequest\x12\"\n" +
+ 	"\rpod_intf_name\x18\x01 \x01(\tR\vpodIntfName\x12\x19\n" +
+ 	"\bpod_name\x18\x02 \x01(\tR\apodName\"Y\n" +
+diff --git a/third_party/meshnet/daemon/proto/meshnet/v1beta1/meshnet.proto b/third_party/meshnet/daemon/proto/meshnet/v1beta1/meshnet.proto
+index dbb533a..80b7bb4 100644
+--- a/third_party/meshnet/daemon/proto/meshnet/v1beta1/meshnet.proto
++++ b/third_party/meshnet/daemon/proto/meshnet/v1beta1/meshnet.proto
+@@ -145,6 +145,17 @@ message WireCarrier {
+   // sender. A daemon sets this after it re-creates its end of a wire, for
+   // example after a restart, when its end has lost the peer's state.
+   bool request_sync = 5;
++  // The next three fields address a VXLAN link, which has no wire interface
++  // id: wire_if_id is then 0 and the receiver's end is named by its pod netns
++  // and interface. The receiver sets the carrier of that VXLAN interface
++  // (IFLA_PROTO_DOWN) to peer_admin_up.
++  // The network namespace of the receiver's pod, as a path on its node.
++  string net_ns = 6;
++  // The name of the receiver's pod-side VXLAN interface.
++  string intf_name = 7;
++  // The VNI of the link, used to reject an end that has been re-created for
++  // another link.
++  int64 vni = 8;
+ }
+ 
+ message GenerateNodeInterfaceNameRequest {
+diff --git a/third_party/meshnet/daemon/vxlan/carrier.go b/third_party/meshnet/daemon/vxlan/carrier.go
+new file mode 100644
+index 0000000..add8211
+--- /dev/null
++++ b/third_party/meshnet/daemon/vxlan/carrier.go
+@@ -0,0 +1,589 @@
++package vxlan
++
++// This file gives VXLAN links the carrier semantics of a veth pair, the same
++// semantics grpcwire/carrier.go gives grpc-wires: an end of a link has carrier
++// (IFF_LOWER_UP) only while the other end is administratively up (IFF_UP).
++// Same-node links are veth pairs and get this from the kernel. A VXLAN
++// interface knows nothing about its remote end, so the daemons carry the state.
++//
++// Each daemon watches the admin state of the pod-side VXLAN interfaces of the
++// links it reconciles (one netlink subscription per pod netns, the same watch
++// the grpc-wires use) and pushes it to the daemon that owns the other end with
++// the existing Remote.SetWireCarrier RPC. A VXLAN end has no wire interface id,
++// so the request names the receiver's end by its pod netns, interface name and
++// VNI (wire_if_id is 0). The receiver sets the carrier of its interface with
++// protodown (wireutil.SetLinkCarrier). Carrier is never reported by the watch,
++// so a carrier we set cannot echo back as an admin change.
++//
++// The node of the peer is known the way it is for the VXLAN itself: the
++// reconciler already resolved the peer pod's node IP and netns from its
++// Topology status. Every reconcile pass calls Carriers.Ensure for every link,
++// so a link is re-registered after a daemon restart, and a changed peer netns
++// or a re-created local interface (new ifindex) makes the daemon send its state
++// again and ask the peer to send its own back.
++//
++// KubeVirt VM ends take no part: the wire of a VM pod is a bridge port under a
++// renamed link, the guest's admin state is not visible in the pod netns, and
++// carrier on a bridge port does not reach the guest. A VM end neither sends nor
++// applies state; a request for one is acknowledged and ignored.
++//
++// The receiver applies a request only to an end it has registered itself (a
++// link of a pod on this node, from its own Topology), with the same VNI.
++
++import (
++	"context"
++	"fmt"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/vishvananda/netlink"
++	"google.golang.org/grpc"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/credentials/insecure"
++	"google.golang.org/grpc/status"
++
++	mpb "github.com/openconfig/kne/third_party/meshnet/daemon/proto/meshnet/v1beta1"
++	"github.com/openconfig/kne/third_party/meshnet/utils/wireutil"
++)
++
++// Hooks replaced by tests.
++var (
++	// sendCarrier sends req to the daemon at peerIP and reports whether the
++	// peer applied it.
++	sendCarrier = grpcSendCarrier
++	// setLinkCarrier sets the carrier of the interface with an ifindex in a pod netns.
++	setLinkCarrier = wireutil.SetLinkCarrier
++	// watchAdminState watches the admin state of the interfaces in a netns and
++	// calls onEnd when the watch ends.
++	watchAdminState = wireutil.WatchAdminStateNotify
++	// wireIndex returns the ifindex of the VXLAN wire ifName names in nsPath
++	// (following KubeVirt renames) and its VNI, or 0 if there is none.
++	wireIndex = findWireIndex
++	// now is the clock of the idle check.
++	now = time.Now
++)
++
++const (
++	carrierRPCTimeout = 5 * time.Second
++	// carrierGiveUpAfter is the number of failed pushes after which a pusher
++	// waits for the next reconcile pass instead of retrying.
++	carrierGiveUpAfter = 8
++)
++
++var (
++	carrierInitialBackoff = 100 * time.Millisecond
++	carrierMaxBackoff     = 5 * time.Second
++	// carrierIdleAfter is how long an end may go without a reconcile pass
++	// before it is dropped (its link or pod is gone).
++	carrierIdleAfter    = 5 * time.Minute
++	carrierIdleInterval = time.Minute
++	// unsupportedPeerFor is how long a peer that answered Unimplemented is left
++	// alone. It is about one reconcile pass: a daemon that is rolled to a version
++	// with the RPC is found again by the next pass, or at once when it asks for our
++	// state (SetLinkCarrier clears the mark).
++	unsupportedPeerFor = time.Minute
++)
++
++// LinkEnd names the local end of a cross-node VXLAN link and the end it
++// connects to.
++type LinkEnd struct {
++	NetNs     string // the local pod netns path
++	IntfName  string // the local pod-side interface
++	Vni       int64
++	LinkUID   int64
++	KubeNs    string // the topology namespace
++	PeerIP    string // the node IP of the daemon that owns the peer end
++	PeerNetNs string // the peer pod netns path, on the peer node
++	PeerIntf  string // the peer pod-side interface
++}
++
++func (e LinkEnd) key() string { return e.NetNs + "|" + e.IntfName }
++
++// carrierEnd pushes the admin state of the local end of a link to the peer.
++type carrierEnd struct {
++	notify chan struct{} // capacity 1; signals that state may need sending
++
++	mu          sync.Mutex
++	link        LinkEnd
++	ifindex     int
++	known       bool // adminUp has been observed
++	adminUp     bool
++	dirty       bool // the peer may not have the latest state
++	requestSync bool // ask the peer to send its state back
++	failures    int
++	lastEnsure  time.Time
++
++	// The carrier last applied to this end for the peer (receiver side).
++	// applyMu serializes the check and the kernel call.
++	applyMu    sync.Mutex
++	applied    bool
++	appliedIdx int
++	appliedUp  bool
++
++	stopOnce sync.Once
++	stop     chan struct{}
++}
++
++func newCarrierEnd(l LinkEnd) *carrierEnd {
++	return &carrierEnd{
++		notify:     make(chan struct{}, 1),
++		stop:       make(chan struct{}),
++		link:       l,
++		lastEnsure: now(),
++	}
++}
++
++func (e *carrierEnd) kick() {
++	select {
++	case e.notify <- struct{}{}:
++	default:
++	}
++}
++
++// setAdmin records the admin state of the local end. Only a change is sent.
++func (e *carrierEnd) setAdmin(up bool) {
++	e.mu.Lock()
++	changed := !e.known || e.adminUp != up
++	e.known = true
++	e.adminUp = up
++	if changed {
++		e.dirty = true
++		e.failures = 0
++	}
++	e.mu.Unlock()
++	if changed {
++		e.kick()
++	}
++}
++
++// resend sends the current admin state again. If requestSync is set, the peer
++// is also asked to send its state back.
++func (e *carrierEnd) resend(requestSync bool) {
++	e.mu.Lock()
++	e.dirty = true
++	e.failures = 0
++	if requestSync {
++		e.requestSync = true
++	}
++	e.mu.Unlock()
++	e.kick()
++}
++
++// kickPending retries what is pending, giving a pusher that gave up a new budget.
++func (e *carrierEnd) kickPending() {
++	e.mu.Lock()
++	e.dirty = true
++	e.failures = 0
++	e.mu.Unlock()
++	e.kick()
++}
++
++func (e *carrierEnd) close() { e.stopOnce.Do(func() { close(e.stop) }) }
++
++// next returns the request to send, or false if there is nothing to send yet.
++// It clears the pending state; a failed send restores it with retry.
++func (e *carrierEnd) next() (*mpb.WireCarrier, string, string, bool) {
++	e.mu.Lock()
++	defer e.mu.Unlock()
++	if !e.dirty || !e.known {
++		return nil, "", "", false
++	}
++	e.dirty = false
++	req := &mpb.WireCarrier{
++		LinkUid:     e.link.LinkUID,
++		TopoNs:      e.link.KubeNs,
++		PeerAdminUp: e.adminUp,
++		RequestSync: e.requestSync,
++		NetNs:       e.link.PeerNetNs,
++		IntfName:    e.link.PeerIntf,
++		Vni:         e.link.Vni,
++	}
++	e.requestSync = false
++	return req, e.link.PeerIP, e.link.IntfName, true
++}
++
++// retry restores the pending state of a request that was not applied. After
++// carrierGiveUpAfter failures the end stays quiet until the next change or
++// reconcile pass (see Ensure).
++func (e *carrierEnd) retry(req *mpb.WireCarrier) (giveUp bool) {
++	e.mu.Lock()
++	defer e.mu.Unlock()
++	e.failures++
++	if req != nil && req.RequestSync {
++		e.requestSync = true
++	}
++	if e.failures >= carrierGiveUpAfter {
++		return true
++	}
++	e.dirty = true
++	return false
++}
++
++// requeue puts a request that could not be sent back as pending, without
++// counting it as a failed attempt. The state is sent when the peer is next
++// tried (Ensure, or the peer asking for our state).
++func (e *carrierEnd) requeue(req *mpb.WireCarrier) {
++	e.mu.Lock()
++	defer e.mu.Unlock()
++	e.dirty = true
++	if req != nil && req.RequestSync {
++		e.requestSync = true
++	}
++}
++
++func (e *carrierEnd) run(r *carrierRegistry) {
++	backoff := carrierInitialBackoff
++	idle := time.NewTicker(carrierIdleInterval)
++	defer idle.Stop()
++	for {
++		select {
++		case <-e.stop:
++			return
++		case <-idle.C:
++			e.mu.Lock()
++			gone := now().Sub(e.lastEnsure) > carrierIdleAfter
++			e.mu.Unlock()
++			if gone {
++				r.remove(e)
++				return
++			}
++			continue
++		case <-e.notify:
++		}
++		for {
++			req, peerIP, ifName, pending := e.next()
++			if !pending {
++				backoff = carrierInitialBackoff
++				break
++			}
++			if r.peerUnsupported(peerIP) {
++				e.requeue(req)
++				break
++			}
++			ctx, cancel := context.WithTimeout(context.Background(), carrierRPCTimeout)
++			applied, err := sendCarrier(ctx, peerIP, req)
++			cancel()
++			if status.Code(err) == codes.Unimplemented {
++				r.markUnsupported(peerIP)
++				e.requeue(req)
++				break
++			}
++			if err == nil && applied {
++				vxLanOvrlyLogger.Infof("[CARRIER] sent admin up=%t of %s (link %d) to peer %s", req.PeerAdminUp, ifName, req.LinkUid, peerIP)
++				e.mu.Lock()
++				e.failures = 0
++				e.mu.Unlock()
++				backoff = carrierInitialBackoff
++				continue
++			}
++			vxLanOvrlyLogger.Debugf("[CARRIER] peer %s did not apply admin up=%t for link %d (err: %v), retrying in %v", peerIP, req.PeerAdminUp, req.LinkUid, err, backoff)
++			if e.retry(req) {
++				vxLanOvrlyLogger.Warnf("[CARRIER] peer %s did not apply the state of link %d (%s); will try again on the next reconcile pass", peerIP, req.LinkUid, ifName)
++				break
++			}
++			select {
++			case <-e.stop:
++				return
++			case <-time.After(backoff):
++			}
++			backoff *= 2
++			if backoff > carrierMaxBackoff {
++				backoff = carrierMaxBackoff
++			}
++		}
++	}
++}
++
++// nsWatch is the admin-state watch of one pod network namespace.
++type nsWatch struct {
++	stop    func()
++	ends    map[string]*carrierEnd // by interface name
++	adminUp map[string]bool        // last observed admin state by interface name
++}
++
++// carrierRegistry tracks the VXLAN ends whose admin state is being watched.
++type carrierRegistry struct {
++	mu          sync.Mutex
++	watches     map[string]*nsWatch // by netns path
++	unsupported map[string]time.Time
++	wg          sync.WaitGroup // the end goroutines
++}
++
++func newCarrierRegistry() *carrierRegistry {
++	return &carrierRegistry{
++		watches:     map[string]*nsWatch{},
++		unsupported: map[string]time.Time{},
++	}
++}
++
++// Carriers is the daemon's registry of VXLAN link ends.
++var Carriers = newCarrierRegistry()
++
++// onAdminChange is called by the watch of netNS.
++func (r *carrierRegistry) onAdminChange(netNS, ifName string, adminUp bool) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	nw, ok := r.watches[netNS]
++	if !ok {
++		return
++	}
++	nw.adminUp[ifName] = adminUp
++	if e := nw.ends[ifName]; e != nil {
++		e.setAdmin(adminUp)
++	}
++}
++
++func (r *carrierRegistry) peerUnsupported(peerIP string) bool {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	return r.peerUnsupportedLocked(peerIP)
++}
++
++func (r *carrierRegistry) peerUnsupportedLocked(peerIP string) bool {
++	until, ok := r.unsupported[peerIP]
++	return ok && now().Before(until)
++}
++
++func (r *carrierRegistry) markUnsupported(peerIP string) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	if until, ok := r.unsupported[peerIP]; !ok || !now().Before(until) {
++		vxLanOvrlyLogger.Warnf("[CARRIER] peer %s does not support SetWireCarrier; carrier of links to it will not follow their peer", peerIP)
++	}
++	r.unsupported[peerIP] = now().Add(unsupportedPeerFor)
++}
++
++// Ensure registers the local end of a link, or refreshes its registration. The
++// reconciler calls it for every cross-node VXLAN link on every pass, after the
++// link has been created or confirmed.
++func (r *carrierRegistry) Ensure(l LinkEnd) {
++	if isKubeVirtWire(l.IntfName) {
++		return // see the KubeVirt note at the top of this file
++	}
++	index, _ := wireIndex(l.NetNs, l.IntfName)
++
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	nw, ok := r.watches[l.NetNs]
++	if !ok {
++		nw = &nsWatch{ends: map[string]*carrierEnd{}, adminUp: map[string]bool{}}
++		// The watch reports existing interfaces from its own goroutine, which
++		// needs r.mu in onAdminChange, so it only starts reporting once we return.
++		netNS, w := l.NetNs, nw
++		stop, err := watchAdminState(l.NetNs, func(ifName string, adminUp bool) {
++			r.onAdminChange(netNS, ifName, adminUp)
++		}, func() { r.watchEnded(netNS, w) })
++		if err != nil {
++			vxLanOvrlyLogger.Warnf("[CARRIER] cannot watch admin state of %s in %s; peer carrier will not follow it: %v", l.IntfName, l.NetNs, err)
++			return
++		}
++		nw.stop = stop
++		r.watches[l.NetNs] = nw
++	}
++	e, exists := nw.ends[l.IntfName]
++	if !exists {
++		e = newCarrierEnd(l)
++		nw.ends[l.IntfName] = e
++		r.wg.Add(1)
++		go func() {
++			defer r.wg.Done()
++			e.run(r)
++		}()
++	}
++	e.mu.Lock()
++	e.lastEnsure = now()
++	recreated := exists && (e.ifindex != index || e.link.PeerIP != l.PeerIP || e.link.PeerNetNs != l.PeerNetNs ||
++		e.link.PeerIntf != l.PeerIntf || e.link.Vni != l.Vni)
++	retryable := exists && (e.failures >= carrierGiveUpAfter || (e.dirty && !r.peerUnsupportedLocked(l.PeerIP)))
++	e.link = l
++	e.ifindex = index
++	e.mu.Unlock()
++	if up, known := nw.adminUp[l.IntfName]; known && !exists {
++		e.setAdmin(up)
++	}
++	switch {
++	case !exists, recreated:
++		// A new end has not had the peer's state yet; ask for it.
++		e.resend(true)
++	case retryable:
++		e.kickPending()
++	}
++}
++
++// watchEnded drops the watch of a netns that ended without being stopped (the
++// netlink subscription failed, or the netns went away) together with its ends,
++// so that the next reconcile pass starts a new watch and re-syncs both sides.
++func (r *carrierRegistry) watchEnded(netNS string, nw *nsWatch) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	if r.watches[netNS] != nw {
++		return // stopped on purpose, or already replaced
++	}
++	vxLanOvrlyLogger.Infof("[CARRIER] admin-state watch of %s ended; it is started again on the next reconcile pass", netNS)
++	delete(r.watches, netNS)
++	for _, e := range nw.ends {
++		e.close()
++	}
++}
++
++// isKubeVirtWire reports whether ifName is the name meshnet gives the wire of
++// a KubeVirt VM pod (see kubevirt_slot.go).
++func isKubeVirtWire(ifName string) bool {
++	nic, _ := kubevirtNames(ifName)
++	return nic != ""
++}
++
++// shutdown stops every end and waits for them. The daemon never calls it; tests do.
++func (r *carrierRegistry) shutdown() {
++	r.mu.Lock()
++	for _, nw := range r.watches {
++		for _, e := range nw.ends {
++			e.close()
++		}
++	}
++	r.mu.Unlock()
++	r.wg.Wait()
++}
++
++// remove drops an end that stopped being reconciled.
++func (r *carrierRegistry) remove(e *carrierEnd) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	e.mu.Lock()
++	l := e.link
++	e.mu.Unlock()
++	nw, ok := r.watches[l.NetNs]
++	if !ok || nw.ends[l.IntfName] != e {
++		return
++	}
++	delete(nw.ends, l.IntfName)
++	e.close()
++	if len(nw.ends) == 0 {
++		delete(r.watches, l.NetNs)
++		if nw.stop != nil {
++			// stop waits for the watch goroutine, which may be waiting for r.mu.
++			go nw.stop()
++		}
++	}
++}
++
++// peerSpoke is called when the peer of the local end (netNS, ifName) has just
++// sent us a request in the VXLAN form, so it supports it: forget any mark that
++// it does not, and send our state if a send was held back. sync asks for our
++// state to be sent again regardless.
++func (r *carrierRegistry) peerSpoke(netNS, ifName string, sync bool) {
++	r.mu.Lock()
++	nw := r.watches[netNS]
++	var e *carrierEnd
++	if nw != nil {
++		e = nw.ends[ifName]
++	}
++	if e != nil {
++		e.mu.Lock()
++		peerIP := e.link.PeerIP
++		e.mu.Unlock()
++		delete(r.unsupported, peerIP)
++	}
++	r.mu.Unlock()
++	if e == nil {
++		return
++	}
++	e.mu.Lock()
++	pending := e.dirty
++	e.mu.Unlock()
++	if sync || pending {
++		e.resend(false)
++	}
++}
++
++// SetLinkCarrier applies the admin state of the peer's end of a VXLAN link as
++// the carrier of the local end named by req. It reports whether the request
++// was applied. Only an end this daemon registered (Ensure) with the same VNI is
++// touched; the kernel call is made only when the state differs from what was
++// last applied to that interface (same ifindex).
++func (r *carrierRegistry) SetLinkCarrier(req *mpb.WireCarrier) (bool, error) {
++	nsPath, ifName := req.GetNetNs(), req.GetIntfName()
++	if nsPath == "" || ifName == "" || req.GetVni() == 0 {
++		return false, nil
++	}
++	if isKubeVirtWire(ifName) {
++		// A VM end does not follow its peer (see the top of this file). Say it
++		// was applied so that the sender does not retry.
++		return true, nil
++	}
++	r.mu.Lock()
++	var e *carrierEnd
++	if nw := r.watches[nsPath]; nw != nil {
++		e = nw.ends[ifName]
++	}
++	r.mu.Unlock()
++	if e == nil {
++		vxLanOvrlyLogger.Debugf("[CARRIER] SetLinkCarrier: %s in %s is not a link end of this node (link %d)", ifName, nsPath, req.GetLinkUid())
++		return false, nil
++	}
++	up := req.GetPeerAdminUp()
++	e.applyMu.Lock()
++	index, vni := wireIndex(nsPath, ifName)
++	if index == 0 || vni != req.GetVni() {
++		// Missing, or re-created for another link: never touch it.
++		e.applyMu.Unlock()
++		vxLanOvrlyLogger.Debugf("[CARRIER] SetLinkCarrier: no VXLAN %s with VNI %d in %s (link %d)", ifName, req.GetVni(), nsPath, req.GetLinkUid())
++		return false, nil
++	}
++	if !e.applied || e.appliedIdx != index || e.appliedUp != up {
++		if err := setLinkCarrier(nsPath, index, up); err != nil {
++			e.applyMu.Unlock()
++			return false, fmt.Errorf("setting carrier of %s in %s: %w", ifName, nsPath, err)
++		}
++		e.applied, e.appliedIdx, e.appliedUp = true, index, up
++		vxLanOvrlyLogger.Infof("[CARRIER] set carrier of %s (link %d) to %t", ifName, req.GetLinkUid(), up)
++	}
++	e.applyMu.Unlock()
++	r.peerSpoke(nsPath, ifName, req.GetRequestSync())
++	return true, nil
++}
++
++// findWireIndex returns the ifindex and VNI of the VXLAN wire named ifName in
++// the pod netns nsPath, following KubeVirt renames (resolveSlot).
++func findWireIndex(nsPath, ifName string) (int, int64) {
++	slot := resolveSlot(func(name string) netlink.Link { return getLinkFromNS(nsPath, name) }, ifName)
++	v, ok := slot.found.(*netlink.Vxlan)
++	if !ok {
++		return 0, 0
++	}
++	return v.Attrs().Index, int64(v.VxlanId)
++}
++
++// peer connections are cached by address.
++var carrierConns = struct {
++	mu    sync.Mutex
++	conns map[string]*grpc.ClientConn
++}{conns: map[string]*grpc.ClientConn{}}
++
++func carrierConn(peerIP string) (*grpc.ClientConn, error) {
++	url := strings.TrimSpace(fmt.Sprintf("%s:%d", peerIP, wireutil.GRPCDefaultPort))
++	carrierConns.mu.Lock()
++	defer carrierConns.mu.Unlock()
++	if c, ok := carrierConns.conns[url]; ok {
++		return c, nil
++	}
++	c, err := grpc.NewClient(url, grpc.WithTransportCredentials(insecure.NewCredentials()))
++	if err != nil {
++		return nil, err
++	}
++	carrierConns.conns[url] = c
++	return c, nil
++}
++
++func grpcSendCarrier(ctx context.Context, peerIP string, req *mpb.WireCarrier) (bool, error) {
++	conn, err := carrierConn(peerIP)
++	if err != nil {
++		return false, err
++	}
++	resp, err := mpb.NewRemoteClient(conn).SetWireCarrier(ctx, req)
++	if err != nil {
++		return false, err
++	}
++	return resp.GetResponse(), nil
++}
+diff --git a/third_party/meshnet/daemon/vxlan/carrier_test.go b/third_party/meshnet/daemon/vxlan/carrier_test.go
+new file mode 100644
+index 0000000..82f6544
+--- /dev/null
++++ b/third_party/meshnet/daemon/vxlan/carrier_test.go
+@@ -0,0 +1,558 @@
++package vxlan
++
++import (
++	"context"
++	"fmt"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
++
++	mpb "github.com/openconfig/kne/third_party/meshnet/daemon/proto/meshnet/v1beta1"
++	"github.com/openconfig/kne/third_party/meshnet/utils/wireutil"
++)
++
++// fakeKernel models the parts of two nodes' kernels the carrier code uses: pod
++// netns with VXLAN interfaces that have an admin state and a carrier. Setting
++// carrier never reports an admin change, which is how the real watch behaves
++// (WatchAdminState ignores IFF_LOWER_UP).
++type fakeKernel struct {
++	mu           sync.Mutex
++	links        map[string]*fakeLink // ns|name
++	watchers     map[string][]func(string, bool)
++	onEnd        map[string][]func()
++	nextIdx      int
++	carrierCalls int
++}
++
++type fakeLink struct {
++	index   int
++	vni     int64
++	adminUp bool
++	carrier bool
++}
++
++func newFakeKernel() *fakeKernel {
++	return &fakeKernel{links: map[string]*fakeLink{}, watchers: map[string][]func(string, bool){}, onEnd: map[string][]func(){}, nextIdx: 10}
++}
++
++func (k *fakeKernel) addLink(ns, name string, vni int64) {
++	k.mu.Lock()
++	k.nextIdx++
++	k.links[ns+"|"+name] = &fakeLink{index: k.nextIdx, vni: vni, adminUp: true, carrier: true}
++	cbs := append([]func(string, bool){}, k.watchers[ns]...)
++	k.mu.Unlock()
++	for _, cb := range cbs {
++		cb(name, true)
++	}
++}
++
++// recreate deletes and re-adds a link: a new ifindex, admin up, carrier on.
++func (k *fakeKernel) recreate(ns, name string) {
++	k.mu.Lock()
++	vni := k.links[ns+"|"+name].vni
++	delete(k.links, ns+"|"+name)
++	k.mu.Unlock()
++	k.addLink(ns, name, vni)
++}
++
++func (k *fakeKernel) setAdmin(ns, name string, up bool) {
++	k.mu.Lock()
++	k.links[ns+"|"+name].adminUp = up
++	cbs := append([]func(string, bool){}, k.watchers[ns]...)
++	k.mu.Unlock()
++	for _, cb := range cbs {
++		cb(name, up)
++	}
++}
++
++func (k *fakeKernel) carrier(ns, name string) bool {
++	k.mu.Lock()
++	defer k.mu.Unlock()
++	return k.links[ns+"|"+name].carrier
++}
++
++func (k *fakeKernel) watch(ns string, cb wireutil.AdminStateFunc, onEnd func()) (func(), error) {
++	k.mu.Lock()
++	k.watchers[ns] = append(k.watchers[ns], cb)
++	k.onEnd[ns] = append(k.onEnd[ns], onEnd)
++	existing := map[string]bool{}
++	for key, l := range k.links {
++		if len(key) > len(ns) && key[:len(ns)+1] == ns+"|" {
++			existing[key[len(ns)+1:]] = l.adminUp
++		}
++	}
++	k.mu.Unlock()
++	go func() {
++		for name, up := range existing {
++			cb(name, up)
++		}
++	}()
++	return func() {}, nil
++}
++
++func (k *fakeKernel) index(ns, name string) (int, int64) {
++	k.mu.Lock()
++	defer k.mu.Unlock()
++	if l, ok := k.links[ns+"|"+name]; ok {
++		return l.index, l.vni
++	}
++	return 0, 0
++}
++
++// setCarrier acts on the link with that ifindex in ns, as the kernel does: a
++// call by a stale index does not reach a link that now holds the same name.
++func (k *fakeKernel) setCarrier(ns string, index int, up bool) error {
++	k.mu.Lock()
++	defer k.mu.Unlock()
++	for key, l := range k.links {
++		if strings.HasPrefix(key, ns+"|") && l.index == index {
++			l.carrier = up
++			k.carrierCalls++
++			return nil
++		}
++	}
++	return fmt.Errorf("no ifindex %d in %s", index, ns)
++}
++
++// endWatches ends every watch of ns as a failed netlink subscription does.
++func (k *fakeKernel) endWatches(ns string) {
++	k.mu.Lock()
++	ends := k.onEnd[ns]
++	delete(k.onEnd, ns)
++	delete(k.watchers, ns)
++	k.mu.Unlock()
++	for _, f := range ends {
++		f()
++	}
++}
++
++// cluster is two nodes, A (10.0.0.1) and B (10.0.0.2), with one link between
++// pod-a/eth1 and pod-b/eth1.
++type cluster struct {
++	k      *fakeKernel
++	reg    map[string]*carrierRegistry // by node IP
++	mu     sync.Mutex
++	sent   []string // "A->B up=false"
++	sendFn func(peerIP string, req *mpb.WireCarrier) (bool, error)
++	old    []*carrierRegistry // registries of restarted daemons
++}
++
++const (
++	nsA, nsB = "/ns/a", "/ns/b"
++	ipA, ipB = "10.0.0.1", "10.0.0.2"
++	linkVni  = 5001
++	linkUID  = 7
++)
++
++func newCluster(t *testing.T) *cluster {
++	t.Helper()
++	InitLogger()
++	c := &cluster{k: newFakeKernel(), reg: map[string]*carrierRegistry{ipA: newCarrierRegistry(), ipB: newCarrierRegistry()}}
++	oldSend, oldSet, oldWatch, oldIdx := sendCarrier, setLinkCarrier, watchAdminState, wireIndex
++	oldBackoff, oldMax := carrierInitialBackoff, carrierMaxBackoff
++	carrierInitialBackoff, carrierMaxBackoff = time.Millisecond, 5*time.Millisecond
++	sendCarrier = func(ctx context.Context, peerIP string, req *mpb.WireCarrier) (bool, error) {
++		from := ipA
++		if peerIP == ipA {
++			from = ipB
++		}
++		c.mu.Lock()
++		c.sent = append(c.sent, fmt.Sprintf("%s->%s up=%t sync=%t", from, peerIP, req.GetPeerAdminUp(), req.GetRequestSync()))
++		fn := c.sendFn
++		c.mu.Unlock()
++		if fn != nil {
++			return fn(peerIP, req)
++		}
++		return c.reg[peerIP].SetLinkCarrier(req)
++	}
++	setLinkCarrier = c.k.setCarrier
++	watchAdminState = c.k.watch
++	wireIndex = c.k.index
++	t.Cleanup(func() {
++		c.mu.Lock()
++		regs := append([]*carrierRegistry{}, c.old...)
++		for _, r := range c.reg {
++			regs = append(regs, r)
++		}
++		c.mu.Unlock()
++		for _, r := range regs {
++			r.shutdown()
++		}
++		sendCarrier, setLinkCarrier, watchAdminState, wireIndex = oldSend, oldSet, oldWatch, oldIdx
++		carrierInitialBackoff, carrierMaxBackoff = oldBackoff, oldMax
++	})
++	c.k.addLink(nsA, "eth1", linkVni)
++	c.k.addLink(nsB, "eth1", linkVni)
++	return c
++}
++
++// restart replaces a node's daemon state with a fresh registry.
++func (c *cluster) restart(ip string) {
++	c.mu.Lock()
++	c.old = append(c.old, c.reg[ip])
++	c.reg[ip] = newCarrierRegistry()
++	c.mu.Unlock()
++}
++
++func (c *cluster) endA() LinkEnd {
++	return LinkEnd{NetNs: nsA, IntfName: "eth1", Vni: linkVni, LinkUID: linkUID, KubeNs: "lab", PeerIP: ipB, PeerNetNs: nsB, PeerIntf: "eth1"}
++}
++func (c *cluster) endB() LinkEnd {
++	return LinkEnd{NetNs: nsB, IntfName: "eth1", Vni: linkVni, LinkUID: linkUID, KubeNs: "lab", PeerIP: ipA, PeerNetNs: nsA, PeerIntf: "eth1"}
++}
++
++// ensureBoth runs a reconcile pass on both nodes and waits until each daemon
++// has sent the initial state of its end (the watch reports existing links
++// asynchronously, as the real one does).
++func (c *cluster) ensureBoth() {
++	c.reg[ipA].Ensure(c.endA())
++	c.reg[ipB].Ensure(c.endB())
++	deadline := time.Now().Add(3 * time.Second)
++	for (c.count("10.0.0.1->") < 1 || c.count("10.0.0.2->") < 1) && time.Now().Before(deadline) {
++		time.Sleep(2 * time.Millisecond)
++	}
++	quiet()
++}
++func (c *cluster) sends() []string {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	return append([]string{}, c.sent...)
++}
++func (c *cluster) count(prefix string) int {
++	n := 0
++	for _, s := range c.sends() {
++		if len(s) >= len(prefix) && s[:len(prefix)] == prefix {
++			n++
++		}
++	}
++	return n
++}
++
++func eventually(t *testing.T, what string, cond func() bool) {
++	t.Helper()
++	deadline := time.Now().Add(3 * time.Second)
++	for time.Now().Before(deadline) {
++		if cond() {
++			return
++		}
++		time.Sleep(2 * time.Millisecond)
++	}
++	t.Fatalf("timed out waiting for %s", what)
++}
++
++// quiet waits long enough for a wrongly sent push to have happened.
++func quiet() { time.Sleep(60 * time.Millisecond) }
++
++func TestCarrierFollowsPeerAdminStateBothDirections(t *testing.T) {
++	c := newCluster(t)
++	c.ensureBoth()
++	eventually(t, "initial state pushed", func() bool { return c.count("10.0.0.1->") >= 1 && c.count("10.0.0.2->") >= 1 })
++	quiet()
++	if !c.k.carrier(nsA, "eth1") || !c.k.carrier(nsB, "eth1") {
++		t.Fatal("both ends are admin up, so both must have carrier")
++	}
++
++	c.k.setAdmin(nsA, "eth1", false) // NOS shutdown on A
++	eventually(t, "B NO-CARRIER after A admin down", func() bool { return !c.k.carrier(nsB, "eth1") })
++	if !c.k.carrier(nsA, "eth1") {
++		t.Fatal("A's own carrier must not follow its own admin state")
++	}
++	c.k.setAdmin(nsA, "eth1", true)
++	eventually(t, "B carrier back after A admin up", func() bool { return c.k.carrier(nsB, "eth1") })
++
++	c.k.setAdmin(nsB, "eth1", false)
++	eventually(t, "A NO-CARRIER after B admin down", func() bool { return !c.k.carrier(nsA, "eth1") })
++	if !c.k.carrier(nsB, "eth1") {
++		t.Fatal("B's own carrier must not follow its own admin state")
++	}
++	c.k.setAdmin(nsB, "eth1", true)
++	eventually(t, "A carrier back after B admin up", func() bool { return c.k.carrier(nsA, "eth1") })
++}
++
++func TestCarrierDoesNotLoopOrRepeat(t *testing.T) {
++	c := newCluster(t)
++	c.ensureBoth()
++	eventually(t, "initial pushes", func() bool { return c.count("10.0.0.1->") >= 1 && c.count("10.0.0.2->") >= 1 })
++	quiet()
++	baseA, baseB, baseCalls := c.count("10.0.0.1->"), c.count("10.0.0.2->"), c.k.carrierCalls
++
++	c.k.setAdmin(nsA, "eth1", false)
++	eventually(t, "B NO-CARRIER", func() bool { return !c.k.carrier(nsB, "eth1") })
++	// The same admin state reported again (a netlink flag-only update) sends nothing.
++	c.k.setAdmin(nsA, "eth1", false)
++	c.k.setAdmin(nsA, "eth1", false)
++	quiet()
++	if got := c.count("10.0.0.1->") - baseA; got != 1 {
++		t.Errorf("A sent %d pushes for one admin change, want 1", got)
++	}
++	if got := c.count("10.0.0.2->") - baseB; got != 0 {
++		t.Errorf("B sent %d pushes after setting carrier (echo), want 0", got)
++	}
++	if got := c.k.carrierCalls - baseCalls; got != 1 {
++		t.Errorf("%d kernel carrier calls for one change, want 1", got)
++	}
++}
++
++func TestReceiverAppliesCarrierOnlyOnChange(t *testing.T) {
++	c := newCluster(t)
++	r := c.reg[ipB]
++	r.Ensure(c.endB())
++	req := &mpb.WireCarrier{NetNs: nsB, IntfName: "eth1", Vni: linkVni, LinkUid: linkUID, PeerAdminUp: false}
++	for i := 0; i < 3; i++ {
++		if ok, err := r.SetLinkCarrier(req); !ok || err != nil {
++			t.Fatalf("SetLinkCarrier = %v, %v", ok, err)
++		}
++	}
++	if c.k.carrierCalls != 1 {
++		t.Errorf("%d kernel calls for 3 identical requests, want 1", c.k.carrierCalls)
++	}
++	// A re-created interface is a new link: the same state is applied again.
++	c.k.recreate(nsB, "eth1")
++	if ok, err := r.SetLinkCarrier(req); !ok || err != nil {
++		t.Fatalf("SetLinkCarrier after recreate = %v, %v", ok, err)
++	}
++	if c.k.carrierCalls != 2 || c.k.carrier(nsB, "eth1") {
++		t.Errorf("calls=%d carrier=%t; want 2 calls and carrier off on the new link", c.k.carrierCalls, c.k.carrier(nsB, "eth1"))
++	}
++}
++
++func TestReceiverRejectsWrongOrMissingLink(t *testing.T) {
++	c := newCluster(t)
++	c.k.addLink(nsB, "eth2", linkVni+7) // a VXLAN that exists but is no link end of ours
++	r := c.reg[ipB]
++	r.Ensure(c.endB())
++	for name, req := range map[string]*mpb.WireCarrier{
++		"stale VNI":            {NetNs: nsB, IntfName: "eth1", Vni: linkVni + 1},
++		"no VNI":               {NetNs: nsB, IntfName: "eth1"},
++		"not a registered end": {NetNs: nsB, IntfName: "eth2", Vni: linkVni + 7},
++		"no interface":         {NetNs: nsB, IntfName: "eth9", Vni: linkVni},
++		"no netns":             {NetNs: "/ns/gone", IntfName: "eth1", Vni: linkVni},
++		"no address":           {Vni: linkVni},
++	} {
++		if ok, err := r.SetLinkCarrier(req); ok || err != nil {
++			t.Errorf("%s: SetLinkCarrier = %v, %v; want false, nil", name, ok, err)
++		}
++	}
++	if c.k.carrierCalls != 0 {
++		t.Errorf("%d kernel calls for requests that name no link of ours", c.k.carrierCalls)
++	}
++}
++
++func TestRecreatedEndAsksPeerForItsState(t *testing.T) {
++	c := newCluster(t)
++	c.ensureBoth()
++	c.k.setAdmin(nsB, "eth1", false) // B is down
++	eventually(t, "A NO-CARRIER", func() bool { return !c.k.carrier(nsA, "eth1") })
++
++	// A's link is re-created (the portal link-up action, a rebuilt wire): new
++	// ifindex, carrier back on, and the daemon has not seen B's state for it.
++	c.k.recreate(nsA, "eth1")
++	if !c.k.carrier(nsA, "eth1") {
++		t.Fatal("fixture: a new link starts with carrier")
++	}
++	c.reg[ipA].Ensure(c.endA()) // the next reconcile pass
++	eventually(t, "A NO-CARRIER again from B's re-sent state", func() bool { return !c.k.carrier(nsA, "eth1") })
++}
++
++func TestDaemonRestartResyncsBothWays(t *testing.T) {
++	c := newCluster(t)
++	c.ensureBoth()
++	c.k.setAdmin(nsB, "eth1", false)
++	eventually(t, "A NO-CARRIER", func() bool { return !c.k.carrier(nsA, "eth1") })
++
++	// A's daemon restarts: its memory is gone, the kernel keeps carrier state.
++	// The first pass of the new daemon must not undo it (B is still down).
++	c.restart(ipA)
++	c.reg[ipA].Ensure(c.endA())
++	quiet()
++	if c.k.carrier(nsA, "eth1") {
++		t.Fatal("restart of A's daemon must not restore carrier while B is admin down")
++	}
++
++	// While A's daemon was down, A went admin down and B's daemon missed the push.
++	c.k.setAdmin(nsB, "eth1", true)
++	eventually(t, "A carrier back", func() bool { return c.k.carrier(nsA, "eth1") })
++	c.restart(ipB) // B's daemon restarts too
++	c.k.mu.Lock()
++	c.k.links[nsA+"|eth1"].adminUp = false // changed with nobody watching
++	c.k.mu.Unlock()
++	c.reg[ipB].Ensure(c.endB())
++	c.restart(ipA)
++	c.reg[ipA].Ensure(c.endA()) // A's new daemon reports the state it finds
++	eventually(t, "B NO-CARRIER from the state A's new daemon found", func() bool { return !c.k.carrier(nsB, "eth1") })
++}
++
++func TestUnappliedPushIsRetriedThenLeftToTheNextPass(t *testing.T) {
++	c := newCluster(t)
++	var mu sync.Mutex
++	calls := 0
++	accept := false
++	c.sendFn = func(peerIP string, req *mpb.WireCarrier) (bool, error) {
++		mu.Lock()
++		defer mu.Unlock()
++		calls++
++		if !accept {
++			return false, nil // the peer has no such link yet
++		}
++		return c.reg[peerIP].SetLinkCarrier(req)
++	}
++	c.reg[ipA].Ensure(c.endA())
++	eventually(t, "pusher gives up", func() bool { mu.Lock(); defer mu.Unlock(); return calls >= carrierGiveUpAfter })
++	quiet()
++	mu.Lock()
++	settled := calls
++	mu.Unlock()
++	quiet()
++	mu.Lock()
++	if calls != settled || calls != carrierGiveUpAfter {
++		t.Errorf("calls=%d settled=%d; want exactly %d and then silence", calls, settled, carrierGiveUpAfter)
++	}
++	accept = true
++	mu.Unlock()
++	c.reg[ipB].Ensure(c.endB())      // B's daemon has the link now
++	c.k.setAdmin(nsA, "eth1", false) // a new state change re-arms it
++	eventually(t, "B NO-CARRIER once the peer accepts", func() bool { return !c.k.carrier(nsB, "eth1") })
++}
++
++func TestUnimplementedPeerIsLeftAlone(t *testing.T) {
++	c := newCluster(t)
++	var mu sync.Mutex
++	calls := 0
++	c.sendFn = func(peerIP string, req *mpb.WireCarrier) (bool, error) {
++		mu.Lock()
++		defer mu.Unlock()
++		calls++
++		return false, status.Error(codes.Unimplemented, "old daemon")
++	}
++	c.reg[ipA].Ensure(c.endA())
++	eventually(t, "one attempt", func() bool { mu.Lock(); defer mu.Unlock(); return calls >= 1 })
++	c.k.setAdmin(nsA, "eth1", false)
++	c.k.setAdmin(nsA, "eth1", true)
++	quiet()
++	mu.Lock()
++	defer mu.Unlock()
++	if calls != 1 {
++		t.Errorf("%d calls to a peer that answered Unimplemented, want 1", calls)
++	}
++}
++
++func TestEndIsDroppedWhenReconcileStopsSeeingIt(t *testing.T) {
++	c := newCluster(t)
++	oldIdle, oldIval := carrierIdleAfter, carrierIdleInterval
++	carrierIdleAfter, carrierIdleInterval = 20*time.Millisecond, 5*time.Millisecond
++	t.Cleanup(func() { carrierIdleAfter, carrierIdleInterval = oldIdle, oldIval })
++	c.reg[ipA].Ensure(c.endA())
++	eventually(t, "end dropped", func() bool {
++		r := c.reg[ipA]
++		r.mu.Lock()
++		defer r.mu.Unlock()
++		return len(r.watches) == 0
++	})
++}
++
++// oldPeerSend answers Unimplemented to calls to ip while old is set, as a node
++// that has not been rolled to a daemon with SetWireCarrier does.
++func (c *cluster) oldPeerSend(ip string, old *atomic.Bool) {
++	c.sendFn = func(peerIP string, req *mpb.WireCarrier) (bool, error) {
++		if peerIP == ip && old.Load() {
++			return false, status.Error(codes.Unimplemented, "old daemon")
++		}
++		return c.reg[peerIP].SetLinkCarrier(req)
++	}
++}
++
++func TestPeerRolledLaterIsFoundAgainWhenItAsksForOurState(t *testing.T) {
++	c := newCluster(t)
++	var old atomic.Bool
++	old.Store(true)
++	c.oldPeerSend(ipB, &old)
++	oldFor := unsupportedPeerFor
++	unsupportedPeerFor = time.Hour // only the peer speaking can clear the mark
++	t.Cleanup(func() { unsupportedPeerFor = oldFor })
++
++	c.reg[ipA].Ensure(c.endA())
++	eventually(t, "A tried B", func() bool { return c.count("10.0.0.1->") >= 1 })
++	c.k.setAdmin(nsA, "eth1", false) // while B has the old daemon
++	quiet()
++	if !c.k.carrier(nsB, "eth1") {
++		t.Fatal("an old peer cannot follow; fixture")
++	}
++
++	// B is rolled: its daemon starts, registers its end and asks A for A's state.
++	old.Store(false)
++	c.reg[ipB].Ensure(c.endB())
++	eventually(t, "B NO-CARRIER from A's held-back state", func() bool { return !c.k.carrier(nsB, "eth1") })
++}
++
++func TestStateChangedWhileThePeerWasOldIsDeliveredByTheNextPass(t *testing.T) {
++	c := newCluster(t)
++	var old atomic.Bool
++	old.Store(true)
++	c.oldPeerSend(ipB, &old)
++	oldFor := unsupportedPeerFor
++	unsupportedPeerFor = 30 * time.Millisecond
++	t.Cleanup(func() { unsupportedPeerFor = oldFor })
++
++	// B's end is registered (the fake models the old daemon only by its
++	// Unimplemented answers), so nothing but A's next pass can deliver the state.
++	c.reg[ipB].Ensure(c.endB())
++	c.reg[ipA].Ensure(c.endA())
++	eventually(t, "A tried B", func() bool { return c.count("10.0.0.1->") >= 1 })
++	c.k.setAdmin(nsA, "eth1", false)
++	quiet()
++	old.Store(false)
++	time.Sleep(40 * time.Millisecond)
++	c.reg[ipA].Ensure(c.endA()) // the next reconcile pass
++	eventually(t, "B NO-CARRIER after the pass", func() bool { return !c.k.carrier(nsB, "eth1") })
++}
++
++// A KubeVirt VM end ("pod<id>", renamed to "<id>-nic" and replaced by a DOWN
++// dummy) neither sends nor applies state: the dummy's admin state is not the
++// guest's, and the peer must not be turned off by it.
++func TestKubeVirtEndNeitherSendsNorApplies(t *testing.T) {
++	c := newCluster(t)
++	c.k.addLink(nsA, "pod24bf8ab8fca", linkVni)
++	c.k.setAdmin(nsA, "pod24bf8ab8fca", false) // the virt-launcher dummy is DOWN
++	vm := LinkEnd{NetNs: nsA, IntfName: "pod24bf8ab8fca", Vni: linkVni, LinkUID: linkUID, KubeNs: "lab", PeerIP: ipB, PeerNetNs: nsB, PeerIntf: "eth1"}
++	c.reg[ipA].Ensure(vm)
++	c.reg[ipB].Ensure(c.endB())
++	quiet()
++	if got := c.count("10.0.0.1->"); got != 0 {
++		t.Errorf("the VM end sent %d pushes, want 0", got)
++	}
++	if !c.k.carrier(nsB, "eth1") {
++		t.Error("the peer of a VM end lost carrier")
++	}
++	c.k.mu.Lock()
++	calls := c.k.carrierCalls
++	c.k.mu.Unlock()
++	ok, err := c.reg[ipA].SetLinkCarrier(&mpb.WireCarrier{NetNs: nsA, IntfName: "pod24bf8ab8fca", Vni: linkVni, PeerAdminUp: false})
++	c.k.mu.Lock()
++	after := c.k.carrierCalls
++	c.k.mu.Unlock()
++	if !ok || err != nil || after != calls {
++		t.Errorf("request for a VM end: %v, %v, %d kernel calls; want acknowledged with no kernel call", ok, err, after-calls)
++	}
++}
++
++// A watch that ends on its own (a failed netlink subscription) is started again
++// by the next reconcile pass, and a change made meanwhile still reaches the peer.
++func TestEndedWatchIsRestartedByTheNextPass(t *testing.T) {
++	c := newCluster(t)
++	c.ensureBoth()
++	c.k.endWatches(nsA)
++	c.k.mu.Lock()
++	c.k.links[nsA+"|eth1"].adminUp = false // changed while nothing watches
++	c.k.mu.Unlock()
++	quiet()
++	if !c.k.carrier(nsB, "eth1") {
++		t.Fatal("fixture: nothing watched the change")
++	}
++	c.reg[ipA].Ensure(c.endA())
++	eventually(t, "B NO-CARRIER after the watch is started again", func() bool { return !c.k.carrier(nsB, "eth1") })
++}
+diff --git a/third_party/meshnet/utils/wireutil/linkwatch.go b/third_party/meshnet/utils/wireutil/linkwatch.go
+index 25dd24e..0ba529e 100644
+--- a/third_party/meshnet/utils/wireutil/linkwatch.go
++++ b/third_party/meshnet/utils/wireutil/linkwatch.go
+@@ -25,6 +25,15 @@ type AdminStateFunc func(ifName string, adminUp bool)
+ // which onChange is no longer called. stop waits for the watch to end and may
+ // be called more than once.
+ func WatchAdminState(nsPath string, onChange AdminStateFunc) (stop func(), err error) {
++	return WatchAdminStateNotify(nsPath, onChange, nil)
++}
++
++// WatchAdminStateNotify is WatchAdminState that also calls onEnd, if not nil,
++// once the watch has ended for any reason: stop was called, the namespace went
++// away, or the netlink subscription failed (for example on ENOBUFS). A caller
++// that must not miss changes re-creates the watch when onEnd is called without
++// it having called stop.
++func WatchAdminStateNotify(nsPath string, onChange AdminStateFunc, onEnd func()) (stop func(), err error) {
+ 	nsh, err := netns.GetFromPath(nsPath)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("could not open netns %s: %w", nsPath, err)
+@@ -50,6 +59,9 @@ func WatchAdminState(nsPath string, onChange AdminStateFunc) (stop func(), err e
+ 	go func() {
+ 		defer close(finished)
+ 		watchAdminUpdates(updates, onChange)
++		if onEnd != nil {
++			onEnd()
++		}
+ 	}()
+ 
+ 	var once sync.Once
+diff --git a/third_party/meshnet/utils/wireutil/protodown.go b/third_party/meshnet/utils/wireutil/protodown.go
+new file mode 100644
+index 0000000..cfffd9a
+--- /dev/null
++++ b/third_party/meshnet/utils/wireutil/protodown.go
+@@ -0,0 +1,54 @@
++package wireutil
++
++import (
++	"fmt"
++
++	"github.com/containernetworking/plugins/pkg/ns"
++	"github.com/vishvananda/netlink"
++	"github.com/vishvananda/netlink/nl"
++	"golang.org/x/sys/unix"
++)
++
++// SetLinkCarrier sets the carrier (IFLA_PROTO_DOWN) of the interface with the
++// given ifindex in the network namespace at nsPath: carrier is off while up is
++// false. The interface is named by index so that a caller who resolved a
++// renamed link acts on that link and not on whatever now holds the old name.
++//
++// A VXLAN interface cannot have its carrier set the way a TAP can
++// (TUNSETCARRIER), but it accepts protodown, which the kernel implements as
++// carrier off. The admin state (IFF_UP) is not touched, so the NOS in the pod
++// keeps its own idea of admin state and sees only NO-CARRIER. The change is
++// idempotent and works on any link whose driver supports protodown (vxlan,
++// veth, bridge, macvlan). The kernel returns EOPNOTSUPP for the others.
++func SetLinkCarrier(nsPath string, index int, up bool) error {
++	if index <= 0 {
++		return fmt.Errorf("invalid ifindex %d", index)
++	}
++	podNs, err := ns.GetNS(nsPath)
++	if err != nil {
++		return fmt.Errorf("could not open netns %s: %w", nsPath, err)
++	}
++	defer podNs.Close()
++	return podNs.Do(func(_ ns.NetNS) error {
++		if _, err := netlink.LinkByIndex(index); err != nil {
++			return fmt.Errorf("could not find ifindex %d in %s: %w", index, nsPath, err)
++		}
++		return setProtoDown(index, !up)
++	})
++}
++
++// setProtoDown sets IFLA_PROTO_DOWN on the link with the given index in the
++// network namespace of the calling thread.
++func setProtoDown(index int, down bool) error {
++	req := nl.NewNetlinkRequest(unix.RTM_NEWLINK, unix.NLM_F_ACK)
++	msg := nl.NewIfInfomsg(unix.AF_UNSPEC)
++	msg.Index = int32(index)
++	req.AddData(msg)
++	var v uint8
++	if down {
++		v = 1
++	}
++	req.AddData(nl.NewRtAttr(unix.IFLA_PROTO_DOWN, nl.Uint8Attr(v)))
++	_, err := req.Execute(unix.NETLINK_ROUTE, 0)
++	return err
++}
+diff --git a/third_party/meshnet/utils/wireutil/protodown_test.go b/third_party/meshnet/utils/wireutil/protodown_test.go
+new file mode 100644
+index 0000000..2723e07
+--- /dev/null
++++ b/third_party/meshnet/utils/wireutil/protodown_test.go
+@@ -0,0 +1,66 @@
++package wireutil
++
++import (
++	"net"
++	"os"
++	"testing"
++
++	"github.com/vishvananda/netlink"
++	"golang.org/x/sys/unix"
++)
++
++// TestSetLinkCarrierOnVxlan needs CAP_NET_ADMIN in a network namespace of its
++// own. Run it unprivileged with:
++//
++//	go test -c -o /tmp/wireutil.test ./utils/wireutil && unshare -Urn /tmp/wireutil.test -test.run SetLinkCarrier -test.v
++//
++// It skips (and says so) when the namespace cannot be changed.
++func TestSetLinkCarrierOnVxlan(t *testing.T) {
++	if os.Getenv("KNE_TEST_OWN_NETNS") == "" && os.Geteuid() != 0 {
++		t.Skip("NOT RUN: needs root or `unshare -Urn` (see test comment)")
++	}
++	lo, err := netlink.LinkByName("lo")
++	if err != nil {
++		t.Skipf("NOT RUN: no lo: %v", err)
++	}
++	_ = netlink.LinkSetUp(lo)
++	vx := &netlink.Vxlan{LinkAttrs: netlink.LinkAttrs{Name: "vxtest0"}, VxlanId: 4242, Group: net.ParseIP("192.0.2.2"), Port: 4789}
++	if err := netlink.LinkAdd(vx); err != nil {
++		t.Skipf("NOT RUN: cannot add a vxlan here: %v", err)
++	}
++	defer netlink.LinkDel(vx)
++	link, _ := netlink.LinkByName("vxtest0")
++	if err := netlink.LinkSetUp(link); err != nil {
++		t.Fatal(err)
++	}
++	const ns = "/proc/thread-self/ns/net"
++	idx := link.Attrs().Index
++	flags := func() uint32 {
++		l, err := netlink.LinkByName("vxtest0")
++		if err != nil {
++			t.Fatal(err)
++		}
++		return l.Attrs().RawFlags
++	}
++	if flags()&unix.IFF_LOWER_UP == 0 {
++		t.Fatal("fixture: a new up vxlan has carrier")
++	}
++	if err := SetLinkCarrier(ns, idx, false); err != nil {
++		t.Fatalf("SetLinkCarrier(false): %v", err)
++	}
++	if f := flags(); f&unix.IFF_LOWER_UP != 0 || f&unix.IFF_UP == 0 {
++		t.Errorf("after carrier off flags=%#x: want admin UP kept and LOWER_UP cleared", f)
++	}
++	if err := SetLinkCarrier(ns, idx, false); err != nil {
++		t.Errorf("setting the same state again must be a no-op, got %v", err)
++	}
++	if err := SetLinkCarrier(ns, idx, true); err != nil {
++		t.Fatalf("SetLinkCarrier(true): %v", err)
++	}
++	if flags()&unix.IFF_LOWER_UP == 0 {
++		t.Error("carrier did not come back")
++	}
++	if err := SetLinkCarrier(ns, 99999, true); err == nil {
++		t.Error("an unknown ifindex must be an error")
++	}
++}
+-- 
+2.56.0
+

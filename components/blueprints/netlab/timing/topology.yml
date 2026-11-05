@@ -1,0 +1,19 @@
+#
+# Lab topology used to test VM start times
+#
+# netlab 26.08: the platform no longer supplies an implicit default device —
+# every catalog blueprint must name one.
+defaults.device: eos
+
+# KNE deployability: a single-node ("stub") link has no far end, and KNE wires
+# every link as a veth pair, so the provider rejects the topology outright.
+# netlab's own remedy (docs/links.md, "additional loopbacks") turns stub links
+# into loopback INTERFACES -- same node, same prefix, same address, same
+# advertisement -- and removes the link. No extra device, no wire, no change to
+# what this lab demonstrates.
+defaults.links.stub_loopback: True
+
+nodes: [ dut ]
+
+links:
+- dut

@@ -1,0 +1,19 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 07:12:20 -0500
+Subject: [PATCH 42/43] manifests: meshnet grpc ClusterRole reads nodes
+ (matches vxlan and base RBAC)
+
+---
+diff --git a/manifests/meshnet/grpc/manifest.yaml b/manifests/meshnet/grpc/manifest.yaml
+index 13e9e59..5f5590b 100644
+--- a/manifests/meshnet/grpc/manifest.yaml
++++ b/manifests/meshnet/grpc/manifest.yaml
+@@ -250,6 +250,7 @@ rules:
+       - ""
+     resources:
+       - pods
++      - nodes
+     verbs:
+       - get
+       - list

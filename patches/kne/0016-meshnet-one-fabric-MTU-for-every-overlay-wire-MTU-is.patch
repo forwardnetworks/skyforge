@@ -1,0 +1,240 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 12:48:48 -0500
+Subject: [PATCH 16/35] meshnet: one fabric MTU for every overlay wire, MTU is
+ an attribute (R8)
+
+---
+diff --git a/third_party/meshnet/daemon/meshnet/controller.go b/third_party/meshnet/daemon/meshnet/controller.go
+index 8f3cf76..b1f0cdf 100644
+--- a/third_party/meshnet/daemon/meshnet/controller.go
++++ b/third_party/meshnet/daemon/meshnet/controller.go
+@@ -104,6 +104,12 @@ func parsePodLinks(topo *unstructured.Unstructured) ([]wireutil.PodLinkConfig, e
+ 		return nil, nil
+ 	}
+ 
++	// Every pod link is built at the one fabric MTU, so a same-node veth and a
++	// KubeVirt NAD carry the same MTU as the overlay (patches/meshnet-cni 0011).
++	mtu, err := wireutil.FabricMTUFromEnv()
++	if err != nil {
++		return nil, err
++	}
+ 	links := make([]wireutil.PodLinkConfig, 0, len(remoteLinks))
+ 	for _, rlItem := range remoteLinks {
+ 		rl, ok := rlItem.(map[string]interface{})
+@@ -126,7 +132,7 @@ func parsePodLinks(topo *unstructured.Unstructured) ([]wireutil.PodLinkConfig, e
+ 			LocalIP:     localIP,
+ 			PeerIntf:    peerIntf,
+ 			PeerIP:      peerIP,
+-			MTU:         1500,
++			MTU:         mtu,
+ 		})
+ 	}
+ 	return links, nil
+diff --git a/third_party/meshnet/daemon/vxlan/vxlan.go b/third_party/meshnet/daemon/vxlan/vxlan.go
+index a74ae58..f05d87e 100644
+--- a/third_party/meshnet/daemon/vxlan/vxlan.go
++++ b/third_party/meshnet/daemon/vxlan/vxlan.go
+@@ -23,6 +23,7 @@ type VxLan struct {
+ 	ParentIF string
+ 	IPAddr   net.IP
+ 	ID       int
++	MTU      int // the fabric MTU this wire must carry (wireutil.FabricMTUEnv)
+ }
+ 
+ // InitLogger initializes the logrus logger for the VXLAN overlay daemon.
+@@ -55,10 +56,15 @@ func CreateOrUpdate(v *mpb.RemotePod) error {
+ 		}
+ 	}
+ 
++	mtu, err := wireutil.FabricMTUFromEnv()
++	if err != nil {
++		return err
++	}
+ 	vxlan := VxLan{
+ 		ParentIF: srcIntf,
+ 		IPAddr:   net.ParseIP(v.PeerVtep),
+ 		ID:       int(v.Vni),
++		MTU:      mtu,
+ 	}
+ 	vxLanOvrlyLogger.Infof("Created vxlan struct %+v", vxlan)
+ 
+@@ -71,10 +77,12 @@ func CreateOrUpdate(v *mpb.RemotePod) error {
+ 	vxLanOvrlyLogger.Infof("Is link %+v a VXLAN?: %s", vxlanLink, strconv.FormatBool(ok))
+ 	if ok { // the link we've found is a vxlan link
+ 
+-		if !(vxlanLink.VxlanId == vxlan.ID && vxlanLink.Group.Equal(vxlan.IPAddr)) { // If Vxlan attrs are different
++		// MTU is an attribute too. A wire built at an older fabric MTU is
++		// rebuilt, so a stale wire cannot pin a lab to an MTU nobody chose.
++		if !vxlanAttrsMatch(vxlanLink, vxlan) { // If Vxlan attrs are different
+ 
+ 			// We remove the existing link and add a new one
+-			vxLanOvrlyLogger.Infof("Vxlan attrs are different: %d!=%d or %v!=%v", vxlanLink.VxlanId, vxlan.ID, vxlanLink.Group, vxlan.IPAddr)
++			vxLanOvrlyLogger.Infof("Vxlan attrs are different: %d!=%d or %v!=%v or mtu %d!=%d", vxlanLink.VxlanId, vxlan.ID, vxlanLink.Group, vxlan.IPAddr, vxlanLink.Attrs().MTU, vxlan.MTU)
+ 			if err = removeLink(v.NetNs, v.IntfName); err != nil {
+ 				return fmt.Errorf(" MESHNETD: Error when removing an old Vxlan interface: %s", err)
+ 			}
+@@ -137,6 +145,7 @@ func makeVxLan(nsName, linkName string, ipNet *net.IPNet, vxlan VxLan) error {
+ 		LinkAttrs: netlink.LinkAttrs{
+ 			Name:   tempLinkName,
+ 			TxQLen: 1000,
++			MTU:    vxlan.MTU,
+ 		},
+ 		VxlanId:      vxlan.ID,
+ 		VtepDevIndex: parentIF.Attrs().Index,
+@@ -259,3 +268,23 @@ func vxlanDifferent(l1 *netlink.Vxlan, l2 VxLan) bool {
+ 	}
+ 	return true
+ }
++
++// vxlanAttrsMatch reports whether an existing VXLAN already is what we want.
++//
++// The VNI and remote VTEP must match. The MTU must be at least the fabric MTU.
++// A wire below the fabric is stale. A wire above it is left alone, because a
++// NOS may raise its own interface MTU (cEOS lifts a routed port's kernel MTU
++// when it moves the port into a VRF). Comparing for equality would call that
++// drift and tear the wire down under the NOS.
++//
++// Source: patches/meshnet-cni/0017 (MTU is an attribute) and 0022 (fabric MTU
++// is a floor). The 0017 measurement (a wire at 1450 kept by a daemon asking
++// for 8950) is the reason the MTU is compared at all.
++func vxlanAttrsMatch(existing *netlink.Vxlan, want VxLan) bool {
++	if existing == nil {
++		return false
++	}
++	return existing.VxlanId == want.ID &&
++		existing.Group.Equal(want.IPAddr) &&
++		existing.Attrs().MTU >= want.MTU
++}
+diff --git a/third_party/meshnet/daemon/vxlan/vxlan_mtu_test.go b/third_party/meshnet/daemon/vxlan/vxlan_mtu_test.go
+new file mode 100644
+index 0000000..c8d4a91
+--- /dev/null
++++ b/third_party/meshnet/daemon/vxlan/vxlan_mtu_test.go
+@@ -0,0 +1,42 @@
++package vxlan
++
++import (
++	"net"
++	"testing"
++
++	"github.com/vishvananda/netlink"
++)
++
++func existingVxlan(vni int, group string, mtu int) *netlink.Vxlan {
++	return &netlink.Vxlan{
++		LinkAttrs: netlink.LinkAttrs{MTU: mtu},
++		VxlanId:   vni,
++		Group:     net.ParseIP(group),
++	}
++}
++
++// The requirement (KNE rebase R8): an existing wire is kept only when its VNI
++// and VTEP match and its MTU is at least the fabric MTU. Below the fabric is
++// stale. Above it is a NOS-raised MTU and is kept.
++func TestVxlanAttrsMatchFabricMTUFloor(t *testing.T) {
++	want := VxLan{ID: 4096, IPAddr: net.ParseIP("192.0.2.1"), MTU: 1450}
++	cases := []struct {
++		name     string
++		existing *netlink.Vxlan
++		want     bool
++	}{
++		{name: "same VNI, VTEP and MTU", existing: existingVxlan(4096, "192.0.2.1", 1450), want: true},
++		{name: "stale: built at 1400 for a 1450 fabric", existing: existingVxlan(4096, "192.0.2.1", 1400), want: false},
++		{name: "NOS raised above the fabric is kept", existing: existingVxlan(4096, "192.0.2.1", 10240), want: true},
++		{name: "wrong VNI", existing: existingVxlan(4097, "192.0.2.1", 1450), want: false},
++		{name: "wrong VTEP", existing: existingVxlan(4096, "192.0.2.2", 1450), want: false},
++		{name: "no existing link", existing: nil, want: false},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			if got := vxlanAttrsMatch(tc.existing, want); got != tc.want {
++				t.Fatalf("vxlanAttrsMatch = %v, want %v", got, tc.want)
++			}
++		})
++	}
++}
+diff --git a/third_party/meshnet/utils/wireutil/fabric_mtu.go b/third_party/meshnet/utils/wireutil/fabric_mtu.go
+new file mode 100644
+index 0000000..0e85aaa
+--- /dev/null
++++ b/third_party/meshnet/utils/wireutil/fabric_mtu.go
+@@ -0,0 +1,37 @@
++package wireutil
++
++import (
++	"fmt"
++	"os"
++	"strconv"
++	"strings"
++)
++
++const (
++	// FabricMTUEnv names the one MTU every overlay wire on the node is built at.
++	FabricMTUEnv = "MESHNET_FABRIC_MTU"
++	// DefaultFabricMTU is 1450: a VXLAN on a 1500 underlay (50 bytes of
++	// VXLAN-over-IPv4 overhead). It is also what the kernel gives a VXLAN with
++	// no MTU set, so the default changes nothing on a 1500 underlay.
++	DefaultFabricMTU = 1450
++)
++
++// ResolveFabricMTU parses a MESHNET_FABRIC_MTU value. Blank means
++// DefaultFabricMTU. Anything outside [1280, 65535] is an error, so a typo
++// does not silently build every wire at the wrong MTU.
++func ResolveFabricMTU(value string) (int, error) {
++	raw := strings.TrimSpace(value)
++	if raw == "" {
++		return DefaultFabricMTU, nil
++	}
++	mtu, err := strconv.Atoi(raw)
++	if err != nil || mtu < 1280 || mtu > 65535 {
++		return 0, fmt.Errorf("%s must be an integer in [1280,65535], got %q", FabricMTUEnv, value)
++	}
++	return mtu, nil
++}
++
++// FabricMTUFromEnv resolves MESHNET_FABRIC_MTU from the process environment.
++func FabricMTUFromEnv() (int, error) {
++	return ResolveFabricMTU(os.Getenv(FabricMTUEnv))
++}
+diff --git a/third_party/meshnet/utils/wireutil/fabric_mtu_test.go b/third_party/meshnet/utils/wireutil/fabric_mtu_test.go
+new file mode 100644
+index 0000000..3e4eb83
+--- /dev/null
++++ b/third_party/meshnet/utils/wireutil/fabric_mtu_test.go
+@@ -0,0 +1,32 @@
++package wireutil
++
++import "testing"
++
++// The requirement: blank is 1450, a jumbo underlay is honoured, and a value
++// outside the range is refused.
++func TestResolveFabricMTU(t *testing.T) {
++	cases := []struct {
++		value   string
++		want    int
++		wantErr bool
++	}{
++		{value: "", want: 1450},
++		{value: " 8950 ", want: 8950},
++		{value: "1280", want: 1280},
++		{value: "1279", wantErr: true},
++		{value: "65536", wantErr: true},
++		{value: "invalid", wantErr: true},
++	}
++	for _, tc := range cases {
++		got, err := ResolveFabricMTU(tc.value)
++		if tc.wantErr {
++			if err == nil {
++				t.Fatalf("ResolveFabricMTU(%q) = %d, want error", tc.value, got)
++			}
++			continue
++		}
++		if err != nil || got != tc.want {
++			t.Fatalf("ResolveFabricMTU(%q) = %d, %v; want %d", tc.value, got, err, tc.want)
++		}
++	}
++}
+-- 
+2.56.0
+

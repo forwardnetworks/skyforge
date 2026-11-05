@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 00:00:00 +0000
+Subject: [PATCH] SKYFORGE-SPECIFIC: IOL/IOLL2 render an archive stanza so
+ napalm can arm a revert timer
+
+---
+diff --git a/netsim/ansible/templates/initial/ios.j2 b/netsim/ansible/templates/initial/ios.j2
+index e8d8ff0..2badc42 100644
+--- a/netsim/ansible/templates/initial/ios.j2
++++ b/netsim/ansible/templates/initial/ios.j2
+@@ -20,6 +20,17 @@ ip ssh authentication-retries 3
+ {{ enable_debugging(ios.debug,prefix='do debug') }}
+ !
+ {% endif %}
++{% if netlab_device_type in ['iol','ioll2'] %}
++{#
++    SKYFORGE-SPECIFIC. Arms the device-side revert timer for change control. napalm's commit_config(revert_in=N) on
++    IOS is `configure replace ... revert timer N`, which refuses to run without an `archive` stanza. IOL has no
++    flash:, nvram: or bootflash: for it: `path unix:` is the only path the image accepts (measured 2026-10-09 on
++    demo-lab, IOL 17.18.2). Config backups land under the lab's own filesystem and die with the lab.
++#}
++archive
++ path unix:skyforge-archive
++!
++{% endif %}
+ lldp run
+ {#
+   CDP is OFF by default, as upstream has it (#3807). netlab_cdp_enable -- a
+-- 
+2.56.0
+

@@ -1,0 +1,279 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 00:00:00 +0000
+Subject: [PATCH] SKYFORGE-SPECIFIC: SKYFORGE_NETLAB_OVERLAP_ANSIBLE_LANE runs
+ the Ansible lane while the exec fan-out runs (default: sequential)
+
+---
+diff --git a/netsim/cli/initial/deploy.py b/netsim/cli/initial/deploy.py
+index f8084c8..65635f9 100644
+--- a/netsim/cli/initial/deploy.py
++++ b/netsim/cli/initial/deploy.py
+@@ -5,6 +5,8 @@
+ #
+ import argparse
+ import concurrent.futures
++import os
++import threading
+ import typing
+ from pathlib import Path
+ 
+@@ -134,12 +136,80 @@ def recreate_configs(topology: Box, args: argparse.Namespace, nodeset: list) ->
+       default_suffix="none",
+     )
+ 
++"""
++SKYFORGE-SPECIFIC: overlap the Ansible lane with the internal (kubectl exec) fan-out.
++
++Upstream runs deploy_internal_config (a thread pool that execs shell/cEOS fragments into pods) to completion and
++only then starts the Ansible playbook for the nodes that need it (PAN-OS and the other VM NOS). The two lanes touch
++disjoint nodes: a node whose whole configuration set is in netlab_ansible_skip_module is never in the playbook
++(utils.nodeset_ansible_skip) and the internal lane never runs Ansible. fleet40 (2026-10-10): the fan-out took 27 s and
++PAN-OS config could not start until it ended; at 4,000 nodes the fan-out is ~8 minutes while a PAN-OS guest is
++usually ready long before.
++
++SKYFORGE_NETLAB_OVERLAP_ANSIBLE_LANE = 1 | true | yes | on: run() calls start_overlapped_ansible_lane() just before the
++internal fan-out; it starts the playbook in a thread. The unchanged call to deploy_ansible_playbook() further down then
++JOINS that thread and returns its (used, status) instead of running the playbook a second time. Unset or anything else:
++nothing is started and every line below runs exactly as upstream. The verdicts are unchanged: a failing lane still
++fails the run with the same message, a failure in one lane never skips the other (it did not before either), and an
++exception in the playbook thread is re-raised from that call, after the internal lane finished.
++"""
++_OVERLAPPED_LANE: typing.Optional[dict] = None
++_LANE_THREAD = threading.local()
++
++def overlap_ansible_lane_enabled() -> bool:
++  return os.environ.get('SKYFORGE_NETLAB_OVERLAP_ANSIBLE_LANE','').strip().lower() in ('1','true','yes','on')
++
++def start_overlapped_ansible_lane(
++      topology: Box,
++      args: argparse.Namespace,
++      nodeset: list,
++      rest: list) -> bool:
++  """Start the Ansible lane in a thread when the switch is on and some node needs it. Returns whether it started."""
++  global _OVERLAPPED_LANE
++  _OVERLAPPED_LANE = None
++  if not overlap_ansible_lane_enabled() or is_dry_run() or args.normalize:
++    return False
++  ansible_skip_list = utils.nodeset_ansible_skip(nodeset, topology, args)
++  if len(ansible_skip_list) == len(nodeset):                # Nothing needs Ansible: nothing to overlap
++    return False
++
++  outcome: dict = {}
++  def ansible_lane() -> None:
++    _LANE_THREAD.active = True                              # deploy_ansible_playbook must RUN, not join, in this thread
++    try:
++      outcome['result'] = deploy_ansible_playbook(topology,args,nodeset,rest,'deploy')
++    except BaseException as ex:                             # Re-raised by the joining call
++      outcome['error'] = ex
++
++  log.info(
++    f'Running the Ansible playbook for {len(nodeset) - len(ansible_skip_list)} node(s) while the other nodes are configured '
++    f'directly (SKYFORGE_NETLAB_OVERLAP_ANSIBLE_LANE)')
++  lane = threading.Thread(target=ansible_lane,name='ansible-lane')
++  _OVERLAPPED_LANE = { 'thread': lane, 'outcome': outcome }
++  lane.start()
++  return True
++
++def join_overlapped_ansible_lane() -> typing.Optional[typing.Tuple[bool, bool]]:
++  """The overlapped lane's (used, status) once it finished; None when no lane was started (run the playbook as upstream)."""
++  global _OVERLAPPED_LANE
++  lane, _OVERLAPPED_LANE = _OVERLAPPED_LANE, None
++  if lane is None:
++    return None
++  lane['thread'].join()
++  if 'error' in lane['outcome']:
++    raise lane['outcome']['error']
++  return lane['outcome']['result']
++
+ def deploy_ansible_playbook(
+       topology: Box,
+       args: argparse.Namespace,
+       nodeset: list,
+       rest: list,
+       deploy_step: str = '') -> typing.Tuple[bool, bool]:
++  if not getattr(_LANE_THREAD,'active',False):
++    overlapped = join_overlapped_ansible_lane()
++    if overlapped is not None:
++      return overlapped
+   ansible_skip_list = utils.nodeset_ansible_skip(nodeset, topology, args)
+   if len(ansible_skip_list) == len(nodeset):
+     return (False,True)
+@@ -205,6 +275,7 @@ def run(
+ 
+   log.section_header('Config',f'Deploying device configurations')
+   lab_status_change(topology, f"deploying configuration: {deploy_text}")
++  start_overlapped_ansible_lane(topology,args,nodeset,rest)
+   (used_internal, status_internal) = deploy_internal_config(nodeset, topology, args)
+   (used_ansible, status_ansible) = deploy_ansible_playbook(topology,args,nodeset,rest,'deploy' if used_internal else '')
+ 
+diff --git a/tests/test_initial_overlap_lanes.py b/tests/test_initial_overlap_lanes.py
+new file mode 100644
+index 0000000..31cd8f8
+--- /dev/null
++++ b/tests/test_initial_overlap_lanes.py
+@@ -0,0 +1,161 @@
++"""netlab initial: SKYFORGE_NETLAB_OVERLAP_ANSIBLE_LANE (SKYFORGE-SPECIFIC).
++
++The requirement: with the switch on, the Ansible lane (PAN-OS and the other VM NOS) runs CONCURRENTLY with the
++internal kubectl-exec fan-out instead of after it; with it off or unrecognised, the order is today's (internal, then
++Ansible). Either way the verdicts are the same: a failing lane fails the run with the same message, and a failure in
++one lane never skips the other. Everything is driven through deploy.run(), the function `netlab initial` calls; only
++the two things that touch the world (the kubectl-exec fan-out and the ansible-playbook process) are replaced. The
++concurrency proof is a rendezvous: each fake lane blocks until it has seen the other one running, which can only
++succeed if they overlap (sequentially it times out).
++"""
++
++import argparse
++import threading
++
++import pytest
++from box import Box
++
++from netsim.cli.initial import deploy
++
++WAIT = 5
++NODES = ["ceos1", "h1", "pa"]
++
++
++class Exit(Exception):
++    pass
++
++
++@pytest.fixture()
++def world(monkeypatch):
++    state = {
++        "order": [], "internal_running": threading.Event(), "ansible_running": threading.Event(),
++        "internal_ok": True, "ansible_ok": True, "ansible_raises": None, "rendezvous": True, "saw_other": {},
++        "playbook_runs": 0, "exit_messages": [], "ansible_skip": ["ceos1", "h1"],
++    }
++
++    def internal(nodeset, topology, args):
++        state["order"].append("internal-start")
++        state["internal_running"].set()
++        if state["rendezvous"]:
++            state["saw_other"]["internal"] = state["ansible_running"].wait(WAIT)
++        state["order"].append("internal-end")
++        return (True, state["internal_ok"])
++
++    def playbook(topology, rest, name):
++        state["playbook_runs"] += 1
++        state["order"].append("ansible-start")
++        state["ansible_running"].set()
++        if state["rendezvous"]:
++            state["saw_other"]["ansible"] = state["internal_running"].wait(WAIT)
++        if state["ansible_raises"]:
++            raise state["ansible_raises"]
++        state["order"].append("ansible-end")
++        return state["ansible_ok"]
++
++    def fake_exit(message, *a, **k):
++        state["exit_messages"].append(message)
++        raise Exit(message)
++
++    monkeypatch.setattr(deploy, "deploy_internal_config", internal)
++    monkeypatch.setattr(deploy, "execute_ansible_playbook", playbook)
++    monkeypatch.setattr(deploy.utils, "nodeset_ansible_skip", lambda nodeset, topology, args: list(state["ansible_skip"]))
++    monkeypatch.setattr(deploy.utils, "ansible_skip_group", lambda skip: None)
++    monkeypatch.setattr(deploy.utils, "ansible_args", lambda args: [])
++    monkeypatch.setattr(deploy, "is_dry_run", lambda: False)
++    monkeypatch.setattr(deploy, "error_and_exit", fake_exit)
++    monkeypatch.setattr(deploy, "get_normalize_list", lambda topology, nodeset: [])
++    monkeypatch.setattr(deploy, "get_message", lambda *a, **k: "")
++    monkeypatch.setattr(deploy.devices, "process_config_sw_check", lambda topology: None)
++    monkeypatch.setattr(deploy, "lab_status_change", lambda *a, **k: None)
++    monkeypatch.setattr(deploy, "print_internal_stats", lambda *a, **k: None)
++    monkeypatch.setattr(deploy.log, "section_header", lambda *a, **k: None)
++    monkeypatch.setattr(deploy.log, "info", lambda *a, **k: None)
++    monkeypatch.setattr(deploy, "_OVERLAPPED_LANE", None)
++    state["topology"] = Box({"nodes": {n: {} for n in NODES}, "groups": {}}, default_box=True)
++    state["args"] = argparse.Namespace(
++        normalize=False, initial=False, module=None, custom=False, deploy=True, skip_ready=True, limit=None,
++        no_message=True, generate=None)
++    return state
++
++
++def run(state):
++    deploy.run(state["topology"], state["args"], [])
++
++
++def set_switch(monkeypatch, value):
++    if value is None:
++        monkeypatch.delenv("SKYFORGE_NETLAB_OVERLAP_ANSIBLE_LANE", raising=False)
++    else:
++        monkeypatch.setenv("SKYFORGE_NETLAB_OVERLAP_ANSIBLE_LANE", value)
++
++
++@pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on"])
++def test_switch_on_runs_the_two_lanes_concurrently(world, monkeypatch, value):
++    set_switch(monkeypatch, value)
++    run(world)
++    assert world["saw_other"] == {"internal": True, "ansible": True}, world["order"]
++    assert world["playbook_runs"] == 1, "the playbook must run exactly once, not once overlapped and once after"
++
++
++@pytest.mark.parametrize("value", [None, "", "0", "false", "off", "garbage"])
++def test_default_and_unrecognised_values_keep_the_sequential_order(world, monkeypatch, value):
++    set_switch(monkeypatch, value)
++    world["rendezvous"] = False
++    run(world)
++    assert world["order"] == ["internal-start", "internal-end", "ansible-start", "ansible-end"]
++    assert world["playbook_runs"] == 1
++
++
++@pytest.mark.parametrize("on", [True, False])
++@pytest.mark.parametrize("failing", ["internal", "ansible", "both"])
++def test_a_failing_lane_fails_the_run_with_the_same_message_and_never_skips_the_other(world, monkeypatch, on, failing):
++    set_switch(monkeypatch, "true" if on else None)
++    world["rendezvous"] = on  # overlapped runs rendezvous; the sequential run cannot
++    world["internal_ok"] = failing not in ("internal", "both")
++    world["ansible_ok"] = failing not in ("ansible", "both")
++    with pytest.raises(Exit):
++        run(world)
++    assert world["exit_messages"] == ["Configuration deployment failed"]
++    assert "internal-end" in world["order"] and "ansible-end" in world["order"], "both lanes ran to the end"
++
++
++@pytest.mark.parametrize("on", [True, False])
++def test_success_is_silent_in_both_modes(world, monkeypatch, on):
++    set_switch(monkeypatch, "true" if on else None)
++    world["rendezvous"] = on
++    run(world)
++    assert world["exit_messages"] == []
++
++
++def test_an_exception_in_the_playbook_thread_surfaces_after_the_internal_lane_finished(world, monkeypatch):
++    set_switch(monkeypatch, "true")
++    world["ansible_raises"] = RuntimeError("ansible-playbook vanished")
++    with pytest.raises(RuntimeError, match="vanished"):
++        run(world)
++    assert "internal-end" in world["order"], "the fan-out must not be abandoned half way"
++
++
++def test_nothing_needing_ansible_means_no_second_lane(world, monkeypatch):
++    set_switch(monkeypatch, "true")
++    world["ansible_skip"] = list(NODES)
++    world["rendezvous"] = False
++    run(world)
++    assert world["order"] == ["internal-start", "internal-end"] and world["playbook_runs"] == 0
++
++
++def test_the_normalize_step_is_never_overlapped(world, monkeypatch):
++    """The overlap is for the main deploy only: start_overlapped_ansible_lane refuses while args.normalize is set."""
++    set_switch(monkeypatch, "true")
++    world["args"].normalize = True
++    assert deploy.start_overlapped_ansible_lane(world["topology"], world["args"], NODES, []) is False
++    assert deploy._OVERLAPPED_LANE is None
++
++
++def test_upstream_lines_are_not_removed_by_the_patch():
++    """The series must keep upstream's text (scripts/check-netlab-series-reverts-upstream.sh): the two sequential calls
++    are still in run(), and the join lives INSIDE deploy_ansible_playbook."""
++    import inspect
++    run_source = inspect.getsource(deploy.run)
++    assert "(used_internal, status_internal) = deploy_internal_config(nodeset, topology, args)" in run_source
++    assert "deploy_ansible_playbook(topology,args,nodeset,rest,'deploy' if used_internal else '')" in run_source
++    assert run_source.index("start_overlapped_ansible_lane") < run_source.index("(used_internal, status_internal) = deploy_internal_config(nodeset, topology, args)\n  (used_ansible")
+-- 
+2.56.0
+

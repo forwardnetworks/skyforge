@@ -1,0 +1,103 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 07:11:34 -0500
+Subject: [PATCH 44/46] meshnet: decode chained prevResult by its own
+ cniVersion (r5)
+
+---
+diff --git a/third_party/meshnet/plugin/meshnet.go b/third_party/meshnet/plugin/meshnet.go
+index 54b22da..11c6611 100644
+--- a/third_party/meshnet/plugin/meshnet.go
++++ b/third_party/meshnet/plugin/meshnet.go
+@@ -11,6 +11,7 @@ import (
+ 
+ 	"github.com/containernetworking/cni/pkg/skel"
+ 	"github.com/containernetworking/cni/pkg/types"
++	"github.com/containernetworking/cni/pkg/types/create"
+ 	types100 "github.com/containernetworking/cni/pkg/types/100"
+ 	"github.com/containernetworking/cni/pkg/version"
+ 	"github.com/containernetworking/plugins/pkg/ns"
+@@ -74,7 +75,20 @@ func loadConf(bytes []byte) (*netConf, *types100.Result, error) {
+ 	// Parse previous result.
+ 	var result *types100.Result
+ 	var err error
+-	if err = version.ParsePrevResult(&n.NetConf); err != nil {
++	// Decode by the prevResult's own cniVersion, not the config's. In a chain the
++	// list cniVersion (0.3.0) can differ from the chained plugins' results (1.0.0).
++	// version.ParsePrevResult selects the decoder from conf.CNIVersion and rejects
++	// the result. Results that omit cniVersion take the config's version (pre-1.0 rule).
++	if ver, ok := n.RawPrevResult["cniVersion"]; !ok || ver == "" {
++		n.RawPrevResult["cniVersion"] = n.CNIVersion
++	}
++	prevBytes, err := json.Marshal(n.RawPrevResult)
++	if err != nil {
++		return nil, nil, fmt.Errorf("could not parse prevResult: could not serialize prevResult: %v", err)
++	}
++	n.RawPrevResult = nil
++	n.PrevResult, err = create.CreateFromBytes(prevBytes)
++	if err != nil {
+ 		return nil, nil, fmt.Errorf("could not parse prevResult: %v", err)
+ 	}
+ 
+diff --git a/third_party/meshnet/plugin/prevresult_test.go b/third_party/meshnet/plugin/prevresult_test.go
+new file mode 100644
+index 0000000..a1ebece
+--- /dev/null
++++ b/third_party/meshnet/plugin/prevresult_test.go
+@@ -0,0 +1,53 @@
++package main
++
++import (
++	"testing"
++)
++
++// A meshnet plugin in a chain (cilium-cni -> multus -> meshnet) receives the
++// previous plugins' result. The production conflist declares cniVersion 0.3.0
++// at the list level, while the chained plugins return cniVersion 1.0.0. The
++// meshnet plugin must accept that prevResult and pass its IPs through.
++func TestLoadConfAcceptsChainedPrevResultAcrossVersions(t *testing.T) {
++	cases := []struct {
++		name       string
++		confVer    string
++		prevResult string
++	}{
++		{
++			name:       "config 0.3.0, prevResult 1.0.0 (production chain)",
++			confVer:    "0.3.0",
++			prevResult: `{"cniVersion":"1.0.0","ips":[{"address":"10.244.1.5/24","gateway":"10.244.1.1","interface":0}]}`,
++		},
++		{
++			name:       "config 1.0.0, prevResult 1.0.0",
++			confVer:    "1.0.0",
++			prevResult: `{"cniVersion":"1.0.0","ips":[{"address":"10.244.1.5/24","gateway":"10.244.1.1","interface":0}]}`,
++		},
++		{
++			name:       "config 0.3.0, prevResult 0.3.1",
++			confVer:    "0.3.0",
++			prevResult: `{"cniVersion":"0.3.1","ips":[{"version":"4","address":"10.244.1.5/24","gateway":"10.244.1.1","interface":0}]}`,
++		},
++		{
++			name:       "config 0.3.0, prevResult without cniVersion",
++			confVer:    "0.3.0",
++			prevResult: `{"ips":[{"version":"4","address":"10.244.1.5/24","gateway":"10.244.1.1","interface":0}]}`,
++		},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			conf := `{"cniVersion":"` + tc.confVer + `","name":"meshnet","type":"meshnet","prevResult":` + tc.prevResult + `}`
++			_, result, err := loadConf([]byte(conf))
++			if err != nil {
++				t.Fatalf("loadConf: %v", err)
++			}
++			if len(result.IPs) != 1 {
++				t.Fatalf("IPs = %d, want 1", len(result.IPs))
++			}
++			if got := result.IPs[0].Address.String(); got != "10.244.1.5/24" {
++				t.Fatalf("IP address = %q, want 10.244.1.5/24", got)
++			}
++		})
++	}
++}
+-- 
+2.56.0
+

@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 12:00:00 +0000
+Subject: [PATCH] ios/nxos: CDP gated on netlab_cdp_enable
+
+---
+diff --git a/netsim/ansible/templates/initial/ios.j2 b/netsim/ansible/templates/initial/ios.j2
+index 8714211..b560219 100644
+--- a/netsim/ansible/templates/initial/ios.j2
++++ b/netsim/ansible/templates/initial/ios.j2
+@@ -16,7 +16,16 @@ ip ssh authentication-retries 3
+ {{ enable_debugging(ios.debug,prefix='do debug') }}
+ !
+ lldp run
++{#
++  CDP is OFF by default, as upstream has it (#3807). netlab_cdp_enable -- a
++  group variable modelled on netlab_lldp_enable -- turns it on for labs whose
++  consumer discovers links over CDP (the collector reads CDP neighbours).
++#}
++{% if netlab_cdp_enable|default(False) %}
++cdp run
++{% else %}
+ no cdp run
++{% endif %}
+ !
+ {% if services.dns._no_hosts is not defined %}
+ {%   for hname,hdata in hosts.items() if hname != inventory_hostname %}
+@@ -205,6 +214,20 @@ interface {{ l.ifname }}
+ {% if l.mac_address is defined %}
+  mac-address {{ l.mac_address }}
+ {% endif %}
++{# CDP PER INTERFACE, only with netlab_cdp_enable (the global `cdp run` above); this makes each
++   data interface's CDP state explicit as well. `cdp enable` is the IOS default
++   and never shows in the running config, so this changes nothing a collector
++   sees -- it exists because of a live observation (a change-review baseline lab,
++   2026-09): after a post-boot global
++   `cdp run`, `show cdp interface` stayed empty until every interface was given
++   `cdp enable` by hand. Loopbacks reject the command (IOS), SVIs/tunnels are
++   virtual, and dot1Q sub-interfaces inherit from the parent, so all of those
++   are skipped. The management interface is not in `interfaces` and is left
++   alone. NOT YET PROVEN LIVE from this template: proof is `show cdp interface`
++   and `show cdp neighbors` on a booted cat8000v and iol. #}
++{% if netlab_cdp_enable|default(False) and l.virtual_interface is not defined and l.type|default('') != 'vlan_member' %}
++ cdp enable
++{% endif %}
+ {%   if l.shutdown|default(False) %}
+  shutdown
+ {%   else %}
+diff --git a/netsim/ansible/templates/initial/nxos.j2 b/netsim/ansible/templates/initial/nxos.j2
+index 1420124..5a90d8e 100644
+--- a/netsim/ansible/templates/initial/nxos.j2
++++ b/netsim/ansible/templates/initial/nxos.j2
+@@ -32,7 +32,12 @@ feature scp-server
+    auto-provisions unattended. role network-admin grants the privileges the
+    accounts need (a role-less user cannot drive config). #}
+ no password strength-check
++{# CDP off unless netlab_cdp_enable (see initial/ios.j2) #}
++{% if netlab_cdp_enable|default(False) %}
++cdp enable
++{% else %}
+ no cdp enable
++{% endif %}
+ !
+ username admin password admin role network-admin
+ username vagrant password vagrant role network-admin
+-- 
+2.56.0
+

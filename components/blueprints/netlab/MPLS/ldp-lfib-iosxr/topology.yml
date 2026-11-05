@@ -1,0 +1,172 @@
+---
+name: ldp_lfib_iosxr
+
+message: |
+  IOS-XR (XRd) label switching over a BGP-free MPLS core.
+
+  This is the iosxr counterpart of MPLS/ldp-lfib (which is EOS). It exists to
+  answer one question with evidence: can the XRd CONTROL PLANE image actually
+  label-switch transit traffic, or does it only run LDP?
+
+  h1 -- pe1 -- p1 -- p2 -- pe2 -- h2
+
+  pe1/pe2 run ISIS + BGP + MPLS. p1/p2 run ISIS + MPLS ONLY, so the core holds
+  no route to the host subnets at all. Traffic therefore cannot cross the core
+  by IP forwarding; if h1 reaches h2, it was label-switched.
+
+  A successful ping is NOT by itself proof of label switching -- the `validate:`
+  block below is. It checks, in order: the core has no IP route to the hosts,
+  LDP is up, the LFIB is populated, the ping succeeds, and finally that p1's
+  LFIB BYTE COUNTERS moved. Counters start at zero at boot, so a non-zero
+  counter after the ping is an increment, which is the part a ping alone cannot
+  establish.
+
+provider: kne
+
+defaults:
+  device: iosxr
+  # XRd boots slowly (see the ssdinit device-scan finding); give readiness and
+  # the validation waits room rather than papering over a slow start with
+  # retries at a higher layer.
+  netlab_check_retries: 400
+  outputs.graph.as_clusters: False
+
+bgp.advertise_loopback: false
+isis.instance: Mordor
+
+groups:
+  _auto_create: True
+  pe:
+    members: [ pe1, pe2 ]
+    module: [ isis, bgp, mpls ]
+    mpls.ldp: True
+    bgp.as: 65001
+  core:
+    members: [ p1, p2 ]
+    # No bgp module: this is what makes the core BGP-free, and it is the whole
+    # point of the topology. Adding bgp here would give p1/p2 a route to the
+    # host subnets and the test would prove nothing.
+    module: [ isis, mpls ]
+    mpls.ldp: True
+    graph.fill: "#d1bfab"
+  hosts:
+    members: [ h1, h2 ]
+    device: linux
+    graph.fill: "#e3e3e3"
+  all:
+    graph.rank: 1
+
+links:
+- h1:
+  pe1:
+  isis: false
+- pe1-p1
+- p1-p2
+- p2-pe2
+- pe2:
+  h2:
+  isis: false
+
+# Validation runs against the RUNNING lab via `netlab validate` (Skyforge
+# deployment action "validate"). netlab reaches each node with `netlab connect`,
+# which under the KNE provider is SSH to the node's management Service.
+#
+# iosxr has no upstream validation plugin (netsim/validate/ ships eos, frr,
+# linux, crpd and cumulus only), so the XR nodes use `exec:` + a regex over the
+# CLI output. Waits are plain integers on purpose: the symbolic names used by
+# netlab's own integration tests (ldp_adj, ping_long) are defined in
+# tests/integration/wait_times.yml, which is not on this topology's source path.
+#
+# !! NO PYTHON BUILT-INS ARE AVAILABLE IN `valid:` EXPRESSIONS !!
+#
+# netsim/cli/validate/utils.py:185 evaluates the expression as
+#     eval(v_test, {'__builtins__': {'len': len}}, result)
+# where `result` is a python-box Box built by data.get_empty_box(), i.e.
+# Box(default_box=True). A default Box returns a NEW EMPTY BOX for any missing
+# key instead of raising KeyError, and eval resolves names through the locals
+# mapping FIRST. So every bare name -- len, max, int, sorted, sum, any, all --
+# resolves to an empty Box and dies with "'Box' object is not callable". Even
+# `len`, the one built-in netlab deliberately exposes, is unreachable: the Box
+# shadows it. A name that is merely a typo does not raise NameError either; it
+# evaluates to a falsy empty Box, so the test silently reports FAIL rather than
+# erroring. Verified empirically against netlab's own get_empty_box()/BUILTINS,
+# not against a plain dict -- testing these against a dict is what let the
+# original len()-based expressions ship broken.
+#
+# The only callables reachable here are methods on real objects already in the
+# namespace: `re` (the module, injected at utils.py:184) and `stdout` (a str).
+# So: use re.search / re.findall, str methods, `in`, slicing and comparisons.
+#   * "at least N matches"  ->  re.findall(...)[N-1:] != []
+#   * "a match exists"      ->  re.search(...) is not None
+#   * "a number >= 10**k"   ->  a \d{k+1,} regex, since integer conversion and
+#                               max() are both unavailable.
+#
+# MTU NOTE: this topology deliberately sets NO mtu / lsp-mtu anywhere. IS-IS
+# needs the link MTU to be large enough to carry its padded P2P IIHs, but that
+# is a PLATFORM concern (providers.kne.link_mtu plus the per-device ceiling in
+# providers.kne.device_link_mtu), not a per-blueprint one. Special-casing MTU
+# here would paper over a platform gap and cap this lane permanently.
+validate:
+  core_is_bgp_free:
+    description: p1/p2 hold NO IP route to h2's subnet (so IP forwarding cannot carry the traffic)
+    nodes: [ p1, p2 ]
+    exec:
+      iosxr: show route ipv4 {{ hostvars.h2.interfaces[0].ipv4.split('/')[0] }}
+    valid:
+      iosxr: |
+        'not in table' in stdout
+    pass: core has no route to the host subnet -- only labels can get traffic across
+
+  ldp:
+    description: LDP sessions are operational on p1 (toward pe1 and p2)
+    wait: 180
+    wait_msg: Waiting for LDP to come up
+    nodes: [ p1 ]
+    exec:
+      iosxr: show mpls ldp neighbor
+    valid:
+      # "at least 2 Oper sessions", expressed without len(): slicing off the
+      # first match and comparing to [] is true iff there were >= 2 matches.
+      iosxr: |
+        re.findall(r'State:\s+Oper\b',stdout)[1:] != []
+    stop_on_error: true
+
+  lfib:
+    description: p1's LFIB is populated with label entries
+    wait: 60
+    wait_msg: Waiting for the LFIB to populate
+    nodes: [ p1 ]
+    exec:
+      iosxr: show mpls forwarding
+    valid:
+      # >= 2 LFIB rows. An XR LFIB row starts with the local label (XR allocates
+      # from 24000, so >= 4 digits keeps the header and the ---- rule out).
+      iosxr: |
+        re.findall(r'^\s*\d{4,}\s+\S+',stdout,re.M)[1:] != []
+    stop_on_error: true
+
+  ping:
+    description: h1 -> h2 end-to-end across the BGP-free MPLS core
+    wait: 60
+    wait_msg: We might have to wait a bit longer
+    nodes: [ h1 ]
+    plugin: ping('h2',count=20,pkt_len=1400)
+
+  lfib_counters:
+    description: p1's LFIB byte counters moved -- XRd actually label-switched the traffic
+    nodes: [ p1 ]
+    exec:
+      iosxr: show mpls forwarding
+    valid:
+      # The last column of `show mpls forwarding` is Bytes Switched. 20 pings at
+      # 1400 bytes is ~28 KB, so a counter above 10000 cannot be explained by
+      # control-plane noise -- and every counter starts at 0 when the lab boots,
+      # which is what makes this an increment rather than a snapshot.
+      #
+      # int()/max() are both unreachable here (see the note above the validate
+      # block), so the ">= 10000" threshold is expressed as a digit count: a
+      # decimal integer with 5 or more digits IS >= 10000. The row must also
+      # start with a label, so a stray 5-digit value elsewhere cannot pass it.
+      iosxr: |
+        re.search(r'^\s*\d{4,}\s.*\s\d{5,}\s*$',stdout,re.M) is not None
+    pass: XRd label-switched transit traffic (LFIB byte counters incremented)

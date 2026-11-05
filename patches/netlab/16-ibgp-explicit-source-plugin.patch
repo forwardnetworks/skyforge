@@ -1,0 +1,109 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 12:00:00 +0000
+Subject: [PATCH] plugins: ibgp explicit_source
+
+---
+diff --git a/netsim/extra/ibgp/explicit_source/__init__.py b/netsim/extra/ibgp/explicit_source/__init__.py
+new file mode 100644
+index 0000000..dde242c
+--- /dev/null
++++ b/netsim/extra/ibgp/explicit_source/__init__.py
+@@ -0,0 +1,74 @@
++"""
++ibgp.explicit_source -- source a plain IBGP session from a directly-connected
++interface instead of the loopback.
++
++netlab's core build_ibgp_sessions (netsim/modules/bgp.py) always sources an
++IBGP session from the node loopback and always neighbors the peer's
++loopback (get_remote_ibgp_endpoint): campus routers peering directly over a
++link between them, with no reachable IGP to the loopback (e.g. the link's
++own OSPF is disabled), can never come up -- the loopback is simply
++unreachable, not a config error.
++
++Opt in per interface with `bgp.session_source: True` on BOTH ends of the
++link; the two nodes must already be IBGP peers (same AS, both already have
++`module: [ bgp ]`) via the normal full mesh netlab builds among same-AS
++nodes -- this plugin only overrides the two address fields on the neighbor
++entry netlab already built, in post_transform, after bgp.py has run. It
++does not create sessions, does not touch EBGP, and does not build a phantom
++link the way ebgp.multihop does: the link is real and already carries real
++addresses, only the loopback default needs replacing.
++"""
++import typing
++
++from box import Box
++
++from netsim.utils import log
++from netsim.utils import routing as _bgp
++
++_config_name = 'ibgp.explicit_source'
++_execute_after = ['bgp']
++_requires = ['bgp']
++
++
++def post_transform(topology: Box) -> None:
++  for name, node in topology.nodes.items():
++    if 'bgp' not in node:
++      continue
++    for intf in node.get('interfaces', []):
++      if not intf.get('bgp', {}).get('session_source', False):
++        continue
++      _apply_explicit_source(node, intf, topology)
++
++
++def _apply_explicit_source(node: Box, intf: Box, topology: Box) -> None:
++  neighbors = intf.get('neighbors', [])
++  if len(neighbors) != 1:
++    log.error(
++      f'ibgp.explicit_source: interface {intf.ifname} on {node.name} needs exactly one '
++      f'link neighbor to source an IBGP session from (found {len(neighbors)})',
++      log.IncorrectValue, _config_name)
++    return
++
++  peer = neighbors[0]
++  peer_name = peer.get('node', None)
++  if not peer_name:
++    return
++
++  matched = False
++  for ngb in _bgp.neighbors(node, vrf=False, select=['ibgp']):
++    if ngb.name != peer_name:
++      continue
++    matched = True
++    for af in ('ipv4', 'ipv6'):
++      addr = peer.get(af, None)
++      if isinstance(addr, str):
++        ngb[af] = _bgp.get_intf_address(addr)
++    ngb._source_intf = intf
++
++  if not matched:
++    log.error(
++      f'ibgp.explicit_source: {node.name}.{intf.ifname} has bgp.session_source set, but '
++      f'{node.name} has no IBGP session toward {peer_name} to source from it -- both nodes '
++      f'need the same bgp.as and IBGP session (a full mesh, or one of them an RR client of '
++      f'the other)',
++      log.IncorrectValue, _config_name)
+diff --git a/netsim/extra/ibgp/explicit_source/defaults.yml b/netsim/extra/ibgp/explicit_source/defaults.yml
+new file mode 100644
+index 0000000..ff653bf
+--- /dev/null
++++ b/netsim/extra/ibgp/explicit_source/defaults.yml
+@@ -0,0 +1,14 @@
++bgp:
++  attributes:
++    interface:
++      session_source:
++        type: bool
++        true_value: True
++    # warn_bgp_attributes (netsim/modules/bgp.py) checks the intra-AS
++    # opt-out under the LINK attribute namespace regardless of whether the
++    # attribute is actually link- or interface-scoped -- this entry exists
++    # only to suppress that warning for an attribute that is, by design,
++    # used exclusively on intra-AS (IBGP) links.
++    link:
++      session_source:
++        _intra_as: True
+-- 
+2.56.0
+

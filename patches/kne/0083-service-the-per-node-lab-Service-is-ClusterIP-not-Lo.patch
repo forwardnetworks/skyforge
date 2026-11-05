@@ -1,0 +1,239 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 09:50:05 -0600
+Subject: [PATCH] service: the per-node lab Service is ClusterIP, not
+ LoadBalancer
+
+SKYFORGE-SPECIFIC: platform behaviour; not for upstream.
+
+---
+diff --git a/topo/node/node.go b/topo/node/node.go
+index 4ebe83b..0a78bbc 100644
+--- a/topo/node/node.go
++++ b/topo/node/node.go
+@@ -1272,6 +1272,10 @@ func k8sServiceType(t tpb.Service_Type) corev1.ServiceType {
+ 	}
+ }
+ 
++// nodeServiceType is the Kubernetes type of the per-node service-<node> Service: the group that
++// k8sServiceType maps to LoadBalancer (an unset type or LOAD_BALANCER). SKYFORGE-SPECIFIC: see CreateService.
++const nodeServiceType = corev1.ServiceTypeClusterIP
++
+ func serviceNameForType(nodeName string, svcType corev1.ServiceType) string {
+ 	switch svcType {
+ 	case corev1.ServiceTypeNodePort:
+@@ -1378,12 +1382,22 @@ func (n *Impl) CreateService(ctx context.Context) (rErr error) {
+ 			},
+ 		}
+ 		if st == corev1.ServiceTypeLoadBalancer {
+-			// Do not allocate a NodePort for this LoadBalancer. MetalLB
+-			// or the equivalent load balancer should handle exposing this service.
+-			// Large topologies may try to allocate more NodePorts than are
+-			// supported in default clusters.
+-			// https://kubernetes.io/docs/concepts/services-networking/service/#load-balancer-nodeport-allocation
+-			s.Spec.AllocateLoadBalancerNodePorts = pointer.Bool(false)
++			// SKYFORGE-SPECIFIC: the per-node service-<node> Service is ClusterIP, not LoadBalancer.
++			// Lab nodes are reached only from inside the cluster (the netlab runtime, napalm/scrapligo,
++			// the the collector collector over management, the portal proxies), always as
++			// service-<node>.<ns>.svc or its ClusterIP; jump servers cover reach from outside. No
++			// LoadBalancer IP pool matches lab Services, so a LoadBalancer here never got an address
++			// (cilium.io/IPAMRequestSatisfied=False no_pool on every lab Service, measured 2026-11-02),
++			// and checkServiceStatus waited for one that never came. The name, the kne-service label,
++			// the ClusterIP and the ports are unchanged, so every consumer reads the same Service.
++			s.Spec.Type = nodeServiceType
++			for i := range s.Spec.Ports {
++				if s.Spec.Ports[i].NodePort != 0 {
++					log.Warningf("Node %s: dropping node_port %d on service port %d; service-%s is ClusterIP (declare type NODE_PORT for a NodePort)",
++						n.Name(), s.Spec.Ports[i].NodePort, s.Spec.Ports[i].Port, n.Name())
++					s.Spec.Ports[i].NodePort = 0
++				}
++			}
+ 			s.Labels["kne-service"] = "true"
+ 		}
+ 		sS, err := n.KubeClient.CoreV1().Services(n.Namespace).Create(ctx, s, metav1.CreateOptions{})
+diff --git a/topo/node/node_test.go b/topo/node/node_test.go
+index ff3f53d..3216d21 100644
+--- a/topo/node/node_test.go
++++ b/topo/node/node_test.go
+@@ -532,9 +532,8 @@ func TestService(t *testing.T) {
+ 					TargetPort: intstr.FromInt(22),
+ 					NodePort:   0,
+ 				}},
+-				Selector:                      map[string]string{"app": "dev1"},
+-				Type:                          "LoadBalancer",
+-				AllocateLoadBalancerNodePorts: pointer.Bool(false),
++				Selector: map[string]string{"app": "dev1"},
++				Type:     "ClusterIP",
+ 			},
+ 		}},
+ 	}, {
+@@ -578,9 +577,8 @@ func TestService(t *testing.T) {
+ 					TargetPort: intstr.FromInt(9339),
+ 					NodePort:   0,
+ 				}},
+-				Selector:                      map[string]string{"app": "dev2"},
+-				Type:                          "LoadBalancer",
+-				AllocateLoadBalancerNodePorts: pointer.Bool(false),
++				Selector: map[string]string{"app": "dev2"},
++				Type:     "ClusterIP",
+ 			},
+ 		}},
+ 	}, {
+@@ -734,9 +732,8 @@ func TestService(t *testing.T) {
+ 					TargetPort: intstr.FromInt(22),
+ 					NodePort:   0,
+ 				}},
+-				Selector:                      map[string]string{"app": "dev-mixed"},
+-				Type:                          "LoadBalancer",
+-				AllocateLoadBalancerNodePorts: pointer.Bool(false),
++				Selector: map[string]string{"app": "dev-mixed"},
++				Type:     "ClusterIP",
+ 			},
+ 		}, {
+ 			TypeMeta: metav1.TypeMeta{
+@@ -781,6 +778,80 @@ func TestService(t *testing.T) {
+ 				Type:     "ClusterIP",
+ 			},
+ 		}},
++	}, {
++		// SKYFORGE-SPECIFIC: an explicit LOAD_BALANCER still yields the ClusterIP service-<node>; labs
++		// get no external load balancer on this platform.
++		desc: "explicit load balancer type is the ClusterIP node service",
++		node: &topopb.Node{
++			Name:   "dev-lb",
++			Vendor: topopb.Vendor(1001),
++			Services: map[uint32]*topopb.Service{
++				22: {
++					Name:   "ssh",
++					Inside: 22,
++					Type:   topopb.Service_LOAD_BALANCER,
++				},
++			},
++		},
++		kClient: kfake.NewSimpleClientset(),
++		want: []*corev1.Service{{
++			TypeMeta: metav1.TypeMeta{
++				Kind:       "Service",
++				APIVersion: "v1",
++			},
++			ObjectMeta: metav1.ObjectMeta{
++				Name:      "service-dev-lb",
++				Namespace: "test",
++				Labels:    map[string]string{"kne-service": "true", "pod": "dev-lb"},
++			},
++			Spec: corev1.ServiceSpec{
++				Ports: []corev1.ServicePort{{
++					Name:       "ssh",
++					Protocol:   "TCP",
++					Port:       22,
++					TargetPort: intstr.FromInt(22),
++				}},
++				Selector: map[string]string{"app": "dev-lb"},
++				Type:     "ClusterIP",
++			},
++		}},
++	}, {
++		// SKYFORGE-SPECIFIC: a ClusterIP Service cannot carry a nodePort (the API server rejects it), so a
++		// node_port on an untyped service is dropped instead of failing the node's create.
++		desc: "untyped service with a node port is ClusterIP without it",
++		node: &topopb.Node{
++			Name:   "dev-np",
++			Vendor: topopb.Vendor(1001),
++			Services: map[uint32]*topopb.Service{
++				22: {
++					Name:     "ssh",
++					Inside:   22,
++					NodePort: 30022,
++				},
++			},
++		},
++		kClient: kfake.NewSimpleClientset(),
++		want: []*corev1.Service{{
++			TypeMeta: metav1.TypeMeta{
++				Kind:       "Service",
++				APIVersion: "v1",
++			},
++			ObjectMeta: metav1.ObjectMeta{
++				Name:      "service-dev-np",
++				Namespace: "test",
++				Labels:    map[string]string{"kne-service": "true", "pod": "dev-np"},
++			},
++			Spec: corev1.ServiceSpec{
++				Ports: []corev1.ServicePort{{
++					Name:       "ssh",
++					Protocol:   "TCP",
++					Port:       22,
++					TargetPort: intstr.FromInt(22),
++				}},
++				Selector: map[string]string{"app": "dev-np"},
++				Type:     "ClusterIP",
++			},
++		}},
+ 	}, {
+ 		desc: "failed create duplicate",
+ 		node: &topopb.Node{
+diff --git a/topo/service_test.go b/topo/service_test.go
+index d5371c0..16a1c69 100644
+--- a/topo/service_test.go
++++ b/topo/service_test.go
+@@ -1,12 +1,57 @@
+ package topo
+ 
+ import (
++	"context"
+ 	"testing"
+ 	"time"
+ 
++	tpb "github.com/openconfig/kne/proto/topo"
++	"github.com/openconfig/kne/topo/node"
+ 	corev1 "k8s.io/api/core/v1"
++	kfake "k8s.io/client-go/kubernetes/fake"
++	"k8s.io/client-go/rest"
+ )
+ 
++// SKYFORGE-SPECIFIC: the per-node Service that CreateService builds must count as ready without a
++// LoadBalancer ingress. No IP pool serves lab Services on this platform, so while it was a LoadBalancer,
++// checkServiceStatus could never see it ready and held kne create for the rest of its timeout.
++func TestCreatedNodeServiceIsReadyWithoutLoadBalancerIngress(t *testing.T) {
++	ctx := context.Background()
++	n := &node.Impl{
++		Namespace:  "test",
++		KubeClient: kfake.NewSimpleClientset(),
++		RestConfig: &rest.Config{},
++		Proto: &tpb.Node{
++			Name:   "r1",
++			Vendor: tpb.Vendor(1001),
++			Services: map[uint32]*tpb.Service{
++				22:  {Name: "ssh", Inside: 22},
++				161: {Name: "snmp", Inside: 161},
++			},
++		},
++	}
++	if err := n.CreateService(ctx); err != nil {
++		t.Fatalf("CreateService() failed: %v", err)
++	}
++	svcs, err := n.Services(ctx)
++	if err != nil {
++		t.Fatalf("Services() failed: %v", err)
++	}
++	if len(svcs) != 1 || svcs[0].Name != "service-r1" {
++		t.Fatalf("want exactly service-r1, got %d service(s): %v", len(svcs), svcs)
++	}
++	if !isServiceReady(svcs[0]) {
++		t.Fatalf("service-r1 (type %s, no load balancer ingress) is not ready; kne create would wait for an address that never comes", svcs[0].Spec.Type)
++	}
++	m := map[uint32]*tpb.Service{}
++	if err := populateServiceMap(svcs[0], m); err != nil {
++		t.Fatalf("populateServiceMap() (kne show) failed on service-r1: %v", err)
++	}
++	if got := m[22].GetType(); got != tpb.Service_CLUSTER_IP {
++		t.Fatalf("kne show reports service-r1 port 22 as %v, want CLUSTER_IP", got)
++	}
++}
++
+ func TestIsServiceReady(t *testing.T) {
+ 	tests := []struct {
+ 		desc string
+-- 
+2.56.0
+

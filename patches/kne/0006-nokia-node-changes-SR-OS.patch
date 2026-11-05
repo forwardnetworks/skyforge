@@ -1,0 +1,116 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 13:47:28 -0500
+Subject: [PATCH 06/35] nokia: node changes (SR OS)
+
+---
+diff --git a/topo/node/nokia/nokia.go b/topo/node/nokia/nokia.go
+index 79ebeca..071acc5 100644
+--- a/topo/node/nokia/nokia.go
++++ b/topo/node/nokia/nokia.go
+@@ -255,6 +255,10 @@ func escapeConfig(cfgBytes []byte) string {
+ 
+ // Create creates a Nokia SR Linux node by interfacing with srl-labs/srl-controller
+ func (n *Node) Create(ctx context.Context) error {
++	if strings.EqualFold(n.Proto.Model, "sros") || strings.Contains(strings.ToLower(n.Proto.GetConfig().GetImage()), "vr-sros") {
++		return n.Impl.Create(ctx)
++	}
++
+ 	log.Infof("Creating Srlinux node resource %s", n.Name())
+ 
+ 	components, err := lineCards(n.GetProto())
+@@ -396,6 +400,10 @@ func (n *Node) DefaultNodeConstraints() node.Constraints {
+ }
+ 
+ func (n *Node) Delete(ctx context.Context) error {
++	if strings.EqualFold(n.Proto.Model, "sros") || strings.Contains(strings.ToLower(n.Proto.GetConfig().GetImage()), "vr-sros") {
++		return n.Impl.Delete(ctx)
++	}
++
+ 	c, err := dynamic.NewForConfig(n.RestConfig)
+ 	if err != nil {
+ 		return err
+diff --git a/topo/node/nokia/nokia_test.go b/topo/node/nokia/nokia_test.go
+index 322f705..538f4ec 100644
+--- a/topo/node/nokia/nokia_test.go
++++ b/topo/node/nokia/nokia_test.go
+@@ -16,6 +16,7 @@ package nokia
+ import (
+ 	"context"
+ 	"os"
++	"strings"
+ 	"testing"
+ 	"time"
+ 
+@@ -36,6 +37,7 @@ import (
+ 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+ 	"k8s.io/apimachinery/pkg/watch"
+ 	"k8s.io/client-go/kubernetes/fake"
++	"k8s.io/client-go/rest"
+ 	ktest "k8s.io/client-go/testing"
+ )
+ 
+@@ -92,7 +94,7 @@ func TestNew(t *testing.T) {
+ 			Os:    "nokia_srlinux",
+ 			Config: &topopb.Config{
+ 				Image:      "ghcr.io/nokia/srlinux:latest",
+-				InitImage:  "us-west1-docker.pkg.dev/kne-external/kne/init-wait:ga",
++				InitImage:  "registry.example.com/skyforge/kne/init-wait:20260925-sandbox-r2",
+ 				ConfigFile: "config.cli",
+ 			},
+ 			Labels: map[string]string{
+@@ -146,7 +148,7 @@ func TestNew(t *testing.T) {
+ 			Os:    "nokia_srlinux",
+ 			Config: &topopb.Config{
+ 				Image:      "ghcr.io/nokia/srlinux:latest",
+-				InitImage:  "us-west1-docker.pkg.dev/kne-external/kne/init-wait:ga",
++				InitImage:  "registry.example.com/skyforge/kne/init-wait:20260925-sandbox-r2",
+ 				ConfigFile: "config.json",
+ 			},
+ 			Labels: map[string]string{
+@@ -200,6 +202,42 @@ func TestNew(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestDeleteSROSUsesKubeVirtDeletePath(t *testing.T) {
++	ctx := context.Background()
++	client := fake.NewSimpleClientset(&corev1.Service{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      "service-sros1",
++			Namespace: "test-ns",
++		},
++	})
++	n := &Node{
++		Impl: &node.Impl{
++			KubeClient: client,
++			Namespace:  "test-ns",
++			RestConfig: &rest.Config{Host: "http://127.0.0.1:1"},
++			Proto: &topopb.Node{
++				Name:   "sros1",
++				Vendor: topopb.Vendor_NOKIA,
++				Model:  "sros",
++				Config: &topopb.Config{Image: "registry.example.com/skyforge/kubevirt/vr-sros:22.10.R2-eve-l1"},
++			},
++		},
++	}
++
++	// Upstream Impl.Delete returns the joined service and resource errors
++	// (it used to log and return nil). The RestConfig points at a dead
++	// endpoint, so the VirtualMachine delete must fail, and that error must
++	// surface. The service delete runs first and must still happen.
++	err := n.Delete(ctx)
++	if err == nil || !strings.Contains(err.Error(), "error deleting resource") {
++		t.Fatalf("Delete() error = %v, want the resource delete error", err)
++	}
++	if _, err := client.CoreV1().Services("test-ns").Get(ctx, "service-sros1", metav1.GetOptions{}); err == nil {
++		t.Fatal("Delete() did not delete SROS service through generic KubeVirt path")
++	}
++}
++
+ func TestGenerateSelfSigned(t *testing.T) {
+ 	ki := fake.NewSimpleClientset(&corev1.Pod{
+ 		ObjectMeta: metav1.ObjectMeta{
+-- 
+2.56.0
+

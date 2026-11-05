@@ -1,0 +1,47 @@
+message: |
+  This topology creates an EVPN fabric with centralized routing
+  on the spine switch.
+
+defaults.device: eos
+provider: kne
+module: [ ospf, bgp, vlan, vxlan, evpn ]
+bgp.as: 65000
+
+vlans:
+  red:
+    links: [ l1-hr1 ]
+    mode: bridge
+    vrf: tenant
+  blue:
+    links: [ l2-hb1 ]
+    mode: bridge
+    vrf: tenant
+
+vrfs:
+  tenant:
+
+groups:
+  hosts:
+    members: [ hb1, hr1 ]
+    device: linux
+
+nodes:
+  spine:
+    module: [ ospf, bgp, vlan, vrf, vxlan, evpn ]
+    vrfs:
+      tenant:
+    vlans:
+      red.mode: irb
+      blue.mode: irb
+  # netlab 26.08 tightening: leaf nodes must enable the modules their VLAN
+  # links use; topology-level `module:` no longer reaches nodes here.
+  l1:
+    module: [ ospf, bgp, vlan, vxlan, evpn ]
+  l2:
+    module: [ ospf, bgp, vlan, vxlan, evpn ]
+  hb1:
+  hr1:
+
+links:
+- group: core
+  members: [ spine-l1, spine-l2 ]

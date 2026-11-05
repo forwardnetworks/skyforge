@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 15:29:23 -0500
+Subject: [PATCH 33/35] meshnet: set the owner alias after the wire is in the
+ pod netns (M0015 fix)
+
+---
+diff --git a/third_party/meshnet/daemon/vxlan/vxlan.go b/third_party/meshnet/daemon/vxlan/vxlan.go
+index 399f1d8..9e15e62 100644
+--- a/third_party/meshnet/daemon/vxlan/vxlan.go
++++ b/third_party/meshnet/daemon/vxlan/vxlan.go
+@@ -200,6 +200,15 @@ func makeVxLan(nsName, linkName string, ipNet *net.IPNet, vxlan VxLan) error {
+ 			}
+ 		}
+ 
++		// The alias is the owner record the orphan reconciler reads. LinkAdd does
++		// not carry IFLA_IFALIAS reliably (the lab run found an empty ifalias on a
++		// wire created with Alias set), so it is set here, after the rename.
++		if vxlan.Owner != "" {
++			if err := netlink.LinkSetAlias(podLink, vxlan.Owner); err != nil {
++				return fmt.Errorf("failed to set owner alias on %q: %w", linkName, err)
++			}
++		}
++
+ 		if err := netlink.LinkSetUp(podLink); err != nil {
+ 			return fmt.Errorf("failed to set %q up: %w", linkName, err)
+ 		}
+-- 
+2.56.0
+

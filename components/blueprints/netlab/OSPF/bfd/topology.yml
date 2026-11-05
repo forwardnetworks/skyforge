@@ -1,0 +1,15 @@
+provider: kne
+module: [ bfd, ospf ]
+
+ospf: # OSPFv2 (ipv4) only for now
+  bfd: True
+
+nodes:
+  r1:
+    device: sros
+
+  r2:
+    device: sros
+
+links:
+- r1-r2

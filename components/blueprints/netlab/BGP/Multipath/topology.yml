@@ -1,0 +1,30 @@
+module: [ bgp, ospf ]
+defaults.device: iol
+bgp.as: 65000
+
+groups:
+  # netlab 26.08 tightening: nodes must enable the modules their attributes
+  # use; topology-level `module:` no longer reaches nodes here.
+  net:
+    members: [ a,b,c,d,m,rr ]
+    module: [ bgp, ospf ]
+    config: [ bgp-addpath.j2 ]
+  ext:
+    members: [ y ]
+    module: [ bgp, ospf ]
+    config: [ test-loopback.j2 ]
+
+nodes:
+  a:
+  b:
+  c:
+  d:
+  m:
+  rr:
+    bgp.rr: True
+    id: 1
+  y:
+    bgp.as: 65100
+    bgp.originate: [ 10.42.42.0/24 ]
+
+links: [ a-b, a-c, b-d, c-d, b-rr, d-rr, c-y, d-y, m-c, m-d ]

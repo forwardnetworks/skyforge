@@ -1,0 +1,343 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 13:36:32 -0500
+Subject: [PATCH 19/35] meshnet: find a VM's wire behind KubeVirt's rename, do
+ not rebuild it (M0013, M0020, M0021, A0009)
+
+---
+diff --git a/third_party/meshnet/daemon/vxlan/kubevirt_slot.go b/third_party/meshnet/daemon/vxlan/kubevirt_slot.go
+new file mode 100644
+index 0000000..4790e0a
+--- /dev/null
++++ b/third_party/meshnet/daemon/vxlan/kubevirt_slot.go
+@@ -0,0 +1,119 @@
++package vxlan
++
++import (
++	"fmt"
++	"strings"
++
++	"github.com/containernetworking/plugins/pkg/ns"
++	"github.com/vishvananda/netlink"
++)
++
++// KubeVirt slot resolution for cross-node VXLAN wires.
++//
++// A VM pod's wire is created under the name the CNI gives it, "pod<id>". When
++// KubeVirt binds the VM's secondary interface, virt-launcher renames that link
++// to "<id>-nic", enslaves it to a bridge "k6t-<id>", and leaves a DOWN, NOARP
++// dummy under the original name. A reconciler that looks only at "pod<id>"
++// then sees a dummy, not a VXLAN. It removes the dummy and builds a second
++// VXLAN with the same VNI, every pass (measured 2026-10-20: a stop and start
++// of the VM left the real wire under "980816f36b7-nic" and the daemon
++// recreated "pod980816f36b7" every 30 to 60 seconds).
++//
++// This is the cross-node half of patches/meshnet-cni 0020 and 0021. The
++// same-node half is koko-side and is not in this tree.
++
++// wireSlot is where a wire actually lives inside a pod netns.
++type wireSlot struct {
++	found       netlink.Link // the link that carries the wire, or nil
++	name        string       // the name found lives under
++	bridge      string       // "k6t-<id>" when the KubeVirt bridge exists, else ""
++	bridgeIndex int
++	dummy       netlink.Link // virt-launcher's placeholder under the original name
++	strays      []netlink.Link
++}
++
++// kubevirtNames returns the renamed NIC and the bridge KubeVirt uses for a
++// "pod<id>" link. It returns "" for any other name (a plain container).
++func kubevirtNames(linkName string) (nic, bridge string) {
++	if !strings.HasPrefix(linkName, "pod") {
++		return "", ""
++	}
++	id := strings.TrimPrefix(linkName, "pod")
++	return id + "-nic", "k6t-" + id
++}
++
++// resolveSlot finds the wire for linkName. lookup returns the link with that
++// name in the pod netns, or nil. For a non-KubeVirt name, or when neither the
++// renamed NIC nor the bridge exists, the result is the original name, which is
++// the pre-KubeVirt behaviour.
++func resolveSlot(lookup func(string) netlink.Link, linkName string) wireSlot {
++	slot := wireSlot{name: linkName}
++	original := lookup(linkName)
++	nicName, bridgeName := kubevirtNames(linkName)
++	if nicName == "" {
++		slot.found = original
++		return slot
++	}
++	if br, ok := lookup(bridgeName).(*netlink.Bridge); ok {
++		slot.bridge = bridgeName
++		slot.bridgeIndex = br.Attrs().Index
++	}
++	nic := lookup(nicName)
++	if nic == nil && slot.bridge == "" {
++		slot.found = original
++		return slot
++	}
++	if d, ok := original.(*netlink.Dummy); ok {
++		slot.dummy = d
++		original = nil
++	}
++	if nic != nil {
++		slot.found = nic
++		slot.name = nicName
++		if _, isVxlan := original.(*netlink.Vxlan); isVxlan {
++			slot.strays = append(slot.strays, original)
++		}
++		return slot
++	}
++	slot.found = original
++	return slot
++}
++
++// bridgeOK reports whether a found wire is enslaved to the KubeVirt bridge the
++// slot expects. With no bridge there is nothing to enslave to, so it is true.
++func (s wireSlot) bridgeOK() bool {
++	if s.bridge == "" || s.found == nil {
++		return true
++	}
++	return s.found.Attrs().MasterIndex == s.bridgeIndex
++}
++
++// enslaveToBridge sets the link's master to bridgeName and brings it up, inside
++// the pod netns.
++func enslaveToBridge(nsName, linkName, bridgeName string) error {
++	netNS, err := ns.GetNS(nsName)
++	if err != nil {
++		return fmt.Errorf("enter %s: %w", nsName, err)
++	}
++	defer netNS.Close()
++	return netNS.Do(func(_ ns.NetNS) error {
++		link, err := netlink.LinkByName(linkName)
++		if err != nil {
++			return fmt.Errorf("lookup %s: %w", linkName, err)
++		}
++		br, err := netlink.LinkByName(bridgeName)
++		if err != nil {
++			return fmt.Errorf("lookup bridge %s: %w", bridgeName, err)
++		}
++		if _, ok := br.(*netlink.Bridge); !ok {
++			return fmt.Errorf("%s is a %T, not a bridge", bridgeName, br)
++		}
++		if err := netlink.LinkSetMaster(link, br); err != nil {
++			return fmt.Errorf("enslave %s to %s: %w", linkName, bridgeName, err)
++		}
++		if err := netlink.LinkSetUp(link); err != nil {
++			return fmt.Errorf("set %s up: %w", linkName, err)
++		}
++		return nil
++	})
++}
+diff --git a/third_party/meshnet/daemon/vxlan/kubevirt_slot_test.go b/third_party/meshnet/daemon/vxlan/kubevirt_slot_test.go
+new file mode 100644
+index 0000000..18b531d
+--- /dev/null
++++ b/third_party/meshnet/daemon/vxlan/kubevirt_slot_test.go
+@@ -0,0 +1,102 @@
++package vxlan
++
++import (
++	"testing"
++
++	"github.com/vishvananda/netlink"
++)
++
++// fakeNS is a pod netns: name -> link. A missing name returns a nil interface,
++// the same as getLinkFromNS does.
++type fakeNS map[string]netlink.Link
++
++func (f fakeNS) lookup(name string) netlink.Link {
++	if l, ok := f[name]; ok {
++		return l
++	}
++	return nil
++}
++
++func vxlanNamed(name string, index, master int) *netlink.Vxlan {
++	return &netlink.Vxlan{LinkAttrs: netlink.LinkAttrs{Name: name, Index: index, MasterIndex: master}, VxlanId: 9820001}
++}
++
++// The state KubeVirt leaves after a VM stop and start (observed on the kind
++// cluster 2026-10-20): the wire is "<id>-nic", enslaved to "k6t-<id>", and a
++// DOWN dummy sits under "pod<id>".
++func TestResolveSlotFindsRenamedWireBehindPlaceholder(t *testing.T) {
++	bridge := &netlink.Bridge{LinkAttrs: netlink.LinkAttrs{Name: "k6t-abc", Index: 7}}
++	ns := fakeNS{
++		"podabc":  &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "podabc", Index: 8}},
++		"abc-nic": vxlanNamed("abc-nic", 9, 7),
++		"k6t-abc": bridge,
++	}
++	slot := resolveSlot(ns.lookup, "podabc")
++	if slot.found == nil || slot.found.Attrs().Name != "abc-nic" {
++		t.Fatalf("found = %v, want abc-nic", slot.found)
++	}
++	if slot.dummy == nil {
++		t.Fatal("placeholder dummy not recorded")
++	}
++	if slot.bridge != "k6t-abc" || !slot.bridgeOK() {
++		t.Fatalf("bridge=%q bridgeOK=%v, want k6t-abc enslaved", slot.bridge, slot.bridgeOK())
++	}
++	if len(slot.strays) != 0 {
++		t.Fatalf("strays = %d, want 0", len(slot.strays))
++	}
++}
++
++// The renamed wire exists but is not enslaved yet: the caller must enslave it,
++// not rebuild it.
++func TestResolveSlotReportsUnenslavedRenamedWire(t *testing.T) {
++	ns := fakeNS{
++		"podabc":  &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "podabc", Index: 8}},
++		"abc-nic": vxlanNamed("abc-nic", 9, 0),
++		"k6t-abc": &netlink.Bridge{LinkAttrs: netlink.LinkAttrs{Name: "k6t-abc", Index: 7}},
++	}
++	slot := resolveSlot(ns.lookup, "podabc")
++	if slot.bridgeOK() {
++		t.Fatal("bridgeOK = true for a wire with master 0; want false")
++	}
++}
++
++// A VXLAN still under the original name beside the renamed one is stray.
++func TestResolveSlotMarksStrayVxlanUnderOriginalName(t *testing.T) {
++	ns := fakeNS{
++		"podabc":  vxlanNamed("podabc", 5, 0),
++		"abc-nic": vxlanNamed("abc-nic", 9, 7),
++		"k6t-abc": &netlink.Bridge{LinkAttrs: netlink.LinkAttrs{Name: "k6t-abc", Index: 7}},
++	}
++	slot := resolveSlot(ns.lookup, "podabc")
++	if len(slot.strays) != 1 || slot.strays[0].Attrs().Name != "podabc" {
++		t.Fatalf("strays = %v, want the vxlan under podabc", slot.strays)
++	}
++}
++
++// Before KubeVirt binds anything, the wire is the vxlan under the original name.
++func TestResolveSlotBeforeBindingKeepsOriginalName(t *testing.T) {
++	ns := fakeNS{"podabc": vxlanNamed("podabc", 5, 0)}
++	slot := resolveSlot(ns.lookup, "podabc")
++	if slot.found == nil || slot.found.Attrs().Name != "podabc" || slot.bridge != "" {
++		t.Fatalf("found=%v bridge=%q, want podabc with no bridge", slot.found, slot.bridge)
++	}
++}
++
++// A plain container link (not pod-shaped) is never resolved to a renamed name.
++func TestResolveSlotPlainContainerUnchanged(t *testing.T) {
++	ns := fakeNS{"eth1": vxlanNamed("eth1", 5, 0), "eth1-nic": vxlanNamed("eth1-nic", 6, 0)}
++	slot := resolveSlot(ns.lookup, "eth1")
++	if slot.found.Attrs().Name != "eth1" || slot.bridge != "" || len(slot.strays) != 0 {
++		t.Fatalf("plain container resolved to %s bridge=%q", slot.found.Attrs().Name, slot.bridge)
++	}
++}
++
++// A dummy with no renamed wire and no bridge is absent for this purpose: the
++// caller removes it and builds.
++func TestResolveSlotDummyOnlyIsNotAWire(t *testing.T) {
++	ns := fakeNS{"podabc": &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "podabc", Index: 8}}}
++	slot := resolveSlot(ns.lookup, "podabc")
++	if _, isVxlan := slot.found.(*netlink.Vxlan); isVxlan {
++		t.Fatal("dummy-only slot reported as a vxlan")
++	}
++}
+diff --git a/third_party/meshnet/daemon/vxlan/vxlan.go b/third_party/meshnet/daemon/vxlan/vxlan.go
+index f05d87e..33d35b0 100644
+--- a/third_party/meshnet/daemon/vxlan/vxlan.go
++++ b/third_party/meshnet/daemon/vxlan/vxlan.go
+@@ -5,8 +5,6 @@ import (
+ 	"fmt"
+ 	"math/rand/v2"
+ 	"net"
+-	"strconv"
+-	"strings"
+ 
+ 	"github.com/containernetworking/plugins/pkg/ns"
+ 	log "github.com/sirupsen/logrus"
+@@ -68,51 +66,51 @@ func CreateOrUpdate(v *mpb.RemotePod) error {
+ 	}
+ 	vxLanOvrlyLogger.Infof("Created vxlan struct %+v", vxlan)
+ 
+-	// Try to read interface attributes from netlink
+-	link := getLinkFromNS(v.NetNs, v.IntfName)
+-	vxLanOvrlyLogger.Infof("Retrieved %s link from %s Netns: %+v", v.IntfName, v.NetNs, link)
+-
+-	// Check if interface already exists
+-	vxlanLink, ok := link.(*netlink.Vxlan)
+-	vxLanOvrlyLogger.Infof("Is link %+v a VXLAN?: %s", vxlanLink, strconv.FormatBool(ok))
+-	if ok { // the link we've found is a vxlan link
+-
+-		// MTU is an attribute too. A wire built at an older fabric MTU is
+-		// rebuilt, so a stale wire cannot pin a lab to an MTU nobody chose.
+-		if !vxlanAttrsMatch(vxlanLink, vxlan) { // If Vxlan attrs are different
++	// KubeVirt may have renamed the wire (see kubevirt_slot.go). Find it where it is.
++	slot := resolveSlot(func(name string) netlink.Link { return getLinkFromNS(v.NetNs, name) }, v.IntfName)
++	vxLanOvrlyLogger.Infof("Resolved wire %s in %s: found=%v name=%s bridge=%q strays=%d dummy=%v",
++		v.IntfName, v.NetNs, slot.found != nil, slot.name, slot.bridge, len(slot.strays), slot.dummy != nil)
++	for _, stray := range slot.strays {
++		vxLanOvrlyLogger.Infof("Removing stray vxlan %s in %s (the wire is %s)", stray.Attrs().Name, v.NetNs, slot.name)
++		if err = removeLink(v.NetNs, stray.Attrs().Name); err != nil {
++			return fmt.Errorf(" MESHNETD: Error when removing stray vxlan %s: %s", stray.Attrs().Name, err)
++		}
++	}
+ 
+-			// We remove the existing link and add a new one
+-			vxLanOvrlyLogger.Infof("Vxlan attrs are different: %d!=%d or %v!=%v or mtu %d!=%d", vxlanLink.VxlanId, vxlan.ID, vxlanLink.Group, vxlan.IPAddr, vxlanLink.Attrs().MTU, vxlan.MTU)
+-			if err = removeLink(v.NetNs, v.IntfName); err != nil {
+-				return fmt.Errorf(" MESHNETD: Error when removing an old Vxlan interface: %s", err)
++	// MTU is an attribute: a wire is kept only when VNI, VTEP and MTU match.
++	vxlanLink, isVxlan := slot.found.(*netlink.Vxlan)
++	if isVxlan && vxlanAttrsMatch(vxlanLink, vxlan) {
++		// Already the wire we want. Keep it under its current name, and only
++		// fix its bridge membership when KubeVirt has not enslaved it yet.
++		if !slot.bridgeOK() {
++			vxLanOvrlyLogger.Infof("Enslaving %s to KubeVirt bridge %s", vxlanLink.Attrs().Name, slot.bridge)
++			if err = enslaveToBridge(v.NetNs, vxlanLink.Attrs().Name, slot.bridge); err != nil {
++				return fmt.Errorf(" MESHNETD: %s", err)
+ 			}
+-
+-			if err = makeVxLan(v.NetNs, v.IntfName, ipNet, vxlan); err != nil {
+-				if strings.Contains(err.Error(), "file exists") {
+-					vxLanOvrlyLogger.Infof(" MESHNETD: Error when creating a Vxlan interface, file exists")
+-				} else {
+-					return fmt.Errorf(" MESHNETD: Error when re-creating a Vxlan interface: %s", err)
+-				}
++		}
++	} else {
++		// Absent, stale, or a placeholder: remove what is there, then build.
++		vxLanOvrlyLogger.Infof("Rebuilding wire %s in %s: found=%v (vxlan=%v)", v.IntfName, v.NetNs, slot.found != nil, isVxlan)
++		if slot.found != nil {
++			if err = removeLink(v.NetNs, slot.found.Attrs().Name); err != nil {
++				return fmt.Errorf(" MESHNETD: Error when removing %s: %s", slot.found.Attrs().Name, err)
+ 			}
+-		} // If Vxlan attrs are the same, do nothing
+-
+-	} else { // the link we've found isn't a vxlan or doesn't exist
+-
+-		vxLanOvrlyLogger.Infof("Link %+v we've found isn't a vxlan or doesn't exist", link)
+-		// If link exists but wasn't matched as vxlan, we need to delete it
+-		if link != nil {
+-			vxLanOvrlyLogger.Infof("Attempting to remove link %s from %s", v.IntfName, v.NetNs)
++		}
++		if slot.dummy != nil && slot.found != slot.dummy {
+ 			if err = removeLink(v.NetNs, v.IntfName); err != nil {
+-				return fmt.Errorf(" MESHNETD: Error when removing an old non-Vxlan interface: %s", err)
++				return fmt.Errorf(" MESHNETD: Error when removing placeholder %s: %s", v.IntfName, err)
+ 			}
+ 		}
+-
+-		// Then we simply create a new one
+-		vxLanOvrlyLogger.Infof("Creating a VXLAN link: %v; inside the pod: %s in %s", vxlan, v.IntfName, v.NetNs)
++		vxLanOvrlyLogger.Infof("Creating a VXLAN link: %v; inside the pod: %s in %s (bridge %q)", vxlan, v.IntfName, v.NetNs, slot.bridge)
+ 		if err = makeVxLan(v.NetNs, v.IntfName, ipNet, vxlan); err != nil {
+ 			vxLanOvrlyLogger.Errorf(" MESHNETD: Error when creating a new Vxlan interface: %s", err)
+ 			return err
+ 		}
++		if slot.bridge != "" {
++			if err = enslaveToBridge(v.NetNs, v.IntfName, slot.bridge); err != nil {
++				return fmt.Errorf(" MESHNETD: %s", err)
++			}
++		}
+ 	}
+ 
+ 	// Tune txqueuelen inside the container netns (configurable via LINK_TXQUEUELEN)
+-- 
+2.56.0
+

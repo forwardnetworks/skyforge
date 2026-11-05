@@ -1,0 +1,2940 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 12:00:00 +0000
+Subject: [PATCH] devices: Palo Alto PAN-OS (panos)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+diff --git a/docs/module/bgp.md b/docs/module/bgp.md
+index 83e9583..448ee2b 100644
+--- a/docs/module/bgp.md
++++ b/docs/module/bgp.md
+@@ -187,6 +187,8 @@ Instead of using a global list of autonomous systems, you could specify a BGP au
+ * **bgp.rr** -- The node is a BGP route reflector within its autonomous system.
+ * **bgp.multipath** -- number of equal-cost BGP paths installed in the routing table (`maximum-paths N`, `maximum-paths ibgp N` on Cisco IOS; `maximum-paths N ecmp N` on Arista EOS). Supported on devices with the **bgp.multipath** feature (IOS/IOL, EOS); a device without it refuses the attribute.
+ * **bgp.multipath_relax** -- allow multipath across EBGP paths with different AS paths of equal length (`bgp bestpath as-path multipath-relax`). Requires **bgp.multipath**.
++* **bgp.install_route** -- install BGP-learned routes into the routing table. Rendered as `protocol bgp install-route yes|no` on PAN-OS, whose default is `no` (BGP routes are learned and re-advertised but never forwarded on). Unset leaves the device default. Supported on devices with the **bgp.install_route** feature (PAN-OS); other devices refuse the attribute.
++* **bgp.allow_redist_default_route** -- allow a 0.0.0.0/0 route to be redistributed into BGP (PAN-OS `allow-redist-default-route`, default `no`). When unset, PAN-OS renders `yes` automatically if **bgp.import** redistributes a routing policy whose prefix list permits 0.0.0.0/0. Same feature as **bgp.install_route**.
+ 
+ ```{note}
+ * The **bgp.as** parameter *must* be specified for every node using the BGP configuration module.
+diff --git a/docs/module/ospf.md b/docs/module/ospf.md
+index 57f2176..0c8c9a4 100644
+--- a/docs/module/ospf.md
++++ b/docs/module/ospf.md
+@@ -126,6 +126,8 @@ VRF OSPF instances are implemented on these devices:
+ * **ospf.priority** -- node-wide OSPF router priority. Applies to all interfaces without an explicit **ospf.priority** setting.
+ * **ospf.reference_bandwidth** – per-node OSPF auto-cost reference bandwidth (in Mbps).
+ * **ospf.distance** -- administrative distance of OSPF routes (1-255). Rendered as `distance N` on Cisco IOS and as intra-area/inter-area/external distance on Arista EOS. Use it to rank OSPF below or above another protocol (for example `201` to prefer IBGP-reflected copies of the same prefixes). Supported on IOS/IOL and EOS; other devices refuse the attribute.
++* **ospf.reject_default_route** -- ignore (`true`) or install (`false`) a default route learned from OSPF neighbours. Rendered as `protocol ospf reject-default-route yes|no` on PAN-OS, whose default is `yes`. Unset leaves the device default. Supported on devices with the **ospf.default_route** feature (PAN-OS); other devices refuse the attribute.
++* **ospf.allow_redist_default_route** -- allow a 0.0.0.0/0 route to be redistributed into OSPF (PAN-OS `allow-redist-default-route`, default `no`). Same feature and default rules as **ospf.reject_default_route**.
+ * **ospf.router_id** -- set [static router ID](routing_router_id).
+ * **ospf.passive** -- node-level default for passive interfaces (default: False)
+ * **ospf.timers** -- default OSPF interface timers. You can override the node values on individual interfaces.
+diff --git a/mypy.ini b/mypy.ini
+index 5f33029..9f3161f 100644
+--- a/mypy.ini
++++ b/mypy.ini
+@@ -12,3 +12,6 @@ ignore_missing_imports = True
+ 
+ [mypy-docutils.*]
+ ignore_missing_imports = True
++
++[mypy-ansible.module_utils.basic]
++ignore_missing_imports = True
+diff --git a/netsim/ansible/library/panos_admpwd_kne.py b/netsim/ansible/library/panos_admpwd_kne.py
+new file mode 100644
+index 0000000..cb6d8df
+--- /dev/null
++++ b/netsim/ansible/library/panos_admpwd_kne.py
+@@ -0,0 +1,349 @@
++#!/usr/bin/python
++from __future__ import annotations
++
++import os
++import pty
++import re
++import select
++import signal
++import time
++
++from ansible.module_utils.basic import AnsibleModule
++
++
++DOCUMENTATION = r'''
++---
++module: panos_admpwd_kne
++short_description: Promote PAN-OS admin password through a KNE runtime SSH endpoint
++description:
++  - Changes the PAN-OS admin password through the runtime SSH endpoint exposed by the KNE provider.
++  - This is used when PAN-OS is exposed through a Kubernetes NodePort and the upstream panos_admpwd module cannot target a non-default SSH port.
++options:
++  host:
++    description: KNE runtime host for the PAN-OS SSH endpoint.
++    required: true
++    type: str
++  port:
++    description: KNE runtime SSH port for the PAN-OS endpoint.
++    required: true
++    type: int
++  username:
++    description: PAN-OS admin username.
++    required: false
++    default: admin
++    type: str
++  old_password:
++    description: Factory password accepted by the first-login password-change prompt.
++    required: false
++    default: admin
++    type: str
++  new_password:
++    description: Desired password for the admin account.
++    required: true
++    type: str
++  key_filename:
++    description: SSH private key file used for first-login authentication when password auth is unavailable.
++    required: false
++    type: str
++  timeout:
++    description: Maximum seconds to wait for the positive password-changed signal.
++    required: false
++    default: 180
++    type: int
++author:
++  - Skyforge
++'''
++
++
++PROMPT_BYTES = 4096
++
++
++def scrub(text: str, *secrets: str) -> str:
++  for secret in secrets:
++    if secret:
++      text = text.replace(secret, '********')
++  return text
++
++
++def send(master: int, value: str) -> None:
++  os.write(master, (value + '\n').encode())
++
++
++def ssh_argv(module: AnsibleModule) -> list:
++  """The ssh invocation both the probe and the promotion use, so they cannot
++  drift in transport options — only in which password they answer with."""
++  port = int(module.params['port'])
++  key_filename = str(module.params.get('key_filename') or '').strip()
++  preferred_auth = 'publickey,keyboard-interactive,password' if key_filename else 'keyboard-interactive,password'
++  cmd = [
++    'ssh',
++    '-tt',
++    '-p', str(port),
++    '-o', f'PreferredAuthentications={preferred_auth}',
++    '-o', 'KbdInteractiveAuthentication=yes',
++    '-o', 'NumberOfPasswordPrompts=3',
++    '-o', f'PubkeyAuthentication={"yes" if key_filename else "no"}',
++    '-o', 'StrictHostKeyChecking=no',
++    '-o', 'UserKnownHostsFile=/dev/null',
++    '-o', 'HostKeyAlgorithms=+ssh-rsa',
++    '-o', 'LogLevel=ERROR',
++  ]
++  if key_filename:
++    cmd += ['-o', 'IdentitiesOnly=yes', '-i', key_filename]
++  cmd.append(f'{module.params["username"]}@{module.params["host"]}')
++  return cmd
++
++
++def already_promoted(module: AnsibleModule) -> tuple:
++  """Is the admin password ALREADY the configured one?
++
++  THIS IS WHAT MAKES THE MODULE IDEMPOTENT, and its absence is why refreshing
++  a lab from its template failed on every PAN-OS host after the first build.
++  The promotion below authenticates with old_password, which is the FACTORY
++  default. That works exactly once per device: after it succeeds the device's
++  password IS new_password, so every later run failed to log in, never saw the
++  "Password changed" signal, and fail_json'd. A task that can only ever succeed
++  once is not a task, it is a one-shot, and a nightly refresh would have gone
++  red on those hosts every night forever.
++
++  So ask the device its state before trying to change it: log in with the
++  password we WANT. Reaching a CLI prompt means the promotion already happened
++  and there is nothing to do. Being asked to change the password means we are
++  still on the factory credential and the promotion must run.
++
++  Returns (promoted, transcript). Any ambiguity returns False so the caller
++  falls through to the real promotion — this probe may never turn a broken
++  device into a reported success.
++  """
++  timeout = min(int(module.params['timeout']), 60)
++  new_password = module.params['new_password']
++  username = module.params['username']
++
++  pid, master = pty.fork()
++  if pid == 0:
++    # Exec the program ssh_argv NAMES rather than a second hard-coded 'ssh'.
++    # One source for both the program and its arguments is what lets a test
++    # point this at a scripted endpoint instead of a real appliance.
++    argv = ssh_argv(module)
++    os.execvp(argv[0], argv)
++
++  transcript = ''
++  sent_login = False
++  promoted = False
++  deadline = time.time() + timeout
++  try:
++    while time.time() < deadline:
++      wait_pid, _ = os.waitpid(pid, os.WNOHANG)
++      if wait_pid == pid:
++        break
++      ready, _, _ = select.select([master], [], [], 0.25)
++      if not ready:
++        continue
++      try:
++        chunk = os.read(master, PROMPT_BYTES).decode(errors='replace')
++      except OSError:
++        break
++      if not chunk:
++        continue
++      transcript += chunk
++      tail = transcript[-2048:]
++
++      if re.search(r'(?i)are you sure you want to continue connecting', tail):
++        send(master, 'yes')
++        continue
++      if re.search(r'(?i)(?:login|username)\s*:\s*$', tail):
++        send(master, username)
++        continue
++      # A forced-change dialog means we are still on the factory password.
++      # Answer nothing and leave: the promotion path owns that conversation.
++      if re.search(r'(?:Enter old password|Current password)\s*:', tail, re.I):
++        break
++      if not sent_login and re.search(r'password\s*:', tail, re.I):
++        send(master, new_password)
++        sent_login = True
++        continue
++      if sent_login and re.search(r'(?m)[>#]\s*$', tail):
++        promoted = True
++        send(master, 'exit')
++        break
++      if re.search(r'(?i)permission denied|authentication fail', tail):
++        break
++  finally:
++    try:
++      os.close(master)
++    except OSError:
++      pass
++    try:
++      os.kill(pid, signal.SIGTERM)
++    except ProcessLookupError:
++      pass
++    try:
++      os.waitpid(pid, 0)
++    except (ChildProcessError, OSError):
++      pass
++
++  return promoted, scrub(transcript, module.params['old_password'], new_password)
++
++
++def promote_password(module: AnsibleModule) -> tuple[bool,str]:
++  host = module.params['host']
++  port = int(module.params['port'])
++  username = module.params['username']
++  old_password = module.params['old_password']
++  new_password = module.params['new_password']
++  key_filename = str(module.params.get('key_filename') or '').strip()
++  timeout = int(module.params['timeout'])
++  preferred_auth = 'publickey,keyboard-interactive,password' if key_filename else 'keyboard-interactive,password'
++
++  cmd = [
++    'ssh',
++    '-tt',
++    '-p', str(port),
++    '-o', f'PreferredAuthentications={preferred_auth}',
++    '-o', 'KbdInteractiveAuthentication=yes',
++    '-o', 'NumberOfPasswordPrompts=3',
++    '-o', f'PubkeyAuthentication={"yes" if key_filename else "no"}',
++    '-o', 'StrictHostKeyChecking=no',
++    '-o', 'UserKnownHostsFile=/dev/null',
++    '-o', 'HostKeyAlgorithms=+ssh-rsa',
++    '-o', 'LogLevel=ERROR',
++  ]
++  if key_filename:
++    cmd += ['-o', 'IdentitiesOnly=yes', '-i', key_filename]
++  cmd.append(f'{username}@{host}')
++
++  pid, master = pty.fork()
++  if pid == 0:
++    os.execvp(cmd[0],cmd)
++
++  transcript = ''
++  sent_login = False
++  sent_old = False
++  sent_new = False
++  sent_confirm = False
++  changed = False
++  exited = False
++  deadline = time.time() + timeout
++
++  try:
++    while time.time() < deadline:
++      wait_pid,_ = os.waitpid(pid,os.WNOHANG)
++      if wait_pid == pid:
++        break
++
++      ready,_,_ = select.select([master],[],[],0.25)
++      if not ready:
++        continue
++
++      try:
++        chunk = os.read(master,PROMPT_BYTES).decode(errors='replace')
++      except OSError:
++        break
++      if not chunk:
++        continue
++
++      transcript += chunk
++      tail = transcript[-2048:]
++
++      if re.search(r'(?i)are you sure you want to continue connecting',tail):
++        send(master,'yes')
++        continue
++
++      if re.search(r'(?i)(?:login|username)\s*:\s*$',tail):
++        send(master,username)
++        continue
++
++      if not sent_old and re.search(r'(?:Enter old password|Current password)\s*:',tail,re.I):
++        send(master,old_password)
++        sent_old = True
++        continue
++
++      if not sent_new and re.search(r'(?:Enter new password|New password)\s*:',tail,re.I):
++        send(master,new_password)
++        sent_new = True
++        continue
++
++      if not sent_confirm and re.search(r'(?:Confirm password|Retype new password)\s*:',tail,re.I):
++        send(master,new_password)
++        sent_confirm = True
++        continue
++
++      if not sent_login and re.search(r"password\s*:",tail,re.I):
++        send(master,old_password)
++        sent_login = True
++        continue
++
++      if 'Password changed' in tail:
++        changed = True
++
++      if sent_confirm and re.search(r'(?m)[>#]\s*$',tail):
++        changed = True
++
++      if changed and not exited and re.search(r'(?m)[>#]\s*$',tail):
++        send(master,'exit')
++        exited = True
++        time.sleep(0.5)
++        try:
++          os.kill(pid,signal.SIGTERM)
++        except ProcessLookupError:
++          pass
++        break
++
++    if not changed:
++      module.fail_json(
++        msg='PAN-OS password promotion did not observe the Password changed signal',
++        transcript=scrub(transcript,old_password,new_password))
++
++    return True,scrub(transcript,old_password,new_password)
++  finally:
++    try:
++      os.close(master)
++    except OSError:
++      pass
++    try:
++      wait_pid,_ = os.waitpid(pid,os.WNOHANG)
++    except ChildProcessError:
++      wait_pid = pid
++    if wait_pid != pid:
++      try:
++        os.kill(pid,signal.SIGTERM)
++      except ProcessLookupError:
++        pass
++      time.sleep(0.5)
++      try:
++        wait_pid,_ = os.waitpid(pid,os.WNOHANG)
++      except ChildProcessError:
++        wait_pid = pid
++      if wait_pid != pid:
++        try:
++          os.kill(pid,signal.SIGKILL)
++        except ProcessLookupError:
++          pass
++
++
++def main() -> None:
++  module = AnsibleModule(
++    argument_spec={
++      'host': { 'required': True, 'type': 'str' },
++      'port': { 'required': True, 'type': 'int' },
++      'username': { 'required': False, 'type': 'str', 'default': 'admin' },
++      'old_password': { 'required': False, 'type': 'str', 'default': 'admin', 'no_log': True },
++      'new_password': { 'required': True, 'type': 'str', 'no_log': True },
++      'key_filename': { 'required': False, 'type': 'str' },
++      'timeout': { 'required': False, 'type': 'int', 'default': 180 },
++    },
++    supports_check_mode=False)
++
++  promoted, probe_transcript = already_promoted(module)
++  if promoted:
++    module.exit_json(
++      changed=False,
++      transcript=probe_transcript,
++      msg='PAN-OS admin password is already the configured one; nothing to promote')
++
++  changed,transcript = promote_password(module)
++  module.exit_json(changed=changed, transcript=transcript)
++
++
++if __name__ == '__main__':
++  main()
+diff --git a/netsim/ansible/library/panos_cli_config_kne.py b/netsim/ansible/library/panos_cli_config_kne.py
+new file mode 100644
+index 0000000..444f528
+--- /dev/null
++++ b/netsim/ansible/library/panos_cli_config_kne.py
+@@ -0,0 +1,234 @@
++#!/usr/bin/python
++from __future__ import annotations
++
++import os
++import pty
++import re
++import select
++import signal
++import time
++
++from ansible.module_utils.basic import AnsibleModule
++
++
++DOCUMENTATION = r'''
++---
++module: panos_cli_config_kne
++short_description: Push set-format CLI configuration to PAN-OS over the KNE SSH endpoint
++description:
++  - Sends configuration-mode C(set) commands to PAN-OS over the runtime SSH endpoint the KNE provider
++    publishes, then commits. This is the deploy lane for netlab module templates (services, bgp, ...):
++    they render set-format CLI, and the Palo Alto Ansible collection has no modules for most of what
++    they configure (there is no module for C(deviceconfig system snmp-setting), for example), so the
++    rendered text is applied the way an operator would apply it.
++  - Same pty-driven ssh transport as C(panos_admpwd_kne), for the same reason - the upstream modules
++    cannot target a non-default SSH port, and sshpass is not part of the runtime image.
++options:
++  host:
++    description: KNE runtime host for the PAN-OS SSH endpoint.
++    required: true
++    type: str
++  port:
++    description: KNE runtime SSH port for the PAN-OS endpoint.
++    required: true
++    type: int
++  username:
++    required: false
++    default: admin
++    type: str
++  password:
++    required: true
++    type: str
++  lines:
++    description: Configuration-mode commands, one per entry. Blank lines and comments are ignored.
++    required: true
++    type: list
++    elements: str
++  commit:
++    description: Commit after the lines are applied. Ignored in op mode.
++    required: false
++    default: true
++    type: bool
++  mode:
++    description: C(configure) enters configuration mode, applies the lines and commits;
++      C(op) runs the lines as operational commands and returns the transcript -- the
++      autocommit gate reads C(show jobs all) this way.
++    required: false
++    default: configure
++    choices: [ configure, op ]
++    type: str
++  timeout:
++    description: Overall budget in seconds. A CLI commit blocks until the job finishes, so this must
++      cover it; a healthy commit on a quiet VM-Series measures well under a minute.
++    required: false
++    default: 300
++    type: int
++author:
++  - Skyforge
++'''
++
++PROMPT_BYTES = 4096
++# Config-mode errors PAN-OS prints instead of failing the session. Any of these
++# in the transcript is a failed apply even though every prompt came back.
++ERROR_RE = re.compile(r'(?i)invalid syntax|unknown command|validation error|server error|malformed')
++
++
++def scrub(text: str, *secrets: str) -> str:
++  for secret in secrets:
++    if secret:
++      text = text.replace(secret, '********')
++  return text
++
++
++def send(master: int, value: str) -> None:
++  os.write(master, (value + '\n').encode())
++
++
++def apply_config(module: AnsibleModule) -> tuple[bool, str]:
++  host = module.params['host']
++  port = int(module.params['port'])
++  username = module.params['username']
++  password = module.params['password']
++  raw_lines = module.params['lines'] or []
++  op_mode = str(module.params.get('mode') or 'configure') == 'op'
++  do_commit = bool(module.params['commit']) and not op_mode
++  timeout = int(module.params['timeout'])
++
++  lines = []
++  for raw in raw_lines:
++    line = str(raw or '').strip()
++    if line and not line.startswith('#'):
++      lines.append(line)
++  if not lines:
++    return False, ''
++
++  # The full session, sent one entry per prompt. scripting-mode keeps the CLI
++  # from echoing interactive furniture; pager off keeps long output from
++  # wedging the prompt detector.
++  queue = ['set cli scripting-mode on', 'set cli pager off']
++  if not op_mode:
++    queue.append('configure')
++  queue += lines
++  if do_commit:
++    queue.append('commit')
++  if not op_mode:
++    queue.append('exit')
++  queue.append('exit')
++
++  cmd = [
++    'ssh',
++    '-tt',
++    '-p', str(port),
++    '-o', 'PreferredAuthentications=keyboard-interactive,password',
++    '-o', 'KbdInteractiveAuthentication=yes',
++    '-o', 'NumberOfPasswordPrompts=3',
++    '-o', 'PubkeyAuthentication=no',
++    '-o', 'StrictHostKeyChecking=no',
++    '-o', 'UserKnownHostsFile=/dev/null',
++    '-o', 'HostKeyAlgorithms=+ssh-rsa',
++    '-o', 'LogLevel=ERROR',
++    f'{username}@{host}',
++  ]
++
++  pid, master = pty.fork()
++  if pid == 0:
++    os.execvp(cmd[0], cmd)
++
++  transcript = ''
++  sent_login = False
++  index = 0
++  committed = not do_commit
++  deadline = time.time() + timeout
++
++  try:
++    while time.time() < deadline:
++      wait_pid, _ = os.waitpid(pid, os.WNOHANG)
++      if wait_pid == pid:
++        break
++
++      ready, _, _ = select.select([master], [], [], 0.25)
++      if not ready:
++        continue
++      try:
++        chunk = os.read(master, PROMPT_BYTES).decode(errors='replace')
++      except OSError:
++        break
++      if not chunk:
++        continue
++
++      transcript += chunk
++      tail = transcript[-2048:]
++
++      if re.search(r'(?i)are you sure you want to continue connecting', tail):
++        send(master, 'yes')
++        continue
++      if not sent_login and re.search(r'password\s*:\s*$', tail, re.I):
++        send(master, password)
++        sent_login = True
++        continue
++
++      if 'Configuration committed successfully' in transcript:
++        committed = True
++
++      # A prompt at end-of-buffer means the previous command settled. Send the
++      # next one; when the queue empties the trailing exits close the session
++      # and waitpid above ends the loop.
++      if index < len(queue) and re.search(r'(?m)[>#]\s*$', tail):
++        send(master, queue[index])
++        index += 1
++        continue
++
++    return committed if do_commit else index >= len(queue), transcript
++  finally:
++    try:
++      os.close(master)
++    except OSError:
++      pass
++    try:
++      os.kill(pid, signal.SIGTERM)
++    except ProcessLookupError:
++      pass
++
++
++def main() -> None:
++  module = AnsibleModule(
++    argument_spec=dict(
++      host=dict(type='str', required=True),
++      port=dict(type='int', required=True),
++      username=dict(type='str', default='admin'),
++      password=dict(type='str', required=True, no_log=True),
++      lines=dict(type='list', elements='str', required=True),
++      mode=dict(type='str', default='configure', choices=['configure', 'op']),
++      commit=dict(type='bool', default=True),
++      timeout=dict(type='int', default=300),
++    ),
++    supports_check_mode=False,
++  )
++
++  wanted = [str(l or '').strip() for l in (module.params['lines'] or [])]
++  if not [l for l in wanted if l and not l.startswith('#')]:
++    module.exit_json(changed=False, msg='no configuration lines to apply')
++
++  ok, transcript = apply_config(module)
++  clean = scrub(transcript, str(module.params['password']))
++
++  if 'Commit failed' in clean:
++    # The device names its reason on the lines above this marker (captured
++    # live: "device is not in jumbo-frame mode but interface ... mtu is
++    # greater than 1500"). Waiting out the timeout here would bury that
++    # reason under a generic no-signal message.
++    module.fail_json(msg='PAN-OS commit failed on the device', transcript=clean[-4000:])
++  if ERROR_RE.search(clean):
++    module.fail_json(msg='PAN-OS rejected at least one configuration line', transcript=clean[-4000:])
++  if not ok:
++    module.fail_json(
++      msg='did not observe the commit-success signal before the timeout; '
++          'an EMPTY transcript means the SSH endpoint was never reached, '
++          'a non-empty one means the device stopped answering mid-session',
++      transcript=clean[-4000:],
++    )
++  module.exit_json(changed=True, transcript=clean[-4000:])
++
++
++if __name__ == '__main__':
++  main()
+diff --git a/netsim/ansible/tasks/deploy-config/panos.yml b/netsim/ansible/tasks/deploy-config/panos.yml
+new file mode 100644
+index 0000000..775da00
+--- /dev/null
++++ b/netsim/ansible/tasks/deploy-config/panos.yml
+@@ -0,0 +1,36 @@
++#
++# PAN-OS module-config deploy lane: netlab renders a module template
++# (services, bgp, routing, ...) into configuration-mode set commands, and this
++# pushes them over the KNE SSH endpoint and commits -- the same transport and
++# module the initial lane uses, so PAN-OS has exactly ONE config mechanism.
++#
++# THIS FILE'S ABSENCE WAS A SILENT HOLE. It existed pre-consolidation, was
++# dropped from the 12-patch series, and every module template kept rendering
++# and then logged "Deploy services configuration: skipping" -- which is how
++# both demo-lab PAN-OS firewalls came up without SNMP and the collector's performance
++# validation reported 10/12 devices (2026-08-31). A rendered template with no
++# deploy script fails NOTHING; the miss surfaces two stages later as somebody
++# else's timeout.
++#
++# The empty-render guard stays even though nothing renders deliberately empty
++# any more: as of the single-transport port the firewall.policy, zonebased and
++# ipsec plugins render real set-command templates through this lane too (their
++# XML-API deploy.panos.yml task lists are deleted). A node that declares a
++# module with nothing to emit still must not open an SSH session to send
++# nothing.
++---
++- name: "panos: render {{ netsim_action }} from {{ config_template }}"
++  ansible.builtin.set_fact:
++    panos_deployed_config: "{{ lookup('template', config_template) }}"
++
++- name: "panos: deploy {{ netsim_action }} over the KNE SSH endpoint"
++  panos_cli_config_kne:
++    host: "{{ ansible_host }}"
++    port: "{{ panos_kne_ssh_port }}"
++    username: "{{ ansible_user }}"
++    password: "{{ ansible_password }}"
++    lines: "{{ panos_deployed_config.splitlines() }}"
++    commit: true
++    timeout: 300
++  when: not ansible_check_mode and ((panos_deployed_config | trim | length) > 0)
++  tags: [ print_action, always ]
+diff --git a/netsim/ansible/tasks/panos/initial.yml b/netsim/ansible/tasks/panos/initial.yml
+new file mode 100644
+index 0000000..0aef208
+--- /dev/null
++++ b/netsim/ansible/tasks/panos/initial.yml
+@@ -0,0 +1,235 @@
++---
++# WAIT FOR THE DEVICE, NOT FOR THE POD.
++#
++# PAN-OS declares netlab_ready: [ ansible ], which -- with
++# ansible_connection: local -- proves the CONTROLLER is alive and says nothing
++# about the firewall. On a first boot the dataplane pod is Running and Ready
++# minutes before the management plane listens, so an ungated first task went
++# straight into "Connection refused" and failed the whole bring-up with 78 of
++# 80 pods healthy (demo-lab 2026-08-30: jfk-fw01 and lax-fw01, the only two
++# PAN-OS nodes).
++#
++# Everything below rides ONE transport: the KNE SSH endpoint. The XML API is
++# not used at all -- the password promotion, the autocommit gate and the
++# config push are all CLI-over-SSH, so SSH answering is the only readiness
++# that matters here.
++#
++# 25 minutes of budget: a cold PAN-OS VM takes 15-25 to answer. This is a WAIT
++# on a condition, not a retry of a failing task -- if the endpoint never comes
++# up the play still fails, with a message that names it rather than a bare
++# connection error.
++# The provider fills panos_kne_ssh_port from the live KNE service. If it is
++# missing, the promotion below would silently try to reach nothing, so say so
++# here instead of failing ten attempts later with an empty transcript.
++- name: Assert the KNE SSH endpoint for PAN-OS is known
++  ansible.builtin.assert:
++    that: panos_kne_ssh_port is defined and (panos_kne_ssh_port | int) > 0
++    fail_msg: >-
++      panos_kne_ssh_port is not set for {{ inventory_hostname }}: the KNE
++      provider did not publish an ssh service for this node, so the mandatory
++      password promotion has no endpoint to reach. Check the node's KNE
++      services in topology.pb.txt.
++
++- name: Wait for the PAN-OS SSH endpoint to accept connections
++  ansible.builtin.wait_for:
++    host: "{{ ansible_host }}"
++    port: "{{ panos_kne_ssh_port }}"
++    state: started
++    timeout: 1500
++    delay: 10
++    sleep: 10
++
++# PROMOTE THE PASSWORD BEFORE ANYTHING AUTHENTICATES.
++#
++# PAN-OS forces a password change at first login: it boots on the factory
++# admin/admin and refuses every API call until admin has been given a new
++# password over the console/SSH. panos_admpwd_kne drives those prompts through
++# the KNE SSH endpoint (the upstream panos_admpwd cannot target a non-default
++# port).
++#
++# The module SHIPPED but was never invoked by any playbook. The device file
++# advertised the promoted password, the API client used it, and the device had
++# never been told it -- so every PAN-OS node failed with
++#
++#   Create layer-3 interfaces: Failed connection: code: 403 Invalid Credential
++#
++# (demo-lab 2026-08-30, jfk-fw01 and lax-fw01). Idempotent by construction: once
++# the password is the configured one the old-password prompt never appears and
++# the module reports no change.
++# panos_kne_ssh_port, NOT ansible_port. The KNE provider publishes the SSH
++# service separately (kne.py: get_kne_service_by_name_or_port(['ssh'],[22]))
++# because ansible_port carries the API/httpapi port -- which is why this module
++# exists at all, per its own docs: "the upstream panos_admpwd module cannot
++# target a non-default SSH port".
++#
++# Getting this wrong does not look like a wrong port. The SSH session simply
++# produces nothing and the module reports
++#   "did not observe the Password changed signal", transcript: ""
++# An EMPTY transcript means we never reached the device; a non-empty one that
++# still fails means the device rejected the change. They are different bugs.
++- name: Promote the PAN-OS admin password off the factory default
++  panos_admpwd_kne:
++    host: "{{ ansible_host }}"
++    port: "{{ panos_kne_ssh_port }}"
++    username: "{{ ansible_user }}"
++    old_password: admin
++    new_password: "{{ ansible_password }}"
++    key_filename: "{{ ansible_ssh_private_key_file | default(omit) }}"
++    # POLL FINELY, DO NOT WAIT COARSELY. timeout is the budget for ONE attempt,
++    # and a device that is not up yet burns ALL of it before failing -- so at
++    # 300s + 30s delay each retry cost 5.5 MINUTES and the ceiling was 55.
++    #
++    # MEASURED on demo-lab 2026-09-08: jfk-fw01 retried at 16:35:28 and 16:41:03,
++    # exactly 5m35s apart, while lax-fw01 -- the same device type in the same
++    # lab -- completed the whole promotion in 8.1 SECONDS once it was ready.
++    # That gap is the entire problem: a READY device answers in single-digit
++    # seconds, so a 300s per-attempt budget buys nothing except discovering
++    # readiness up to five and a half minutes after it happened.
++    #
++    # The overall ceiling is deliberately NOT shortened -- a cold PAN-OS really
++    # can take many minutes, and cutting the budget would fail a slow but
++    # healthy device. 45s x 50 retries with a 10s delay holds a ~46 minute
++    # ceiling (was ~55) while detecting readiness within ~55s instead of ~330s.
++    timeout: 45
++  register: panos_pwd_promotion
++  until: panos_pwd_promotion is succeeded
++  retries: 50
++  delay: 10
++
++# THE AUTOCOMMIT GATE, OVER THE SAME SSH SESSION EVERYTHING ELSE USES.
++#
++# A cold PAN-OS refuses every user commit until its first-boot AutoCom job
++# finishes -- committing earlier returns "auto-commit not yet finished
++# successfully". Two prior gates watched the wrong signal or the wrong shape:
++# chassis-ready flips yes BEFORE AutoCom reaches FIN (r16 passed the gate and
++# still lost the commit), and the XML API answer turned out to be CDATA-wrapped
++# (r15 burned 30 minutes against a ready firewall). Reading the job table over
++# the CLI needs no API key and no separate API-port wait -- the whole
++# XML-API leg of this file existed only to feed that one poll.
++#
++# The table format is CAPTURED from a live device, not taken from docs:
++#
++#   Enqueued              Dequeued   ID  PositionInQ   Type     Status Result
++#   2026/08/30 18:43:54   18:43:54    2                AutoCom     FIN     OK
++#
++# Type/Status/Result are whitespace-separated columns on one row, so the match
++# is AutoCom\s+FIN (finished) and AutoCom\s+FIN\s+OK (succeeded). A healthy
++# VM-Series reaches FIN by ~T+15min from VM start; 30 minutes is that doubled.
++#
++# THE AutoCom ROW AGES OUT, AND THIS GATE IS NOT ONLY A FIRST-BOOT GATE.
++#
++# netlab initial runs on every reconfigure, not only on a fresh lab, and
++# PAN-OS's job table is BOUNDED: it keeps roughly the last 29 jobs and the
++# first-boot AutoCom is job 1 or 2. Captured from sjc-dc1in-panos-fw1 on
++# 2026-09-19 (demo-lab, reconfigure an internal task), the whole visible
++# table was
++#
++#   2026/09/18 22:50:16 ... 30 ... Commit  FIN  OK 22:51:30
++#   ... 27 more Commit rows ...
++#   2026/09/18 18:38:49 ...  3 ... Commit  FIN  OK 18:39:59
++#
++# -- no AutoCom row at all. A regex that cannot match spends every second of
++# the budget it is given: both DC firewalls ran the full 90 retries, 56
++# MINUTES, then failed the assert below, were dropped from the play, and
++# received NO initial and NO module configuration. The other 182 nodes had
++# finished at T+5min and sat idle for the rest. That is 86% of a 65-minute
++# reconfigure spent proving nothing about a device that was healthy.
++#
++# The fix is to name the OTHER shape the table can legitimately have, not to
++# widen the budget. PAN-OS refuses to queue any user commit until the
++# first-boot autocommit has finished successfully -- "Commit job was not
++# queued since auto-commit not yet finished successfully" is the device's own
++# refusal. So a `Commit ... FIN OK` row is PROOF that the autocommit already
++# finished and succeeded; it cannot exist otherwise.
++#
++# That inference is only safe while no AutoCom row is visible. A table that
++# shows BOTH a finished user commit and an AutoCom still in ACT/PEND is a
++# device whose autocommit is genuinely running (the captured
++# REAL_JOBS_RUNNING fixture in tests/test_panos_initial_gates.py is exactly
++# that shape), so the AutoCom row, when present, always wins.
++#
++# Absence alone proves nothing, which is why the second branch also demands a
++# POSITIVE match: an empty transcript, a refused login or a CLI that answered
++# nothing carries no Commit row either, so it keeps waiting exactly as before.
++#
++# Reboots cannot smuggle a stale table past this. Every KNE NOS VM boots from
++# an ephemeral KubeVirt containerDisk (patches/kne/0007, kubeVirtContainerDisk
++# Specs -- no PVC, no DataVolume for the root disk), so a restarted PAN-OS
++# starts with an empty job table in which AutoCom is job 1 and visible.
++- name: Wait for the PAN-OS first-boot autocommit job to finish
++  panos_cli_config_kne:
++    host: "{{ ansible_host }}"
++    port: "{{ panos_kne_ssh_port }}"
++    username: "{{ ansible_user }}"
++    password: "{{ ansible_password }}"
++    mode: op
++    lines: [ 'show jobs all' ]
++    timeout: 60
++  register: panos_autocommit_job
++  until: >-
++    panos_autocommit_job.transcript | default('') is search('AutoCom\s+FIN')
++    or (panos_autocommit_job.transcript | default('') is not search('AutoCom')
++        and panos_autocommit_job.transcript | default('') is search('Commit\s+FIN\s+OK'))
++  retries: 90
++  delay: 20
++  ignore_errors: true
++
++# ignore_errors, not failed_when: an exhausted `until` loop sets failed=True
++# itself, AFTER any failed_when is applied, so only ignore_errors lets the play
++# continue to the asserts that name the autocommit.
++- name: Assert the PAN-OS autocommit finished
++  ansible.builtin.assert:
++    that: >-
++      panos_autocommit_job.transcript | default('') is search('AutoCom\s+FIN')
++      or (panos_autocommit_job.transcript | default('') is not search('AutoCom')
++          and panos_autocommit_job.transcript | default('') is search('Commit\s+FIN\s+OK'))
++    fail_msg: >-
++      PAN-OS on {{ inventory_hostname }} never reported its first-boot
++      autocommit job (AutoCom) as finished within 30 minutes of the password
++      promotion, and its job table carries no finished user commit either, so
++      any commit we issue would be refused. The device is reachable and the
++      password is correct. A healthy VM-Series finishes its autocommit by
++      ~T+15min, so a genuine exhaustion here means the job is wedged -- read
++      `show jobs all` on the device.
++
++# FIN is not OK: a finished autocommit can have FAILED, and a failed autocommit
++# refuses user commits forever -- only `commit force` clears it. Different
++# repair from waiting, so it gets its own message.
++- name: Assert the PAN-OS autocommit succeeded
++  ansible.builtin.assert:
++    that: >-
++      panos_autocommit_job.transcript | default('') is search('AutoCom\s+FIN\s+OK')
++      or (panos_autocommit_job.transcript | default('') is not search('AutoCom')
++          and panos_autocommit_job.transcript | default('') is search('Commit\s+FIN\s+OK'))
++    fail_msg: >-
++      The first-boot autocommit on {{ inventory_hostname }} FINISHED but did
++      not report result OK: the device will refuse every normal commit until a
++      `commit force` clears the failed state. This is a device-side autocommit
++      failure, not a wait that ran out -- read `show jobs all` for the AutoCom
++      job's details before retrying the lab.
++
++# THE INITIAL CONFIG, RENDERED AND PUSHED LIKE EVERY OTHER NETLAB DEVICE.
++#
++# templates/initial/panos.j2 renders the complete day-1 baseline -- hostname,
++# ping management profile, per-interface IP/MTU/zone/vsys-import, virtual
++# router membership -- as configuration-mode set commands, and the module
++# applies them over SSH and commits. This REPLACES the collection's API
++# modules: they covered a subset of the template (no zones -- every commit
++# warned "Interface ethernet1/1 has no zone configuration"), needed an API key
++# the CLI does not, and split PAN-OS across two transports for no gain.
++#
++# Subinterfaces (layer3 units) and the loopback are covered too, every line
++# probe-verified on a live device before it entered the template.
++- name: Render the PAN-OS initial configuration
++  ansible.builtin.set_fact:
++    panos_initial_config: "{{ lookup('template', config_template) }}"
++
++- name: Apply and commit the PAN-OS initial configuration
++  panos_cli_config_kne:
++    host: "{{ ansible_host }}"
++    port: "{{ panos_kne_ssh_port }}"
++    username: "{{ ansible_user }}"
++    password: "{{ ansible_password }}"
++    lines: "{{ panos_initial_config.splitlines() }}"
++    commit: true
++    timeout: 300
+diff --git a/netsim/ansible/tasks/panos/routing.yml b/netsim/ansible/tasks/panos/routing.yml
+new file mode 100644
+index 0000000..f98b314
+--- /dev/null
++++ b/netsim/ansible/tasks/panos/routing.yml
+@@ -0,0 +1,23 @@
++---
++- name: Configure PAN-OS static routes
++  loop: "{{ routing.static|default([]) }}"
++  loop_control:
++    loop_var: route
++    index_var: route_idx
++  when: route.ipv4 is defined
++  paloaltonetworks.panos.panos_static_route:
++    provider: "{{ panos_provider }}"
++    virtual_router: "{{ panos_virtual_router }}"
++    name: "{{ route.name|default('netlab-route-' ~ route_idx) }}"
++    destination: "{{ route.ipv4 }}"
++    interface: "{{ route.nexthop.intf|default(omit) }}"
++    nexthop: "{{ route.nexthop.ipv4|default(omit) }}"
++    nexthop_type: >-
++      {{ 'discard' if route.nexthop.discard is defined else
++         'next-vr' if route.nexthop.vrf is defined and route.nexthop.vrf is not none else
++         'ip-address' }}
++
++- name: Commit static routing configuration
++  when: routing.static|default([])|length > 0
++  paloaltonetworks.panos.panos_commit_firewall:
++    provider: "{{ panos_provider }}"
+diff --git a/netsim/ansible/tasks/panos/security.yml b/netsim/ansible/tasks/panos/security.yml
+new file mode 100644
+index 0000000..435029a
+--- /dev/null
++++ b/netsim/ansible/tasks/panos/security.yml
+@@ -0,0 +1,15 @@
++---
++- name: "PAN-OS SSH apply: {{ netsim_action }} from {{ config_template }}"
++  delegate_to: localhost
++  ansible.builtin.expect:
++    command: >-
++      sshpass -p '{{ ansible_password }}'
++      ssh -o UserKnownHostsFile=/dev/null
++          -o StrictHostKeyChecking=no
++          {{ ansible_user }}@{{ ansible_host }}
++    responses:
++      '.*>':
++      - "configure\n"
++      - "{{ lookup('template', config_template) }}\ncommit\nexit\n"
++      '.*#': "exit\n"
++  tags: [ print_action, always ]
+diff --git a/netsim/ansible/templates/bgp/panos.j2 b/netsim/ansible/templates/bgp/panos.j2
+new file mode 100644
+index 0000000..8c385ea
+--- /dev/null
++++ b/netsim/ansible/templates/bgp/panos.j2
+@@ -0,0 +1,191 @@
++{#
++  PAN-OS BGP, rendered from netlab's NATIVE bgp model (bgp.as, bgp.router_id,
++  bgp.neighbors, bgp.advertise) as configuration-mode `set` commands, deployed
++  over the KNE SSH endpoint by deploy-config/panos.yml -- the same single
++  transport the other panos module templates use.
++
++  PAN-OS is not a netlab-native BGP device upstream (there is no upstream
++  bgp/panos.j2), which is why this template hand-writes the virtual-router BGP
++  stanza. But every VALUE comes from the bgp module's own derivation, not from
++  any hand-authored per-node pack: the neighbor list, peer AS, local AS,
++  router-id and advertised prefixes are exactly what build_ebgp_sessions and
++  bgp.originate produced. A router with `module: [bgp]` + `bgp.as` peered over
++  a normal link to any bgp-capable neighbour gets its config from here with no sidecar and no custom config.
++
++  PAN-OS has no bare BGP `network` statement, so advertised prefixes are
++  originated the way PAN-OS itself does it: a discard static route per prefix,
++  a redistribution profile matching static, and a BGP export rule referencing
++  that profile -- driven by bgp.advertise (the resolved bgp.originate set).
++
++  local-address is the address of THIS node's interface facing each neighbour,
++  found by asking each local interface WHICH NODES IT FACES (intf.neighbors,
++  which netlab fills per link with {ifname, ipv4, node}); peer-address is the
++  neighbour's own interface address. No dot1Q sub-interface and no static ARP:
++  the peering /30 is already live on the physical interface from the netlab
++  link definition, so BGP's `local-address ip` alone selects the egress
++  interface.
++
++  DO NOT match on ifindex. This template used to pick the local interface with
++  `intf.ifindex == n.ifindex`, but n.ifindex is the interface index on the
++  NEIGHBOUR, not on this node -- the two only coincide by accident. On
++  demo-lab's sjc-dc1in-panos-fw1 its BGP neighbour's single lab
++  interface is index 1, so the PAN sourced the session from ITS index 1
++  (ethernet1/1, the DMZ_LB link, 10.254.1.14/30) instead of ethernet1/6
++  (169.254.10.2/30, the link the peer is actually on). The session then never
++  established: the peer sat in Connect, PAN-OS discarded the speaker's inbound
++  SYN, and nothing in the zone/security-policy layer explained it (proven
++  live 2026-09-16 -- an explicit allow rule for the exact matched application
++  changed nothing, because the peering was bound to the wrong interface).
++
++  DO NOT strip the CIDR mask off local-address ip, and DO NOT set
++  local-address interface and local-address ip in separate `set` commands.
++  PAN-OS's `local-address ip` leaf is a REFERENCE into the set of addresses
++  actually configured on `local-address interface`, keyed by the EXACT string
++  the interface's own address is configured with (mask included, e.g.
++  "169.254.10.2/30" -- "169.254.10.2" alone is "not a valid reference").
++  Because ip is validated against whichever interface is CURRENTLY bound,
++  changing interface and ip as two separate `set` lines is a dead end no
++  matter the order: setting interface first leaves the OLD ip as an invalid
++  reference against the NEW interface (rejected immediately, before the ip
++  line ever runs); setting ip first leaves the NEW ip an invalid reference
++  against the OLD interface. Confirmed live 2026-09-16 on sjc-dc1in-panos-fw1
++  by hand at the PAN-OS CLI: both orderings of two separate `set` commands
++  were rejected ("local-address -> ip '...' is not a valid reference"); one
++  `set ... local-address interface ethernet1/6 ip 169.254.10.2/30` command
++  (both leaves in the same edit) committed cleanly, and the session reached
++  Established within 69 seconds. That diagnostic edit was reverted by this
++  fix taking over the same config on the next netlab reconfigure -- netlab
++  remains the only producer of device config; nothing was left hand-pushed.
++
++  THIS TEMPLATE IS THE PAN-OS BGP LANE. Until patch 71 it was dead code: a
++  per-device task file (tasks/panos/bgp.yml, XML API via panos_bgp*) shadowed
++  it in deploy-module.yml's lookup, so nothing below ever reached a firewall --
++  live sjc-dc1in-panos-fw1 (2026-09-23) ran `install-route no`, no redist-rules
++  and advertised 0 prefixes while this file said `install-route yes`. Patch 71
++  deleted the task file; deploy-config/panos.yml now pushes this render over
++  the KNE SSH endpoint like every other PAN-OS module. The peer groups keep
++  the names the task file created (panos-ebgp / panos-ibgp) so a reconfigure
++  of a lab deployed by the old lane edits the same objects instead of
++  colliding with them.
++
++  ADVERTISEMENT IS REDISTRIBUTION. PAN-OS puts a route into BGP only through
++  `protocol bgp redist-rules <redist-profile>` (then, with no export policy,
++  advertises the whole loc-RIB). There is no `policy export ... match
++  redistribution-profile` -- pan-os-python's BgpPolicyRule has no such match,
++  and the export rule this template used to render named one. Two sources:
++    * bgp.originate -- discard static per prefix + redist-profile
++      nlb-advertise (type static, destination = exactly those prefixes)
++      + redist-rules. The discard static FLOATS (admin-dist 240, the PAN-OS
++      maximum): at the default static distance (10) it would beat an OSPF or
++      BGP route for the SAME prefix and blackhole it -- demo-lab's SJC
++      PAN originated 21 prefixes it also learns via OSPF (10.50.101.0/24 ...).
++      As an aggregate with no exact-match route it is still the active route
++      and is still redistributed. Prefixes the box already learns belong in
++      bgp.import, not originate.
++    * bgp.import (netlab's native redistribution) -- one redist-profile per
++      policy name (protocols importing with the same policy share it:
++      filter type [ connect ospf ]), destination filter from the policy's
++      permit prefix lists, priority from its first sequence, set-origin
++      incomplete. As the seed does it:
++        redist-profile Export_to_Amazon { filter { type [ connect ospf ] } priority 2; action { redist } }
++        bgp redist-rules Export_to_Amazon { address-family-identifier ipv4; enable yes; set-origin incomplete }
++  bgp.allow_redist_default_route renders allow-redist-default-route; unset, it
++  is rendered `yes` automatically when a redistributed destination is
++  0.0.0.0/0 (PAN-OS silently drops the default otherwise). bgp.install_route
++  renders install-route; unset, the device default (no) stays.
++#}
++{% if bgp.neighbors | default([]) %}
++{% set vr = panos_virtual_router | default('default') %}
++{% set all_dests = [] %}
++{% set adv = bgp.originate | default([]) %}
++{% for p in adv %}
++set network virtual-router {{ vr }} routing-table ip static-route "netlab-bgp-advertise-{{ loop.index }}" destination {{ p }}
++set network virtual-router {{ vr }} routing-table ip static-route "netlab-bgp-advertise-{{ loop.index }}" nexthop discard
++set network virtual-router {{ vr }} routing-table ip static-route "netlab-bgp-advertise-{{ loop.index }}" metric 254
++set network virtual-router {{ vr }} routing-table ip static-route "netlab-bgp-advertise-{{ loop.index }}" admin-dist 240
++{%   set _ = all_dests.append(p) %}
++{% endfor %}
++{% if adv %}
++set network virtual-router {{ vr }} protocol redist-profile "nlb-advertise" filter type [ static ]
++set network virtual-router {{ vr }} protocol redist-profile "nlb-advertise" filter destination [ {{ adv | join(' ') }} ]
++set network virtual-router {{ vr }} protocol redist-profile "nlb-advertise" priority 1
++set network virtual-router {{ vr }} protocol redist-profile "nlb-advertise" action redist
++{% endif %}
++{% set imp = bgp.import | default({}) %}
++{% set r_policy = routing.policy if routing is defined and routing.policy is defined else {} %}
++{% set pnames = [] %}
++{% for s_proto, s_data in imp | dictsort %}
++{%   set pn = s_data.policy | default('nlb-' ~ s_proto) %}
++{%   if pn not in pnames %}
++{%     set _ = pnames.append(pn) %}
++{%   endif %}
++{% endfor %}
++{% for pn in pnames %}
++{%   set types = [] %}
++{%   for s_proto, s_data in imp | dictsort if s_data.policy | default('nlb-' ~ s_proto) == pn %}
++{%     set _ = types.append('connect' if s_proto == 'connected' else s_proto) %}
++{%   endfor %}
++{%   set entries = r_policy[pn] if pn in r_policy else [] %}
++{%   set dests = [] %}
++{%   for e in entries if e.action | default('permit') == 'permit' and e.match.prefix is defined %}
++{%     for pe in routing._prefix.ipv4[e.match.prefix] | default([]) if pe.action | default('permit') == 'permit' and pe.ipv4 is defined %}
++{%       set _ = dests.append(pe.ipv4) %}
++{%       set _ = all_dests.append(pe.ipv4) %}
++{%     endfor %}
++{%   endfor %}
++set network virtual-router {{ vr }} protocol redist-profile "{{ pn }}" filter type [ {{ types | join(' ') }} ]
++{%   if dests %}
++set network virtual-router {{ vr }} protocol redist-profile "{{ pn }}" filter destination [ {{ dests | join(' ') }} ]
++{%   endif %}
++set network virtual-router {{ vr }} protocol redist-profile "{{ pn }}" priority {{ entries[0].sequence | default(10) if entries else 10 }}
++set network virtual-router {{ vr }} protocol redist-profile "{{ pn }}" action redist
++{% endfor %}
++set network virtual-router {{ vr }} protocol bgp router-id {{ bgp.router_id }}
++set network virtual-router {{ vr }} protocol bgp local-as {{ bgp.as }}
++{% if bgp.install_route is defined %}
++set network virtual-router {{ vr }} protocol bgp install-route {{ 'yes' if bgp.install_route else 'no' }}
++{% endif %}
++{% if bgp.allow_redist_default_route is defined %}
++set network virtual-router {{ vr }} protocol bgp allow-redist-default-route {{ 'yes' if bgp.allow_redist_default_route else 'no' }}
++{% elif '0.0.0.0/0' in all_dests %}
++set network virtual-router {{ vr }} protocol bgp allow-redist-default-route yes
++{% endif %}
++{% for pn in (['nlb-advertise'] if adv else []) + pnames %}
++set network virtual-router {{ vr }} protocol bgp redist-rules "{{ pn }}" address-family-identifier ipv4
++set network virtual-router {{ vr }} protocol bgp redist-rules "{{ pn }}" set-origin incomplete
++set network virtual-router {{ vr }} protocol bgp redist-rules "{{ pn }}" enable yes
++{% endfor %}
++{% for n in bgp.neighbors if n.ipv4 is defined and n.type in ['ebgp', 'ibgp'] %}
++{%   set pg = 'panos-ibgp' if n.type == 'ibgp' else 'panos-ebgp' %}
++{%   set local_if = namespace(ifname=None, ipv4=None) %}
++{%   for intf in interfaces | default([]) if intf.ipv4 is defined %}
++{%     for nb in intf.neighbors | default([]) if nb.node is defined and nb.node == n.name %}
++{%       set local_if.ifname = intf.ifname %}
++{%       set local_if.ipv4 = intf.ipv4 %}
++{%     endfor %}
++{%   endfor %}
++{%   if not local_if.ifname and n.type == 'ibgp' and loopback.ipv4 is defined %}
++{%     set local_if.ifname = loopback.ifname %}
++{%     set local_if.ipv4 = loopback.ipv4 %}
++{%   endif %}
++{%   if n.type == 'ibgp' %}
++set network virtual-router {{ vr }} protocol bgp peer-group "{{ pg }}" type ibgp export-nexthop {{ 'use-self' if bgp.next_hop_self | default(true) else 'original' }}
++{%   else %}
++set network virtual-router {{ vr }} protocol bgp peer-group "{{ pg }}" type ebgp remove-private-as yes
++{%   endif %}
++set network virtual-router {{ vr }} protocol bgp peer-group "{{ pg }}" enable yes
++set network virtual-router {{ vr }} protocol bgp peer-group "{{ pg }}" peer "{{ n.name }}" peer-as {{ n.as }}
++set network virtual-router {{ vr }} protocol bgp peer-group "{{ pg }}" peer "{{ n.name }}" enable-mp-bgp no
++set network virtual-router {{ vr }} protocol bgp peer-group "{{ pg }}" peer "{{ n.name }}" address-family-identifier ipv4
++set network virtual-router {{ vr }} protocol bgp peer-group "{{ pg }}" peer "{{ n.name }}" subsequent-address-family-identifier unicast yes
++{%   if local_if.ifname and local_if.ipv4 %}
++set network virtual-router {{ vr }} protocol bgp peer-group "{{ pg }}" peer "{{ n.name }}" local-address interface {{ local_if.ifname }} ip {{ local_if.ipv4 }}
++{%   endif %}
++set network virtual-router {{ vr }} protocol bgp peer-group "{{ pg }}" peer "{{ n.name }}" peer-address ip {{ n.ipv4 }}
++{%   if n.multihop is defined %}
++set network virtual-router {{ vr }} protocol bgp peer-group "{{ pg }}" peer "{{ n.name }}" connection-options multihop {{ n.multihop }}
++{%   endif %}
++set network virtual-router {{ vr }} protocol bgp peer-group "{{ pg }}" peer "{{ n.name }}" enable yes
++{% endfor %}
++set network virtual-router {{ vr }} protocol bgp enable yes
++{% endif %}
+diff --git a/netsim/ansible/templates/initial/panos.j2 b/netsim/ansible/templates/initial/panos.j2
+new file mode 100644
+index 0000000..0783e39
+--- /dev/null
++++ b/netsim/ansible/templates/initial/panos.j2
+@@ -0,0 +1,80 @@
++{% set vr_name = panos_virtual_router | default('default') %}
++{% set panos_mgmt_if = mgmt_if | default('mgmt') %}
++
++set deviceconfig system hostname {{ inventory_hostname | replace("_","-") }}
++
++set network profiles interface-management-profile netlab-ping ping yes
++
++{# LLDP. Global enable plus per-physical-interface `layer3 lldp enable yes`,
++   the exact seed syntax (demo-lab sjc-dc1in-panos-fw1 configuration.txt:
++   `lldp { enable yes; }` under each ethernet's layer3, and a top-level
++   `lldp { enable yes; }`). Without this the device never sources or is
++   sourced by any LLDP-derived adjacency, dropping every neighbor link a
++   collector infers from LLDP alone -- physical-port protocol, so it is set
++   on physical interfaces only, never on a VLAN subinterface. #}
++set network lldp enable yes
++
++{% for intf in interfaces | default([]) if intf.ifname != panos_mgmt_if and '.' not in intf.ifname %}
++{%   set zone_name = intf.firewall.zone | default(intf.panos_zone | default('netlab')) %}
++set network interface ethernet {{ intf.ifname }} layer3
++set network interface ethernet {{ intf.ifname }} layer3 interface-management-profile netlab-ping
++set network interface ethernet {{ intf.ifname }} layer3 lldp enable yes
++{%   if intf.ipv4 is defined %}
++set network interface ethernet {{ intf.ifname }} layer3 ip {{ intf.ipv4 }}
++{%   endif %}
++{%   set intf_mtu = intf.mtu | default(mtu | default(0)) | int %}
++{#   MTU only up to 1500. Anything larger needs the device-wide jumbo-frame
++     mode, which PAN-OS will not enable without a REBOOT -- the commit fails
++     with "device is not in jumbo-frame mode but interface ethernet1/1 mtu is
++     greater than 1500 ... Commit failed" (captured live, demo-lab 2026-08-31,
++     fabric MTU 8950). The retired API lane never set MTU at all, so the
++     device default (1500) is exactly the behaviour every certified run had.
++     If PAN-OS jumbo is ever needed, the fix is jumbo-frame mode plus a
++     managed reboot in the bring-up, not this line. #}
++{%   if intf_mtu > 0 and intf_mtu <= 1500 %}
++set network interface ethernet {{ intf.ifname }} layer3 mtu {{ intf_mtu }}
++{%   endif %}
++set network virtual-router {{ vr_name }} interface {{ intf.ifname }}
++{# NO `set vsys ... import`: VM-Series is single-vsys and the `set vsys`
++   subtree does not exist there -- a live device answers every such line with
++   "Invalid syntax." (demo-lab jfk-fw01/lax-fw01, 2026-08-31, first run of this
++   template against real hardware; the retired API lane imported through the
++   panos_interface module's vsys parameter instead). Zone membership imports
++   the interface into the vsys implicitly. #}
++set zone "{{ zone_name }}" network layer3 {{ intf.ifname }}
++{% endfor %}
++{# NO memberless zone creation: `set zone X network layer3` with no interface
++   is not a complete set statement and the device rejects it ("Invalid
++   syntax.", same capture). Zones referenced only by policy and bound to no
++   interface are created by the firewall.policy deploy lane when it writes the
++   rules, which is the only place that knows they are needed. #}
++
++{#
++  SUBINTERFACES. `layer3 units <parent>.<tag>` under the parent interface --
++  every line below was accepted verbatim by a live VM-Series (probe, demo-lab
++  jfk-fw01, 2026-08-31) before this block existed. Same zone/VR/mgmt-profile
++  treatment as physical interfaces, same implicit vsys import via the zone.
++#}
++{% for intf in interfaces | default([]) if intf.ifname != panos_mgmt_if and '.' in intf.ifname %}
++{%   set parent = intf.ifname.split('.')[0] %}
++{%   set tag = intf.ifname.split('.')[1] %}
++{%   set zone_name = intf.firewall.zone | default(intf.panos_zone | default('netlab')) %}
++set network interface ethernet {{ parent }} layer3 units {{ intf.ifname }} tag {{ tag }}
++set network interface ethernet {{ parent }} layer3 units {{ intf.ifname }} interface-management-profile netlab-ping
++{%   if intf.ipv4 is defined %}
++set network interface ethernet {{ parent }} layer3 units {{ intf.ifname }} ip {{ intf.ipv4 }}
++{%   endif %}
++set network virtual-router {{ vr_name }} interface {{ intf.ifname }}
++set zone "{{ zone_name }}" network layer3 {{ intf.ifname }}
++{% endfor %}
++{#
++  LOOPBACK. `loopback units <name> ip <addr>` -- probe-verified like the
++  subinterfaces. VR membership but NO zone, matching the retired API lane
++  (panos_loopback_interface took vr and vsys only); a loopback that needs a
++  zone can declare one the day a topology wants it.
++#}
++{% if loopback is defined and loopback.ipv4 is defined %}
++set network interface loopback units {{ loopback.ifname }} ip {{ loopback.ipv4 }}
++set network interface loopback units {{ loopback.ifname }} comment "netlab loopback"
++set network virtual-router {{ vr_name }} interface {{ loopback.ifname }}
++{% endif %}
+diff --git a/netsim/ansible/templates/ospf/panos.j2 b/netsim/ansible/templates/ospf/panos.j2
+new file mode 100644
+index 0000000..15d25c9
+--- /dev/null
++++ b/netsim/ansible/templates/ospf/panos.j2
+@@ -0,0 +1,68 @@
++{# PAN-OS OSPFv2, phase-2 of routing/panos.j2's phase-1 bootstrap note: the
++   virtual-router/protocol/ospf config tree, pushed as `set` commands the same
++   way every other panos template in this directory does (deploy-config/panos.yml
++   SSHes in, enters `configure`, pastes the rendered lines, `commit`s). Every
++   path segment below matches PAN-OS's own set-command convention 1:1 with its
++   XML config tree (network virtual-router <vr> protocol ospf ...), verified
++   against a real PAN-OS OSPF capture (configuration.txt) rather than guessed:
++   router-id / enable / area <id> type normal / area <id> interface <name>
++   enable / passive / metric / priority / hello-interval / dead-interval. #}
++{% set vr = panos_virtual_router | default('default') %}
++set network virtual-router {{ vr }} protocol ospf router-id {{ ospf.router_id }}
++set network virtual-router {{ vr }} protocol ospf enable yes
++{# Default-route knobs, rendered only when set (PAN-OS defaults:
++   reject-default-route yes, allow-redist-default-route no). Seed:
++   sjc-dc1in-panos-fw1 `ospf { reject-default-route no; }`, atl-dc1in-panos-fw1
++   additionally `allow-redist-default-route yes`. #}
++{% if ospf.reject_default_route is defined %}
++set network virtual-router {{ vr }} protocol ospf reject-default-route {{ 'yes' if ospf.reject_default_route else 'no' }}
++{% endif %}
++{% if ospf.allow_redist_default_route is defined %}
++set network virtual-router {{ vr }} protocol ospf allow-redist-default-route {{ 'yes' if ospf.allow_redist_default_route else 'no' }}
++{% endif %}
++{% for area_data in ospf.areas | default([]) %}
++set network virtual-router {{ vr }} protocol ospf area {{ area_data.area }} type normal
++{% endfor %}
++{% for intf in netlab_interfaces if intf.ospf.area is defined %}
++set network virtual-router {{ vr }} protocol ospf area {{ intf.ospf.area }} interface {{ intf.ifname }} enable yes
++set network virtual-router {{ vr }} protocol ospf area {{ intf.ospf.area }} interface {{ intf.ifname }} passive {{ 'yes' if intf.ospf.passive | default(false) else 'no' }}
++{% if intf.ospf.cost is defined %}
++set network virtual-router {{ vr }} protocol ospf area {{ intf.ospf.area }} interface {{ intf.ifname }} metric {{ intf.ospf.cost }}
++{% endif %}
++{% if intf.ospf.priority is defined %}
++set network virtual-router {{ vr }} protocol ospf area {{ intf.ospf.area }} interface {{ intf.ifname }} priority {{ intf.ospf.priority }}
++{% endif %}
++{% if intf.ospf.timers.hello is defined %}
++set network virtual-router {{ vr }} protocol ospf area {{ intf.ospf.area }} interface {{ intf.ifname }} hello-interval {{ intf.ospf.timers.hello }}
++{% endif %}
++{% if intf.ospf.timers.dead is defined %}
++set network virtual-router {{ vr }} protocol ospf area {{ intf.ospf.area }} interface {{ intf.ifname }} dead-interval {{ intf.ospf.timers.dead }}
++{% endif %}
++{% endfor %}
++{# Redistribution (ospf.import). PAN-OS models it as a virtual-router
++   redist-profile (source type, destination filter, priority, action) named by
++   protocol ospf export-rules (external path type), as in a real PAN-OS capture:
++     redist-profile P { filter { type static; destination [ ... ] } priority N; action { redist } }
++     ospf export-rules P { new-path-type ext-2 }
++   An import policy maps onto one profile: the permit entries' match.prefix
++   lists become the destination filter, and the first entry's sequence the
++   priority. Deny entries, and matches other than a prefix list, have no
++   redist-profile equivalent. With no policy, the profile has no destination
++   filter and redistributes every route of that type. #}
++{% for s_proto, s_data in ospf.import|default({})|dictsort if s_proto == 'static' %}
++{%   set pname = s_data.policy|default('nlo-' ~ s_proto) %}
++{%   set entries = routing.policy[s_data.policy]|default([]) if s_data.policy is defined else [] %}
++{%   set dests = [] %}
++{%   for e in entries if e.action|default('permit') == 'permit' and e.match.prefix is defined %}
++{%     for pe in routing._prefix.ipv4[e.match.prefix]|default([]) if pe.action|default('permit') == 'permit' and pe.ipv4 is defined %}
++{%       set _ = dests.append(pe.ipv4) %}
++{%     endfor %}
++{%   endfor %}
++set network virtual-router {{ vr }} protocol redist-profile {{ pname }} filter type {{ s_proto }}
++{%   if dests %}
++set network virtual-router {{ vr }} protocol redist-profile {{ pname }} filter destination [ {{ dests|join(' ') }} ]
++{%   endif %}
++set network virtual-router {{ vr }} protocol redist-profile {{ pname }} priority {{ entries[0].sequence|default(10) if entries else 10 }}
++set network virtual-router {{ vr }} protocol redist-profile {{ pname }} action redist
++set network virtual-router {{ vr }} protocol ospf export-rules {{ pname }} new-path-type ext-2
++{% endfor %}
+diff --git a/netsim/ansible/templates/routing/panos.j2 b/netsim/ansible/templates/routing/panos.j2
+new file mode 100644
+index 0000000..a668f12
+--- /dev/null
++++ b/netsim/ansible/templates/routing/panos.j2
+@@ -0,0 +1 @@
++{# PAN-OS static routing is deployed through Ansible modules / feature templates. #}
+diff --git a/netsim/ansible/templates/services/panos.j2 b/netsim/ansible/templates/services/panos.j2
+new file mode 100644
+index 0000000..2ee24cd
+--- /dev/null
++++ b/netsim/ansible/templates/services/panos.j2
+@@ -0,0 +1,15 @@
++{% if services.server.snmp is defined %}
++{#
++    SNMP agent, ported VERBATIM from the snmp_config custom config module so the
++    generated configuration is byte-for-byte what this platform emitted before.
++    The only change is that the community is a parameter, defaulting to
++    `skyforge` -- the community the collector's collectors poll with. Any other default
++    leaves every device reachable and unpollable.
++#}
++set deviceconfig system service disable-snmp no
++set deviceconfig system snmp-setting access-setting version v2c snmp-community-string {{ services.server.snmp.community|default('skyforge') }}
++{% set panos_mgmt_if = mgmt_if | default('mgmt') %}
++{% for intf in interfaces | default([]) if intf.ifname != panos_mgmt_if %}
++set network interface ethernet {{ intf.ifname }} layer3 lldp enable yes
++{% endfor %}
++{% endif %}
+diff --git a/netsim/devices/panos.yml b/netsim/devices/panos.yml
+new file mode 100644
+index 0000000..707a57a
+--- /dev/null
++++ b/netsim/devices/panos.yml
+@@ -0,0 +1,104 @@
++---
++description: Palo Alto PAN-OS firewall
++support:
++  level: minimal
++  caveats:
++  - PAN-OS support currently covers KNE device onboarding and Ansible/API readiness checks
++  - PAN-OS automation uses the Palo Alto Networks Ansible collection on the control node
++  - Install the Palo Alto Networks Ansible collection on the control node before using PAN-OS automation
++interface_name: ethernet1/{ifindex}
++mgmt_if: mgmt
++role: router
++clab:
++  image: vrnetlab/vr-pan
++  build: https://containerlab.dev/manual/kinds/vr-pan/
++  node:
++    kind: paloalto_panos
++    env:
++      VCPU: "4"
++      RAM: "8192"
++      QEMU_CPU: host
++  interface:
++    name: eth{ifindex}
++group_vars:
++  ansible_user: admin
++  # PAN-OS FORCES a password change at first login -- admin/admin cannot be
++  # kept, which is why panos_admpwd_kne exists: it drives the mandatory
++  # "Enter old password / Enter new password / Confirm" prompts over the KNE
++  # SSH endpoint before anything talks to the XML API.
++  #
++  # Admin@123 is the CONTAINERLAB default for PA-VM
++  # (containerlab.dev/manual/kinds/vr-pan) -- we follow upstream naming and
++  # upstream credentials so anyone who knows containerlab already knows this
++  # lab.
++  #
++  # KNOWN RISK, stated because its failure mode is silent: this value contains
++  # the username, and PAN-OS can reject username-derived passwords during the
++  # MANDATORY first-login change. Containerlab never hits that -- its image
++  # ships pre-provisioned with this password, so the policy is never evaluated
++  # -- whereas we promote through the change prompt. If the promotion is
++  # rejected it fails as a prompt that never completes, and surfaces much later
++  # as "403 Invalid Credential" from the API client. If that happens, this line
++  # is the first suspect.
++  #
++  # This is a LAB credential for ephemeral firewalls, chosen to be readable in
++  # a demo. It is recorded in four places that must agree -- here, the server's
++  # netlab_device_defaults.json, netlab/runtime/defaults.yml, and the test that
++  # pins it. Change them together or the promotion and the API client disagree
++  # and every PAN-OS node fails with 403 Invalid Credential.
++  ansible_password: "Admin@123"
++  ansible_ssh_private_key_file: >-
++    {{ lookup('env', 'SKYFORGE_NETLAB_SSH_KEY_FILE') | default('/skyforge-secrets/netlab-runner-rsa', true) }}
++  ansible_ssh_common_args: -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa
++  ansible_connection: local
++  ansible_network_os: panos
++  collections:
++  - paloaltonetworks.panos
++  netlab_console_connection: ssh
++  netlab_ready: [ ansible ]
++  netlab_device_type: panos
++  panos_vsys: vsys1
++  panos_virtual_router: default
++  panos_provider:
++    ip_address: "{{ ansible_host }}"
++    username: "{{ ansible_user }}"
++    password: "{{ ansible_password }}"
++    port: 443
++external:
++  image: none
++graphite.icon: firewall
++features:
++  services:
++    # SNMP agent: this device answers an NMS. Ported from the
++    # snmp_config custom config module.
++    server.snmp: True
++  bgp:
++    activate_af: true
++    local_as: true
++    # bgp.import renders redist-profile + `protocol bgp redist-rules` (the
++    # only way a route enters PAN-OS BGP); connected maps to type `connect`.
++    import: [ connected, ospf, static ]
++    install_route: true             # bgp.install_route / bgp.allow_redist_default_route
++  nat: true
++  ipsec:
++    route_based: true
++    policy_based: true
++    tunnel: true
++    ike: [ ikev1, ikev2, ikev2-preferred ]
++  security:
++    policy: true
++  routing:
++    static:
++      discard: true
++    policy:
++      match:
++        prefix: true
++    prefix: true
++  ospf:
++    default_route: true             # ospf.reject_default_route / ospf.allow_redist_default_route
++    import: [ static ]
++    priority: true
++    timers: true
++
++kne:
++  interface.name: eth{ifindex}
+diff --git a/netsim/modules/bgp.py b/netsim/modules/bgp.py
+index 741d866..5ccb6e3 100644
+--- a/netsim/modules/bgp.py
++++ b/netsim/modules/bgp.py
+@@ -763,6 +763,23 @@ def check_bgp_multipath(node: Box, topology: Box) -> None:
+       category=log.IncorrectValue,
+       module='bgp')
+ 
++"""
++check_bgp_install_route: bgp.install_route / bgp.allow_redist_default_route are
++device features (PAN-OS keeps BGP routes out of the forwarding table and refuses
++to redistribute a default route unless told otherwise). A device without the
++feature fails loudly instead of silently ignoring the knob.
++"""
++def check_bgp_install_route(node: Box, topology: Box) -> None:
++  used = [ k for k in ('install_route','allow_redist_default_route') if k in node.bgp ]
++  if not used:
++    return
++  features = devices.get_device_features(node,topology.defaults)
++  if not features.bgp.get('install_route',False):
++    log.error(
++      text=f'{node.name} (device {node.device}) does not support bgp.{" / bgp.".join(used)}',
++      category=log.IncorrectValue,
++      module='bgp')
++
+ """
+ Check the confederation data (if it exists) against node AS numbers
+ """
+@@ -1012,6 +1029,7 @@ class BGP(_Module):
+       return
+     build_bgp_sessions(node,topology)
+     check_bgp_multipath(node,topology)
++    check_bgp_install_route(node,topology)
+     check_advertise_data(node,topology)
+     bgp_set_advertise(node,topology)
+     bgp_process_originate(node,topology)
+diff --git a/netsim/modules/bgp.yml b/netsim/modules/bgp.yml
+index 775188f..f97167b 100644
+--- a/netsim/modules/bgp.yml
++++ b/netsim/modules/bgp.yml
+@@ -104,6 +104,18 @@ attributes:
+     import: _r_import
+     multipath: { copy: global }
+     multipath_relax: { copy: global }
++    # Devices that keep BGP-learned routes out of the forwarding table unless
++    # told otherwise (PAN-OS: `protocol bgp install-route`, default no). Unset
++    # renders nothing -- the device default applies. See features.bgp.install_route.
++    install_route:
++      type: bool
++      _description: Install BGP-learned routes into the routing table
++    allow_redist_default_route:
++      type: bool
++      _description: |
++        Allow a 0.0.0.0/0 route to be redistributed into BGP (PAN-OS:
++        allow-redist-default-route). When unset, devices that need it render it
++        automatically if bgp.import redistributes a policy permitting 0.0.0.0/0.
+   vrf:
+     router_id: { type: ipv4, use: id }
+     advertise: bgp_prefix_list
+@@ -142,6 +154,7 @@ features:
+     community: Granular BGP community propagation
+     confederation: BGP confederations
+     import: Import routes from other routing protocols
++    install_route: Supports bgp.install_route and bgp.allow_redist_default_route
+   session:
+     _title: BGP session parameters
+     allowas_in: Allow own AS in incoming AS path (allowas in)
+diff --git a/netsim/modules/ospf.py b/netsim/modules/ospf.py
+index 9d1c60a..32df242 100644
+--- a/netsim/modules/ospf.py
++++ b/netsim/modules/ospf.py
+@@ -257,6 +257,13 @@ class OSPF(_Module):
+         text=f'{node.name} (device {node.device}) does not support ospf.distance (administrative distance)',
+         category=log.IncorrectValue,
+         module='ospf')
++    dr_used = [ k for k in ('reject_default_route','allow_redist_default_route') if k in node.get('ospf',{}) ]
++    if dr_used and not features.get('ospf.default_route',False):
++      log.error(
++        text=f'{node.name} (device {node.device}) does not support ospf.{" / ospf.".join(dr_used)}',
++        category=log.IncorrectValue,
++        module='ospf')
++
+     dlist = node.get('ospf.distribute_list',None)
+     if dlist is not None:
+       if not features.get('ospf.distribute_list',False):
+diff --git a/netsim/modules/ospf.yml b/netsim/modules/ospf.yml
+index 6045a98..3c95078 100644
+--- a/netsim/modules/ospf.yml
++++ b/netsim/modules/ospf.yml
+@@ -40,6 +40,16 @@ attributes:
+         type: { type: str, valid_values: [ e1, e2 ] }
+     digest: { type: dict }
+     distance: { type: int, min_value: 1, max_value: 255 }
++    # Default-route handling knobs for devices whose OSPF treats 0.0.0.0/0
++    # specially (PAN-OS: `protocol ospf reject-default-route` defaults to yes,
++    # `allow-redist-default-route` to no). Unset renders nothing -- the device
++    # default applies. See features.ospf.default_route.
++    reject_default_route:
++      type: bool
++      _description: Ignore (true) or install (false) a default route learned from OSPF neighbours
++    allow_redist_default_route:
++      type: bool
++      _description: Allow (true) a 0.0.0.0/0 route to be redistributed into OSPF
+     # Global (not per-interface) inbound route filter: `router ospf <pid> /
+     # distribute-list <acl> in`. References the name of a `routing.acl` entry
+     # already declared on this node -- same `id` type interface.acl.in.ipv4
+@@ -108,6 +118,7 @@ attributes:
+ 
+ features:
+   default: Originate external default route
++  default_route: Supports ospf.reject_default_route and ospf.allow_redist_default_route
+   digest: MD5 authentication
+   gr: OSPF graceful restart (restart and helper)
+   import: Import routes from other routing protocols
+diff --git a/tests/test_panos_initial_gates.py b/tests/test_panos_initial_gates.py
+new file mode 100644
+index 0000000..56d3486
+--- /dev/null
++++ b/tests/test_panos_initial_gates.py
+@@ -0,0 +1,235 @@
++"""PAN-OS bring-up: one transport, ordered gates, and a deploy lane that exists.
++
++A cold PAN-OS lies about readiness three ways, and each gate in
++netsim/ansible/tasks/panos/initial.yml exists because a full 80-pod bring-up
++paid for it:
++
++  * the pod is Ready long before the mgmt plane listens  -> SSH-port wait
++  * the CLI answers but only to change the password      -> promotion
++  * the credentials work while the first-boot AutoCom
++    job still refuses every commit                       -> job-table gate
++
++Everything rides the KNE SSH endpoint -- the XML API is not used. Two prior
++gates watched the wrong signal (chassis-ready flips before AutoCom FIN) or the
++wrong shape (the API's CDATA answer), so the fixtures below are CAPTURED from
++a live device's CLI, never taken from documentation.
++
++And the deploy lane itself is pinned: tasks/deploy-config/panos.yml was
++silently dropped once, every module template kept rendering into a skip, and
++the miss surfaced two stages later as the collector's SNMP validation timing out on
++exactly the PAN-OS nodes.
++"""
++
++import re
++from pathlib import Path
++
++import pytest
++import yaml
++
++TASKS = Path(__file__).parent.parent / "netsim" / "ansible" / "tasks"
++INITIAL = TASKS / "panos" / "initial.yml"
++DEPLOY_LANE = TASKS / "deploy-config" / "panos.yml"
++
++FIN_RE = r"AutoCom\s+FIN"
++OK_RE = r"AutoCom\s+FIN\s+OK"
++
++# Captured raw from a live VM-Series CLI, 2026-08-30. Whitespace columns; the
++# newest job is listed first, so a finished user Commit precedes AutoCom and
++# the match must land on AutoCom's own row.
++REAL_JOBS_OK = """
++Enqueued              Dequeued           ID  PositionInQ                              Type                         Status Result Completed
++------------------------------------------------------------------------------------------------------------------------------------------
++2026/08/30 19:32:53   19:32:53            4                                         Commit                            FIN     OK 19:33:55
++2026/08/30 18:43:54   18:43:54            2                                        AutoCom                            FIN     OK 18:45:26
++"""
++REAL_JOBS_RUNNING = REAL_JOBS_OK.replace(
++    "AutoCom                            FIN     OK", "AutoCom                            ACT   PEND"
++)
++REAL_JOBS_FAILED = REAL_JOBS_OK.replace(
++    "AutoCom                            FIN     OK", "AutoCom                            FIN   FAIL"
++)
++
++# Captured from sjc-dc1in-panos-fw1 on 2026-09-19 (demo-lab reconfigure,
++# an internal task). PAN-OS's job table is BOUNDED -- it holds roughly the last 29
++# jobs -- so on a device that has been reconfigured a few dozen times the
++# first-boot AutoCom (job 1 or 2) has AGED OUT and the table is nothing but
++# user commits. The AutoCom-only gate could never match this shape and spent
++# its whole 90-retry budget, 56 minutes, on BOTH DC firewalls, which were then
++# dropped from the play and got no configuration at all.
++REAL_JOBS_AGED_OUT = """
++Enqueued              Dequeued           ID  PositionInQ                              Type                         Status Result Completed
++------------------------------------------------------------------------------------------------------------------------------------------
++2026/09/18 22:50:16   22:50:16           30                                         Commit                            FIN     OK 22:51:30
++2026/09/18 22:48:42   22:48:42           29                                         Commit                            FIN     OK 22:49:51
++2026/09/18 18:38:49   18:38:49            3                                         Commit                            FIN     OK 18:39:59
++"""
++
++# A device that answered nothing: an empty transcript must never read as ready,
++# and it is the shape a refused login or a dead CLI produces.
++NO_TRANSCRIPT = ""
++
++
++def evaluate(expression, transcript):
++  """Evaluate the gate's REAL expression text against a captured transcript.
++
++  Not a reimplementation -- the string comes straight out of initial.yml, so a
++  mirror of the logic cannot drift away from the file it is meant to pin. The
++  `search` test is Ansible's; Jinja2 supplies everything else (`default`,
++  `is not`), which is exactly what Ansible evaluates `until:` and `assert.that`
++  with.
++  """
++  import jinja2
++
++  env = jinja2.Environment()
++  env.tests["search"] = lambda value, pattern: re.search(pattern, value) is not None
++  rendered = env.from_string("{{ (" + expression + ") is true }}").render(
++      panos_autocommit_job={"transcript": transcript})
++  assert rendered in ("True", "False"), f"expression did not evaluate to a boolean: {rendered!r}"
++  return rendered == "True"
++
++
++@pytest.fixture(scope="module")
++def tasks():
++  return yaml.safe_load(INITIAL.read_text())
++
++
++def names(tasks):
++  return [t.get("name", "") for t in tasks]
++
++
++def index_of(tasks, needle):
++  for i, name in enumerate(names(tasks)):
++    if needle in name:
++      return i
++  raise AssertionError(f"no task matching {needle!r} in {names(tasks)}")
++
++
++def test_gates_precede_the_config_push_and_ride_one_transport(tasks):
++  ssh_known = index_of(tasks, "KNE SSH endpoint for PAN-OS is known")
++  ssh_wait = index_of(tasks, "SSH endpoint to accept connections")
++  promotion = index_of(tasks, "Promote the PAN-OS admin password")
++  jobwait = index_of(tasks, "autocommit job to finish")
++  fin_assert = index_of(tasks, "Assert the PAN-OS autocommit finished")
++  ok_assert = index_of(tasks, "Assert the PAN-OS autocommit succeeded")
++  push = index_of(tasks, "Apply and commit the PAN-OS initial configuration")
++
++  assert ssh_known < ssh_wait < promotion, "no endpoint, no wait; no wait, no promotion"
++  assert promotion < jobwait, "the job table needs the promoted password"
++  assert jobwait < fin_assert < ok_assert < push, "no config may be pushed during the autocommit"
++
++  text = INITIAL.read_text()
++  assert "panos_kne_ssh_port" in text, "every beat targets the KNE SSH endpoint"
++  # Scan CODE, not commentary: the file deliberately narrates the retired API
++  # lane's history in comments, and history is not a relic.
++  code = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
++  for api_relic in ("keygen", "panos_api_key", "chassis-ready", "port: 443",
++                    "panos_interface:", "panos_virtual_router:", "panos_commit_firewall:",
++                    "paloaltonetworks.panos."):
++    assert api_relic not in code, f"XML-API relic {api_relic!r} survived the single-transport rewrite"
++
++
++def test_autocommit_gate_matches_the_captured_cli_table(tasks):
++  gate = tasks[index_of(tasks, "autocommit job to finish")]
++  assert re.search(FIN_RE, REAL_JOBS_OK), "a finished autocommit must match"
++  assert not re.search(FIN_RE, REAL_JOBS_RUNNING), "ACT/PEND must not read as finished"
++  assert not re.search(FIN_RE, ""), "an absent transcript must not read as finished"
++  assert re.search(OK_RE, REAL_JOBS_OK), "a succeeded autocommit must pass the OK assert"
++  assert not re.search(OK_RE, REAL_JOBS_FAILED), "FIN with FAIL must NOT pass -- only commit force clears it"
++  assert FIN_RE.replace("\\", "\\\\") in gate["until"] or FIN_RE in gate["until"]
++  assert gate["retries"] >= 60, "budget: measured FIN-by-T+15min, doubled"
++  assert gate.get("ignore_errors") is True, "an exhausted until sets failed itself; only ignore_errors reaches the asserts"
++
++  ok = tasks[index_of(tasks, "Assert the PAN-OS autocommit succeeded")]
++  assert "AutoCom" in str(ok["ansible.builtin.assert"]["that"])
++
++
++def test_an_aged_out_autocommit_row_does_not_cost_the_whole_budget(tasks):
++  """The gate must recognise a device that is LONG past first boot.
++
++  netlab initial runs on every reconfigure, and PAN-OS's job table holds only
++  its last ~29 jobs, so the first-boot AutoCom row disappears once a lab has
++  been reconfigured a few dozen times. Measured on demo-lab an internal task
++  (2026-09-19): both DC firewalls ran all 90 retries -- 56 minutes, 86% of the
++  job -- then failed the assert and were dropped from the play unconfigured,
++  while the other 182 nodes had been finished since T+5min.
++
++  A finished user Commit is PROOF the autocommit finished successfully: PAN-OS
++  refuses to queue one otherwise ("Commit job was not queued since auto-commit
++  not yet finished successfully"). It is only proof while no AutoCom row is
++  visible, and only alongside a positive match -- absence on its own is what a
++  dead CLI also looks like.
++  """
++  gate = tasks[index_of(tasks, "autocommit job to finish")]
++  fin = tasks[index_of(tasks, "Assert the PAN-OS autocommit finished")]
++  succeeded = tasks[index_of(tasks, "Assert the PAN-OS autocommit succeeded")]
++
++  for what, expression in (
++      ("until", gate["until"]),
++      ("finished assert", fin["ansible.builtin.assert"]["that"]),
++      ("succeeded assert", succeeded["ansible.builtin.assert"]["that"]),
++  ):
++    assert evaluate(expression, REAL_JOBS_OK), f"{what}: a cold device that finished must pass"
++    assert evaluate(expression, REAL_JOBS_AGED_OUT), \
++        f"{what}: an aged-out table full of finished commits must not cost 56 minutes"
++    assert not evaluate(expression, REAL_JOBS_RUNNING), \
++        f"{what}: a VISIBLE AutoCom in ACT/PEND always wins -- a finished commit beside it must not pass"
++    assert not evaluate(expression, NO_TRANSCRIPT), \
++        f"{what}: absence proves nothing; an empty transcript must keep waiting"
++
++  assert not evaluate(succeeded["ansible.builtin.assert"]["that"], REAL_JOBS_FAILED), \
++      "FIN with FAIL still refuses every commit -- only commit force clears it"
++  assert evaluate(fin["ansible.builtin.assert"]["that"], REAL_JOBS_FAILED), \
++      "FIN with FAIL is FINISHED: it must reach the succeeded assert's own message, not the wait's"
++
++
++def test_initial_push_uses_the_rendered_template_and_commits(tasks):
++  push = tasks[index_of(tasks, "Apply and commit the PAN-OS initial configuration")]
++  mod = push["panos_cli_config_kne"]
++  assert mod["commit"] is True
++  assert "panos_initial_config" in str(mod["lines"])
++  render = tasks[index_of(tasks, "Render the PAN-OS initial configuration")]
++  assert "config_template" in str(render["ansible.builtin.set_fact"]), \
++      "the initial baseline comes from templates/initial/panos.j2, netlab's own resolution"
++
++
++def test_the_module_deploy_lane_exists_and_guards_empty_renders():
++  """The lane's ABSENCE was a silent hole: templates rendered, then 'skipping',
++  and the miss surfaced two stages later as the collector's SNMP validation timeout.
++  The empty-render guard keeps the XML-API custom configs (firewall.policy,
++  nat, ipsec render deliberately-empty templates here) from double-applying."""
++  lane = yaml.safe_load(DEPLOY_LANE.read_text())
++  deploy = None
++  for task in lane:
++    if "panos_cli_config_kne" in task:
++      deploy = task
++  assert deploy is not None, "the lane must push through the same module as initial"
++  assert deploy["panos_cli_config_kne"]["commit"] is True
++  when = str(deploy.get("when"))
++  assert "trim" in when and "length" in when, "empty renders must deploy nothing"
++
++
++def test_the_cli_module_ships_with_the_lane():
++  mod = TASKS.parent / "library" / "panos_cli_config_kne.py"
++  assert mod.exists(), "the deploy lane and initial.yml both invoke this module"
++  text = mod.read_text()
++  assert "no_log=True" in text, "the password parameter must never reach the log"
++  assert "Configuration committed successfully" in text, "commit success is detected by the device's own phrase"
++
++
++def test_no_xml_api_task_lists_remain_in_the_plugin_dirs():
++  """The single-transport port: firewall.policy, zonebased and ipsec render
++  set-command templates pushed by deploy-config/panos.yml, all verified against
++  a live device (grammar probes + full commit on demo-lab jfk-fw01, 2026-08-31 --
++  including the one real grammar surprise, the ipsec-crypto-profile's SCALAR
++  dh-group). A deploy.panos.yml reappearing means someone reintroduced the
++  XML API lane; an emptied template means a module silently stopped rendering."""
++  extra = Path(__file__).parent.parent / "netsim" / "extra"
++  for plugin in ("firewall/policy", "firewall/zonebased", "ipsec", "nat"):
++    d = extra / plugin
++    assert not (d / "deploy.panos.yml").exists(), f"{plugin}: the XML-API task list is back"
++    tpl = d / "panos.j2"
++    assert tpl.exists(), f"{plugin}: panos.j2 is missing"
++    code = "\n".join(
++        l for l in tpl.read_text().splitlines() if l.strip() and not l.strip().startswith(("{#", "#"))
++    )
++    assert "set " in code, f"{plugin}: panos.j2 emits no set commands"
+diff --git a/tests/topology/expected/ipsec-panos.yml b/tests/topology/expected/ipsec-panos.yml
+new file mode 100644
+index 0000000..a8cacfc
+--- /dev/null
++++ b/tests/topology/expected/ipsec-panos.yml
+@@ -0,0 +1,347 @@
++groups:
++  netlab_no_collect:
++    members:
++    - fw1
++    - fw2
++  netlab_no_reload:
++    members:
++    - fw1
++    - fw2
++input:
++- topology/input/ipsec-panos.yml
++- package:topology-defaults.yml
++links:
++- _linkname: links[1]
++  interfaces:
++  - ifindex: 1
++    ifname: ethernet1/1
++    ipv4: 192.0.2.1/30
++    node: fw1
++  - ifindex: 1
++    ifname: ethernet1/1
++    ipv4: 192.0.2.2/30
++    node: fw2
++  linkindex: 1
++  node_count: 2
++  prefix:
++    ipv4: 10.1.0.0/30
++  type: p2p
++- _linkname: links[2]
++  bridge: input_2
++  interfaces:
++  - ifindex: 20000
++    ifname: tunnel.1
++    ipsec:
++      endpoint: 192.0.2.1
++      local_interface: Ethernet1/1
++    ipv4: 10.1.0.5/30
++    node: fw1
++  - ifindex: 20000
++    ifname: tunnel.1
++    ipsec:
++      endpoint: 192.0.2.2
++      local_interface: Ethernet1/1
++    ipv4: 10.1.0.6/30
++    node: fw2
++  ipsec:
++    esp:
++      authentication:
++      - sha256
++      dh_group: group14
++      encryption:
++      - aes-256-cbc
++      lifetime_hours: 1
++    ike:
++      authentication:
++      - sha256
++      dh_group:
++      - group14
++      enable_nat_traversal: true
++      encryption:
++      - aes-256-cbc
++      lifetime_hours: 8
++      version: ikev2
++    preshared_key: netlab-secret
++    selectors:
++    - local: 10.10.0.0/24
++      remote: 10.20.0.0/24
++  linkindex: 2
++  node_count: 2
++  prefix:
++    ipv4: 10.1.0.4/30
++  type: tunnel
++name: input
++nodes:
++  fw1:
++    af:
++      ipv4: true
++    box: vrnetlab/vr-pan
++    clab:
++      env:
++        QEMU_CPU: host
++        RAM: '8192'
++        VCPU: '4'
++      kind: paloalto_panos
++    config:
++    - ipsec
++    device: panos
++    hostname: clab-input-fw1
++    id: 1
++    interfaces:
++    - clab:
++        name: eth1
++      ifindex: 1
++      ifname: ethernet1/1
++      ipv4: 192.0.2.1/30
++      linkindex: 1
++      name: fw1 -> fw2
++      neighbors:
++      - ifname: ethernet1/1
++        ipv4: 192.0.2.2/30
++        node: fw2
++      type: p2p
++    - ifindex: 20000
++      ifname: tunnel.1
++      ipsec:
++        endpoint: 192.0.2.1
++        esp:
++          authentication:
++          - sha256
++          dh_group: group14
++          encryption:
++          - aes-256-cbc
++          lifetime_hours: 1
++        ike:
++          authentication:
++          - sha256
++          dh_group:
++          - group14
++          enable_nat_traversal: true
++          encryption:
++          - aes-256-cbc
++          lifetime_hours: 8
++          version: ikev2
++        local_interface: Ethernet1/1
++        preshared_key: netlab-secret
++        selectors:
++        - local: 10.10.0.0/24
++          remote: 10.20.0.0/24
++      ipv4: 10.1.0.5/30
++      linkindex: 2
++      name: fw1 -> fw2
++      neighbors:
++      - ifname: tunnel.1
++        ipv4: 10.1.0.6/30
++        node: fw2
++      type: tunnel
++      virtual_interface: true
++    ipsec:
++      esp_profiles:
++      - authentication:
++        - sha256
++        dh_group: group14
++        encryption:
++        - aes-256-cbc
++        lifetime_hours: 1
++        name: netlab-fw1-ipsec-profile-e3ae90a3
++      ike_profiles:
++      - authentication:
++        - sha256
++        dh_group:
++        - group14
++        encryption:
++        - aes-256-cbc
++        lifetime_hours: 8
++        name: netlab-fw1-ike-profile-4b7dd9b2
++      transform_sets:
++      - authentication:
++        - sha256
++        encryption:
++        - aes-256-cbc
++        name: netlab-fw1-transform-set-6e97eb1c
++      tunnels:
++      - esp:
++          authentication:
++          - sha256
++          create_profile: true
++          crypto_profile: netlab-fw1-ipsec-profile-e3ae90a3
++          dh_group: group14
++          encryption:
++          - aes-256-cbc
++          lifetime_hours: 1
++          profile_name: netlab-fw1-tunnel.1-ipsec-profile
++          transform_set: netlab-fw1-transform-set-6e97eb1c
++        ifname: tunnel.1
++        ike:
++          authentication:
++          - sha256
++          create_profile: true
++          crypto_profile: netlab-fw1-ike-profile-4b7dd9b2
++          dh_group:
++          - group14
++          enable_nat_traversal: true
++          encryption:
++          - aes-256-cbc
++          keyring_name: netlab-fw1-tunnel.1-ike-keyring
++          lifetime_hours: 8
++          policy_name: netlab-fw1-tunnel.1-ike-policy
++          profile_name: netlab-fw1-tunnel.1-ikev2-profile
++          version: ikev2
++        ike_gateway: netlab-fw1-tunnel.1-ike
++        ipv4: 10.1.0.5/30
++        linkindex: 2
++        local_address: 192.0.2.1
++        local_interface: Ethernet1/1
++        mode: route-based
++        name: netlab-fw1-tunnel.1-tunnel
++        peer: 192.0.2.2
++        peer_type: ip
++        preshared_key: netlab-secret
++        selectors:
++        - local: 10.10.0.0/24
++          name: fw1-tunnel.1-selector-1
++          remote: 10.20.0.0/24
++    mgmt:
++      ifname: mgmt
++      ipv4: 192.168.121.101
++      mac: ca:fe:00:01:00:00
++    name: fw1
++    role: router
++  fw2:
++    af:
++      ipv4: true
++    box: vrnetlab/vr-pan
++    clab:
++      env:
++        QEMU_CPU: host
++        RAM: '8192'
++        VCPU: '4'
++      kind: paloalto_panos
++    config:
++    - ipsec
++    device: panos
++    hostname: clab-input-fw2
++    id: 2
++    interfaces:
++    - clab:
++        name: eth1
++      ifindex: 1
++      ifname: ethernet1/1
++      ipv4: 192.0.2.2/30
++      linkindex: 1
++      name: fw2 -> fw1
++      neighbors:
++      - ifname: ethernet1/1
++        ipv4: 192.0.2.1/30
++        node: fw1
++      type: p2p
++    - ifindex: 20000
++      ifname: tunnel.1
++      ipsec:
++        endpoint: 192.0.2.2
++        esp:
++          authentication:
++          - sha256
++          dh_group: group14
++          encryption:
++          - aes-256-cbc
++          lifetime_hours: 1
++        ike:
++          authentication:
++          - sha256
++          dh_group:
++          - group14
++          enable_nat_traversal: true
++          encryption:
++          - aes-256-cbc
++          lifetime_hours: 8
++          version: ikev2
++        local_interface: Ethernet1/1
++        preshared_key: netlab-secret
++        selectors:
++        - local: 10.10.0.0/24
++          remote: 10.20.0.0/24
++      ipv4: 10.1.0.6/30
++      linkindex: 2
++      name: fw2 -> fw1
++      neighbors:
++      - ifname: tunnel.1
++        ipv4: 10.1.0.5/30
++        node: fw1
++      type: tunnel
++      virtual_interface: true
++    ipsec:
++      esp_profiles:
++      - authentication:
++        - sha256
++        dh_group: group14
++        encryption:
++        - aes-256-cbc
++        lifetime_hours: 1
++        name: netlab-fw2-ipsec-profile-e3ae90a3
++      ike_profiles:
++      - authentication:
++        - sha256
++        dh_group:
++        - group14
++        encryption:
++        - aes-256-cbc
++        lifetime_hours: 8
++        name: netlab-fw2-ike-profile-4b7dd9b2
++      transform_sets:
++      - authentication:
++        - sha256
++        encryption:
++        - aes-256-cbc
++        name: netlab-fw2-transform-set-67b44679
++      tunnels:
++      - esp:
++          authentication:
++          - sha256
++          create_profile: true
++          crypto_profile: netlab-fw2-ipsec-profile-e3ae90a3
++          dh_group: group14
++          encryption:
++          - aes-256-cbc
++          lifetime_hours: 1
++          profile_name: netlab-fw2-tunnel.1-ipsec-profile
++          transform_set: netlab-fw2-transform-set-67b44679
++        ifname: tunnel.1
++        ike:
++          authentication:
++          - sha256
++          create_profile: true
++          crypto_profile: netlab-fw2-ike-profile-4b7dd9b2
++          dh_group:
++          - group14
++          enable_nat_traversal: true
++          encryption:
++          - aes-256-cbc
++          keyring_name: netlab-fw2-tunnel.1-ike-keyring
++          lifetime_hours: 8
++          policy_name: netlab-fw2-tunnel.1-ike-policy
++          profile_name: netlab-fw2-tunnel.1-ikev2-profile
++          version: ikev2
++        ike_gateway: netlab-fw2-tunnel.1-ike
++        ipv4: 10.1.0.6/30
++        linkindex: 2
++        local_address: 192.0.2.2
++        local_interface: Ethernet1/1
++        mode: route-based
++        name: netlab-fw2-tunnel.1-tunnel
++        peer: 192.0.2.1
++        peer_type: ip
++        preshared_key: netlab-secret
++        selectors:
++        - local: 10.10.0.0/24
++          name: fw2-tunnel.1-selector-1
++          remote: 10.20.0.0/24
++    mgmt:
++      ifname: mgmt
++      ipv4: 192.168.121.102
++      mac: ca:fe:00:02:00:00
++    name: fw2
++    role: router
++plugin:
++- ipsec
++provider: clab
+diff --git a/tests/topology/expected/nat-panos.yml b/tests/topology/expected/nat-panos.yml
+new file mode 100644
+index 0000000..e477598
+--- /dev/null
++++ b/tests/topology/expected/nat-panos.yml
+@@ -0,0 +1,123 @@
++groups:
++  netlab_no_collect:
++    members:
++    - fw
++  netlab_no_reload:
++    members:
++    - fw
++input:
++- topology/input/nat-panos.yml
++- package:topology-defaults.yml
++links:
++- _linkname: links[1]
++  bridge: input_1
++  interfaces:
++  - ifindex: 1
++    ifname: ethernet1/1
++    ipv4: 172.16.0.1/24
++    nat:
++      role: inside
++    node: fw
++  linkindex: 1
++  node_count: 1
++  prefix:
++    ipv4: 172.16.0.0/24
++  role: stub
++  type: stub
++- _linkname: links[2]
++  bridge: input_2
++  interfaces:
++  - ifindex: 2
++    ifname: ethernet1/2
++    ipv4: 172.16.1.1/24
++    nat:
++      role: outside
++    node: fw
++  linkindex: 2
++  node_count: 1
++  prefix:
++    ipv4: 172.16.1.0/24
++  role: stub
++  type: stub
++name: input
++nodes:
++  fw:
++    af:
++      ipv4: true
++    box: vrnetlab/vr-pan
++    clab:
++      env:
++        QEMU_CPU: host
++        RAM: '8192'
++        VCPU: '4'
++      kind: paloalto_panos
++    config:
++    - nat
++    device: panos
++    hostname: clab-input-fw
++    id: 1
++    interfaces:
++    - bridge: input_1
++      clab:
++        name: eth1
++      ifindex: 1
++      ifname: ethernet1/1
++      ipv4: 172.16.0.1/24
++      linkindex: 1
++      name: fw -> stub
++      nat:
++        role: inside
++      neighbors: []
++      role: stub
++      type: stub
++    - bridge: input_2
++      clab:
++        name: eth2
++      ifindex: 2
++      ifname: ethernet1/2
++      ipv4: 172.16.1.1/24
++      linkindex: 2
++      name: fw -> stub
++      nat:
++        role: outside
++      neighbors: []
++      role: stub
++      type: stub
++    mgmt:
++      ifname: mgmt
++      ipv4: 192.168.121.101
++      mac: ca:fe:00:01:00:00
++    name: fw
++    nat:
++      _roles:
++        inside:
++        - ifname: ethernet1/1
++          name: fw -> stub
++        outside:
++        - ifname: ethernet1/2
++          name: fw -> stub
++      _zones: {}
++      rules:
++      - enabled: true
++        inside:
++        - trust
++        name: trust_to_untrust
++        outside:
++        - untrust
++        source:
++        - 10.0.0.0/24
++        translated_source: interface
++        type: source
++      - destination:
++        - 203.0.113.100/32
++        enabled: true
++        name: web_vip
++        service:
++        - https
++        translated_destination: 10.0.0.100
++        type: destination
++    role: router
++plugin:
++- firewall.policy
++- nat
++provider: clab
+diff --git a/tests/topology/expected/panos-firewall-zonebased.yml b/tests/topology/expected/panos-firewall-zonebased.yml
+new file mode 100644
+index 0000000..ad3bccd
+--- /dev/null
++++ b/tests/topology/expected/panos-firewall-zonebased.yml
+@@ -0,0 +1,288 @@
++groups:
++  netlab_no_collect:
++    members:
++    - fw
++    - h1
++    - h2
++  netlab_no_reload:
++    members:
++    - fw
++    - h1
++    - h2
++input:
++- topology/input/panos-firewall-zonebased.yml
++- package:topology-defaults.yml
++links:
++- _linkname: links[1]
++  bridge: input_1
++  interfaces:
++  - firewall:
++      zone: trusted
++    ifindex: 1
++    ifname: ethernet1/1
++    ipv4: 172.16.0.1/24
++    node: fw
++  - ifindex: 1
++    ifname: eth1
++    ipv4: 172.16.0.2/24
++    node: h1
++  linkindex: 1
++  node_count: 2
++  prefix:
++    ipv4: 172.16.0.0/24
++  role: stub
++  type: lan
++- _linkname: links[2]
++  bridge: input_2
++  interfaces:
++  - firewall:
++      zone: untrusted
++    ifindex: 2
++    ifname: ethernet1/2
++    ipv4: 172.16.1.1/24
++    node: fw
++  - ifindex: 1
++    ifname: eth1
++    ipv4: 172.16.1.3/24
++    node: h2
++  linkindex: 2
++  node_count: 2
++  prefix:
++    ipv4: 172.16.1.0/24
++  role: stub
++  type: lan
++module:
++- routing
++name: input
++nodes:
++  fw:
++    af:
++      ipv4: true
++    box: vrnetlab/vr-pan
++    clab:
++      env:
++        QEMU_CPU: host
++        RAM: '8192'
++        VCPU: '4'
++      kind: paloalto_panos
++    config:
++    - firewall.zonebased
++    device: panos
++    firewall:
++      zonebased:
++        _zones:
++          trusted: {}
++          untrusted: {}
++        default_rules:
++        - action: permit
++          from_zone: trusted
++          to_zone: untrusted
++        rules:
++        - action: permit
++          application:
++          - web-browsing
++          destination:
++          - 198.51.100.10/32
++          from_zone: trusted
++          name: web-only
++          service:
++          - application-default
++          source:
++          - 10.0.0.0/24
++          to_zone: untrusted
++    hostname: clab-input-fw
++    id: 1
++    interfaces:
++    - bridge: input_1
++      clab:
++        name: eth1
++      firewall:
++        zone: trusted
++      ifindex: 1
++      ifname: ethernet1/1
++      ipv4: 172.16.0.1/24
++      linkindex: 1
++      name: fw -> h1
++      neighbors:
++      - ifname: eth1
++        ipv4: 172.16.0.2/24
++        node: h1
++      role: stub
++      type: lan
++    - bridge: input_2
++      clab:
++        name: eth2
++      firewall:
++        zone: untrusted
++      ifindex: 2
++      ifname: ethernet1/2
++      ipv4: 172.16.1.1/24
++      linkindex: 2
++      name: fw -> h2
++      neighbors:
++      - ifname: eth1
++        ipv4: 172.16.1.3/24
++        node: h2
++      role: stub
++      type: lan
++    mgmt:
++      ifname: mgmt
++      ipv4: 192.168.121.101
++      mac: ca:fe:00:01:00:00
++    name: fw
++    role: router
++  h1:
++    _node_config:
++      initial: :ns
++      routing: :ns
++    af:
++      ipv4: true
++    box: python:3.13-alpine
++    clab:
++      binds:
++      - mode: ro
++        source: node_files/-shared-hosts
++        target: /etc/hosts
++      config_templates:
++      - mode: ns
++        source: initial
++        target: ''
++      - mode: ns
++        source: routing
++        target: ''
++      - mode: shared
++        source: hosts
++        target: /etc/hosts
++      kind: linux
++    device: linux
++    hostname: clab-input-h1
++    id: 2
++    interfaces:
++    - bridge: input_1
++      gateway:
++        ipv4: 172.16.0.1/24
++      ifindex: 1
++      ifname: eth1
++      ipv4: 172.16.0.2/24
++      linkindex: 1
++      mtu: 1500
++      name: h1 -> fw
++      neighbors:
++      - ifname: ethernet1/1
++        ipv4: 172.16.0.1/24
++        node: fw
++      role: stub
++      type: lan
++    mgmt:
++      ifname: eth0
++      ipv4: 192.168.121.102
++      mac: ca:fe:00:02:00:00
++    module:
++    - routing
++    mtu: 1500
++    name: h1
++    netlab_ansible_skip_module:
++    - initial
++    - routing
++    role: host
++    routing:
++      static:
++      - ipv4: 172.16.0.0/16
++        nexthop:
++          idx: 0
++          intf: eth1
++          ipv4: 172.16.0.1
++      - ipv4: 10.0.0.0/24
++        nexthop:
++          idx: 0
++          intf: eth1
++          ipv4: 172.16.0.1
++      - ipv4: 10.1.0.0/16
++        nexthop:
++          idx: 0
++          intf: eth1
++          ipv4: 172.16.0.1
++      - ipv4: 10.2.0.0/24
++        nexthop:
++          idx: 0
++          intf: eth1
++          ipv4: 172.16.0.1
++  h2:
++    _node_config:
++      initial: :ns
++      routing: :ns
++    af:
++      ipv4: true
++    box: python:3.13-alpine
++    clab:
++      binds:
++      - mode: ro
++        source: node_files/-shared-hosts
++        target: /etc/hosts
++      config_templates:
++      - mode: ns
++        source: initial
++        target: ''
++      - mode: ns
++        source: routing
++        target: ''
++      - mode: shared
++        source: hosts
++        target: /etc/hosts
++      kind: linux
++    device: linux
++    hostname: clab-input-h2
++    id: 3
++    interfaces:
++    - bridge: input_2
++      gateway:
++        ipv4: 172.16.1.1/24
++      ifindex: 1
++      ifname: eth1
++      ipv4: 172.16.1.3/24
++      linkindex: 2
++      mtu: 1500
++      name: h2 -> fw
++      neighbors:
++      - ifname: ethernet1/2
++        ipv4: 172.16.1.1/24
++        node: fw
++      role: stub
++      type: lan
++    mgmt:
++      ifname: eth0
++      ipv4: 192.168.121.103
++      mac: ca:fe:00:03:00:00
++    module:
++    - routing
++    mtu: 1500
++    name: h2
++    netlab_ansible_skip_module:
++    - initial
++    - routing
++    role: host
++    routing:
++      static:
++      - ipv4: 172.16.0.0/16
++        nexthop:
++          idx: 0
++          intf: eth1
++          ipv4: 172.16.1.1
++      - ipv4: 10.0.0.0/24
++        nexthop:
++          idx: 0
++          intf: eth1
++          ipv4: 172.16.1.1
++      - ipv4: 10.1.0.0/16
++        nexthop:
++          idx: 0
++          intf: eth1
++          ipv4: 172.16.1.1
++      - ipv4: 10.2.0.0/24
++        nexthop:
++          idx: 0
++          intf: eth1
++          ipv4: 172.16.1.1
++plugin:
++- firewall.zonebased
++provider: clab
+diff --git a/tests/topology/expected/panos-routing.yml b/tests/topology/expected/panos-routing.yml
+new file mode 100644
+index 0000000..d3cb1ce
+--- /dev/null
++++ b/tests/topology/expected/panos-routing.yml
+@@ -0,0 +1,184 @@
++bgp:
++  advertise_loopback: true
++  community:
++    ebgp:
++    - standard
++    ibgp:
++    - standard
++    - extended
++  next_hop_self: true
++groups:
++  as65001:
++    members:
++    - fw1
++  as65002:
++    members:
++    - fw2
++  netlab_no_collect:
++    members:
++    - fw1
++    - fw2
++  netlab_no_reload:
++    members:
++    - fw1
++    - fw2
++input:
++- topology/input/panos-routing.yml
++- package:topology-defaults.yml
++links:
++- _linkname: links[1]
++  interfaces:
++  - ifindex: 1
++    ifname: ethernet1/1
++    ipv4: 10.1.0.1/30
++    node: fw1
++  - ifindex: 1
++    ifname: ethernet1/1
++    ipv4: 10.1.0.2/30
++    node: fw2
++  linkindex: 1
++  node_count: 2
++  prefix:
++    ipv4: 10.1.0.0/30
++  role: external
++  type: p2p
++module:
++- routing
++- bgp
++name: input
++nodes:
++  fw1:
++    af:
++      ipv4: true
++    bgp:
++      advertise_loopback: true
++      as: 65001
++      community:
++        ebgp:
++        - standard
++        ibgp:
++        - standard
++        - extended
++        localas_ibgp:
++        - standard
++        - extended
++      ipv4: true
++      neighbors:
++      - activate:
++          ipv4: true
++        as: 65002
++        ifindex: 1
++        ipv4: 10.1.0.2
++        name: fw2
++        type: ebgp
++      next_hop_self: true
++      router_id: 10.0.0.1
++    box: vrnetlab/vr-pan
++    clab:
++      env:
++        QEMU_CPU: host
++        RAM: '8192'
++        VCPU: '4'
++      kind: paloalto_panos
++    device: panos
++    hostname: clab-input-fw1
++    id: 1
++    interfaces:
++    - clab:
++        name: eth1
++      ifindex: 1
++      ifname: ethernet1/1
++      ipv4: 10.1.0.1/30
++      linkindex: 1
++      name: fw1 -> fw2
++      neighbors:
++      - ifname: ethernet1/1
++        ipv4: 10.1.0.2/30
++        node: fw2
++      role: external
++      type: p2p
++    mgmt:
++      ifname: mgmt
++      ipv4: 192.168.121.101
++      mac: ca:fe:00:01:00:00
++    module:
++    - routing
++    - bgp
++    name: fw1
++    role: router
++    router_id: 10.0.0.1
++    routing:
++      static:
++      - ipv4: 198.51.100.0/24
++        nexthop:
++          discard: true
++          idx: 0
++      - ipv4: 192.0.2.0/24
++        nexthop:
++          idx: 0
++          intf: ethernet1/1
++          ipv4: 10.1.0.2
++  fw2:
++    af:
++      ipv4: true
++    bgp:
++      advertise_loopback: true
++      as: 65002
++      community:
++        ebgp:
++        - standard
++        ibgp:
++        - standard
++        - extended
++        localas_ibgp:
++        - standard
++        - extended
++      ipv4: true
++      neighbors:
++      - activate:
++          ipv4: true
++        as: 65001
++        ifindex: 1
++        ipv4: 10.1.0.1
++        name: fw1
++        type: ebgp
++      next_hop_self: true
++      router_id: 10.0.0.2
++    box: vrnetlab/vr-pan
++    clab:
++      env:
++        QEMU_CPU: host
++        RAM: '8192'
++        VCPU: '4'
++      kind: paloalto_panos
++    device: panos
++    hostname: clab-input-fw2
++    id: 2
++    interfaces:
++    - clab:
++        name: eth1
++      ifindex: 1
++      ifname: ethernet1/1
++      ipv4: 10.1.0.2/30
++      linkindex: 1
++      name: fw2 -> fw1
++      neighbors:
++      - ifname: ethernet1/1
++        ipv4: 10.1.0.1/30
++        node: fw1
++      role: external
++      type: p2p
++    mgmt:
++      ifname: mgmt
++      ipv4: 192.168.121.102
++      mac: ca:fe:00:02:00:00
++    module:
++    - bgp
++    name: fw2
++    role: router
++    router_id: 10.0.0.2
++prefix:
++  any:
++    ipv4: 0.0.0.0/0
++    ipv6: ::/0
++provider: clab
+diff --git a/tests/topology/input/ipsec-panos.yml b/tests/topology/input/ipsec-panos.yml
+new file mode 100644
+index 0000000..97a81a5
+--- /dev/null
++++ b/tests/topology/input/ipsec-panos.yml
+@@ -0,0 +1,41 @@
++---
++plugin: [ ipsec ]
++
++provider: clab
++defaults.device: panos
++
++nodes: [ fw1, fw2 ]
++
++links:
++- fw1:
++    ipv4: 192.0.2.1/30
++  fw2:
++    ipv4: 192.0.2.2/30
++- fw1:
++    ifname: tunnel.1
++    ipsec:
++      local_interface: Ethernet1/1
++      endpoint: 192.0.2.1
++  fw2:
++    ifname: tunnel.1
++    ipsec:
++      local_interface: Ethernet1/1
++      endpoint: 192.0.2.2
++  type: tunnel
++  ipsec:
++    selectors:
++    - local: 10.10.0.0/24
++      remote: 10.20.0.0/24
++    preshared_key: netlab-secret
++    ike:
++      version: ikev2
++      enable_nat_traversal: true
++      authentication: [ sha256 ]
++      encryption: [ aes-256-cbc ]
++      dh_group: [ group14 ]
++      lifetime_hours: 8
++    esp:
++      authentication: [ sha256 ]
++      encryption: [ aes-256-cbc ]
++      dh_group: group14
++      lifetime_hours: 1
+diff --git a/tests/topology/input/nat-panos.yml b/tests/topology/input/nat-panos.yml
+new file mode 100644
+index 0000000..210444a
+--- /dev/null
++++ b/tests/topology/input/nat-panos.yml
+@@ -0,0 +1,27 @@
++---
++plugin: [ firewall.policy, nat ]
++
++provider: clab
++
++nodes:
++  fw:
++    device: panos
++    nat:
++      rules:
++      - name: trust_to_untrust
++        type: source
++        inside: trust
++        outside: untrust
++        source: 10.0.0.0/24
++        translated_source: interface
++      - name: web_vip
++        type: destination
++        destination: 203.0.113.100/32
++        service: https
++        translated_destination: 10.0.0.100
++
++links:
++- fw:
++    nat.role: inside
++- fw:
++    nat.role: outside
+diff --git a/tests/topology/input/panos-firewall-zonebased.yml b/tests/topology/input/panos-firewall-zonebased.yml
+new file mode 100644
+index 0000000..fdcc68e
+--- /dev/null
++++ b/tests/topology/input/panos-firewall-zonebased.yml
+@@ -0,0 +1,35 @@
++---
++plugin: [ firewall.zonebased ]
++
++nodes:
++  fw:
++    device: panos
++    provider: clab
++    firewall.zonebased:
++      default_rules:
++      - from_zone: trusted
++        to_zone: untrusted
++        action: permit
++      rules:
++      - name: web-only
++        from_zone: trusted
++        to_zone: untrusted
++        action: permit
++        source: [ 10.0.0.0/24 ]
++        destination: [ 198.51.100.10/32 ]
++        application: [ web-browsing ]
++        service: [ application-default ]
++  h1:
++    device: linux
++    provider: clab
++  h2:
++    device: linux
++    provider: clab
++
++links:
++- fw:
++    firewall.zone: trusted
++  h1:
++- fw:
++    firewall.zone: untrusted
++  h2:
+diff --git a/tests/topology/input/panos-routing.yml b/tests/topology/input/panos-routing.yml
+new file mode 100644
+index 0000000..3d1d64f
+--- /dev/null
++++ b/tests/topology/input/panos-routing.yml
+@@ -0,0 +1,20 @@
++---
++provider: clab
++defaults.device: panos
++
++module: [ bgp ]
++
++nodes:
++  fw1:
++    bgp.as: 65001
++    module: [ bgp, routing ]
++    routing.static:
++    - ipv4: 192.0.2.0/24
++      nexthop.ipv4: 10.1.0.2
++    - ipv4: 198.51.100.0/24
++      nexthop.discard: true
++  fw2:
++    bgp.as: 65002
++
++links:
++- fw1-fw2
+-- 
+2.56.0
+

@@ -1,0 +1,310 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 07:15:30 -0500
+Subject: [PATCH 43/43] meshnet: ask a peer daemon to repair its end of a
+ cross-node link (M1)
+
+---
+diff --git a/third_party/meshnet/daemon/meshnet/controller.go b/third_party/meshnet/daemon/meshnet/controller.go
+index c06e588..8ae29dd 100644
+--- a/third_party/meshnet/daemon/meshnet/controller.go
++++ b/third_party/meshnet/daemon/meshnet/controller.go
+@@ -271,6 +271,7 @@ func (m *Meshnet) reconcilePodLinksInternal(ctx context.Context, topo *unstructu
+ 
+ 	sameNodeLinks := make([]wireutil.PodLinkConfig, 0, len(links))
+ 	var vxlanJobs []func() error
++	var peerEnds []peerEnd
+ 	for _, link := range links {
+ 		peerKey := link.PeerKubeNs + "/" + link.PeerPodName
+ 		peerTopo, ok := peerCache[peerKey]
+@@ -391,6 +392,7 @@ func (m *Meshnet) reconcilePodLinksInternal(ctx context.Context, topo *unstructu
+ 				}
+ 				mnetdLogger.Infof("ReconcilePodLinks: configuring remote VXLAN link for pod %s interface %s (peer %s on VTEP %s, VNI %d)",
+ 					topo.GetName(), link.LocalIntf, link.PeerPodName, peerSrcIP, remotePod.Vni)
++				peerEnds = append(peerEnds, peerEnd{localPod: topo.GetName(), linkUID: int64(link.LinkUID), peerNs: link.PeerKubeNs, peerPod: link.PeerPodName, peerIP: peerSrcIP, peerNet: peerNetNS})
+ 				podName := topo.GetName()
+ 				vxlanJobs = append(vxlanJobs, func() error {
+ 					if err := vxlan.CreateOrUpdate(remotePod); err != nil {
+@@ -408,6 +410,9 @@ func (m *Meshnet) reconcilePodLinksInternal(ctx context.Context, topo *unstructu
+ 	if err := runLinkJobs(vxlanJobs, linkConcurrency); err != nil {
+ 		return err
+ 	}
++	// M1: the peer may have come up before our end existed, and its daemon
++	// may not repair its own end for minutes. Ask it once per peer epoch (peer_repair.go).
++	m.nudgePeerEnds(ctx, peerEnds)
+ 
+ 	// 2. Process gRPC peer batches in chunks (default 50 items per RPC) to allow pipelined processing
+ 	batchSize := wireutil.GetEnvInt("WIRE_BATCH_SIZE", 50)
+diff --git a/third_party/meshnet/daemon/meshnet/meshnet.go b/third_party/meshnet/daemon/meshnet/meshnet.go
+index ade33c5..5fa3cdd 100644
+--- a/third_party/meshnet/daemon/meshnet/meshnet.go
++++ b/third_party/meshnet/daemon/meshnet/meshnet.go
+@@ -9,6 +9,7 @@ import (
+ 	"net"
+ 	"os"
+ 	"path/filepath"
++	"sync"
+ 	"time"
+ 
+ 	"github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/logging"
+@@ -53,6 +54,9 @@ type Meshnet struct {
+ 	interNodeLinkType string
+ 	topoCache         *TopologyCache
+ 	reconcileQueue    *ReconcileQueue
++	// peerRepairDone records the peer ends already asked to rebuild (peer_repair.go).
++	peerRepairMu   sync.Mutex
++	peerRepairDone map[string]struct{}
+ }
+ 
+ var mnetdLogger *log.Entry = nil
+diff --git a/third_party/meshnet/daemon/meshnet/peer_repair.go b/third_party/meshnet/daemon/meshnet/peer_repair.go
+new file mode 100644
+index 0000000..d1b6238
+--- /dev/null
++++ b/third_party/meshnet/daemon/meshnet/peer_repair.go
+@@ -0,0 +1,123 @@
++package meshnet
++
++import (
++	"context"
++	"fmt"
++	"time"
++
++	log "github.com/sirupsen/logrus"
++	"google.golang.org/grpc"
++	"google.golang.org/grpc/credentials/insecure"
++
++	mpb "github.com/openconfig/kne/third_party/meshnet/daemon/proto/meshnet/v1beta1"
++	"github.com/openconfig/kne/third_party/meshnet/utils/wireutil"
++)
++
++// Skip-record repair (M1, measured 393 s on the mixed kind run).
++//
++// The old plugin does no wiring for a peer that is not alive yet; it records a
++// skip and expects the peer to finish the link. When the new side comes up
++// second, its daemon builds its own end, but the old peer's end (a veth in
++// the old pod's netns) is built only by that node's reconciler, which runs
++// every 5 minutes with two confirmations.
++//
++// The old daemon serves RepairLinkNow (patches/meshnet-cni 0024), which
++// rebuilds the named pod's declared wires at once, without corroboration. The
++// old repair path calls vxlan.CreateOrUpdate, which is a no-op when the wire
++// already matches (VNI, VTEP, MTU, bridge): a healthy wire is not rebuilt.
++// So this side asks the peer's daemon for RepairLinkNow once per link and
++// peer netns, after its own VXLAN end is built, and retries for a bounded
++// time. A peer that does not serve the RPC (Unimplemented) only logs.
++
++// peerRepairTimeout bounds one RepairLinkNow call.
++const peerRepairTimeout = 5 * time.Second
++
++// peerRepairDelays is the wait before each attempt. Worst case: the waits sum to
++// 35 s and four calls of 5 s each add 20 s, so one link gives up within 55 s.
++var peerRepairDelays = []time.Duration{0, 5 * time.Second, 10 * time.Second, 20 * time.Second}
++
++// peerEnd is one cross-node link whose peer end this daemon may need repaired.
++type peerEnd struct {
++	localPod string
++	linkUID  int64
++	peerNs   string
++	peerPod  string
++	peerIP   string
++	peerNet  string // the peer's netns: a new netns is a new epoch, so a restarted peer is asked again
++}
++
++// peerRepairFunc asks the daemon at peerIP to rebuild the wires of pod.
++type peerRepairFunc func(ctx context.Context, peerIP string, pod *mpb.PodQuery) error
++
++// peerRepairCall is the network call. It is a variable so tests can replace it.
++var peerRepairCall peerRepairFunc = dialRepairLinkNow
++
++// dialRepairLinkNow is the production peerRepairCall.
++func dialRepairLinkNow(ctx context.Context, peerIP string, pod *mpb.PodQuery) error {
++	url := fmt.Sprintf("%s:%d", peerIP, wireutil.GRPCDefaultPort)
++	conn, err := grpc.Dial(url, grpc.WithTransportCredentials(insecure.NewCredentials()))
++	if err != nil {
++		return err
++	}
++	defer conn.Close()
++	cctx, cancel := context.WithTimeout(ctx, peerRepairTimeout)
++	defer cancel()
++	resp, err := mpb.NewLocalClient(conn).RepairLinkNow(cctx, pod)
++	if err != nil {
++		return err
++	}
++	if resp.GetFailed() > 0 {
++		return fmt.Errorf("peer %s rebuilt %d and failed %d wire(s) for %s/%s", peerIP, resp.GetRepaired(), resp.GetFailed(), pod.GetKubeNs(), pod.GetName())
++	}
++	return nil
++}
++
++// claimPeerEnd reports whether key is new, and records it. A key is claimed for
++// the daemon's lifetime, so a link is asked once per peer epoch, not on every pass.
++func (m *Meshnet) claimPeerEnd(key string) bool {
++	m.peerRepairMu.Lock()
++	defer m.peerRepairMu.Unlock()
++	if m.peerRepairDone == nil {
++		m.peerRepairDone = make(map[string]struct{})
++	}
++	if _, ok := m.peerRepairDone[key]; ok {
++		return false
++	}
++	m.peerRepairDone[key] = struct{}{}
++	return true
++}
++
++// nudgePeerEnds starts one bounded repair per new peer end. It does not block
++// the reconcile pass.
++func (m *Meshnet) nudgePeerEnds(ctx context.Context, ends []peerEnd) {
++	for _, e := range ends {
++		key := fmt.Sprintf("%s|%d|%s/%s|%s", e.localPod, e.linkUID, e.peerNs, e.peerPod, e.peerNet)
++		if !m.claimPeerEnd(key) {
++			continue
++		}
++		go m.repairPeerEnd(context.WithoutCancel(ctx), e, peerRepairCall, peerRepairDelays)
++	}
++}
++
++// repairPeerEnd asks the peer's daemon to rebuild its end, retrying with the
++// given delays. It returns true when a call succeeds. A failure is logged and is not fatal.
++func (m *Meshnet) repairPeerEnd(ctx context.Context, e peerEnd, call peerRepairFunc, delays []time.Duration) bool {
++	pod := &mpb.PodQuery{Name: e.peerPod, KubeNs: e.peerNs}
++	for i, d := range delays {
++		if d > 0 {
++			select {
++			case <-ctx.Done():
++				return false
++			case <-time.After(d):
++			}
++		}
++		err := call(ctx, e.peerIP, pod)
++		if err == nil {
++			log.Infof("peer repair: asked %s (%s) to rebuild its end of link %d (attempt %d): ok", e.peerPod, e.peerIP, e.linkUID, i+1)
++			return true
++		}
++		log.Warnf("peer repair: %s (%s) link %d attempt %d: %v", e.peerPod, e.peerIP, e.linkUID, i+1, err)
++	}
++	log.Errorf("peer repair: gave up on %s (%s) link %d after %d attempts", e.peerPod, e.peerIP, e.linkUID, len(delays))
++	return false
++}
+diff --git a/third_party/meshnet/daemon/meshnet/peer_repair_test.go b/third_party/meshnet/daemon/meshnet/peer_repair_test.go
+new file mode 100644
+index 0000000..5dcfaf1
+--- /dev/null
++++ b/third_party/meshnet/daemon/meshnet/peer_repair_test.go
+@@ -0,0 +1,116 @@
++package meshnet
++
++import (
++	"context"
++	"errors"
++	"testing"
++	"time"
++
++	mpb "github.com/openconfig/kne/third_party/meshnet/daemon/proto/meshnet/v1beta1"
++)
++
++// fakePeer models the old daemon's RepairLinkNow. It rebuilds the peer end only
++// when that end is absent (vxlan.CreateOrUpdate is a no-op on a matching wire),
++// and it can refuse the first failFirst calls, as an unready daemon would.
++type fakePeer struct {
++	present   bool
++	failFirst int
++	calls     int
++	rebuilds  int
++}
++
++func (f *fakePeer) call(_ context.Context, _ string, _ *mpb.PodQuery) error {
++	f.calls++
++	if f.calls <= f.failFirst {
++		return errors.New("transport: connection refused")
++	}
++	if !f.present {
++		f.rebuilds++
++		f.present = true
++	}
++	return nil
++}
++
++func testPeerEnd() peerEnd {
++	return peerEnd{localPod: "a", linkUID: 7, peerNs: "lab", peerPod: "b", peerIP: "10.0.0.2", peerNet: "/var/run/netns/x"}
++}
++
++// The requirement: a link whose peer end is absent is repaired within the
++// bound, and a retry after a refused call still gets there.
++func TestRepairPeerEndRepairsAbsentPeerEnd(t *testing.T) {
++	peer := &fakePeer{present: false, failFirst: 2}
++	m := &Meshnet{}
++	delays := []time.Duration{0, time.Millisecond, time.Millisecond, time.Millisecond}
++
++	if !m.repairPeerEnd(context.Background(), testPeerEnd(), peer.call, delays) {
++		t.Fatalf("repairPeerEnd gave up; calls=%d", peer.calls)
++	}
++	if !peer.present {
++		t.Fatalf("peer end still absent after repair")
++	}
++	if peer.rebuilds != 1 {
++		t.Errorf("rebuilds = %d, want 1", peer.rebuilds)
++	}
++	if peer.calls != 3 {
++		t.Errorf("calls = %d, want 3 (two refused, one served)", peer.calls)
++	}
++}
++
++// A healthy link must not be rebuilt. The call may still happen once; it must be a no-op.
++func TestRepairPeerEndHealthyLinkNotRebuilt(t *testing.T) {
++	peer := &fakePeer{present: true}
++	m := &Meshnet{}
++
++	if !m.repairPeerEnd(context.Background(), testPeerEnd(), peer.call, []time.Duration{0}) {
++		t.Fatalf("repairPeerEnd on a healthy peer returned false")
++	}
++	if peer.rebuilds != 0 {
++		t.Errorf("rebuilds on a healthy link = %d, want 0", peer.rebuilds)
++	}
++}
++
++// An old daemon without the RPC (Unimplemented) must not wedge or panic. It
++// gives up after the bounded attempts and returns false.
++func TestRepairPeerEndGivesUpBounded(t *testing.T) {
++	peer := &fakePeer{present: false, failFirst: 1 << 30}
++	m := &Meshnet{}
++	delays := []time.Duration{0, time.Millisecond, time.Millisecond}
++
++	if m.repairPeerEnd(context.Background(), testPeerEnd(), peer.call, delays) {
++		t.Fatalf("repairPeerEnd reported success against a refusing peer")
++	}
++	if peer.calls != len(delays) {
++		t.Errorf("calls = %d, want %d (one per delay)", peer.calls, len(delays))
++	}
++}
++
++// The production schedule must finish one link within 60 s: the waits plus
++// one timed-out call per attempt.
++func TestPeerRepairScheduleWithinBound(t *testing.T) {
++	var waits time.Duration
++	for _, d := range peerRepairDelays {
++		waits += d
++	}
++	worst := waits + time.Duration(len(peerRepairDelays))*peerRepairTimeout
++	if worst >= 60*time.Second {
++		t.Fatalf("worst case %v, want < 60s", worst)
++	}
++	if peerRepairTimeout > 5*time.Second {
++		t.Errorf("per-call timeout %v, want <= 5s", peerRepairTimeout)
++	}
++}
++
++// A link is asked once per peer epoch. A restarted peer has a new netns and is
++// asked again.
++func TestClaimPeerEndOncePerEpoch(t *testing.T) {
++	m := &Meshnet{}
++	if !m.claimPeerEnd("k1") {
++		t.Fatalf("first claim refused")
++	}
++	if m.claimPeerEnd("k1") {
++		t.Errorf("second claim of the same epoch allowed")
++	}
++	if !m.claimPeerEnd("k2") {
++		t.Errorf("claim of a new epoch refused")
++	}
++}

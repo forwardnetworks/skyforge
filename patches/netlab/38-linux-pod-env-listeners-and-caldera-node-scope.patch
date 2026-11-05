@@ -1,0 +1,203 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 12:00:00 +0000
+Subject: [PATCH] kne provider: linux pod env from services.listen; Caldera
+ agent env limited to the selected nodes
+
+SKYFORGE-SPECIFIC: platform behaviour; not for upstream.
+
+---
+diff --git a/netsim/providers/kne.py b/netsim/providers/kne.py
+index 482e1de..ccc05b4 100644
+--- a/netsim/providers/kne.py
++++ b/netsim/providers/kne.py
+@@ -2523,26 +2523,61 @@ def adjust_iol_node_data(kne_data: Box, node: Box) -> None:
+   kne_data.env.IOL_RUNNER_LOCAL_APP = str(node_id)
+ 
+ CALDERA_AGENT_ENV_KEYS = ('SKYFORGE_CALDERA_AGENT_ENABLED','SKYFORGE_CALDERA_SERVER')
++LINUX_SERVICES_ENV_KEYS = ('SKYFORGE_SERVICES','SKYFORGE_SERVICES_NAME','SKYFORGE_IPERF3_SERVER_PORT')
+ 
+-def adjust_linux_node_data(kne_data: Box, node: Box) -> None:
++def caldera_agent_node_selected(node: Box) -> bool:
++  '''
++  Is this node one the platform asked to run the Caldera agent?
++
++  NETLAB_KNE_CALDERA_AGENT_NODES is a comma-separated list of node names the Skyforge server puts on the
++  runtime Job together with NETLAB_KNE_CALDERA_AGENT_SERVER. ABSENT (or empty) means every linux node of the
++  deployment, which is the default scope of the deployment setting; PRESENT means exactly those nodes.
++  '''
++  selected = [ n.strip() for n in str(os.environ.get('NETLAB_KNE_CALDERA_AGENT_NODES','') or '').split(',') if n.strip() ]
++  return (not selected) or node.name in selected
++
++def linux_services_env(node: Box) -> dict:
+   '''
+-  SKYFORGE-SPECIFIC: the Caldera (Sandcat) agent is OPT-IN PER LAB, and this is the only door.
++  The pod env for the node's DECLARED listeners (services.listen).
+ 
+-  The skyforge-linux-host image starts its Sandcat launcher only when the pod carries
+-  SKYFORGE_CALDERA_AGENT_ENABLED=1 and SKYFORGE_CALDERA_SERVER. Both come from ONE per-run fact,
+-  NETLAB_KNE_CALDERA_AGENT_SERVER, which the Skyforge server puts on the runtime Job only when the
+-  deployment's owner switched Caldera on for that deployment (default off, audited). Unset -> the pod
+-  gets neither variable and the image runs no agent.
++  SKYFORGE_SERVICES is the "<proto>:<port>,..." list the skyforge-linux-host image's strict parser reads
++  (https, http, tcp-echo, udp-echo); an iperf3 entry becomes SKYFORGE_IPERF3_SERVER_PORT because the image
++  starts that server on its own switch. SKYFORGE_SERVICES_NAME is the node name, echoed in the health JSON.
++  No declaration -> empty dict -> the image starts no listener.
++  '''
++  env: dict = {}
++  listen = node.get('services.listen',None) or []
++  items = [ f"{e.proto}:{e.port}" for e in listen if e.get('proto') and e.get('proto') != 'iperf3' ]
++  if items:
++    env['SKYFORGE_SERVICES'] = ','.join(items)
++    env['SKYFORGE_SERVICES_NAME'] = node.name
++  for e in listen:
++    if e.get('proto') == 'iperf3':
++      env['SKYFORGE_IPERF3_SERVER_PORT'] = str(e.port)
++  return env
+ 
+-  A topology author's own `kne.env.SKYFORGE_CALDERA_*` is DISCARDED either way: the lab file is user
+-  input and must not be able to enrol a node by itself (the Caldera NetworkPolicy is the second lock;
+-  this keeps the pod spec honest about it).
++def adjust_linux_node_data(kne_data: Box, node: Box) -> None:
++  '''
++  SKYFORGE-SPECIFIC: the pod env of a linux host comes from the platform and the declaration, not from raw env.
++
++  1. Caldera (Sandcat) agent -- OPT-IN, PLATFORM-AUTHORISED, PER DEPLOYMENT AND PER NODE SCOPE. The
++     skyforge-linux-host image starts its launcher only when the pod carries SKYFORGE_CALDERA_AGENT_ENABLED=1 and
++     SKYFORGE_CALDERA_SERVER. Both come from ONE per-run fact, NETLAB_KNE_CALDERA_AGENT_SERVER, which the
++     Skyforge server puts on the runtime Job only when the deployment's owner switched Caldera on (default off,
++     audited); the optional NETLAB_KNE_CALDERA_AGENT_NODES narrows it to the nodes the owner selected. Nothing in
++     the topology can ask for the agent: a topology author's own `kne.env.SKYFORGE_CALDERA_*` is DISCARDED either
++     way (the lab file is user input; the Caldera NetworkPolicy is the second lock).
++  2. Listeners -- `services.listen` (node or group level) is rendered into SKYFORGE_SERVICES /
++     SKYFORGE_IPERF3_SERVER_PORT, and a topology author's own values for those keys are discarded, so the
++     declaration is the only door and the node data tells the truth about what listens.
+   '''
+   kne_data.env = kne_data.get('env',Box(default_box=True,box_dots=True))
+-  for key in CALDERA_AGENT_ENV_KEYS:
++  for key in CALDERA_AGENT_ENV_KEYS + LINUX_SERVICES_ENV_KEYS:
+     kne_data.env.pop(key,None)
++  for key,value in linux_services_env(node).items():
++    kne_data.env[key] = value
+   server = str(os.environ.get('NETLAB_KNE_CALDERA_AGENT_SERVER','') or '').strip()
+-  if not server:
++  if not server or not caldera_agent_node_selected(node):
+     return
+   kne_data.env.SKYFORGE_CALDERA_AGENT_ENABLED = '1'
+   kne_data.env.SKYFORGE_CALDERA_SERVER = server
+diff --git a/tests/test_kne_provider.py b/tests/test_kne_provider.py
+index 5365939..9ecbcdc 100644
+--- a/tests/test_kne_provider.py
++++ b/tests/test_kne_provider.py
+@@ -1759,6 +1759,108 @@ nodes:
+     augment.main.transform(topology)
+ 
+ 
++def _linux_listen_env(tmp_path: Path) -> tuple:
++  topo_file = write_topology(tmp_path,LISTEN_TOPOLOGY)
++  init_log()
++  create.run(['-o','config','-o','provider',str(topo_file)])
++  return Path('topology.pb.txt').read_text()
++
++
++def _node_block(provider_text: str, name: str) -> str:
++  # topology.pb.txt lists one `nodes {` block per node; return the one named `name`
++  blocks = provider_text.split('nodes: {')
++  return next(b for b in blocks if f'name: "{name}"' in b)
++
++
++def test_kne_linux_declared_listeners_render_into_the_pod_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.chdir(tmp_path)
++  monkeypatch.delenv('NETLAB_KNE_CALDERA_AGENT_SERVER',raising=False)
++  monkeypatch.delenv('NETLAB_KNE_CALDERA_AGENT_NODES',raising=False)
++  text = _linux_listen_env(tmp_path)
++  h1 = _node_block(text,'h1')
++  assert 'value: "https:443,http:80,tcp-echo:7001,udp-echo:7002"' in h1
++  assert 'key: "SKYFORGE_IPERF3_SERVER_PORT"' in h1 and 'value: "5201"' in h1
++  assert 'value: "h1"' in h1                      # SKYFORGE_SERVICES_NAME
++  assert 'KEEP_ME' in h1
++  # the lab author's own values for the same keys are discarded: the declaration is the only door
++  assert 'http:9999' not in text and '9998' not in text
++  # a node with no declaration gets no listener env at all
++  h2 = _node_block(text,'h2')
++  assert 'SKYFORGE_SERVICES' not in h2 and 'SKYFORGE_IPERF3' not in h2
++  # group-level declaration reaches every member
++  for member in ('h3','h4'):
++    assert 'value: "https:8443"' in _node_block(text,member)
++
++
++def _caldera_text(tmp_path: Path) -> str:
++  topo_file = write_topology(tmp_path,"""
++provider: kne
++
++nodes:
++  h1:
++    device: linux
++  h2:
++    device: linux
++  r1:
++    device: eos
++""")
++  init_log()
++  create.run(['-o','config','-o','provider',str(topo_file)])
++  return Path('topology.pb.txt').read_text()
++
++
++def test_kne_linux_caldera_agent_follows_the_node_scope(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.chdir(tmp_path)
++  monkeypatch.setenv('NETLAB_KNE_CALDERA_AGENT_SERVER','http://caldera.example.invalid:8888')
++  monkeypatch.setenv('NETLAB_KNE_CALDERA_AGENT_NODES','h2')
++  text = _caldera_text(tmp_path)
++  assert 'SKYFORGE_CALDERA' not in _node_block(text,'h1')          # enabled deployment, node not selected: no agent
++  assert 'key: "SKYFORGE_CALDERA_AGENT_ENABLED"' in _node_block(text,'h2')
++  assert 'SKYFORGE_CALDERA' not in _node_block(text,'r1')          # never a non-linux node
++
++
++def test_kne_linux_caldera_agent_scope_absent_means_every_linux_node(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.chdir(tmp_path)
++  monkeypatch.setenv('NETLAB_KNE_CALDERA_AGENT_SERVER','http://caldera.example.invalid:8888')
++  monkeypatch.delenv('NETLAB_KNE_CALDERA_AGENT_NODES',raising=False)
++  text = _caldera_text(tmp_path)
++  for name in ('h1','h2'):
++    assert 'key: "SKYFORGE_CALDERA_AGENT_ENABLED"' in _node_block(text,name)
++  assert 'SKYFORGE_CALDERA' not in _node_block(text,'r1')
++
++
++def test_kne_linux_caldera_node_scope_without_a_server_starts_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  # a node list alone (deployment not enabled) must never produce an agent
++  monkeypatch.chdir(tmp_path)
++  monkeypatch.delenv('NETLAB_KNE_CALDERA_AGENT_SERVER',raising=False)
++  monkeypatch.setenv('NETLAB_KNE_CALDERA_AGENT_NODES','h1,h2')
++  assert 'SKYFORGE_CALDERA' not in _caldera_text(tmp_path)
++
++
++def test_kne_linux_caldera_env_in_the_topology_is_discarded_in_every_scope(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.chdir(tmp_path)
++  monkeypatch.setenv('NETLAB_KNE_CALDERA_AGENT_SERVER','http://caldera.example.invalid:8888')
++  monkeypatch.setenv('NETLAB_KNE_CALDERA_AGENT_NODES','h2')
++  topo_file = write_topology(tmp_path,"""
++provider: kne
++
++nodes:
++  h1:
++    device: linux
++    kne:
++      env:
++        SKYFORGE_CALDERA_AGENT_ENABLED: "1"
++        SKYFORGE_CALDERA_SERVER: http://attacker.example:8888
++  h2:
++    device: linux
++""")
++  init_log()
++  create.run(['-o','config','-o','provider',str(topo_file)])
++  text = Path('topology.pb.txt').read_text()
++  assert 'attacker.example' not in text
++  assert 'SKYFORGE_CALDERA' not in _node_block(text,'h1')
++
++
+ def test_kne_ioll2_uses_distinct_image_contract(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+   monkeypatch.chdir(tmp_path)
+   topo_file = write_topology(tmp_path,"""
+-- 
+2.56.0
+

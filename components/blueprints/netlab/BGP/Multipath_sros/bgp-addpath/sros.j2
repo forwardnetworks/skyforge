@@ -1,0 +1,16 @@
+updates:
+- path: configure/router[router-name=Base]/bgp
+  val:
+   ibgp-multipath: True # Not strictly needed
+   add-paths:
+    ipv4:
+     send: multipaths
+     receive: True
+{# `|bool` is an ANSIBLE filter and netlab renders custom configs in its own
+   Jinja environment, where it does not exist ("No filter named 'bool' found").
+   Jinja already evaluates the default() result for truth, so the test is
+   unchanged: rr has bgp.rr True, m does not. #}
+{% if bgp.rr|default(false) %}
+   best-path-selection: # Need this, else D wins over C due to OSPF cost metric
+    ignore-nh-metric: True
+{% endif %}

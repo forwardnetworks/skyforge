@@ -1,0 +1,105 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Thu, 10 Sep 2026 15:10:00 -0500
+Subject: [PATCH] catalystwan: a refused attach must say WHY
+
+---
+diff --color -ruN '--exclude=*.orig' '--exclude=__pycache__' /home/user/src/skyforge/components/server/netlab/runtime/vendor/ansible_collections/cisco/catalystwan/plugins/modules/device_templates.py cw/plugins/modules/device_templates.py
+--- a/plugins/modules/device_templates.py	2026-09-01 14:31:27.850558395 -0500
++++ b/plugins/modules/device_templates.py	2026-09-10 15:52:01.353576267 -0500
+@@ -128,6 +128,7 @@
+   sample: true
+ """
+ 
++import logging
+ from typing import Literal, Optional, get_args
+ 
+ from catalystwan.api.template_api import DeviceTemplate, GeneralTemplate
+@@ -259,6 +260,39 @@
+ 
+         if not device:
+             module.fail_json(f"No devices with hostname found, hostname provided: {hostname}")
++        # CAPTURE THE LIBRARY'S LOG, because that is where the reason goes.
++        #
++        # catalystwan's TemplatesAPI._attach_cli POSTs to
++        # /dataservice/template/device/config/attachcli, and vManage ACCEPTS it
++        # -- a task is created. The task then fails, and the library does:
++        #
++        #     logger.warning(f"Task activity information: {task.sub_tasks_data[0].activity}")
++        #     return False
++        #
++        # The activity IS the reason vManage refused, and it is written to a
++        # logger and thrown away. Every layer above therefore sees a bare
++        # boolean, which is why a live refusal on 2026-09-10 could only ever
++        # report "Failed to attach device template: <name>".
++        #
++        # The library is pip-installed in the runtime image, not vendored here,
++        # so it cannot be patched from this collection. Attaching a handler to
++        # its logger for the duration of the call gets the same information
++        # without touching it.
++        _attach_log: list = []
++
++        class _CaptureAttachLog(logging.Handler):
++            def emit(self, record):
++                try:
++                    _attach_log.append(f"{record.levelname}: {record.getMessage()}")
++                except Exception:  # a diagnostic must never break the run
++                    pass
++
++        _cw_logger = logging.getLogger("catalystwan")
++        _capture = _CaptureAttachLog(level=logging.WARNING)
++        _cw_logger.addHandler(_capture)
++        _prev_level = _cw_logger.level
++        if _cw_logger.level > logging.WARNING or _cw_logger.level == logging.NOTSET:
++            _cw_logger.setLevel(logging.WARNING)
+         try:
+             response = None
+             if module.params.get("device_specific_vars"):
+@@ -276,7 +310,36 @@
+                     timeout_seconds=module.params.get("timeout_seconds"),
+                 )
+             if not response:
+-                module.fail_json(f"Failed to attach device template: {template_name}")
++                # SAY WHY, or the lane cannot be diagnosed at all.
++                #
++                # This branch is NOT an HTTP error -- ManagerHTTPError below
++                # catches those with ex.info. It means the attach call returned
++                # a falsy result, and the original discarded it, so the only
++                # evidence anyone ever saw was the template name. Measured
++                # 2026-09-10 on a live vManage: "Failed to attach device
++                # template: skyforge-site1-edge01-service" and nothing else,
++                # which is not enough to tell a refused device from an empty
++                # task list from a device vManage will not template at all.
++                #
++                # The device's own fields are the ones that explain a refusal
++                # (an uninstalled certificate, an unreachable or non-READY
++                # device), so carry them next to the empty response.
++                detail = {
++                    "response": repr(response)[:500],
++                    "template": template_name,
++                    "hostname": hostname,
++                    # the vManage task activity, if the library logged one
++                    "library_log": _attach_log[-6:],
++                }
++                for field in ("uuid", "reachability", "device_state", "validity",
++                              "cert_install_status", "device_model", "personality"):
++                    value = getattr(device, field, None)
++                    if value is not None:
++                        detail[field] = str(value)[:200]
++                module.fail_json(
++                    msg=f"Failed to attach device template: {template_name}; vManage returned "
++                        f"no attach task. device/context: {detail}"
++                )
+             result.changed = True
+             result.msg = f"Attached template {template_name} to device: {hostname}"
+         except ManagerHTTPError as ex:
+@@ -285,6 +348,9 @@
+             module.fail_json(msg=f"Template with name: {template_name} doesn't exist. \nOriginal error: {ex}")
+         except TypeError as ex:
+             module.fail_json(msg=f"{ex}")
++        finally:
++            _cw_logger.removeHandler(_capture)
++            _cw_logger.setLevel(_prev_level)
+ 
+     if module.params.get("state") == "absent":
+         if target_template:

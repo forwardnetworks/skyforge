@@ -1,0 +1,42 @@
+provider: kne
+
+bgp.as: 65000
+bgp.activate.ipv4: []
+
+vlans:
+  red:
+    mode: bridge
+  blue:
+    mode: bridge
+
+nodes:
+  s1:
+    device: eos
+    module: [ vlan, vxlan, ospf, bgp, evpn ]
+  s2:
+    device: eos
+    module: [ vlan, vxlan, ospf, bgp, evpn ]
+  h1:
+    device: linux
+  h2:
+    device: linux
+  h3:
+    device: linux
+  h4:
+    device: linux
+
+links:
+- h1:
+  s1:
+    vlan.access: red
+- h2:
+  s2:
+    vlan.access: red
+- h3:
+  s1:
+    vlan.access: blue
+- h4:
+  s2:
+    vlan.access: blue
+- s1:
+  s2:

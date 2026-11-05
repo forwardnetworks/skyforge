@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 12:00:00 +0000
+Subject: [PATCH] plugin: sort_extra_config() is deterministic (first-seen
+ order, not set order)
+
+---
+diff --git a/netsim/augment/plugin.py b/netsim/augment/plugin.py
+index 1a0abf7..c5268af 100644
+--- a/netsim/augment/plugin.py
++++ b/netsim/augment/plugin.py
+@@ -236,13 +236,20 @@ Output: topology-wide list of custom configurations sorted in 'at least one node
+ '''
+ 
+ def sort_extra_config(topology: Box) -> list:
+-  extra_set: typing.Set[str] = set()
++  # DETERMINISTIC: build the list in first-seen order (nodes in topology order, each node's
++  # configs in the order it lists them). This used to be a set() whose iteration order follows
++  # Python's per-process string-hash seed, so two runs over the SAME topology could emit
++  # independent custom configs in a different order (netlab_custom_config in group_vars).
++  # First-seen order also honours the contract above ("at least one node has them in this
++  # order"), which the set never did. Dependencies are still resolved by _sort.dependency.
++  extra_list: typing.List[str] = []
+   for ndata in topology.nodes.values():                       # Iterate over all nodes
+     if not 'config' in ndata:                                 # Skip nodes without custom configs
+       continue
+-    extra_set = extra_set | set(ndata.config)                 # and keep building the (unordered non-duplicate) set
++    for cfg in ndata.config:                                  # and keep building the ordered non-duplicate list
++      if cfg not in extra_list:
++        extra_list.append(cfg)
+ 
+-  extra_list = list(extra_set)                                # Turn set of extra configs into an unordered list
+   if not extra_list:                                          # If we got nothing useful, we were called by accident
+     return []                                                 # ... tell the caller there's nothing to do
+ 
+diff --git a/tests/test_plugin_sort_extra_config.py b/tests/test_plugin_sort_extra_config.py
+new file mode 100644
+index 0000000..d79bc68
+--- /dev/null
++++ b/tests/test_plugin_sort_extra_config.py
+@@ -0,0 +1,38 @@
++#!/usr/bin/env python3
++"""sort_extra_config() must not depend on Python's per-process string-hash seed.
++
++Found 2026-10-02 by the Skyforge render oracle: rendering the same commit twice through the same
++image reordered group_vars netlab_custom_config, because the function collected the names in a
++set(). The seed is fixed at interpreter start, so each case runs in a subprocess.
++"""
++import os
++import subprocess
++import sys
++
++SCRIPT = r"""
++import sys
++from box import Box
++from netsim.augment import plugin
++topo = Box({'nodes': {
++    'a': {'config': ['zeta', 'alpha', 'mike']},
++    'b': {'config': ['mike', 'bravo', 'yankee']},
++    'c': {},
++    'd': {'config': ['charlie', 'alpha', 'xray']},
++}}, default_box=True, box_dots=True)
++print(','.join(plugin.sort_extra_config(topo)))
++"""
++
++
++def _run(seed: str) -> str:
++    env = dict(os.environ, PYTHONHASHSEED=seed)
++    out = subprocess.run([sys.executable, "-c", SCRIPT], env=env, capture_output=True, text=True, check=True)
++    return out.stdout.strip()
++
++
++def test_sort_extra_config_is_hash_seed_independent():
++    results = {seed: _run(seed) for seed in ("0", "1", "2", "3", "7", "42", "1337", "31337")}
++    assert len(set(results.values())) == 1, results
++
++
++def test_sort_extra_config_is_first_seen_order():
++    assert _run("5") == "zeta,alpha,mike,bravo,yankee,charlie,xray"
+-- 
+2.56.0
+

@@ -1,0 +1,57 @@
+#
+# This topology combines SR-MPLS topology with IBGP session between AS-edge devices
+# and EBGP sessions with two external routers.
+#
+# The goal: test BGP-free core based on Segment Routing
+#
+
+# KNE deployability: a single-node ("stub") link has no far end, and KNE wires
+# every link as a veth pair, so the provider rejects the topology outright.
+# netlab's own remedy (docs/links.md, "additional loopbacks") turns stub links
+# into loopback INTERFACES -- same node, same prefix, same address, same
+# advertisement -- and removes the link. No extra device, no wire, no change to
+# what this lab demonstrates.
+defaults.links.stub_loopback: True
+
+nodes:
+  e1:
+    device: cat8000v
+    module: [ sr, isis, bgp ]
+    bgp:
+      as: 65000
+  e2:
+    device: eos
+    module: [ sr, isis, bgp ]
+    bgp:
+      as: 65000
+  c1:
+    device: cat8000v
+    module: [ sr,isis ]
+  c2:
+    device: eos
+    module: [ sr,isis ]
+  x1:
+    device: iol
+    module: [ bgp ]
+    bgp:
+      as: 65001
+  x2:
+    device: iol
+    module: [ bgp ]
+    bgp:
+      as: 65002
+
+links:
+# Core links
+- e1-c1
+- e1-c2
+- e2-c1
+- e2-c2
+
+# External links
+- x1-e1
+- x2-e2
+
+# Stub links
+- x1
+- x2

@@ -1,0 +1,172 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 14:17:02 -0500
+Subject: [PATCH 28/35] meshnet: build a pod's VXLAN links with at most 4 in
+ flight (M0016, ported)
+
+---
+diff --git a/third_party/meshnet/daemon/meshnet/controller.go b/third_party/meshnet/daemon/meshnet/controller.go
+index 710f0ec..704d6ed 100644
+--- a/third_party/meshnet/daemon/meshnet/controller.go
++++ b/third_party/meshnet/daemon/meshnet/controller.go
+@@ -270,6 +270,7 @@ func (m *Meshnet) reconcilePodLinksInternal(ctx context.Context, topo *unstructu
+ 	grpcBatches := make(map[string]*grpcPeerBatch)
+ 
+ 	sameNodeLinks := make([]wireutil.PodLinkConfig, 0, len(links))
++	var vxlanJobs []func() error
+ 	for _, link := range links {
+ 		peerKey := link.PeerKubeNs + "/" + link.PeerPodName
+ 		peerTopo, ok := peerCache[peerKey]
+@@ -382,19 +383,29 @@ func (m *Meshnet) reconcilePodLinksInternal(ctx context.Context, topo *unstructu
+ 					IntfIp:   link.LocalIP,
+ 					PeerVtep: peerSrcIP,
+ 					// Both ends of a cross-namespace link must derive the same VNI, so the key is the ordered pair.
+-					Vni:      link.LinkUID + wireutil.NamespaceVNIOffset(wireutil.LinkKeyNamespace(link.KubeNs, link.PeerKubeNs)),
+-					KubeNs:   link.KubeNs,
++					Vni:    link.LinkUID + wireutil.NamespaceVNIOffset(wireutil.LinkKeyNamespace(link.KubeNs, link.PeerKubeNs)),
++					KubeNs: link.KubeNs,
+ 				}
+ 				mnetdLogger.Infof("ReconcilePodLinks: configuring remote VXLAN link for pod %s interface %s (peer %s on VTEP %s, VNI %d)",
+ 					topo.GetName(), link.LocalIntf, link.PeerPodName, peerSrcIP, remotePod.Vni)
+-				if err := vxlan.CreateOrUpdate(remotePod); err != nil {
+-					mnetdLogger.Errorf("ReconcilePodLinks: failed to create VXLAN for pod %s: %v", topo.GetName(), err)
+-					return err
+-				}
++				podName := topo.GetName()
++				vxlanJobs = append(vxlanJobs, func() error {
++					if err := vxlan.CreateOrUpdate(remotePod); err != nil {
++						mnetdLogger.Errorf("ReconcilePodLinks: failed to create VXLAN for pod %s: %v", podName, err)
++						return err
++					}
++					return nil
++				})
+ 			}
+ 		}
+ 	}
+ 
++	// VXLAN links are built with a bounded pool (M0016); the first failure in
++	// link order is returned, as the serial loop did.
++	if err := runLinkJobs(vxlanJobs, linkConcurrency); err != nil {
++		return err
++	}
++
+ 	// 2. Process gRPC peer batches in chunks (default 50 items per RPC) to allow pipelined processing
+ 	batchSize := wireutil.GetEnvInt("WIRE_BATCH_SIZE", 50)
+ 	var batchErrs []error
+diff --git a/third_party/meshnet/daemon/meshnet/link_concurrency.go b/third_party/meshnet/daemon/meshnet/link_concurrency.go
+new file mode 100644
+index 0000000..0b0bb12
+--- /dev/null
++++ b/third_party/meshnet/daemon/meshnet/link_concurrency.go
+@@ -0,0 +1,42 @@
++package meshnet
++
++import "sync"
++
++// linkConcurrency bounds how many VXLAN links one pod's reconcile builds at a
++// time (M0016, patches/meshnet-cni 0016). Each build is netns work and a
++// netlink write; 40 links built one after another paid that latency 40 times
++// inside the CNI budget. The default 4 is the production value. The env knob
++// is dropped: the bound is a constant, and the kill switch is the constant.
++const linkConcurrency = 4
++
++// runLinkJobs runs jobs with at most n in flight. It runs every job, then
++// returns the first error in job order, so the result does not depend on
++// which job finished first. Each job must touch only its own link: the
++// callers build distinct interface names and VNIs per link, so jobs of one pod
++// never contend for the same netns object.
++func runLinkJobs(jobs []func() error, n int) error {
++	if n < 1 {
++		n = 1
++	}
++	errs := make([]error, len(jobs))
++	sem := make(chan struct{}, n)
++	var wg sync.WaitGroup
++	for i, job := range jobs {
++		wg.Add(1)
++		sem <- struct{}{}
++		go func(i int, job func() error) {
++			defer func() {
++				<-sem
++				wg.Done()
++			}()
++			errs[i] = job()
++		}(i, job)
++	}
++	wg.Wait()
++	for _, err := range errs {
++		if err != nil {
++			return err
++		}
++	}
++	return nil
++}
+diff --git a/third_party/meshnet/daemon/meshnet/link_concurrency_test.go b/third_party/meshnet/daemon/meshnet/link_concurrency_test.go
+new file mode 100644
+index 0000000..07655e2
+--- /dev/null
++++ b/third_party/meshnet/daemon/meshnet/link_concurrency_test.go
+@@ -0,0 +1,60 @@
++package meshnet
++
++import (
++	"errors"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++// The requirement (M0016): at most n jobs run at once, every job runs, and the
++// error returned is the first one in job order.
++func TestRunLinkJobsBoundsConcurrency(t *testing.T) {
++	const n = 3
++	var inFlight, peak int32
++	var mu sync.Mutex
++	var ran []int
++	jobs := make([]func() error, 12)
++	for i := range jobs {
++		i := i
++		jobs[i] = func() error {
++			cur := atomic.AddInt32(&inFlight, 1)
++			for {
++				p := atomic.LoadInt32(&peak)
++				if cur <= p || atomic.CompareAndSwapInt32(&peak, p, cur) {
++					break
++				}
++			}
++			time.Sleep(10 * time.Millisecond)
++			atomic.AddInt32(&inFlight, -1)
++			mu.Lock()
++			ran = append(ran, i)
++			mu.Unlock()
++			return nil
++		}
++	}
++	if err := runLinkJobs(jobs, n); err != nil {
++		t.Fatalf("runLinkJobs = %v, want nil", err)
++	}
++	if peak > n {
++		t.Fatalf("peak in flight = %d, want at most %d", peak, n)
++	}
++	if len(ran) != len(jobs) {
++		t.Fatalf("ran %d jobs, want %d", len(ran), len(jobs))
++	}
++}
++
++func TestRunLinkJobsReturnsFirstErrorInJobOrder(t *testing.T) {
++	first := errors.New("link 1 failed")
++	second := errors.New("link 3 failed")
++	jobs := []func() error{
++		func() error { return nil },
++		func() error { time.Sleep(20 * time.Millisecond); return first },
++		func() error { return nil },
++		func() error { return second },
++	}
++	if err := runLinkJobs(jobs, 4); err != first {
++		t.Fatalf("runLinkJobs = %v, want the first failure in order %v", err, first)
++	}
++}
+-- 
+2.56.0
+

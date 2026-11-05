@@ -1,0 +1,244 @@
+---
+defaults.device: eos
+# netlab 26.08 / platform: libvirt is not a usable provider on this platform
+# (per-device netlab_config_mode group_vars are kne/clab-only) — same fabric,
+# platform provider.
+provider: kne
+plugin: [ fabric, multilab ]
+defaults.multilab.id: 31
+bgp:
+  as: 65000
+  #bgp.activate.ipv4: [ ebgp ]                     # Activate IPv4 only on EBGP sessions
+  activate:
+     ipv6: [ ebgp ]                     # Activate IPv6 only on EBGP sessions
+  sessions: 
+     ipv6: [ ebgp, ibgp ]
+defaults.bgp.warnings.missing_igp: False        # Skip the "you probably need an IGP" warnings
+
+# Both IPv4 and IPv6 pools are defined.
+# Underlay uses IPv4; IPv6 is used for tenant addressing and optional loopbacks and bgp sessions.
+addressing:
+  loopback:
+    ipv4: 10.0.0.0/24
+    ipv6: 2001:db8:0::/48
+  p2p:
+    ipv4: 10.1.0.0/16
+    ipv6: 2001:db8:1::/48
+
+groups:
+  _auto_create: True
+  leafs:
+    members: [ roma-leaf01, roma-leaf02, roma-leaf03, roma-leaf04 ]
+    module: [ bgp, vlan, vxlan, evpn, vrf, lag, gateway ]
+    config: [ eos-activate-evpn.j2 ]
+    
+  spines:
+    members: [ roma-spine01, roma-spine02 ]
+    module: [ bgp, evpn ]
+    bgp.rr: True
+    config: [ eos-activate-evpn.j2 ]
+
+  exits:
+    members: [ roma-exit01, roma-exit02 ]
+    module: [ bgp, vxlan, vlan, vrf, evpn ]
+    config: [ eos-activate-evpn.j2, route-map.j2 ]
+    vrfs:
+      tenant:
+        loopback: true
+      internet:
+        loopback: true
+
+  dcedge:
+    members: [ roma-dcedge01 ]
+    module: [ bgp ]
+    
+  hosts:
+    members: [ srv101, srv102, srv201, srv202 ]
+    module: [ lag ]
+    device: linux
+
+vlan.mode: irb                                   # Enable routing between VLANs
+
+vrfs:
+  tenant:
+    id: 50000
+    evpn:
+      transit_vni: 50000
+    bgp: False
+
+  internet:
+
+    
+vlans:
+  red:
+    vrf: tenant                                  # Assign to VRF
+    prefix.ipv4: 172.16.10.0/24                   # IPv4 subnet
+    prefix.ipv6: 2001:db8:10::/64
+    gateway: true                                # Enable gateway on this VLAN
+
+  blue:
+    vrf: tenant                                  # Assign to VRF
+    prefix.ipv4: 172.16.20.0/24                   # IPv4 subnet
+    prefix.ipv6: 2001:db8:20::/64
+    gateway: true                                # Enable gateway on this VLAN
+
+  cyan:
+    vrf: tenant                                  # Assign to VRF
+    prefix.ipv4: 172.16.30.0/24                   # IPv4 subnet
+    prefix.ipv6: 2001:db8:30::/64
+    gateway: true                                # Enable gateway on this VLAN
+
+nodes:
+  roma-dcedge01:
+    bgp:
+      as: 65534
+
+links:
+
+# Loopbacks for VTEP for leaves and exits.
+#
+# `type` IS A LINK ATTRIBUTE, NOT A NODE ATTRIBUTE. It used to be indented under
+# the node key. netlab still rendered the INTERFACE as Loopback1, so the device
+# config looked right -- but the LINK kept type `stub` and stayed in the link
+# list, and KNE wires every link as a veth pair, so a one-ended link has nowhere
+# to land and the provider refused the whole topology. Outdented to link level,
+# netlab drops the link; the rendered interface is unchanged apart from losing
+# its `[stub]` description tag (verified by diffing the generated configs).
+# `ipv6` and `vxlan.vtep` stay on the node: they are per-interface.
+- roma-leaf01:
+    ipv6: 2001:db8:2::12/128
+    vxlan.vtep: true
+  type: loopback
+- roma-leaf02:
+    ipv6: 2001:db8:2::12/128
+    vxlan.vtep: true
+  type: loopback
+- roma-leaf03:
+    ipv6: 2001:db8:2::34/128
+    vxlan.vtep: true
+  type: loopback
+- roma-leaf04:
+    ipv6: 2001:db8:2::34/128
+    vxlan.vtep: true
+  type: loopback
+
+- roma-exit01:
+    ipv6: 2001:db8:2::101/128
+    vxlan.vtep: true
+  type: loopback
+
+- roma-exit02:
+    ipv6: 2001:db8:2::101/128
+    vxlan.vtep: true
+  type: loopback
+
+# Fabric Links, with as
+- roma-leaf01:
+    bgp.local_as: 65101
+  roma-spine01:
+    bgp.local_as: 65200
+- roma-leaf01:
+    bgp.local_as: 65101
+  roma-spine02:
+    bgp.local_as: 65200
+- roma-leaf02:
+    bgp.local_as: 65102
+  roma-spine01:
+    bgp.local_as: 65200
+- roma-leaf02:
+    bgp.local_as: 65102
+  roma-spine02:
+    bgp.local_as: 65200
+- roma-leaf03:
+    bgp.local_as: 65103
+  roma-spine01:
+    bgp.local_as: 65200
+- roma-leaf03:
+    bgp.local_as: 65103
+  roma-spine02:
+    bgp.local_as: 65200
+- roma-leaf04:
+    bgp.local_as: 65104
+  roma-spine01:
+    bgp.local_as: 65200
+- roma-leaf04:
+    bgp.local_as: 65104
+  roma-spine02:
+    bgp.local_as: 65200
+- roma-exit01:
+    bgp.local_as: 65111
+  roma-spine01:
+    bgp.local_as: 65200
+- roma-exit01:
+    bgp.local_as: 65111
+  roma-spine02:
+    bgp.local_as: 65200
+- roma-exit02:
+    bgp.local_as: 65112
+  roma-spine01:
+    bgp.local_as: 65200
+- roma-exit02:
+    bgp.local_as: 65112
+  roma-spine02:
+    bgp.local_as: 65200
+
+# Connection to DC edge
+- roma-exit01:
+    vrf: internet
+    bgp:
+      local_as: 65111
+      advertise: true
+  roma-dcedge01:
+    
+- roma-exit02:
+    bgp:
+      local_as: 65111
+      advertise: true
+    vrf: internet
+  roma-dcedge01:
+    
+# MLAG peerlinks
+- lag:
+    members:
+      - roma-leaf01: { ifname: eth3 }
+        roma-leaf02: { ifname: eth3 }
+    mlag.peergroup: true
+
+- lag:
+    members:
+      - roma-leaf03: { ifname: eth3 }
+        roma-leaf04: { ifname: eth3 }
+    mlag.peergroup: true
+
+- vlan: { access: red }
+  lag:
+    members:
+      - srv101: {}
+        roma-leaf01: {}
+      - srv101: {}
+        roma-leaf02: {}
+
+- vlan: { access: blue }
+  lag:
+    members:
+      - srv201: {}
+        roma-leaf03: {}
+      - srv201: {}
+        roma-leaf04: {}
+- vlan: { access: cyan }
+  lag:
+    members:
+      - srv102: {}
+        roma-leaf01: {}
+      - srv102: {}
+        roma-leaf02: {}
+- vlan: { access: cyan }
+  lag:
+    members:
+      - srv202: {}
+        roma-leaf03: {}
+      - srv202: {}
+        roma-leaf04: {}
+
+    
+ 

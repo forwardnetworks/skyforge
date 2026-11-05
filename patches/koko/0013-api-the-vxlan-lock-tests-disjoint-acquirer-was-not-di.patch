@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sat, 5 Sep 2026 13:00:00 -0500
+Subject: api: the vxlan lock test's "disjoint" acquirer was not disjoint
+
+---
+diff --git a/api/koko_vxlan_lock_test.go b/api/koko_vxlan_lock_test.go
+--- a/api/koko_vxlan_lock_test.go
++++ b/api/koko_vxlan_lock_test.go
+@@ -118,9 +118,22 @@
+ 		return done
+ 	}
+ 
+-	// Disjoint: a different pod, a different interface, a different VNI.
+-	// Under the old global lock this could not proceed.
+-	disjoint := acquireAsync(VEth{NsName: "/var/run/netns/cni-b", LinkName: "eth3"}, vxlanFor(9999, "bond0"))
++	// Disjoint: a different pod, a different interface, and a VNI SHARED WITH NO
++	// OTHER CONTENDER IN THIS TEST. That last clause is the whole fixture.
++	//
++	// It used to be 9999 -- the same VNI sameTarget uses. Keys are acquired in
++	// sorted order and the host key sorts before the target key, so sameTarget
++	// takes host(9999) FIRST and then blocks forever on the held target slot,
++	// holding host(9999) the entire time. This "disjoint" acquirer also needs
++	// host(9999), so the two raced for it, and whenever the disjoint one lost it
++	// could not proceed until release() -- which the test only reaches after
++	// this select. It was not disjoint at all; it was disjoint from `held` and
++	// contending with a sibling the test itself introduced.
++	//
++	// Measured on the pre-fix fixture: 4 of 10 batches of 20 runs failed. The
++	// implementation was never at fault, which is why raising the timeout did
++	// not help -- the acquirer is genuinely blocked, not slow.
++	disjoint := acquireAsync(VEth{NsName: "/var/run/netns/cni-b", LinkName: "eth3"}, vxlanFor(7777, "bond0"))
+ 	// Overlapping on the TARGET slot only (same netns+ifname, different VNI).
+ 	sameTarget := acquireAsync(held, vxlanFor(9999, "bond0"))
+ 	// Overlapping on the HOST tuple only (different slot, same VNI+parent).

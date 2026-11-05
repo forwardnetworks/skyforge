@@ -1,0 +1,29 @@
+module: [ bgp, ospf ]
+defaults.device: eos
+
+plugin: [ bgp.session ]
+
+nodes:
+  # netlab 26.08 tightening: a node using module attributes must enable the
+  # module itself, and node-level `provider: clab` no longer mixes with the
+  # platform kne provider (dropped — the whole lab runs on the lab provider).
+  xt:
+    module: [ bgp, ospf ]
+    bgp.as: 65100
+    device: eos
+  edge:
+    module: [ bgp, ospf ]
+    bgp.as: 65200
+    bgp.next_hop_self: False
+    config: [ ospf-default ]
+    device: eos
+  int:
+    module: [ bgp, ospf ]
+    bgp.as: 65200
+
+links:
+- xt:
+  edge:
+- edge:
+  int:
+  mtu: 1500

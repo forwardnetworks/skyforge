@@ -1,0 +1,22 @@
+---
+defaults.device: eos
+
+module: [ bgp, ospf ]
+bgp.as: 65000
+
+nodes:
+  # netlab 26.08 tightening: a node using module attributes must enable the
+  # module itself (topology-level `module:` no longer reaches nodes here).
+  rr:
+    module: [ bgp, ospf ]
+    id: 1
+    bgp.rr: true
+  e1:
+    module: [ bgp, ospf ]
+  e2:
+    module: [ bgp, ospf ]
+  x1:
+    module: [ bgp, ospf ]
+    bgp.as: 65100
+
+links: [ e1-rr, e2-rr, x1-rr ]

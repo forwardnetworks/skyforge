@@ -1,0 +1,18 @@
+provider: kne
+
+plugin: [ bgp.session ]
+module: [ bgp ]
+
+nodes:
+  dut:                  # Device under test, change with 'netlab up -d'
+    bgp.as: 65000
+  peer:                 # A valid peer -- FRR daemon running in a container
+    bgp.as: 65001
+    device: eos
+    # provider: clab dropped (kne conversion): this node/group runs on the lab provider.
+
+links:
+- dut:
+    bgp.gtsm: True
+    bgp.passive: True
+  peer:

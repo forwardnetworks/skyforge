@@ -1,0 +1,198 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 14:00:00 +0000
+Subject: [PATCH] netmiko: wait for a device that reports it is still loading
+ before configuring it
+
+SKYFORGE-SPECIFIC: platform behaviour; not for upstream.
+
+---
+diff --git a/netsim/cli/initial/netmiko.py b/netsim/cli/initial/netmiko.py
+index f22fdbc..79bb1ea 100644
+--- a/netsim/cli/initial/netmiko.py
++++ b/netsim/cli/initial/netmiko.py
+@@ -31,6 +31,67 @@ def _session_tail(session_log: str, lines: int = 40) -> str:
+   return '\n--- last ' + str(len(tail)) + ' lines of ' + session_log + ' ---\n' + '\n'.join(tail) + '\n--- end of session log ---'
+ 
+ 
++def _wait_until_ready(net_connect, n_data: Box, topology: Box, reconnect=None, sleep=time.sleep):
++  """Wait for a device that announces "still loading" in its own CLI prompt.
++
++  Some devices accept SSH, log in, and even enter enable and configuration modes while
++  their configuration subsystem is still starting, then reject the first real
++  configuration line. A10 vThunder is the case this was written for: its prompt reads
++  `vThunder(LOADING)#` and the login banner says "System is not ready. Please wait a
++  moment." until it is done, and `hostname <name>` is "Unrecognized command" until then.
++  It can also close the SSH session while it finishes loading, so a closed socket during the
++  wait is answered by reconnecting (`reconnect`), within the same budget.
++
++  The device declares the signal as `netmiko_not_ready_regexp` (matched against the CLI
++  prompt); the wait is bounded by the same netlab_check_retries * netlab_check_delay
++  budget the readiness checks use. This is a wait for a state the device itself reports,
++  not a retry of the configuration push. A device that declares no pattern is unaffected.
++
++  Returns the connection to use (a new one after a reconnect) or None if the device never
++  became ready.
++  """
++  pattern = a_devices.get_node_group_var(n_data,'netmiko_not_ready_regexp',topology.defaults)
++  if not pattern:
++    return net_connect
++  retries = int(a_devices.get_node_group_var(n_data,'netlab_check_retries',topology.defaults) or 30)
++  delay = int(a_devices.get_node_group_var(n_data,'netlab_check_delay',topology.defaults) or 10)
++  state = ''
++  for attempt in range(retries + 1):
++    try:
++      prompt = net_connect.find_prompt()
++      state = f'CLI prompt: {prompt} (matches netmiko_not_ready_regexp {pattern})'
++      if not re.search(pattern,prompt):
++        if attempt:
++          net_connect.set_base_prompt()
++          log.info(f'{n_data.name} reports ready after {attempt * delay} seconds (prompt {prompt})',module='netmiko')
++        return net_connect
++    except Exception as ex:
++      state = f'session error while waiting: {type(ex).__name__}: {ex}'
++      if reconnect:
++        fresh = reconnect()
++        if fresh:
++          net_connect = fresh
++          continue
++    if attempt < retries:
++      sleep(delay)
++  log.error(
++    f'{n_data.name} still reports it is not ready after {retries * delay} seconds',
++    more_data=state,
++    more_hints='The device never left its loading state; configuration was not attempted',
++    module='netmiko')
++  return None
++
++
++def _reconnect(n_data: Box, netmiko_params: dict):
++  """A quiet second connection attempt (netmiko.connect() reports a failure as fatal)."""
++  try:
++    fresh = _netmiko._netmiko.ConnectHandler(**netmiko_params)
++    fresh.enable()
++    return fresh
++  except Exception:
++    return None
++
++
+ def deploy(n_data: Box,topology: Box,n_deploy: list) -> None:
+   node_config = n_data.get('_node_config',None)
+   if not node_config:
+@@ -57,6 +118,11 @@ def deploy(n_data: Box,topology: Box,n_deploy: list) -> None:
+   if netmiko_delay:
+     time.sleep(netmiko_delay)
+ 
++  net_connect = _wait_until_ready(net_connect,n_data,topology,reconnect=lambda: _reconnect(n_data,netmiko_params))
++  if not net_connect:
++    append_to_list(n_data._deploy,'failed',n_deploy[0])
++    return
++
+   netmiko_err_list = features.get('netmiko.error_regexp',None)
+   netmiko_errors = rf"({'|'.join(netmiko_err_list)})" if isinstance(netmiko_err_list,list) else (netmiko_err_list or "")
+   if log.debug_active('netmiko'):
+diff --git a/netsim/devices/a10.yml b/netsim/devices/a10.yml
+index 891bdfe..bd6aa17 100644
+--- a/netsim/devices/a10.yml
++++ b/netsim/devices/a10.yml
+@@ -64,6 +64,9 @@ group_vars:
+   - Unrecognized command
+   # netmiko's A10 driver cannot save_config()
+   netmiko_save_command: write memory
++  # vThunder accepts SSH and enters config mode while still LOADING, then rejects the first
++  # configuration line; its own prompt (vThunder(LOADING)#) is the not-ready signal.
++  netmiko_not_ready_regexp: '\(LOADING\)'
+   netlab_console_connection: ssh
+   # ssh first (connect-only, above), then readiness-check/a10.yml proves enable
+   # mode and a configure-terminal session before netmiko pushes the config.
+diff --git a/tests/test_netmiko_wait_until_ready.py b/tests/test_netmiko_wait_until_ready.py
+new file mode 100644
+index 0000000..b82f8c6
+--- /dev/null
++++ b/tests/test_netmiko_wait_until_ready.py
+@@ -0,0 +1,82 @@
++"""A device that reports "still loading" in its CLI prompt is waited for, not configured early.
++
++SKYFORGE-SPECIFIC: A10 vThunder answers `hostname <name>` with "Unrecognized command" while its
++prompt reads `vThunder(LOADING)#`.
++"""
++import pytest
++from box import Box
++
++from netsim.cli.initial import netmiko as nm
++
++
++class _FakeConn:
++  def __init__(self, prompts):
++    self.prompts = list(prompts)
++    self.polls = 0
++    self.base_prompt_resets = 0
++
++  def find_prompt(self):
++    self.polls += 1
++    return self.prompts.pop(0) if len(self.prompts) > 1 else self.prompts[0]
++
++  def set_base_prompt(self):
++    self.base_prompt_resets += 1
++
++
++def _topology(**group_vars):
++  gv = {'netlab_check_retries': 3, 'netlab_check_delay': 7, **group_vars}
++  return Box({'provider': 'kne', 'defaults': {'provider': 'kne', 'devices': {'a10': {'group_vars': gv}}}}, box_dots=True)
++
++
++def _node():
++  return Box({'name': 'lb1', 'device': 'a10', 'provider': 'kne'}, box_dots=True)
++
++
++def test_waits_for_a_loading_prompt_then_proceeds() -> None:
++  conn = _FakeConn(['vThunder(LOADING)#', 'vThunder(LOADING)#', 'vThunder#'])
++  slept: list = []
++  topo = _topology(netmiko_not_ready_regexp=r'\(LOADING\)')
++  assert nm._wait_until_ready(conn, _node(), topo, sleep=slept.append) is conn
++  assert slept == [7, 7]               # waited twice, once per LOADING prompt
++  assert conn.base_prompt_resets == 1  # the prompt changed, so the session re-learns it
++
++
++def test_a_ready_device_is_not_delayed() -> None:
++  conn = _FakeConn(['vThunder#'])
++  slept: list = []
++  assert nm._wait_until_ready(conn, _node(), _topology(netmiko_not_ready_regexp=r'\(LOADING\)'), sleep=slept.append) is conn
++  assert slept == [] and conn.base_prompt_resets == 0
++
++
++def test_a_device_that_never_loads_fails_within_the_budget() -> None:
++  conn = _FakeConn(['vThunder(LOADING)#'])
++  slept: list = []
++  assert nm._wait_until_ready(conn, _node(), _topology(netmiko_not_ready_regexp=r'\(LOADING\)'), sleep=slept.append) is None
++  assert len(slept) == 3 and conn.polls == 4   # retries=3: four looks, three waits, then give up
++
++
++def test_a_device_with_no_declared_signal_is_untouched() -> None:
++  conn = _FakeConn(['anything(LOADING)#'])
++  assert nm._wait_until_ready(conn, _node(), _topology(), sleep=lambda s: pytest.fail('must not wait')) is conn
++  assert conn.polls == 0
++
++
++class _ClosedConn(_FakeConn):
++  def find_prompt(self):
++    self.polls += 1
++    raise OSError('Socket is closed')
++
++
++def test_a_closed_session_during_the_wait_is_reconnected() -> None:
++  dead, fresh = _ClosedConn(['x']), _FakeConn(['vThunder#'])
++  topo = _topology(netmiko_not_ready_regexp=r'\(LOADING\)')
++  assert nm._wait_until_ready(dead, _node(), topo, reconnect=lambda: fresh, sleep=lambda s: None) is fresh
++  assert dead.polls == 1 and fresh.polls == 1
++
++
++def test_a_session_that_cannot_be_reestablished_fails_within_the_budget() -> None:
++  dead = _ClosedConn(['x'])
++  slept: list = []
++  topo = _topology(netmiko_not_ready_regexp=r'\(LOADING\)')
++  assert nm._wait_until_ready(dead, _node(), topo, reconnect=lambda: None, sleep=slept.append) is None
++  assert len(slept) == 3 and dead.polls == 4
+-- 
+2.56.0
+

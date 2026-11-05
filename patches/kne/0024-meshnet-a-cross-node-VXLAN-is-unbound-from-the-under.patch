@@ -1,0 +1,187 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 14:01:31 -0500
+Subject: [PATCH 24/35] meshnet: a cross-node VXLAN is unbound from the
+ underlay when the path is proven (A0015)
+
+---
+diff --git a/third_party/meshnet/daemon/vxlan/underlay.go b/third_party/meshnet/daemon/vxlan/underlay.go
+new file mode 100644
+index 0000000..fd39e6c
+--- /dev/null
++++ b/third_party/meshnet/daemon/vxlan/underlay.go
+@@ -0,0 +1,76 @@
++package vxlan
++
++import (
++	"fmt"
++	"net"
++
++	"github.com/vishvananda/netlink"
++)
++
++// A cross-node VXLAN is UNBOUND from its underlay device when it can be: it
++// gets SrcAddr = the underlay's IPv4 address instead of VtepDevIndex = the
++// underlay. A bound vxlan is capped at the underlay MTU minus overhead, so
++// a NOS that raises its routed port (cEOS moving a port into a VRF) cannot
++// get past it. The unbound form is chosen only when the path is provable: the
++// kernel route to the peer leaves through the underlay, and the underlay has
++// an IPv4 address to pin as the source. Anything else keeps the bound form.
++//
++// Source: patches/koko 0015 (koko_vxlan_underlay.go) and patches/meshnet-cni
++// 0022. Production has run this since 2026-09-23 (demo-lab sjc wanleaf1,
++// 382/382 wires healthy on the canary).
++
++// vxlanUnderlay is the underlay decision for one wire. The zero value is the
++// bound form (VtepDevIndex), so code that does not set it keeps the old wire.
++type vxlanUnderlay struct {
++	unbound bool
++	src     net.IP // the SrcAddr for an unbound wire
++	reason  string
++}
++
++// chooseUnderlay is the pure decision. parentIndex and parentAddr describe the
++// underlay interface; routeLinkIndex and routeErr are the kernel route to peer.
++func chooseUnderlay(parentIndex int, parentAddr, peer net.IP, routeLinkIndex int, routeErr error) vxlanUnderlay {
++	bound := func(reason string) vxlanUnderlay { return vxlanUnderlay{reason: reason} }
++	switch {
++	case peer == nil || peer.IsUnspecified():
++		return bound("no unicast peer VTEP")
++	case peer.To4() == nil:
++		return bound("peer VTEP is not IPv4")
++	case peer.IsMulticast():
++		return bound("peer is a multicast group, which needs a bound device")
++	case parentAddr == nil || parentAddr.To4() == nil:
++		return bound("underlay interface has no IPv4 address to pin as the source")
++	case routeErr != nil:
++		return bound(fmt.Sprintf("route to peer %s could not be resolved: %v", peer, routeErr))
++	case routeLinkIndex == 0 || routeLinkIndex != parentIndex:
++		return bound(fmt.Sprintf("route to peer %s leaves via ifindex %d, not the underlay ifindex %d", peer, routeLinkIndex, parentIndex))
++	}
++	return vxlanUnderlay{
++		unbound: true,
++		src:     parentAddr.To4(),
++		reason:  fmt.Sprintf("route to peer %s leaves via the underlay (ifindex %d)", peer, parentIndex),
++	}
++}
++
++// resolveUnderlay reads the kernel for parentName and the route to peer, then
++// decides. A lookup failure keeps the bound form.
++func resolveUnderlay(parentName string, peer net.IP) vxlanUnderlay {
++	parent, err := netlink.LinkByName(parentName)
++	if err != nil {
++		return vxlanUnderlay{reason: fmt.Sprintf("underlay %s: %v", parentName, err)}
++	}
++	var parentAddr net.IP
++	if addrs, err := netlink.AddrList(parent, netlink.FAMILY_V4); err == nil && len(addrs) > 0 {
++		parentAddr = addrs[0].IP
++	}
++	routeIdx, routeErr := 0, error(nil)
++	routes, err := netlink.RouteGet(peer)
++	if err != nil {
++		routeErr = err
++	} else if len(routes) == 0 {
++		routeErr = fmt.Errorf("no route")
++	} else {
++		routeIdx = routes[0].LinkIndex
++	}
++	return chooseUnderlay(parent.Attrs().Index, parentAddr, peer, routeIdx, routeErr)
++}
+diff --git a/third_party/meshnet/daemon/vxlan/underlay_test.go b/third_party/meshnet/daemon/vxlan/underlay_test.go
+new file mode 100644
+index 0000000..bc50640
+--- /dev/null
++++ b/third_party/meshnet/daemon/vxlan/underlay_test.go
+@@ -0,0 +1,41 @@
++package vxlan
++
++import (
++	"errors"
++	"net"
++	"testing"
++)
++
++// The requirement: unbound only when the path to the peer is provably the
++// underlay. Every other case stays bound, which is the old behaviour.
++func TestChooseUnderlay(t *testing.T) {
++	underlayIP := net.ParseIP("172.18.0.2").To4()
++	peer := net.ParseIP("172.18.0.4")
++	cases := []struct {
++		name      string
++		parentIdx int
++		parentIP  net.IP
++		peer      net.IP
++		routeIdx  int
++		routeErr  error
++		unbound   bool
++	}{
++		{name: "route via underlay, IPv4 underlay: unbound", parentIdx: 2, parentIP: underlayIP, peer: peer, routeIdx: 2, unbound: true},
++		{name: "no peer: bound", parentIdx: 2, parentIP: underlayIP, peer: nil, routeIdx: 2},
++		{name: "multicast peer: bound", parentIdx: 2, parentIP: underlayIP, peer: net.ParseIP("239.1.1.1"), routeIdx: 2},
++		{name: "no underlay IPv4: bound", parentIdx: 2, parentIP: nil, peer: peer, routeIdx: 2},
++		{name: "route error: bound", parentIdx: 2, parentIP: underlayIP, peer: peer, routeErr: errors.New("no route"), routeIdx: 0},
++		{name: "route via another link: bound", parentIdx: 2, parentIP: underlayIP, peer: peer, routeIdx: 9},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			got := chooseUnderlay(tc.parentIdx, tc.parentIP, tc.peer, tc.routeIdx, tc.routeErr)
++			if got.unbound != tc.unbound {
++				t.Fatalf("unbound = %v (%s), want %v", got.unbound, got.reason, tc.unbound)
++			}
++			if tc.unbound && !got.src.Equal(underlayIP) {
++				t.Fatalf("src = %v, want the underlay address %v", got.src, underlayIP)
++			}
++		})
++	}
++}
+diff --git a/third_party/meshnet/daemon/vxlan/vxlan.go b/third_party/meshnet/daemon/vxlan/vxlan.go
+index 33d35b0..4d51b5e 100644
+--- a/third_party/meshnet/daemon/vxlan/vxlan.go
++++ b/third_party/meshnet/daemon/vxlan/vxlan.go
+@@ -22,6 +22,8 @@ type VxLan struct {
+ 	IPAddr   net.IP
+ 	ID       int
+ 	MTU      int // the fabric MTU this wire must carry (wireutil.FabricMTUEnv)
++	// Underlay is bound or unbound (underlay.go). The zero value is bound.
++	Underlay vxlanUnderlay
+ }
+ 
+ // InitLogger initializes the logrus logger for the VXLAN overlay daemon.
+@@ -64,7 +66,8 @@ func CreateOrUpdate(v *mpb.RemotePod) error {
+ 		ID:       int(v.Vni),
+ 		MTU:      mtu,
+ 	}
+-	vxLanOvrlyLogger.Infof("Created vxlan struct %+v", vxlan)
++	vxlan.Underlay = resolveUnderlay(srcIntf, vxlan.IPAddr)
++	vxLanOvrlyLogger.Infof("Created vxlan struct %+v (underlay: unbound=%v %s)", vxlan, vxlan.Underlay.unbound, vxlan.Underlay.reason)
+ 
+ 	// KubeVirt may have renamed the wire (see kubevirt_slot.go). Find it where it is.
+ 	slot := resolveSlot(func(name string) netlink.Link { return getLinkFromNS(v.NetNs, name) }, v.IntfName)
+@@ -145,13 +148,17 @@ func makeVxLan(nsName, linkName string, ipNet *net.IPNet, vxlan VxLan) error {
+ 			TxQLen: 1000,
+ 			MTU:    vxlan.MTU,
+ 		},
+-		VxlanId:      vxlan.ID,
+-		VtepDevIndex: parentIF.Attrs().Index,
+-		Group:        vxlan.IPAddr,
+-		Port:         4789,
+-		Learning:     true,
+-		L2miss:       true,
+-		L3miss:       true,
++		VxlanId:  vxlan.ID,
++		Group:    vxlan.IPAddr,
++		Port:     4789,
++		Learning: true,
++		L2miss:   true,
++		L3miss:   true,
++	}
++	if vxlan.Underlay.unbound {
++		vxlanconf.SrcAddr = vxlan.Underlay.src
++	} else {
++		vxlanconf.VtepDevIndex = parentIF.Attrs().Index
+ 	}
+ 
+ 	if err := netlink.LinkAdd(vxlanconf); err != nil {
+-- 
+2.56.0
+

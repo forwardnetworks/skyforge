@@ -1,0 +1,408 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 13:48:07 -0500
+Subject: [PATCH 12/35] topology CLI and init-wait: init image,
+ expected-interface count, topology recreate
+
+---
+diff --git a/cmd/topology/topology.go b/cmd/topology/topology.go
+index 65e1c0c..5f481e1 100644
+--- a/cmd/topology/topology.go
++++ b/cmd/topology/topology.go
+@@ -21,6 +21,7 @@ import (
+ 	"path/filepath"
+ 	"strconv"
+ 	"strings"
++	"time"
+ 
+ 	"github.com/openconfig/gnmi/errlist"
+ 	cpb "github.com/openconfig/kne/proto/controller"
+@@ -63,6 +64,12 @@ func New() *cobra.Command {
+ 	}
+ 	resetCfgCmd.Flags().Bool("skip", false, "skip nodes if they are not resetable")
+ 	resetCfgCmd.Flags().Bool("push", false, "additionally push orginal topology configuration")
++	recreateCmd := &cobra.Command{
++		Use:   "recreate <topology> <device>",
++		Short: "delete ONE container node's pod/service/config and create it again from the topology (never a topology delete; KubeVirt nodes refused)",
++		RunE:  recreateFn,
++	}
++	recreateCmd.Flags().Duration("timeout", 0, "Timeout for the node's pod admission after recreation (0 = do not wait)")
+ 	generateCmd := &cobra.Command{
+ 		Use:   "generate",
+ 		Short: "Generates a topology of a given type.",
+@@ -84,6 +91,7 @@ func New() *cobra.Command {
+ 	topoCmd.AddCommand(serviceCmd)
+ 	topoCmd.AddCommand(watchCmd)
+ 	topoCmd.AddCommand(resetCfgCmd)
++	topoCmd.AddCommand(recreateCmd)
+ 	topoCmd.AddCommand(generateCmd)
+ 	return topoCmd
+ }
+@@ -309,6 +317,47 @@ func certFn(cmd *cobra.Command, args []string) error {
+ 	return tm.GenerateSelfSigned(cmd.Context(), args[1])
+ }
+ 
++// recreateFn is `kne topology recreate <topology> <device>`: rebuild ONE node.
++// The topology file is loaded so the node's Create sees the same proto (and
++// config file path, relative to the topology file) it was first created from.
++func recreateFn(cmd *cobra.Command, args []string) error {
++	if len(args) != 2 {
++		return fmt.Errorf("%s: missing args (need <topology> <device>)", cmd.Use)
++	}
++	topopb, err := topo.Load(args[0])
++	if err != nil {
++		return fmt.Errorf("%s: %w", cmd.Use, err)
++	}
++	bp, err := fileRelative(args[0])
++	if err != nil {
++		return fmt.Errorf("%s: %w", cmd.Use, err)
++	}
++	tOpts := append(opts, topo.WithKubecfg(viper.GetString("kubecfg")), topo.WithBasePath(bp))
++	tm, err := newRecreateManager(topopb, tOpts...)
++	if err != nil {
++		return fmt.Errorf("%s: %w", cmd.Use, err)
++	}
++	if err := tm.RecreateNode(cmd.Context(), args[1]); err != nil {
++		return fmt.Errorf("%s: %w", cmd.Use, err)
++	}
++	timeout, _ := cmd.Flags().GetDuration("timeout")
++	if timeout <= 0 {
++		return nil
++	}
++	return tm.WaitNodeAdmission(cmd.Context(), args[1], timeout)
++}
++
++// RecreateManager is the slice of the topology manager `recreate` needs; a
++// variable so the command's argument handling can be tested without a cluster.
++type RecreateManager interface {
++	RecreateNode(ctx context.Context, nodeName string) error
++	WaitNodeAdmission(ctx context.Context, nodeName string, timeout time.Duration) error
++}
++
++var newRecreateManager = func(topopb *tpb.Topology, opts ...topo.Option) (RecreateManager, error) {
++	return topo.New(topopb, opts...)
++}
++
+ var newTopologyManager = func(topopb *tpb.Topology, opts ...topo.Option) (TopologyManager, error) {
+ 	return topo.New(topopb, opts...)
+ }
+diff --git a/cmd/topology/topology_test.go b/cmd/topology/topology_test.go
+index 0c16399..df2c8df 100644
+--- a/cmd/topology/topology_test.go
++++ b/cmd/topology/topology_test.go
+@@ -9,6 +9,7 @@ import (
+ 	"os"
+ 	"path/filepath"
+ 	"testing"
++	"time"
+ 
+ 	"github.com/google/go-cmp/cmp"
+ 	"github.com/openconfig/gnmi/errdiff"
+@@ -637,3 +638,81 @@ func TestPush(t *testing.T) {
+ 		})
+ 	}
+ }
++
++type fakeRecreateManager struct {
++	recreated []string
++	waited    []string
++	rErr      string
++}
++
++func (f *fakeRecreateManager) RecreateNode(_ context.Context, name string) error {
++	f.recreated = append(f.recreated, name)
++	if f.rErr != "" {
++		return fmt.Errorf("%s", f.rErr)
++	}
++	return nil
++}
++
++func (f *fakeRecreateManager) WaitNodeAdmission(_ context.Context, name string, _ time.Duration) error {
++	f.waited = append(f.waited, name)
++	return nil
++}
++
++func TestRecreate(t *testing.T) {
++	topoFile := filepath.Join(t.TempDir(), "topo.pb.txt")
++	if err := os.WriteFile(topoFile, []byte(`name: "t"
++nodes: { name: "iol1" vendor: CISCO model: "iol" }
++`), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	tests := []struct {
++		desc          string
++		args          []string
++		mgr           *fakeRecreateManager
++		wantErr       string
++		wantRecreated []string
++		wantWaited    []string
++	}{{
++		desc:    "missing device",
++		args:    []string{"recreate", topoFile},
++		mgr:     &fakeRecreateManager{},
++		wantErr: "missing args",
++	}, {
++		desc:          "recreates the named node and does not wait by default",
++		args:          []string{"recreate", topoFile, "iol1"},
++		mgr:           &fakeRecreateManager{},
++		wantRecreated: []string{"iol1"},
++	}, {
++		desc:          "waits for admission when asked",
++		args:          []string{"recreate", topoFile, "iol1", "--timeout", "30s"},
++		mgr:           &fakeRecreateManager{},
++		wantRecreated: []string{"iol1"},
++		wantWaited:    []string{"iol1"},
++	}, {
++		desc:          "manager refusal is the command's error",
++		args:          []string{"recreate", topoFile, "vsrx1"},
++		mgr:           &fakeRecreateManager{rErr: "KubeVirt-backed"},
++		wantErr:       "KubeVirt-backed",
++		wantRecreated: []string{"vsrx1"},
++	}}
++	for _, tt := range tests {
++		t.Run(tt.desc, func(t *testing.T) {
++			orig := newRecreateManager
++			newRecreateManager = func(_ *tpb.Topology, _ ...topo.Option) (RecreateManager, error) { return tt.mgr, nil }
++			defer func() { newRecreateManager = orig }()
++			cmd := New()
++			cmd.SetOut(bytes.NewBuffer(nil))
++			cmd.SetArgs(tt.args)
++			err := cmd.ExecuteContext(context.Background())
++			if s := errdiff.Substring(err, tt.wantErr); s != "" {
++				t.Fatalf("recreate %v: %s", tt.args, s)
++			}
++			if diff := cmp.Diff(tt.wantRecreated, tt.mgr.recreated); diff != "" {
++				t.Fatalf("recreated diff (-want +got):\n%s", diff)
++			}
++			if diff := cmp.Diff(tt.wantWaited, tt.mgr.waited); diff != "" {
++				t.Fatalf("waited diff (-want +got):\n%s", diff)
++			}
++		})
++	}
++}
+diff --git a/init_wait/Dockerfile b/init_wait/Dockerfile
+index 63dde0c..4805104 100644
+--- a/init_wait/Dockerfile
++++ b/init_wait/Dockerfile
+@@ -11,7 +11,8 @@
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+-FROM busybox:1.38.0
++FROM alpine:3.22.2
++RUN apk add --no-cache python3
+ COPY entrypoint.sh /
+ ENTRYPOINT [ "/entrypoint.sh" ]
+ CMD []
+diff --git a/init_wait/entrypoint.sh b/init_wait/entrypoint.sh
+index 61abadd..45d1f10 100755
+--- a/init_wait/entrypoint.sh
++++ b/init_wait/entrypoint.sh
+@@ -16,12 +16,144 @@
+ INTFS=${1:-1}
+ SLEEP=${2:-0}
+ DISABLE_IPV6=${3:-0}
++POD_NAME=${POD_NAME:-${HOSTNAME:-}}
++POD_NAMESPACE=""
++
++if [ -r /var/run/secrets/kubernetes.io/serviceaccount/namespace ]; then
++    POD_NAMESPACE="$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace 2>/dev/null || true)"
++fi
++
++api_expected_interfaces () {
++    if [ -z "$POD_NAME" ] || [ -z "$POD_NAMESPACE" ] || [ ! -r /var/run/secrets/kubernetes.io/serviceaccount/token ]; then
++        printf '%s\n' "$INTFS"
++        return 0
++    fi
++    if ! command -v python3 >/dev/null 2>&1; then
++        printf '%s\n' "$INTFS"
++        return 0
++    fi
++    python3 - "$POD_NAME" "$POD_NAMESPACE" "$INTFS" <<'PY'
++import json
++import os
++import ssl
++import sys
++import urllib.error
++import urllib.request
++
++pod_name = sys.argv[1].strip()
++namespace = sys.argv[2].strip()
++fallback = sys.argv[3].strip()
++
++def emit(value):
++    try:
++        ivalue = int(value)
++    except Exception:
++        ivalue = 0
++    if ivalue <= 0:
++        ivalue = int(fallback)
++    print(ivalue)
++
++if not pod_name or not namespace:
++    emit(fallback)
++    sys.exit(0)
++
++token_path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
++ca_path = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
++try:
++    with open(token_path, "r", encoding="utf-8") as f:
++        token = f.read().strip()
++except Exception:
++    emit(fallback)
++    sys.exit(0)
++
++url = f"https://kubernetes.default.svc/apis/networkop.co.uk/v1beta1/namespaces/{namespace}/topologies/{pod_name}"
++headers = {"Authorization": f"Bearer {token}"}
++req = urllib.request.Request(url, headers=headers)
++ctx = ssl.create_default_context(cafile=ca_path if os.path.exists(ca_path) else None)
++try:
++    with urllib.request.urlopen(req, context=ctx, timeout=2) as resp:
++        topo = json.load(resp)
++except Exception:
++    emit(fallback)
++    sys.exit(0)
++
++spec_links = topo.get("spec", {}).get("links", []) or []
++if not spec_links:
++    emit(fallback)
++    sys.exit(0)
++
++skipped = topo.get("status", {}).get("skipped", []) or []
++if skipped:
++    summary = []
++    for item in skipped:
++        if isinstance(item, dict):
++            summary.append(f"{item.get('link_id')}:{item.get('pod_name')}")
++    if summary:
++        print(
++            "init-wait: topology status contains skipped links; still waiting for all declared interfaces: "
++            + ",".join(summary),
++            file=sys.stderr,
++        )
++
++active = 0
++names = []
++for link in spec_links:
++    if not isinstance(link, dict):
++        continue
++    ifname = str(link.get("local_intf", "")).strip()
++    if ifname == "" or ifname == "eth0":
++        continue
++    # A link naming a peer_namespace is wired to a pod OUTSIDE this lab's
++    # topology namespace (a Sandbox attach -- meshnet-cni 0023). Its peer can
++    # come and go independently of the lab (the sandbox pod restarting, or not
++    # attached yet), so it must never block THIS pod's init-wait the way a
++    # normal lab-internal link does.
++    if str(link.get("peer_namespace", "")).strip():
++        continue
++    active += 1
++    if ifname not in names:
++        names.append(ifname)
++
++emit(str(active + 1))
++# Second line: the declared interface NAMES, so the wait can check presence by
++# name rather than by count. Count alone is satisfied by anything that matches
++# the grep; a name is satisfied only by the wire meshnet actually declared.
++print(" ".join(names))
++PY
++}
++
++# expected_names_present -- 0 when every name in EXPECTED_NAMES exists in
++# /sys/class/net, 1 otherwise. With no names known (API unavailable) it defers
++# to the count, which is the pre-2026-09-15 behaviour.
++expected_names_present () {
++    if [ -z "$EXPECTED_NAMES" ]; then
++        [ "$MYINT" -ge "$EXPECTED_INTFS" ]
++        return $?
++    fi
++    for n in $EXPECTED_NAMES; do
++        [ -e "/sys/class/net/$n" ] || return 1
++    done
++    return 0
++}
++
++# read_expected -- refresh EXPECTED_INTFS / EXPECTED_NAMES from the API output
++# (line 1 = count, line 2 = names); a malformed count leaves the old value.
++read_expected () {
++    _out=$(api_expected_interfaces)
++    _count=$(printf '%s\n' "$_out" | sed -n '1p')
++    _names=$(printf '%s\n' "$_out" | sed -n '2p')
++    case "$_count" in
++        ''|*[!0-9]*) : ;;
++        *) EXPECTED_INTFS="$_count" ;;
++    esac
++    EXPECTED_NAMES="$_names"
++}
+ 
+ int_calc () 
+ {
+     index=0
+     # shellcheck disable=2010
+-    for i in $(ls -1v /sys/class/net/ | grep 'eth\|ens\|eno\|^e[0-9]'); do
++    for i in $(ls -1v /sys/class/net/ | grep 'eth\|et\|ens\|eno\|^e[0-9]'); do
+       # shellcheck disable=3039
+       let index=index+1
+     done
+@@ -29,18 +161,54 @@ int_calc ()
+ }
+ 
+ int_calc
++EXPECTED_INTFS="$INTFS"
++EXPECTED_NAMES=""
++read_expected
++
++# STABLE_SECONDS: how long every declared interface must be CONTINUOUSLY
++# present before the NOS is allowed to boot. "Reached the count once" is not a
++# wiring contract. Measured 2026-09-15 (demo-lab r11, and r8 x3 before
++# it): a KubeVirt peer whose sandbox kubelet keeps tearing down and retrying
++# (its other peers not yet admitted by the heavy lane) makes meshnet create and
++# delete this pod's eth4/eth5 every few seconds, ~1s wide. init-wait saw the
++# count touch N during one flash, exited, and cEOS -- which enumerates its
++# interfaces once at boot and never hot-plugs -- came up with Ethernet1-3 and
++# no Ethernet4/5, permanently, no matter how long anyone waited afterwards.
++# A settle window that resets on any regression can only be satisfied once
++# the peer's sandbox has actually stabilized. Default 20s; override with the
++# INIT_WAIT_STABLE_SECONDS env for a lab that needs it, never below 1.
++STABLE_SECONDS=${INIT_WAIT_STABLE_SECONDS:-20}
++case "$STABLE_SECONDS" in ''|*[!0-9]*|0) STABLE_SECONDS=20 ;; esac
+ 
+-echo "Waiting for all $INTFS interfaces to be connected"
+-while [ "$MYINT" -lt "$INTFS" ]; do
+-  echo "Connected $MYINT interfaces out of $INTFS"
++echo "Waiting for all $EXPECTED_INTFS interfaces to be connected (names: ${EXPECTED_NAMES:-unknown, using count}) and stable for ${STABLE_SECONDS}s"
++stable=0
++was_ready=0
++while :; do
++  if expected_names_present; then
++    stable=$((stable + 1))
++    if [ "$was_ready" -eq 0 ]; then
++      echo "All $EXPECTED_INTFS interfaces present ($MYINT seen); holding for ${STABLE_SECONDS}s of stability"
++      was_ready=1
++    fi
++    [ "$stable" -ge "$STABLE_SECONDS" ] && break
++  else
++    if [ "$was_ready" -eq 1 ]; then
++      echo "init-wait: interfaces REGRESSED after being complete (now $MYINT of $EXPECTED_INTFS present) -- a peer is flapping its side of a link; restarting the stability window"
++    fi
++    stable=0
++    was_ready=0
++    echo "Connected $MYINT interfaces out of $EXPECTED_INTFS"
++  fi
+   sleep 1
+   int_calc
++  read_expected
+ done
++echo "All $EXPECTED_INTFS interfaces present and stable for ${STABLE_SECONDS}s"
+ 
+ if [ "$DISABLE_IPV6" -ne 0 ]; then
+     # shellcheck disable=2010
+     # Remove eth0 from disable list
+-    for i in $(ls -1v /sys/class/net/ | grep 'eth\|ens\|eno\|^e[0-9]' | grep -v '^eth0'); do
++    for i in $(ls -1v /sys/class/net/ | grep 'eth\|et\|ens\|eno\|^e[0-9]' | grep -v '^eth0'); do
+       sysctl net.ipv6.conf."$i".disable_ipv6=1
+       ip link set dev "$i" arp off
+     done
+-- 
+2.56.0
+

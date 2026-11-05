@@ -1,0 +1,186 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 12:00:00 +0000
+Subject: [PATCH] netmiko: A10 and FortiOS declare the netmiko parameters as
+ device features; KNE Nexus keeps its startup lane
+
+SKYFORGE-SPECIFIC: platform behaviour; not for upstream.
+
+---
+diff --git a/netsim/devices/a10.yml b/netsim/devices/a10.yml
+index bd6aa17..9c95a0f 100644
+--- a/netsim/devices/a10.yml
++++ b/netsim/devices/a10.yml
+@@ -57,11 +57,6 @@ group_vars:
+   netlab_ssh_args: -tt
+   netlab_device_type: a10
+   netlab_config_mode: netmiko
+-  netmiko_device_type: a10
+-  netmiko_error_regexp:
+-  - '% Invalid input'
+-  - '% Incomplete command'
+-  - Unrecognized command
+   # netmiko's A10 driver cannot save_config()
+   netmiko_save_command: write memory
+   # vThunder accepts SSH and enters config mode while still LOADING, then rejects the first
+@@ -94,6 +89,14 @@ features:
+   initial:
+     config_mode: [ netmiko ]
+     roles: [ host ]
++  # netlab moved the netmiko parameters from group variables (netmiko_device_type,
++  # netmiko_error_regexp) to device features (upstream #3930); same values, new home
++  netmiko:
++    device_type: a10
++    error_regexp:
++    - '% Invalid input'
++    - '% Incomplete command'
++    - Unrecognized command
+   ospf:
+     ipv4: true
+   routing:
+diff --git a/netsim/devices/asav.yml b/netsim/devices/asav.yml
+index e560751..0dfb1d6 100644
+--- a/netsim/devices/asav.yml
++++ b/netsim/devices/asav.yml
+@@ -165,6 +165,12 @@ features:
+     priority: true
+     timers: true
+   nat: true
++# Upstream #3935 reports a static route whose next hop is not directly connected as an
++# ERROR. demo-lab declares such routes on atl-bldg1-fw01; our asa.j2 renders them when a
++# connected subnet reaches the next hop and otherwise emits a visible "! SKIPPED static route"
++# line. Keep that behaviour: without this the blueprint no longer compiles.
++warnings:
++  indirect_nexthop: false
+ libvirt:
+   image: cisco/asav
+   create_template: asav.xml.j2
+diff --git a/netsim/devices/fortios.yml b/netsim/devices/fortios.yml
+index e9c6508..c3896c0 100644
+--- a/netsim/devices/fortios.yml
++++ b/netsim/devices/fortios.yml
+@@ -37,11 +37,6 @@ group_vars:
+   netlab_console_connection: ssh
+   netlab_ready: [ ansible ]
+   netlab_device_type: fortios
+-  netmiko_device_type: fortinet
+-  netmiko_error_regexp:
+-  - Command fail\. Return code
+-  - Unknown action
+-  - command parse error
+ external:
+   image: none
+ features:
+@@ -65,6 +60,14 @@ features:
+       valid: [ enable, disable ]   # restart capability or stays silent
+       caveats: true
+   nat: true
++  # netlab moved the netmiko parameters from group variables (netmiko_device_type,
++  # netmiko_error_regexp) to device features (upstream #3930); same values, new home
++  netmiko:
++    device_type: fortinet
++    error_regexp:
++    - Command fail\. Return code
++    - Unknown action
++    - command parse error
+   security:
+     policy: true
+   ospf:
+@@ -118,7 +121,7 @@ kne:
+     # KNE provider moves the node to this mode (add_default_config_mode ->
+     # _kne_boot_config_mode=startup, netlab_config_mode=netmiko) and
+     # `netlab initial` pushes the changed node over netmiko
+-    # (netmiko_device_type fortinet, from the device file). It connects to
++    # (features.netmiko.device_type fortinet, from the device file). It connects to
+     # the SSH service port the provider publishes as `netmiko_port`, NOT
+     # ansible_port: on KNE the provider points ansible_port at the
+     # management service, which for fortios is httpapi, not SSH -- see
+diff --git a/netsim/devices/nxos.yml b/netsim/devices/nxos.yml
+index 14832cb..459f4d4 100644
+--- a/netsim/devices/nxos.yml
++++ b/netsim/devices/nxos.yml
+@@ -148,6 +148,11 @@ kne:
+   group_vars:
+     ansible_ssh_pass: admin
+     ansible_user: admin
++    # Upstream #3936 made the Nexus config lane netmiko (netlab_config_mode: netmiko in the
++    # base group_vars). Under KNE the n9kv BOOTS its day-0 from the startup config (KubeVirt
++    # CVAC), which is the proven lane; without this the node would be configured by an SSH
++    # push after boot instead. Declared here so the KNE behaviour is unchanged.
++    netlab_config_mode: startup
+     netlab_ready: [ ssh, ansible ]
+     netlab_ssh_args: "-o KexAlgorithms=+diffie-hellman-group14-sha1 -o PubkeyAcceptedKeyTypes=+ssh-rsa -o HostKeyAlgorithms=+ssh-rsa"
+     # SSH-readiness window for netlab's `initial` gate (netsim/cli/initial/ready.py:74
+@@ -162,6 +167,12 @@ kne:
+     # is NOT injected into the netlab topology and does NOT affect this gate.
+     netlab_check_retries: 180
+     netlab_check_delay: 10
++  features:
++    initial:
++      # upstream #3936 added a `normalize` config module (shut every data interface before
++      # the netmiko push). A startup-config boot starts from an empty config, so it has
++      # nothing to normalize; keep the day-0 file as it was.
++      normalize: false
+   interface.name: eth{ifindex}
+   node:
+     kind: nxos
+diff --git a/tests/test_a10_deploy_and_vip_advertise.py b/tests/test_a10_deploy_and_vip_advertise.py
+index 279f63c..9372534 100644
+--- a/tests/test_a10_deploy_and_vip_advertise.py
++++ b/tests/test_a10_deploy_and_vip_advertise.py
+@@ -106,7 +106,7 @@ def test_every_a10_module_template_is_delivered_over_netmiko(tmp_path: Path, mon
+   assert set(lb.netlab_ansible_skip_module) >= set(modules)   # nothing left for the Ansible lane
+ 
+   device = yaml.safe_load((NETSIM / 'devices' / 'a10.yml').read_text())
+-  assert device['group_vars']['netmiko_device_type'] == 'a10'
++  assert device['features']['netmiko']['device_type'] == 'a10'
+   assert device['group_vars']['netmiko_save_command'] == 'write memory'
+   # The acos_config lane is retired, not dormant
+   assert not (NETSIM / 'ansible' / 'tasks' / 'deploy-config' / 'a10.yml').exists()
+diff --git a/tests/test_kne_netmiko.py b/tests/test_kne_netmiko.py
+index c891471..13808c3 100644
+--- a/tests/test_kne_netmiko.py
++++ b/tests/test_kne_netmiko.py
+@@ -49,11 +49,12 @@ def test_kne_netmiko_mode_maps_every_module_to_netmiko(tmp_path: Path, monkeypat
+ 
+ 
+ def test_netmiko_connects_where_ansible_does() -> None:
+-  topology = Box({ 'defaults': { 'provider': 'kne', 'devices': { 'iosv': { 'group_vars': {} } } } },box_dots=True)
++  topology = Box({ 'defaults': { 'provider': 'kne', 'devices': { 'iosv': {
++    'group_vars': {}, 'features': { 'netmiko': { 'device_type': 'cisco_ios' } } } } } },box_dots=True)
+   node = Box({
+     'name': 'r1', 'device': 'iosv', 'provider': 'kne',
+     'mgmt': { 'ipv4': '192.168.121.101' },
+-    'netmiko_device_type': 'cisco_ios', 'ansible_user': 'vagrant', 'ansible_ssh_pass': 'vagrant',
++    'ansible_user': 'vagrant', 'ansible_ssh_pass': 'vagrant',
+   },box_dots=True)
+   assert _netmiko.prepare_params(node,topology)['host'] == '192.168.121.101'
+   assert 'port' not in _netmiko.prepare_params(node,topology)
+@@ -93,8 +94,9 @@ def _netmiko_deploy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, conn: _Fake
+   monkeypatch.chdir(tmp_path)
+   Path('node_files/lb').mkdir(parents=True)
+   Path('node_files/lb/initial').write_text('hostname lb\n')
+-  topology = Box({ 'defaults': { 'provider': 'kne', 'devices': { 'a10': { 'group_vars': {
+-    'netmiko_error_regexp': [ '% Invalid input' ], **group_vars } } } } },box_dots=True)
++  topology = Box({ 'defaults': { 'provider': 'kne', 'devices': { 'a10': {
++    'features': { 'netmiko': { 'error_regexp': [ '% Invalid input' ] } },
++    'group_vars': group_vars } } } },box_dots=True)
+   node = Box({ 'name': 'lb', 'device': 'a10', 'provider': 'kne', '_node_config': { 'initial': ':netmiko' }, '_deploy': {} },box_dots=True)
+   monkeypatch.setattr(initial_netmiko._netmiko,'check_netmiko',lambda n: True)
+   monkeypatch.setattr(initial_netmiko._netmiko,'prepare_params',lambda n,t: { 'session_log': 'netmiko.log' })
+diff --git a/tests/test_kne_provider.py b/tests/test_kne_provider.py
+index 360ca9b..ba6baab 100644
+--- a/tests/test_kne_provider.py
++++ b/tests/test_kne_provider.py
+@@ -3660,7 +3660,7 @@ def test_kne_fortios_reconfigure_goes_over_netmiko_with_the_same_user_data(
+   assert fw1._node_config.initial == ':netmiko'
+   assert fw1._node_config.ospf == ':netmiko'
+   assert set(fw1.get('netlab_ansible_skip_module',[])) >= {'initial','ospf'}
+-  assert devices.get_node_group_var(fw1,'netmiko_device_type',topology.defaults) == 'fortinet'
++  assert devices.get_device_features(fw1,topology.defaults).netmiko.device_type == 'fortinet'
+   assert reconf_user_data == bringup_user_data
+ 
+ 
+-- 
+2.56.0
+

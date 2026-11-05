@@ -1,0 +1,252 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 12:46:09 -0500
+Subject: [PATCH 13/35] meshnet: VXLAN is the inter-node link default, GRPC
+ needs the word (R4)
+
+---
+diff --git a/third_party/meshnet/daemon/cni/cni.go b/third_party/meshnet/daemon/cni/cni.go
+index 2de3d66..d8dfd32 100644
+--- a/third_party/meshnet/daemon/cni/cni.go
++++ b/third_party/meshnet/daemon/cni/cni.go
+@@ -15,6 +15,8 @@ import (
+ 	"github.com/containernetworking/cni/libcni"
+ 	"github.com/containernetworking/cni/pkg/types"
+ 	log "github.com/sirupsen/logrus"
++
++	"github.com/openconfig/kne/third_party/meshnet/utils/wireutil"
+ )
+ 
+ const (
+@@ -100,7 +102,13 @@ func saveConfList(m map[string]interface{}) error {
+ }
+ 
+ func saveInterNodeLinkConf() error {
+-	return ioutil.WriteFile(interNodeLinkConf, []byte(os.Getenv("INTER_NODE_LINK_TYPE")), os.FileMode(06444))
++	// Write the resolved value, never the raw env: an unset env becomes VXLAN
++	// here, so the plugin never reads an empty or misspelt link type.
++	lnkTyp, err := wireutil.ResolveInterNodeLinkType(os.Getenv("INTER_NODE_LINK_TYPE"))
++	if err != nil {
++		return err
++	}
++	return ioutil.WriteFile(interNodeLinkConf, []byte(lnkTyp), os.FileMode(06444))
+ }
+ 
+ func removeInterNodeLinkConf() error {
+diff --git a/third_party/meshnet/daemon/meshnet/meshnet.go b/third_party/meshnet/daemon/meshnet/meshnet.go
+index 23e2144..a8b8a47 100644
+--- a/third_party/meshnet/daemon/meshnet/meshnet.go
++++ b/third_party/meshnet/daemon/meshnet/meshnet.go
+@@ -118,7 +118,10 @@ func New(cfg Config) (*Meshnet, error) {
+ 	allOpts := append(defaultOpts, cfg.GRPCOpts...)
+ 
+ 	var svr *grpc.Server
+-	lnkTyp := os.Getenv("INTER_NODE_LINK_TYPE")
++	lnkTyp, err := wireutil.ResolveInterNodeLinkType(os.Getenv("INTER_NODE_LINK_TYPE"))
++	if err != nil {
++		return nil, err
++	}
+ 	if lnkTyp == wireutil.INTER_NODE_LINK_GRPC {
+ 		svr = grpc.NewServer(allOpts...)
+ 	} else {
+diff --git a/third_party/meshnet/manifests/link_type_test.go b/third_party/meshnet/manifests/link_type_test.go
+new file mode 100644
+index 0000000..ac57362
+--- /dev/null
++++ b/third_party/meshnet/manifests/link_type_test.go
+@@ -0,0 +1,92 @@
++package manifests
++
++import (
++	"os"
++	"path/filepath"
++	"regexp"
++	"strings"
++	"testing"
++)
++
++// The requirement (KNE rebase plan R4): the meshnet DaemonSet that ships
++// without an overlay carries INTER_NODE_LINK_TYPE=VXLAN, and GRPC is selected
++// only by an overlay that says so. A manifest that quietly ships GRPC is the
++// failure this test exists to stop.
++var envValue = regexp.MustCompile(`^\s*value:\s*(\S+)\s*$`)
++
++// linkTypeValue returns the value of INTER_NODE_LINK_TYPE in a manifest, or
++// "" when the manifest does not set it. A commented-out line never counts.
++func linkTypeValue(t *testing.T, path string) string {
++	t.Helper()
++	raw, err := os.ReadFile(path)
++	if err != nil {
++		t.Fatalf("read %s: %v", path, err)
++	}
++	lines := strings.Split(string(raw), "\n")
++	for i, line := range lines {
++		if strings.TrimSpace(line) != "- name: INTER_NODE_LINK_TYPE" && strings.TrimSpace(line) != "name: INTER_NODE_LINK_TYPE" {
++			continue
++		}
++		for _, next := range lines[i+1:] {
++			if m := envValue.FindStringSubmatch(next); m != nil {
++				return strings.Trim(m[1], `"'`)
++			}
++			if strings.TrimSpace(next) == "" || strings.HasPrefix(strings.TrimSpace(next), "#") {
++				continue
++			}
++			break
++		}
++	}
++	return ""
++}
++
++func TestBaseDaemonSetDefaultsToVXLAN(t *testing.T) {
++	got := linkTypeValue(t, "base/daemonset.yaml")
++	if got != "VXLAN" {
++		t.Fatalf("base DaemonSet INTER_NODE_LINK_TYPE = %q, want VXLAN", got)
++	}
++}
++
++// GRPC is allowed only where an overlay names it. Walk every manifest and
++// fail on a GRPC value outside an overlay directory.
++func TestGRPCOnlyFromExplicitOverlay(t *testing.T) {
++	var checked int
++	err := filepath.WalkDir(".", func(path string, d os.DirEntry, err error) error {
++		if err != nil {
++			return err
++		}
++		if d.IsDir() || !strings.HasSuffix(path, ".yaml") {
++			return nil
++		}
++		if strings.HasSuffix(path, "_test.go") {
++			return nil
++		}
++		v := linkTypeValue(t, path)
++		if v == "" {
++			return nil
++		}
++		checked++
++		if v == "GRPC" && !strings.HasPrefix(path, filepath.Join("overlays", "grpc-link")) {
++			t.Errorf("%s selects GRPC inter-node links without an explicit grpc-link overlay", path)
++		}
++		return nil
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if checked == 0 {
++		t.Fatal("found no manifest that sets INTER_NODE_LINK_TYPE; the gate would pass over nothing")
++	}
++}
++
++// Positive control for the overlay: the grpc-link overlay must still select
++// GRPC, so the gate above is not passing because no overlay sets it.
++func TestGRPCOverlaySelectsGRPC(t *testing.T) {
++	raw, err := os.ReadFile(filepath.Join("overlays", "grpc-link", "kustomization.yaml"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !strings.Contains(string(raw), "value: GRPC") {
++		t.Fatal("grpc-link overlay no longer selects GRPC")
++	}
++}
+diff --git a/third_party/meshnet/plugin/meshnet.go b/third_party/meshnet/plugin/meshnet.go
+index 82746d3..422b78a 100644
+--- a/third_party/meshnet/plugin/meshnet.go
++++ b/third_party/meshnet/plugin/meshnet.go
+@@ -7,7 +7,6 @@ import (
+ 	"net"
+ 	"os"
+ 	"runtime"
+-	"strings"
+ 	"time"
+ 
+ 	"github.com/containernetworking/cni/pkg/skel"
+@@ -428,7 +427,12 @@ func SetInterNodeLinkType() {
+ 		return
+ 	}
+ 
+-	interNodeLinkType = strings.TrimSpace(string(b))
++	lnkTyp, err := wireutil.ResolveInterNodeLinkType(string(b))
++	if err != nil {
++		log.Warningf("Ignoring inter node link type file: %v; using %s", err, interNodeLinkType)
++		return
++	}
++	interNodeLinkType = lnkTyp
+ }
+ 
+ // -------------------------------------------------------------------------------------------------
+diff --git a/third_party/meshnet/utils/wireutil/inter_node_link.go b/third_party/meshnet/utils/wireutil/inter_node_link.go
+new file mode 100644
+index 0000000..21bc48a
+--- /dev/null
++++ b/third_party/meshnet/utils/wireutil/inter_node_link.go
+@@ -0,0 +1,26 @@
++package wireutil
++
++import (
++	"fmt"
++	"strings"
++)
++
++// ResolveInterNodeLinkType maps the INTER_NODE_LINK_TYPE value to the link type
++// used for cross-node links. VXLAN is the default: an unset or empty value is
++// VXLAN. Only the exact value GRPC selects the gRPC wire overlay. Any other
++// value is an error, so a typo such as "grpc" cannot silently pick VXLAN or
++// GRPC without the operator asking for it.
++//
++// Upstream's own default was GRPC. Skyforge runs VXLAN (MTU 1450 on a 1500
++// underlay; see the KNE rebase plan R4), and the manifests set it explicitly.
++func ResolveInterNodeLinkType(value string) (string, error) {
++	v := strings.TrimSpace(value)
++	switch v {
++	case "", INTER_NODE_LINK_VXLAN:
++		return INTER_NODE_LINK_VXLAN, nil
++	case INTER_NODE_LINK_GRPC:
++		return INTER_NODE_LINK_GRPC, nil
++	default:
++		return "", fmt.Errorf("INTER_NODE_LINK_TYPE must be %q, %q or unset, got %q", INTER_NODE_LINK_VXLAN, INTER_NODE_LINK_GRPC, value)
++	}
++}
+diff --git a/third_party/meshnet/utils/wireutil/inter_node_link_test.go b/third_party/meshnet/utils/wireutil/inter_node_link_test.go
+new file mode 100644
+index 0000000..bd28d4a
+--- /dev/null
++++ b/third_party/meshnet/utils/wireutil/inter_node_link_test.go
+@@ -0,0 +1,36 @@
++package wireutil
++
++import "testing"
++
++// The requirement: unset means VXLAN, GRPC needs the explicit word, and
++// anything else is refused rather than guessed.
++func TestResolveInterNodeLinkType(t *testing.T) {
++	cases := []struct {
++		name    string
++		value   string
++		want    string
++		wantErr bool
++	}{
++		{name: "unset defaults to VXLAN", value: "", want: INTER_NODE_LINK_VXLAN},
++		{name: "blank defaults to VXLAN", value: "  ", want: INTER_NODE_LINK_VXLAN},
++		{name: "explicit VXLAN", value: "VXLAN", want: INTER_NODE_LINK_VXLAN},
++		{name: "explicit GRPC", value: "GRPC", want: INTER_NODE_LINK_GRPC},
++		{name: "GRPC with surrounding space", value: " GRPC\n", want: INTER_NODE_LINK_GRPC},
++		{name: "lowercase grpc is refused", value: "grpc", wantErr: true},
++		{name: "unknown value is refused", value: "VXLANX", wantErr: true},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			got, err := ResolveInterNodeLinkType(tc.value)
++			if tc.wantErr {
++				if err == nil {
++					t.Fatalf("ResolveInterNodeLinkType(%q) = %q, want error", tc.value, got)
++				}
++				return
++			}
++			if err != nil || got != tc.want {
++				t.Fatalf("ResolveInterNodeLinkType(%q) = %q, %v; want %q", tc.value, got, err, tc.want)
++			}
++		})
++	}
++}
+-- 
+2.56.0
+

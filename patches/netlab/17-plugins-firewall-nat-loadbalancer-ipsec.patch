@@ -1,0 +1,4424 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 12:00:00 +0000
+Subject: [PATCH] plugins: firewall.policy, nat, loadbalancer (health
+ monitors), ipsec
+
+---
+diff --git a/docs/plugins.md b/docs/plugins.md
+index e1cdf93..c171ac9 100644
+--- a/docs/plugins.md
++++ b/docs/plugins.md
+@@ -71,6 +71,9 @@ These plugins are included with _netlab_ and can be used in all lab topologies:
+ 
+    plugins/bonding.md
+    plugins/firewall.zonebased.md
++   plugins/ipsec.md
++   plugins/loadbalancer.md
++   plugins/nat.md
+    plugins/mlag.vtep.md
+    plugins/evpn.multihoming.md
+    plugins/tunnel.gre.md
+diff --git a/docs/plugins/firewall.policy.md b/docs/plugins/firewall.policy.md
+new file mode 100644
+index 0000000..1d88afa
+--- /dev/null
++++ b/docs/plugins/firewall.policy.md
+@@ -0,0 +1,84 @@
++(plugin-firewall-policy)=
++# Firewall policy plugin
++
++This plugin adds a vendor-neutral security-policy data model and renders it as device configuration.
++
++`firewall.policy` is a **Skyforge plugin**, not stock *netlab* — it was added here alongside `nat` and `loadbalancer` for blueprint-import parity. Changes belong in `patches/netlab/`.
++
++## Supported Platforms
++
++| Operating system | Schema | Renders config | Template |
++| ---------------- | :--: | :--: | --- |
++| Fortinet FortiOS |  ✅  |  ✅  | `fortios.j2` |
++| Palo Alto PAN-OS |  ✅  |  ✅  | `panos.j2` |
++| `none`           |  ✅  |  ❌  | none — the meta device declares nearly every feature so transform tests pass |
++
++A device that is not in this list and carries `firewall.policy.rules` is an error, not a silent skip — see [Validation](#validation).
++
++## Using the Plugin
++
++```yaml
++plugin: [ firewall.policy ]
++
++nodes:
++  fw:
++    device: fortios
++    firewall.policy.rules:
++    - name: trust-to-untrust
++      action: permit
++      from_zone: LAN
++      to_zone: WAN
++      src: [ 10.0.0.0/8 ]
++      dst: [ any ]
++      services: [ ALL ]
++```
++
++## Supported attributes
++
++Node-level:
++
++* `firewall.policy.rules` — a list of rules.
++* `firewall.policy.service_objects` — named protocol/port services (`name`, `protocol` tcp|udp, `port`, optional `description`).
++* `firewall.policy.service_groups` — named service GROUPS (`name`, `members`). Members are service objects, inline `tcp/PORT` forms, other groups, or predefined platform services. A rule that names a group keeps the group: FortiOS and PAN-OS emit the group object and reference it, the ASA expands the members into one ACE each.
++* `firewall.policy.address_objects` — named addresses (`name`, `ipv4` as prefix, host or `a-b` range). FortiOS also generates an address object for any src/dst token that is written as a prefix, host or range, because a FortiGate policy cannot take one inline.
++
++Rule attributes:
++
++| Attribute | Type | Required | Values | Default applied by the plugin |
++| --- | --- | :--: | --- | --- |
++| `name` | str | no | — | `policy_<n>`, 1-based |
++| `sequence` | int | no | — | `10`, then `20`, `30`… (+10 per rule) |
++| `action` | str | **yes** | `permit`, `deny` | normalized to `permit` if unrecognized |
++| `from_zone` | id | **yes** | — | `any` |
++| `to_zone` | id | **yes** | — | `any` |
++| `src` | list of str | no | — | `[any]` |
++| `dst` | list of str | no | — | `[any]` |
++| `services` | list of str | no | — | `[any]` |
++| `log` | bool | no | — | `True` |
++| `nat` | bool | no | — | `False` — see [Interaction with the NAT plugin](#interaction-with-the-nat-plugin) |
++
++An explicit `sequence` wins but does **not** shift the counter for later rules, so mixing explicit and generated sequence numbers can collide. FortiOS keys its policies on `sequence`; PAN-OS does not use it at all.
++
++### Platform differences worth knowing
++
++* **FortiOS** maps `from_zone`/`to_zone` to `srcintf`/`dstintf` — an interface name or a zone object (bind zones with `firewall.zone` and the `firewall.zonebased` plugin). `set schedule "always"` is emitted on every rule. Rule names are stripped of surrounding double quotes. Objects are rendered before the policy table: `config firewall address` (address objects + inline prefixes), `config firewall service custom` (service objects + inline `tcp/PORT`), `config firewall service group`. Predefined FortiOS services (`HTTP`, `HTTPS`, `SSH`, `DNS`, `LDAPS`, ...) may be named directly: the device declares `features.firewall.policy_named_services`, which exempts bare names from the resolvability check below. `any`/`all` become the built-ins `all` / `ALL`.
++* **PAN-OS** keys rules by `name`, so ordering is insertion order, not `sequence`. `application any` is emitted on every rule; there is no `application` attribute. Rule names are **not** quote-stripped, so a name containing `"` produces malformed configuration.
++* On PAN-OS the stock `initial/panos.j2` template reads `firewall.policy.rules` directly and auto-creates a `set zone "<name>" network layer3` for every non-`any` zone referenced. That is a hard dependency of the initial config on this plugin's data.
++
++## Validation
++
++Only two conditions are reported, both in `post_transform`, and both are skipped entirely when a node has no rules:
++
++* `Node <name>(<device>) does not support firewall.policy rules` — the device does not declare `features.firewall.policy`. The whole node is skipped.
++* `Node <name>(<device>) cannot resolve service '<svc>'` — on a platform without App-ID a service must be `any`, a bare protocol, an inline `tcp|udp/PORT`, a `service_objects` name, a `service_groups` name whose members all resolve, or (on `policy_named_services` platforms) any name. The ASA builds its ACE from the service, so an unresolvable name would render nothing.
++* `Node <name> firewall.policy.rules[<idx>] must be a dictionary` — that one rule is skipped; the rest of the node still renders.
++
++There is deliberately **no** duplicate-name check, duplicate-sequence check, zone-existence check, or address/service object validation. An unrecognized `action` is coerced to `permit` rather than rejected — the schema's `valid_values` is what actually rejects a bad action, earlier.
++
++## Interaction with the NAT plugin
++
++A rule carrying `nat: true` is promoted into `node.nat.rules` by the [`nat` plugin](nat.md), which renders the translation. The two plugins are otherwise independent: `nat` no longer *requires* `firewall.policy`, so `plugin: [ nat ]` works on its own.
++
++Promoted rules are **appended** to any NAT rules the author wrote, not substituted for them. They also skip the standalone NAT rule schema — a promoted rule needs no `type` and no `translated_*` attribute, because the platform's policy template renders it.
++
++On FortiOS this is how source NAT is expressed at all: `nat/fortios.j2` re-enters `config firewall policy` and adds `set nat enable` to the policy IDs this plugin created, matching them by `sequence`. That is the platform's model — FortiOS NAT only takes effect where a matching firewall policy exists.
+diff --git a/docs/plugins/firewall.zonebased.md b/docs/plugins/firewall.zonebased.md
+index d6284c6..d016b45 100644
+--- a/docs/plugins/firewall.zonebased.md
++++ b/docs/plugins/firewall.zonebased.md
+@@ -24,6 +24,7 @@ The plugin includes Jinja2 templates for the following platforms:
+ ### Supported attributes
+ 
+ The plugin adds the following attributes defined at node level:
++* **firewall.zonebased.default_policy** (`permit` or `deny`, default `deny`) -- what happens to traffic no rule matches. vSRX renders `security policies default-policy permit-all|deny-all`. Junos' factory setting is deny-all; a source whose global group says `default-policy permit-all` needs `permit` here or its unlisted inter-zone flows are dropped in the lab.
+ * **firewall.zonebased.default_rules** (list) -- List of defaults *zone to zone* policies. Each item is a *dict* with the following attributes:
+     * **from_zone** (id, mandatory) -- Policy Source Zone
+     * **to_zone** (id, mandatory) -- Policy Destination Zone
+diff --git a/docs/plugins/ipsec.md b/docs/plugins/ipsec.md
+new file mode 100644
+index 0000000..f565848
+--- /dev/null
++++ b/docs/plugins/ipsec.md
+@@ -0,0 +1,76 @@
++(plugin-ipsec)=
++# IPsec plugin
++
++This plugin turns `type: tunnel` links into vendor-configurable IPsec tunnels.
++
++The plugin uses the tunnel link for overlay addressing and interface creation, and adds IPsec-specific underlay, peer, and crypto data on top of that model.
++
++The current generic model is built around route-based tunnels. Policy-based data can be carried in the model with `mode: policy-based` and `selectors`, but full deployment support depends on the target platform.
++
++## Supported Platforms
++
++| Operating system    | IPsec tunnel deployment |
++| ------------------- | :--: |
++| Cisco IOS / CSR     |  ✅  |
++| Palo Alto PAN-OS    |  ✅  |
++
++## Using the Plugin
++
++* Add `plugin: [ ipsec ]` to the lab topology.
++* Use `type: tunnel` on links that should become IPsec tunnels.
++* Put shared crypto settings under the link-level `ipsec` attribute.
++* Put per-endpoint underlay data under the interface-level `ipsec` attribute.
++
++## Supported attributes
++
++Link-level attributes:
++* `ipsec.preshared_key` (string, mandatory) -- shared secret used by both tunnel endpoints.
++* `ipsec.mode` (`route-based` or `policy-based`) -- IPsec service model. The default is `route-based`.
++* `ipsec.name` (string) -- optional vendor tunnel object name.
++* `ipsec.peer_type` (`ip`, `dynamic`, or `fqdn`) -- default peer type for all endpoints on the link.
++* `ipsec.selectors` (list) -- policy-based traffic selectors, each entry containing `local` and `remote` prefixes.
++* `ipsec.ike` -- IKE settings including `version`, `crypto_profile`, `authentication`, `encryption`, `dh_group`, lifetimes, and `enable_nat_traversal`.
++* `ipsec.esp` -- IPsec ESP settings including `crypto_profile`, `authentication`, `encryption`, `dh_group`, and lifetimes.
++
++Interface-level attributes:
++* `ipsec.local_interface` (string) -- underlay interface used to terminate the tunnel.
++* `ipsec.local_address` (string) -- local underlay source address when the platform needs an address instead of an interface.
++* `ipsec.endpoint` (string) -- local underlay address or FQDN. The remote endpoint can use this value automatically.
++* `ipsec.peer` (string) -- explicit remote peer override for the local endpoint.
++* `ipsec.peer_type` (`ip`, `dynamic`, or `fqdn`) -- local peer type override.
++* `ipsec.selectors` (list) -- endpoint-specific selector override or refinement.
++* `ipsec.local_id_type` / `ipsec.local_id_value` -- local IKE identity.
++* `ipsec.peer_id_type` / `ipsec.peer_id_value` -- remote peer IKE identity.
++
++## Example
++
++```yaml
++plugin: [ ipsec ]
++
++provider: clab
++defaults.device: csr
++
++nodes: [ r1, r2 ]
++
++links:
++- r1:
++    ipv4: 192.0.2.1/30
++  r2:
++    ipv4: 192.0.2.2/30
++- r1:
++    ipsec:
++      local_interface: GigabitEthernet2
++      endpoint: 192.0.2.1
++  r2:
++    ipsec:
++      local_interface: GigabitEthernet2
++      endpoint: 192.0.2.2
++  type: tunnel
++  ipsec:
++    mode: route-based
++    preshared_key: netlab-secret
++    ike:
++      version: ikev2
++    esp:
++      dh_group: group14
++```
+diff --git a/docs/plugins/loadbalancer.md b/docs/plugins/loadbalancer.md
+new file mode 100644
+index 0000000..dd2e926
+--- /dev/null
++++ b/docs/plugins/loadbalancer.md
+@@ -0,0 +1,98 @@
++# Load Balancer Plugin
++
++The **loadbalancer** plugin preserves and renders load-balancing metadata discovered by the the collector importer.
++
++```yaml
++plugin: [ loadbalancer ]
++```
++
++## Data Model
++
++The plugin expects node-level `load_balancing` data:
++
++```yaml
++nodes:
++  lb1:
++    load_balancing:
++      virtual_servers: []
++      service_groups: []
++      servers: []
++```
++
++Malformed structures are reported as transformation errors.
++
++### Health monitors
++
++`loadbalancer.monitors` declares named probes and three attributes bind them,
++one per level a load balancer checks health at:
++
++| Attribute | Checks | A10 ACOS rendering |
++|---|---|---|
++| `pools[].monitor` | the pool / service group | `slb service-group <p>` → `health-check <m>` |
++| `members[].monitor` (default `pools[].member_monitor`) | the member service (ip:port) | `slb server <s>` → `port <n> <proto>` → `health-check <m>` |
++| `members[].server_monitor` (default `pools[].server_monitor`) | the member host | `slb server <s>` → `health-check <m>` |
++
++Each binding takes a `monitors[].name`, `ping` (the built-in ICMP probe, never
++declared), `none` (health checking disabled: `health-check-disable` on ACOS) or
++`default` (no binding -- the device default applies). A reference to an
++undeclared monitor is an error.
++
++Monitor attributes: `type` (`icmp` -- `ping` is accepted and normalized to
++`icmp` -- `tcp` or `http`), `port` (required for `tcp`), `url` (HTTP request
++path, default `/`), `interval` and `timeout` (seconds, rendered only when set;
++`timeout` must not exceed `interval`). `send`/`receive` are carried but not
++rendered on A10.
++
++```yaml
++loadbalancer:
++  monitors:
++  - { name: webfarm_check, type: http, port: 80, url: /index.php }
++  - { name: hm_vip_80, type: icmp, interval: 10 }
++  pools:
++  - name: web
++    monitor: ping              # service-group level
++    server_monitor: ping       # every member host
++    member_monitor: ping       # every member service
++    members:
++    - { name: s1, address: 10.0.0.11, port: 0, server_monitor: none }
++```
++
++Without a binding ACOS falls back to its defaults -- an ICMP check on the
++server and an L4 TCP handshake on each server port -- so a pool whose members
++run no listener on the service port reads Down although they answer ping.
++Only the A10 template renders monitors today; the F5 template renders the
++imported `load_balancing` model and ignores them.
++
++## Capability Contract
++
++Rendering is enabled by device capability:
++
++```yaml
++features:
++  loadbalancer: {}
++```
++
++Behavior:
++- If `features.loadbalancer` is present (or any non-`False` value), the plugin schedules extra config rendering for that device (`api.node_config(node, "loadbalancer")`).
++- If capability is absent, the plugin keeps warning behavior:
++  - `Node <name>(<device>) has load-balancing metadata; rendering of these features is not implemented yet`
++
++This keeps onboarding generic: new load-balancer platforms do not require plugin code changes.
++
++## Onboarding a New LB Platform
++
++To onboard a new load-balancer device:
++
++1. Add/extend device definition in `netsim/devices/<device>.yml`
++   - include `features.loadbalancer: {}`
++2. Add template in `netsim/extra/loadbalancer/<device>.j2`
++4. Add/update tests:
++   - positive rendering test (`netlab create ...` without warning)
++   - negative/unsupported test (warning still emitted when capability is missing)
++
++## Current Implementation
++
++- Implemented template: `netsim/extra/loadbalancer/f5.j2`
++- Existing test coverage includes:
++  - rendering test for supported F5
++  - warning-preservation test for unsupported devices
+diff --git a/docs/plugins/nat.md b/docs/plugins/nat.md
+new file mode 100644
+index 0000000..196226f
+--- /dev/null
++++ b/docs/plugins/nat.md
+@@ -0,0 +1,144 @@
++(plugin-nat)=
++# NAT plugin
++
++This plugin adds a generic NAT data model to supported firewall and router operating systems, and renders vendor configuration for the platforms marked below.
++
++`nat` is a **Skyforge plugin**, not stock *netlab* — it is maintained in this fork alongside `firewall.policy` and `loadbalancer`. Changes to it belong in `patches/netlab/`.
++
++## Supported Platforms
++
++The earlier version of this plugin carried a schema only and rendered no device configuration. That is no longer uniformly true, and the distinction matters: a platform with a schema but no template will accept `plugin: [ nat ]`, validate your rules, report the feature as supported, and emit **no NAT configuration at all**.
++
++| Operating system    | NAT schema | Renders config | Template |
++| ------------------- | :--: | :--: | --- |
++| Arista EOS          |  ✅  |  ✅  | `eos.j2` — interface-based |
++| Cisco IOS / IOS-XE  |  ✅  |  ✅  | `ios.j2` — inside/outside + global statement |
++| Cisco IOL           |  ✅  |  ✅  | `iol.j2` — includes `ios.j2` |
++| Palo Alto PAN-OS    |  ✅  |  ✅  | `panos.j2` — zone-based, own NAT rulebase |
++| Fortinet FortiOS    |  ✅  |  ⚠️  | `fortios.j2` — see the FortiOS exception |
++| Juniper vSRX        |  ✅  |  ✅  | `vsrx.j2` — source NAT only, one `security nat source rule-set` per rule (interface or pool); from/to zones from the rule's `inside`/`outside` zone names or the `firewall.zone` of the interfaces carrying `nat.role` |
++| Cisco ASA / ASAv    |  ✅  |  ❌  | **none — schema only** |
++
++**Every NAT template lives in this plugin.** PAN-OS NAT is its own rulebase (`rulebase nat rules`), completely separate from `rulebase security rules`, so it belongs here like every other platform. It is easy to assume `firewall.policy/panos.j2` covers it — it does not, and never did: that template emits SECURITY rules only. Before `panos.j2` existed, PAN-OS was declared `features.nat: True` and rendered nothing at all.
++
++**The FortiOS exception.** In FortiOS, source NAT genuinely *is* a flag on a firewall policy (`set nat enable`), so `fortios.j2` re-opens `config firewall policy` and sets it per rule. That is the platform's model, not a layering choice — but it does mean FortiOS NAT only takes effect where a corresponding firewall policy exists. It is marked ⚠️ rather than ✅ for that reason.
++
++**ASAv** is declared and unimplemented. Do not read the schema column as "this works".
++
++## Using the Plugin
++
++* Add `plugin: [ nat ]` to the lab topology. **No other plugin is required.**
++* Mark NAT-facing interfaces with `nat.role: inside` or `nat.role: outside`.
++* Add node-level NAT rules under `nat.rules`.
++
++The plugin used to declare `_requires: [ firewall.policy ]`, which *netlab* enforces as a hard dependency — `plugin: [ nat ]` alone was rejected at compile time and every pure-NAT topology had to load a firewall plugin it never used. You can translate addresses without having any policy at all, so that dependency is gone. `_execute_after` preserves the ordering when both plugins *are* loaded, so policy-derived NAT rules are still promoted correctly.
++
++### Interface roles are not optional in the same way on every platform
++
++* **EOS** applies the translation on the **outside** interface. An outside role is enough.
++* **IOS / IOL** need **both** `inside` and `outside`: the inside/outside markings and the global `ip nat inside source` statement are three separate pieces of configuration, and a node with only one role cannot translate anything.
++
++Both templates say so in the rendered configuration rather than emitting a partial config: a node with rules but without the roles it needs renders a `! NAT NOT APPLIED` comment explaining what is missing. A lab that comes up green while silently doing no translation is the worst possible outcome, so the templates are deliberately loud.
++
++## Supported attributes
++
++Interface-level attributes:
++* `nat.role` (`inside` or `outside`) -- classifies the interface for NAT policy.
++
++Node-level attributes:
++* `nat.rules` -- list of NAT rules.
++
++Rule attributes:
++* `name` -- rule name. Used to name the generated ACL on IOS/EOS (`NAT-<NAME>`).
++* `type` (`source`, `destination`, or `static`) -- NAT rule type.
++* `description` -- optional description.
++* `enabled` -- optional enable flag, defaults to `True`. Only an explicit `enabled: false` suppresses a rule.
++* `inside` -- list of source-side zones or interfaces.
++* `outside` -- list of destination-side zones or interfaces.
++* `source` -- source match prefixes or objects.
++* `destination` -- destination match prefixes or objects.
++* `service` -- service match values.
++* `translated_source` -- translated source value for source/static NAT. On EOS and IOS, omitting it (or setting it to `interface`) means PAT/overload onto the outside interface address.
++* `translated_destination` -- translated destination value for destination/static NAT.
++* `translated_service` -- translated service value.
++
++The plugin normalizes scalar match values into lists and records discovered interface roles and zones under `node.nat._roles` and `node.nat._zones`.
++If another plugin provides interface zone metadata, the NAT plugin records those zones under `node.nat._zones`. Otherwise only interface roles are collected.
++
++## Example: PAT on an Arista switch
++
++```yaml
++plugin: [ nat ]
++
++nodes:
++  s2:
++    device: eos
++    nat.rules:
++    - name: outbound
++      type: source
++      source: [ 10.0.0.0/8 ]
++      translated_source: interface
++
++links:
++- s2:
++    ipv4: 10.0.0.1/24
++    nat.role: inside
++  h1:
++- s2:
++    ipv4: 203.0.113.1/30
++    nat.role: outside
++```
++
++Renders on `s2`:
++
++```
++ip access-list standard NAT-OUTBOUND
++   permit 10.0.0.0/8
++!
++interface Ethernet2
++   ip nat source dynamic access-list NAT-OUTBOUND overload
++!
++```
++
++The same topology with `device: iol` renders the IOS form instead — standard ACL with a wildcard mask, `ip nat inside` / `ip nat outside` on the interfaces, and the global statement:
++
++```
++ip access-list standard NAT-OUTBOUND
++ permit 10.0.0.0 0.255.255.255
++!
++interface Ethernet0/1
++ ip nat inside
++!
++interface Ethernet0/0
++ ip nat outside
++!
++ip nat inside source list NAT-OUTBOUND interface Ethernet0/0 overload
++```
++
++## Example: policy-based NAT on a firewall
++
++```yaml
++plugin: [ nat ]
++
++provider: clab
++
++nodes:
++  fw:
++    device: panos
++    nat:
++      rules:
++      - name: trust_to_untrust
++        type: source
++        inside: trust
++        outside: untrust
++        source: 10.0.0.0/24
++        translated_source: interface
++
++links:
++- fw:
++    ipv4: 10.0.0.1/24
++    nat.role: inside
++- fw:
++    ipv4: 203.0.113.1/30
++    nat.role: outside
++```
+diff --git a/netsim/ansible/templates/loadbalancer/a10.j2 b/netsim/ansible/templates/loadbalancer/a10.j2
+new file mode 100644
+index 0000000..4e304a9
+--- /dev/null
++++ b/netsim/ansible/templates/loadbalancer/a10.j2
+@@ -0,0 +1,39 @@
++{#
++  A10 ACOS SLB, rendered from the vendor-neutral loadbalancer model.
++
++  Health checks bind at three ACOS levels, each from its own attribute:
++    slb server <n> <ip>            health-check <m>  <- members[].server_monitor
++      port <p> <proto>             health-check <m>  <- members[].monitor
++    slb service-group <n> <proto>  health-check <m>  <- pools[].monitor
++  (pools[].server_monitor / pools[].member_monitor are resolved onto every
++  member by the plugin.) `ping` is ACOS's predefined ICMP monitor and is never
++  declared; `none` renders health-check-disable; `default`/unset renders
++  nothing, which leaves ACOS's own default -- an L3 ICMP check on the server
++  and an L4 TCP handshake on the port. That default is why a VIP whose members
++  run no listener on the port reads Down while ICMP to them is fine.
++
++  An icmp monitor renders no `method` line: ICMP is the ACOS default method and
++  running-config does not show it (seed: `health monitor hm_... / interval 10`).
++#}
++{% macro hc(ref) %}{{ 'health-check-disable' if ref == 'none' else 'health-check ' ~ ref }}{% endmacro %}
++{% for m in loadbalancer.monitors | default([]) %}
++health monitor {{ m.name }}
++{%   if m.type == 'tcp' %}
++  method tcp port {{ m.port }}
++{%   elif m.type == 'http' %}
++  method http{% if m.port is defined %} port {{ m.port }}{% endif %} url GET {{ m.url | default('/') }}
++{%   endif %}
++{%   if m.interval is defined %}
++  interval {{ m.interval }}{% if m.timeout is defined %} timeout {{ m.timeout }}{% endif %}
++
++{%   endif %}
++{% endfor %}
++{%     if member.server_monitor | default('default') != 'default' %}
++  {{ hc(member.server_monitor) }}
++{%     endif %}
++{%     if member.monitor | default('default') != 'default' %}
++    {{ hc(member.monitor) }}
++{%     endif %}
++{%   if pool.monitor | default('default', true) != 'default' %}
++  {{ hc(pool.monitor) }}
++{%   endif %}
+diff --git a/netsim/devices/asav.yml b/netsim/devices/asav.yml
+index 5ee4a97..7ffe320 100644
+--- a/netsim/devices/asav.yml
++++ b/netsim/devices/asav.yml
+@@ -55,7 +55,7 @@ features:
+   ipsec:
+     route_based: true
+     tunnel: true
+-    ike: [ ikev2 ]
++    ike: [ ikev1, ikev2 ]
+   isis:
+     caveats: true
+     circuit_type: true
+@@ -82,6 +82,7 @@ features:
+     password: true
+     priority: true
+     timers: true
++  nat: true
+   routing:
+     static:
+       caveats: true
+diff --git a/netsim/devices/ios.yml b/netsim/devices/ios.yml
+index fb9df2d..0df9ad1 100644
+--- a/netsim/devices/ios.yml
++++ b/netsim/devices/ios.yml
+@@ -202,6 +202,7 @@ features:
+     ripng: True
+   gateway:
+     protocol: [ vrrp ]
++  nat: true
+ external:
+   image: none
+ graphite.icon: router
+diff --git a/netsim/extra/firewall/policy/__init__.py b/netsim/extra/firewall/policy/__init__.py
+new file mode 100644
+index 0000000..f87657a
+--- /dev/null
++++ b/netsim/extra/firewall/policy/__init__.py
+@@ -0,0 +1,179 @@
++#
++# Firewall policy plugin
++#
++
++import re
++
++from box import Box
++
++from netsim import api
++from netsim.augment import devices
++from netsim.utils import log
++
++_config_name = "firewall.policy"
++
++# tcp/4022, udp/53, tcp/8080-8090 -- the inline form, so a one-off port does not
++# need a named service object.
++_INLINE_SERVICE = re.compile(r"^(tcp|udp)/(\d+(?:-\d+)?)$", re.IGNORECASE)
++
++# Services every platform understands without an object behind them.
++_BARE_PROTOCOLS = ("ip", "icmp", "tcp", "udp")
++
++
++def _as_list(value: object, default: str = "any") -> list:
++    if value is None:
++        return [default]
++    if isinstance(value, list):
++        return [str(v) for v in value if str(v)]
++    text = str(value).strip()
++    return [text] if text else [default]
++
++
++def _normalize_action(value: object) -> str:
++    action = str(value or "permit").strip().lower()
++    if action in ("allow", "accept"):
++        return "permit"
++    if action not in ("permit", "deny"):
++        return "permit"
++    return action
++
++
++def _has_feature(features: Box, key: str) -> bool:
++    try:
++        return bool(features.get(key, False))
++    except Exception:                                     # noqa: BLE001 - Box lookup shapes vary
++        return False
++
++
++def _service_is_resolvable(name: str, objects: dict, groups: dict = None, named_ok: bool = False, _seen: set = None) -> bool:
++    """Can a platform WITHOUT App-ID turn this service token into an ACE?
++
++    A group resolves when every member resolves (recursively, cycles refused).
++    On a platform with a predefined service catalogue (policy_named_services)
++    any bare name is accepted: the device defines it, the plugin cannot know
++    the list and must not narrow it.
++    """
++    lowered = name.strip().lower()
++    if lowered in ("any", "") or lowered in _BARE_PROTOCOLS:
++        return True
++    if _INLINE_SERVICE.match(lowered):
++        return True
++    if name in objects:
++        return True
++    groups = groups or {}
++    if name in groups:
++        _seen = set(_seen or ())
++        if name in _seen:
++            return False
++        _seen.add(name)
++        return all(_service_is_resolvable(m, objects, groups, named_ok, _seen) for m in groups[name])
++    return named_ok
++
++
++def post_transform(topology: Box) -> None:
++    for node in topology.nodes.values():
++        rules = node.get("firewall.policy.rules", [])
++        if not isinstance(rules, list) or not rules:
++            continue
++
++        features = devices.get_device_features(node, topology.defaults)
++        if "firewall.policy" not in features:
++            log.error(
++                f"Node {node.name}({node.device}) does not support firewall.policy rules",
++                category=log.IncorrectAttr,
++                module=_config_name,
++            )
++            continue
++
++        app_id = _has_feature(features, "firewall.policy_app_id")
++        named_ok = _has_feature(features, "firewall.policy_named_services")
++
++        objects = {}
++        for obj_idx, obj in enumerate(node.get("firewall.policy.service_objects", []) or []):
++            if not isinstance(obj, Box) or not obj.get("name"):
++                log.error(
++                    f"Node {node.name} firewall.policy.service_objects[{obj_idx}] needs a name",
++                    category=log.IncorrectType,
++                    module=_config_name,
++                )
++                continue
++            objects[obj.name] = obj
++
++        groups = {}
++        for grp_idx, grp in enumerate(node.get("firewall.policy.service_groups", []) or []):
++            if not isinstance(grp, Box) or not grp.get("name") or not isinstance(grp.get("members"), list):
++                log.error(
++                    f"Node {node.name} firewall.policy.service_groups[{grp_idx}] needs a name and a members list",
++                    category=log.IncorrectType,
++                    module=_config_name,
++                )
++                continue
++            groups[grp.name] = [str(m) for m in grp.members]
++
++        for adr_idx, adr in enumerate(node.get("firewall.policy.address_objects", []) or []):
++            if not isinstance(adr, Box) or not adr.get("name") or not adr.get("ipv4"):
++                log.error(
++                    f"Node {node.name} firewall.policy.address_objects[{adr_idx}] needs a name and an ipv4 value",
++                    category=log.IncorrectType,
++                    module=_config_name,
++                )
++
++        sequence = 10
++        for idx, rule in enumerate(rules):
++            if not isinstance(rule, Box):
++                log.error(
++                    f"Node {node.name} firewall.policy.rules[{idx}] must be a dictionary",
++                    category=log.IncorrectType,
++                    module=_config_name,
++                )
++                continue
++
++            rule.action = _normalize_action(rule.get("action", "permit"))
++            rule.from_zone = str(rule.get("from_zone", "any"))
++            rule.to_zone = str(rule.get("to_zone", "any"))
++            rule.src = _as_list(rule.get("src"), "any")
++            rule.dst = _as_list(rule.get("dst"), "any")
++            declared_services = rule.get("services")
++            rule.application = _as_list(rule.get("application"), "any")
++            # A rule that names an application and no service means "this
++            # application, on the ports it normally uses" -- PAN-OS spells that
++            # `application-default`. Defaulting to `any` instead would widen the
++            # rule to that application on EVERY port, which is not what the
++            # author wrote. Same default the firewall.zonebased PAN-OS path uses.
++            if declared_services is None and rule.application != ["any"]:
++                rule.services = ["application-default"]
++            else:
++                rule.services = _as_list(declared_services, "any")
++            rule.log = bool(rule.get("log", True))
++            rule.nat = bool(rule.get("nat", False))
++            rule.setdefault("name", f"policy_{idx + 1}")
++            rule.setdefault("sequence", sequence)
++            sequence += 10
++
++            # An application match that the platform cannot make is not a
++            # warning: rendering the rule without it changes what the rule
++            # PERMITS. Fail the build instead.
++            if rule.application != ["any"] and not app_id:
++                log.error(
++                    f"Node {node.name}({node.device}) cannot match on application "
++                    f"{rule.application} in firewall.policy.rules[{idx}] ({rule.name}): "
++                    "the platform has no App-ID. Express the intent as a service "
++                    "(protocol/port) instead, or move the rule to a device that has one.",
++                    category=log.IncorrectAttr,
++                    module=_config_name,
++                )
++
++            # Likewise, a platform without App-ID builds its ACE from the
++            # service, so an unresolvable service name renders nothing at all.
++            if not app_id:
++                for svc in rule.services:
++                    if not _service_is_resolvable(svc, objects, groups, named_ok):
++                        log.error(
++                            f"Node {node.name}({node.device}) cannot resolve service '{svc}' in "
++                            f"firewall.policy.rules[{idx}] ({rule.name}): name it in "
++                            "firewall.policy.service_objects or service_groups, or write it inline as tcp/PORT.",
++                            category=log.IncorrectAttr,
++                            module=_config_name,
++                        )
++
++        api.node_config(node, _config_name)
+diff --git a/netsim/extra/firewall/policy/asa.j2 b/netsim/extra/firewall/policy/asa.j2
+new file mode 100644
+index 0000000..718a8a9
+--- /dev/null
++++ b/netsim/extra/firewall/policy/asa.j2
+@@ -0,0 +1,96 @@
++{#
++    Cisco ASA firewall.policy.
++
++    The ASA has no zone object: an interface's `nameif` IS its zone, and an ACL
++    is bound to one interface in one direction. from_zone therefore selects the
++    interface the ACL is applied INBOUND on, and every rule sharing a from_zone
++    lands in that interface's ACL, in declared order -- which is what makes rule
++    ORDER meaningful here, exactly as it is on PAN-OS.
++
++    nameif and security-level are set by the initial config from
++    `firewall.zone` / `firewall.security_level`, not here: changing an
++    interface's nameif after the fact makes the ASA discard the configuration
++    already attached to the old name, including the ACL this template binds.
++#}
++{% set svcmap = {} %}
++{% for obj in firewall.policy.service_objects | default([]) %}
++{%   set _ = svcmap.update({obj.name: obj}) %}
++{% endfor %}
++{#
++  Service GROUPS are flattened into their members here, one ACE per member:
++  the ASA object-group form would need `object-group service` plus a
++  protocol-qualified reference, and a flat ACE list is what the plugin's
++  resolvability check already validated member by member. Two levels of
++  nesting are enough for every group a seed has shown so far.
++#}
++{% set grpmap = {} %}
++{% for grp in firewall.policy.service_groups | default([]) %}
++{%   set _ = grpmap.update({grp.name: grp.members}) %}
++{% endfor %}
++{% macro expand(lst) -%}
++{%- set out = [] -%}
++{%- for s in lst -%}
++{%-   if s in grpmap -%}
++{%-     for m in grpmap[s] -%}
++{%-       if m in grpmap -%}
++{%-         for mm in grpmap[m] -%}{%- set _ = out.append(mm) -%}{%- endfor -%}
++{%-       else -%}{%- set _ = out.append(m) -%}
++{%-       endif -%}
++{%-     endfor -%}
++{%-   else -%}{%- set _ = out.append(s) -%}
++{%-   endif -%}
++{%- endfor -%}
++{{ out | join(',') }}
++{%- endmacro %}
++{% macro addr(a) %}
++{%- set t = a | lower -%}
++{%- if t in ['any','any4','0.0.0.0/0'] -%}any
++{%- elif '/' in a -%}
++{%- if a.endswith('/32') -%}host {{ a.split('/')[0] }}
++{%- else -%}{{ a | ipaddr('network') }} {{ a | ipaddr('netmask') }}
++{%- endif -%}
++{%- else -%}host {{ a }}
++{%- endif -%}
++{% endmacro %}
++{% macro svc_proto(s) %}
++{%- set t = s | lower -%}
++{%- if t == 'any' -%}ip
++{%- elif t in ['ip','icmp','tcp','udp'] -%}{{ t }}
++{%- elif '/' in t -%}{{ t.split('/')[0] }}
++{%- elif s in svcmap -%}{{ svcmap[s].protocol }}
++{%- else -%}ip
++{%- endif -%}
++{% endmacro %}
++{% macro svc_port(s) %}
++{%- set t = s | lower -%}
++{%- if '/' in t -%}
++{%- set p = t.split('/')[1] -%}
++{%- if '-' in p %} range {{ p.split('-')[0] }} {{ p.split('-')[1] }}{% else %} eq {{ p }}{% endif -%}
++{%- elif s in svcmap -%}
++{%- set p = svcmap[s].port | string -%}
++{%- if '-' in p %} range {{ p.split('-')[0] }} {{ p.split('-')[1] }}{% else %} eq {{ p }}{% endif -%}
++{%- endif -%}
++{% endmacro %}
++{% if firewall.policy.same_security_traffic | default(false) %}
++same-security-traffic permit inter-interface
++{% endif %}
++{% set zones = [] %}
++{% for policy in firewall.policy.rules | default([]) %}
++{%   if policy.from_zone not in zones %}
++{%     set _ = zones.append(policy.from_zone) %}
++{%   endif %}
++{% endfor %}
++{% for zone in zones %}
++{%   set aclname = (zone | upper) ~ '-IN' %}
++{%   for policy in firewall.policy.rules | default([]) if policy.from_zone == zone %}
++{%     for src in policy.src | default(['any']) %}
++{%       for dst in policy.dst | default(['any']) %}
++{%         for svc in (expand(policy.services | default(['any'])) | trim).split(',') %}
++access-list {{ aclname }} extended {{ policy.action }} {{ svc_proto(svc) | trim }} {{ addr(src) | trim }} {{ addr(dst) | trim }}{{ svc_port(svc) }}{% if policy.icmp_type is defined and svc_proto(svc) | trim == 'icmp' %} {{ policy.icmp_type }}{% endif %}{% if policy.log | default(true) %} log{% endif %}
++
++{%         endfor %}
++{%       endfor %}
++{%     endfor %}
++{%   endfor %}
++access-group {{ aclname }} in interface {{ zone }}
++{% endfor %}
+diff --git a/netsim/extra/firewall/policy/defaults.yml b/netsim/extra/firewall/policy/defaults.yml
+new file mode 100644
+index 0000000..fcf4cb0
+--- /dev/null
++++ b/netsim/extra/firewall/policy/defaults.yml
+@@ -0,0 +1,131 @@
++# firewall.policy
++#
++---
++devices:
++  # asav: added by Skyforge. The ASA has no App-ID, so it deliberately does NOT
++  # get firewall.policy_app_id -- see the comment on panos below.
++  asav:
++    features.firewall.policy: True
++  fortios:
++    features.firewall.policy: True
++    # FortiOS ships a catalogue of predefined service objects (HTTP, HTTPS,
++    # SSH, DNS, LDAPS ...) that a policy may name without defining. Without
++    # this flag the plugin's non-App-ID resolvability check rejected every
++    # such name and blueprint authors flattened the seed's `set service "HTTP
++    # and HTTPS"` into inline ports or widened it to `any` -- which is exactly
++    # the fidelity loss the check exists to prevent. Named services are
++    # emitted verbatim; groups and custom objects declared in this plugin are
++    # rendered as objects first (fortios.j2).
++    features.firewall.policy_named_services: True
++  panos:
++    features.firewall.policy: True
++    # PAN-OS classifies traffic by App-ID, and `application:` on a rule is only
++    # meaningful where the platform actually does that. It is a SEPARATE feature
++    # flag rather than an implied part of firewall.policy because dropping an
++    # application match silently INVERTS the author's intent: a rule that reads
++    # "deny ssh" becomes "deny nothing", and a rule that reads "permit
++    # web-browsing" becomes "permit every port the service list allows". The
++    # plugin therefore hard-errors on `application:` for a device without this
++    # flag instead of rendering something weaker than what was written.
++    features.firewall.policy_app_id: True
++  none:
++    features.firewall.policy: True
++    features.firewall.policy_app_id: True
++    features.firewall.policy_named_services: True
++
++attributes:
++  node:
++    firewall.policy:
++      rules: { type: list, _subtype: _fw_policy_rule }
++      # Named service objects. PAN-OS needs the object to exist before a rule
++      # can reference it by name, and the ASA needs the protocol/port pair to
++      # build an ACE at all, so both consumers read this same list.
++      service_objects: { type: list, _subtype: _fw_policy_service }
++      # Named service GROUPS (FortiOS `config firewall service group`, PAN-OS
++      # `set service-group`, ASA object-group service). A rule that names a
++      # group keeps the group: the ASA template expands members into ACEs,
++      # FortiOS and PAN-OS emit the group object and reference it by name.
++      # Members are service_objects names, inline tcp|udp/PORT forms, other
++      # groups, or (on policy_named_services platforms) predefined names.
++      service_groups: { type: list, _subtype: _fw_policy_service_group }
++      # Named address objects for platforms that cannot take a prefix inline
++      # (FortiOS `set srcaddr`/`set dstaddr` need an address object). A rule's
++      # src/dst may still be a bare prefix or host: fortios.j2 generates the
++      # object for it, named after the prefix.
++      address_objects: { type: list, _subtype: _fw_policy_address }
++      # ASA only: interfaces at EQUAL security levels cannot talk without this.
++      # It is a node-wide switch on the platform, not a per-rule one.
++      same_security_traffic: bool
++  interface:
++    # The ASA has no zone construct: an interface's `nameif` IS its zone, and
++    # rules reference that name. Declaring the zone on the interface is what
++    # lets from_zone/to_zone resolve to a real interface on that platform.
++    firewall.zone: { type: id }
++    firewall.security_level: { type: int, min_value: 0, max_value: 100 }
++
++  _fw_policy_service:
++    name:
++      type: str
++      _required: true
++    protocol:
++      type: str
++      _required: true
++      valid_values: [ tcp, udp ]
++    # str, not int: PAN-OS and the ASA both accept ranges ("8080-8090"), and an
++    # int type would reject them at validation time.
++    port:
++      type: str
++      _required: true
++    description: str
++
++  _fw_policy_service_group:
++    name:
++      type: str
++      _required: true
++    members:
++      type: list
++      _subtype: str
++      _required: true
++    description: str
++
++  _fw_policy_address:
++    name:
++      type: str
++      _required: true
++    # a prefix (10.1.0.0/16), a host (10.1.1.1/32) or a range (10.1.1.1-10.1.1.9)
++    ipv4:
++      type: str
++      _required: true
++    description: str
++
++  _fw_policy_rule:
++    name: str
++    sequence: int
++    action:
++      type: str
++      _required: true
++      valid_values: [ permit, deny ]
++    from_zone:
++      type: id
++      _required: true
++    to_zone:
++      type: id
++      _required: true
++    src:
++      type: list
++      _subtype: str
++    dst:
++      type: list
++      _subtype: str
++    services:
++      type: list
++      _subtype: str
++    application:
++      type: list
++      _subtype: str
++    # ICMP message type, for platforms that filter on it (ASA writes it as the
++    # last token of the ACE, e.g. `permit icmp any any echo-reply`). PAN-OS
++    # expresses the same intent as an App-ID and ignores this.
++    icmp_type: str
++    log: bool
++    nat: bool
+diff --git a/netsim/extra/firewall/policy/fortios.j2 b/netsim/extra/firewall/policy/fortios.j2
+new file mode 100644
+index 0000000..485e41b
+--- /dev/null
++++ b/netsim/extra/firewall/policy/fortios.j2
+@@ -0,0 +1,158 @@
++{#
++  firewall.policy on FortiOS.
++
++  OBJECTS FIRST. A FortiGate policy cannot name a prefix or a port inline:
++  `set srcaddr` / `set dstaddr` take address objects and `set service` takes
++  service objects or groups. Before this template rendered the rule lines
++  only, so a rule whose dst was a prefix or whose service was a group the
++  seed defined (`"HTTP and HTTPS"`) either failed on the box or had to be
++  widened to `all`/`ALL` by the author. Now:
++
++    * service_objects  -> config firewall service custom
++    * service_groups   -> config firewall service group   (members by name)
++    * address_objects  -> config firewall address
++    * a src/dst token that is a prefix, a host or a range gets an address
++      object named after itself; `any`/`all` stays the built-in `all`
++    * an inline tcp/PORT or udp/PORT service gets a custom object tcp-PORT
++    * names that are none of the above are emitted verbatim: FortiOS
++      predefines HTTP, HTTPS, SSH, DNS, LDAPS ... (policy_named_services)
++
++  from_zone/to_zone are srcintf/dstintf: an interface OR a zone object. Zones
++  come from firewall.zone on the node's interfaces; a bare interface name works
++  without it.
++
++  ZONES FIRST. A zone is a `config system zone` object, and a policy naming one
++  that does not exist fails on the box (`node_check_object fail! for name
++  LB_DMZ ... Command fail. Return code -651`). firewall.policy is rendered and
++  deployed BEFORE firewall.zonebased (in the KNE user_data and in the replay),
++  so the zones are declared here as well, ahead of the first policy. The block
++  is the same one firewall/zonebased/fortios.j2 renders; keep them identical.
++  Re-declaring a zone is idempotent (`edit` + the same `set`s).
++#}
++{% set zb_zones = {} %}
++{% for intf in interfaces|default([]) if intf.firewall.zone is defined %}
++{%   set _ = zb_zones.setdefault(intf.firewall.zone, []).append(intf.ifname) %}
++{% endfor %}
++{% set zb_intra = {} %}
++{% for rule in firewall.zonebased.default_rules|default([]) if rule.from_zone == rule.to_zone %}
++{%   set _ = zb_intra.update({ rule.from_zone: 'allow' if rule.action == 'permit' else 'deny' }) %}
++{% endfor %}
++{% if zb_zones %}
++config system zone
++{%   for zname, zifs in zb_zones.items() %}
++edit "{{ zname }}"
++set intrazone {{ zb_intra[zname]|default('deny') }}
++set interface "{{ zifs|join('" "') }}"
++next
++{%   endfor %}
++end
++{% endif %}
++{% set ns = namespace(addr=[], svc=[]) %}
++{% for rule in firewall.policy.rules | default([]) %}
++{%   for a in (rule.src | default([])) + (rule.dst | default([])) %}
++{%     if a not in ns.addr and a | lower not in ['any', 'all'] and ('/' in a or '-' in a or (a.count('.') == 3 and a.replace('.', '').isdigit())) %}
++{%       set ns.addr = ns.addr + [a] %}
++{%     endif %}
++{%   endfor %}
++{%   for s in rule.services | default([]) %}
++{%     if '/' in s and s not in ns.svc %}
++{%       set ns.svc = ns.svc + [s] %}
++{%     endif %}
++{%   endfor %}
++{% endfor %}
++{% set svc_objects = firewall.policy.service_objects | default([]) %}
++{% set svc_groups = firewall.policy.service_groups | default([]) %}
++{% set addr_objects = firewall.policy.address_objects | default([]) %}
++{% if addr_objects or ns.addr %}
++config firewall address
++{%   for a in addr_objects %}
++edit "{{ a.name }}"
++{%     if '-' in a.ipv4 %}
++set type iprange
++set start-ip {{ a.ipv4.split('-')[0] }}
++set end-ip {{ a.ipv4.split('-')[1] }}
++{%     else %}
++set subnet {{ a.ipv4 | ipaddr('network') }} {{ a.ipv4 | ipaddr('netmask') }}
++{%     endif %}
++{%     if a.description is defined %}
++set comment "{{ a.description }}"
++{%     endif %}
++next
++{%   endfor %}
++{%   for a in ns.addr %}
++edit "{{ a }}"
++{%     if '-' in a %}
++set type iprange
++set start-ip {{ a.split('-')[0] }}
++set end-ip {{ a.split('-')[1] }}
++{%     elif '/' in a %}
++set subnet {{ a | ipaddr('network') }} {{ a | ipaddr('netmask') }}
++{%     else %}
++set subnet {{ a }} 255.255.255.255
++{%     endif %}
++set comment "generated from the inline form {{ a }}"
++next
++{%   endfor %}
++end
++{% endif %}
++{% if svc_objects or ns.svc %}
++config firewall service custom
++{%   for s in svc_objects %}
++edit "{{ s.name }}"
++set {{ s.protocol | lower }}-portrange {{ s.port }}
++{%     if s.description is defined %}
++set comment "{{ s.description }}"
++{%     endif %}
++next
++{%   endfor %}
++{%   for s in ns.svc %}
++edit "{{ s | replace('/', '-') }}"
++set {{ s.split('/')[0] | lower }}-portrange {{ s.split('/')[1] }}
++set comment "generated from the inline form {{ s }}"
++next
++{%   endfor %}
++end
++{% endif %}
++{% if svc_groups %}
++config firewall service group
++{%   for g in svc_groups %}
++edit "{{ g.name }}"
++set member "{{ g.members | map('replace', '/', '-') | join('" "') }}"
++{%     if g.description is defined %}
++set comment "{{ g.description }}"
++{%     endif %}
++next
++{%   endfor %}
++end
++{% endif %}
++{% macro addr(lst) -%}
++{%- set out = [] -%}
++{%- for a in lst | default(['all']) -%}
++{%-   set _ = out.append('all' if a | lower in ['any', 'all'] else a) -%}
++{%- endfor -%}
++{{ out | join('" "') }}
++{%- endmacro %}
++{% macro svc(lst) -%}
++{%- set out = [] -%}
++{%- for s in lst | default(['ALL']) -%}
++{%-   set _ = out.append('ALL' if s | lower in ['any', 'all', 'ip'] else s | replace('/', '-')) -%}
++{%- endfor -%}
++{{ out | join('" "') }}
++{%- endmacro %}
++config firewall policy
++{% for policy in firewall.policy.rules | default([]) %}
++edit {{ policy.sequence | default(loop.index * 10) }}
++set name "{{ (policy.name | string).strip('\"') }}"
++set srcintf "{{ policy.from_zone }}"
++set dstintf "{{ policy.to_zone }}"
++set srcaddr "{{ addr(policy.src) }}"
++set dstaddr "{{ addr(policy.dst) }}"
++set action {{ 'accept' if policy.action == 'permit' else 'deny' }}
++set schedule "always"
++set service "{{ svc(policy.services) }}"
++{% if policy.log | default(true) %}
++set logtraffic all
++{% endif %}
++next
++{% endfor %}
++end
+diff --git a/netsim/extra/firewall/policy/panos.j2 b/netsim/extra/firewall/policy/panos.j2
+new file mode 100644
+index 0000000..94ae3b1
+--- /dev/null
++++ b/netsim/extra/firewall/policy/panos.j2
+@@ -0,0 +1,60 @@
++{#
++  firewall.policy on PAN-OS, as configuration-mode set commands.
++
++  This replaces the XML-API task list (deploy.panos.yml): PAN-OS is
++  single-transport now -- everything reaches the device over the KNE SSH
++  endpoint through panos_cli_config_kne, which detects device rejections and
++  fails fast, keeps the password out of process arguments, and re-applies
++  idempotently (an unchanged candidate commits as a no-op). The concerns the
++  old task-list header raised about the sshpass lane are answered by the
++  module, not ignored.
++
++  ORDER IS THE POLICY. PAN-OS evaluates top-down and a set-created rule
++  appends to the bottom, so declaration order here IS evaluation order on a
++  fresh device -- the same loop-order semantic the API lane had, with the same
++  limit: a rule added to the middle of an existing policy appends instead.
++
++  One set statement per attribute: a set line addresses one subtree path.
++  Multi-value fields use the [ a b ] list form.
++#}
++{% for svc in firewall.policy.service_objects|default([]) %}
++set service "{{ svc.name }}" protocol {{ svc.protocol }} port {{ svc.port }}
++{%   if svc.description is defined %}
++set service "{{ svc.name }}" description "{{ svc.description }}"
++{%   endif %}
++{% endfor %}
++{% for grp in firewall.policy.service_groups|default([]) %}
++set service-group "{{ grp.name }}" members [ {{ grp.members|map('replace','/','-')|join(' ') }} ]
++{% endfor %}
++{% for adr in firewall.policy.address_objects|default([]) %}
++set address "{{ adr.name }}" {{ 'ip-range' if '-' in adr.ipv4 else 'ip-netmask' }} {{ adr.ipv4 }}
++{% endfor %}
++{# The inline `tcp/4022` service form gets an object generated for it, exactly
++   as the API lane did -- PAN-OS has no inline protocol/port syntax on a rule. #}
++{# PURE JINJA2 ONLY in extra/ templates: netlab create renders them with its
++   own environment, which has neither ansible's flatten/search/regex_* filters
++   nor its tests. Measured 2026-08-31: "No test named 'search'" failed the
++   whole demo-lab create at the topology-processing stage. #}
++{% set ns = namespace(seen=[]) %}
++{% for rule in firewall.policy.rules|default([]) %}
++{%   for inline_svc in rule.services|default([]) %}
++{%     if '/' in inline_svc and inline_svc not in ns.seen %}
++{%       set ns.seen = ns.seen + [inline_svc] %}
++set service "{{ inline_svc|replace('/','-') }}" protocol {{ inline_svc.split('/')[0] }} port {{ inline_svc.split('/')[1] }}
++set service "{{ inline_svc|replace('/','-') }}" description "generated from the inline form {{ inline_svc }}"
++{%     endif %}
++{%   endfor %}
++{% endfor %}
++{% for rule in firewall.policy.rules|default([]) %}
++{%   set rname = rule.name|default('policy_' ~ loop.index) %}
++set rulebase security rules "{{ rname }}" from [ {{ rule.from_zone }} ]
++set rulebase security rules "{{ rname }}" to [ {{ rule.to_zone }} ]
++set rulebase security rules "{{ rname }}" source [ {{ rule.src|default(['any'])|join(' ') }} ]
++set rulebase security rules "{{ rname }}" destination [ {{ rule.dst|default(['any'])|join(' ') }} ]
++set rulebase security rules "{{ rname }}" application [ {{ rule.application|default(['any'])|join(' ') }} ]
++set rulebase security rules "{{ rname }}" service [ {{ rule.services|default(['application-default'])|map('replace','/','-')|join(' ') }} ]
++set rulebase security rules "{{ rname }}" action {{ 'allow' if rule.action == 'permit' else 'deny' }}
++set rulebase security rules "{{ rname }}" rule-type {{ 'intrazone' if rule.from_zone == rule.to_zone else 'interzone' }}
++set rulebase security rules "{{ rname }}" log-start no
++set rulebase security rules "{{ rname }}" log-end {{ 'yes' if rule.log|default(true) else 'no' }}
++{% endfor %}
+diff --git a/netsim/extra/firewall/zonebased/__init__.py b/netsim/extra/firewall/zonebased/__init__.py
+index 3755697..3f61b43 100644
+--- a/netsim/extra/firewall/zonebased/__init__.py
++++ b/netsim/extra/firewall/zonebased/__init__.py
+@@ -10,6 +10,40 @@ from netsim.utils import log
+ _description = 'Zone-based firewall'
+ _config_name = 'firewall.zonebased'
+ 
++# Deployed AFTER firewall.policy, on every platform. The default rules this
++# plugin renders are zone-to-zone catch-alls; on list-ordered rulebases
++# (FortiOS policy list, PAN-OS rulebase) whatever is created first is evaluated
++# first, so the specific firewall.policy rules must land before them. This was
++# only true when a topology happened to list firewall.policy first in `plugin:`.
++# Zones that firewall.policy names are declared by its own FortiOS template.
++_execute_after = [ 'firewall.policy' ]
++
++# FortiOS: the policy IDs the default rules take (fortios.j2). firewall.policy
++# and nat address policies by their `sequence`, so a sequence in this range
++# would overwrite (or be overwritten by) a default rule.
++FORTIOS_DEFAULT_RULE_ID_BASE = 10000
++
++def check_fortios_policy_ids(node: Box) -> None:
++  for (attr,rules) in (('firewall.policy.rules',node.get('firewall.policy.rules',[])),('nat.rules',node.get('nat.rules',[]))):
++    for idx,rule in enumerate(rules or []):
++      seq = rule.get('sequence',None) if isinstance(rule,dict) else None
++      if isinstance(seq,int) and seq >= FORTIOS_DEFAULT_RULE_ID_BASE:
++        log.error(
++          f"Node {node.name}(fortios) {attr}[{idx}].sequence {seq} is in the policy ID range "
++          f"firewall.zonebased reserves for its default rules ({FORTIOS_DEFAULT_RULE_ID_BASE} and up)",
++          category=log.IncorrectValue,
++          module=_config_name)
++
++def check_rule(node: Box, def_rule: Box, rule_idx: int) -> None:
++    global _config_name
++    for z_direction in [ 'from_zone', 'to_zone' ]:
++        z = def_rule[z_direction]
++        if z not in node.firewall.zonebased._zones:
++            log.error(
++                f"Node {node.name} does not have zone '{z}' used in firewall.zonebased rules[{rule_idx}].{z_direction}",
++                category=log.IncorrectAttr,
++                module=_config_name)
++
+ def post_transform(topology: Box) -> None:
+     global _config_name
+     for node in topology.nodes.values():
+@@ -17,6 +51,15 @@ def post_transform(topology: Box) -> None:
+         zbf_supported = 'firewall.zonebased' in features
+         OK = True
+ 
++        # `firewall.zone` is shared with firewall.policy: on the ASA the zone IS
++        # the interface nameif that plugin binds its ACLs to. A node that never
++        # declares firewall.zonebased data and whose platform has firewall.policy
++        # is that plugin's business, not an error here -- otherwise loading both
++        # plugins in one topology (a lab with SRXs and ASAs) fails every ASA
++        # interface with "does not support 'firewall.zone'".
++        if not zbf_supported and 'firewall.zonebased' not in node and 'firewall.policy' in features:
++            continue
++
+         for intf in node.get('interfaces',[]):
+             fw_zone = intf.get('firewall.zone', '')
+             if not fw_zone:                                     # No zone defined on the interface, move on
+@@ -33,11 +76,14 @@ def post_transform(topology: Box) -> None:
+         if not OK:                                              # Errors? Move on
+             continue
+ 
++        if node.device == 'fortios' and (node.get('firewall.zonebased.default_rules',[]) or
++                                         node.get('firewall.zonebased.default_policy','deny') == 'permit'):
++            check_fortios_policy_ids(node)
++
+         # now check that zones defined in rules are defined
+         for rule_idx,def_rule in enumerate(node.get('firewall.zonebased.default_rules', [])):
+-            for z_direction in [ 'from_zone', 'to_zone' ]:
+-                z = def_rule[z_direction]
+-                if z not in node.firewall.zonebased._zones:
+-                    log.error( f"Node {node.name} does not have zone '{z}' used in firewall.zonebased.default_rules[{rule_idx}].{z_direction}",
+-                            category=log.IncorrectAttr,module=_config_name)
++            check_rule(node,def_rule,rule_idx)
++
++        for rule_idx,def_rule in enumerate(node.get('firewall.zonebased.rules', [])):
++            check_rule(node,def_rule,rule_idx)
+     return
+diff --git a/netsim/extra/firewall/zonebased/defaults.yml b/netsim/extra/firewall/zonebased/defaults.yml
+index 483af52..f68e903 100644
+--- a/netsim/extra/firewall/zonebased/defaults.yml
++++ b/netsim/extra/firewall/zonebased/defaults.yml
+@@ -4,6 +4,8 @@
+ devices:
+   fortios:
+     features.firewall.zonebased: True
++  panos:
++    features.firewall.zonebased: True
+   vsrx:
+     features.firewall.zonebased: True
+   vyos:
+@@ -15,6 +17,13 @@ attributes:
+   node:
+     firewall.zonebased:
+       default_rules: { type: list, _subtype: _fw_rule_entry }
++      rules: { type: list, _subtype: _fw_rule_entry }
++      # What happens to traffic no rule matches. Junos' factory setting is
++      # deny-all and that is what the vSRX template hardcoded, so a source
++      # whose `groups global security policies default-policy permit-all`
++      # (demo-lab's building SRXs) came up denying the inter-zone flows
++      # it permits. Default stays `deny`; `permit` renders permit-all.
++      default_policy: { type: str, valid_values: [ permit, deny ] }
+   interface:
+     firewall.zone: { type: id }
+ 
+@@ -30,3 +39,23 @@ attributes:
+     to_zone:
+       type: id
+       _required: true
++    name:
++      type: str
++    source:
++      type: list
++      _subtype: str
++    destination:
++      type: list
++      _subtype: str
++    application:
++      type: list
++      _subtype: str
++    service:
++      type: list
++      _subtype: str
++    description:
++      type: str
++    log_start:
++      type: bool
++    log_end:
++      type: bool
+diff --git a/netsim/extra/firewall/zonebased/deploy.fortios.yml b/netsim/extra/firewall/zonebased/deploy.fortios.yml
+deleted file mode 100644
+index 47e6c6a..0000000
+--- a/netsim/extra/firewall/zonebased/deploy.fortios.yml
++++ /dev/null
+@@ -1,99 +0,0 @@
+----
+-- name: Define intra-zone policy structure
+-  set_fact:
+-    intra_zone_policy: {}
+-    zone_interface_list: {}
+-    zone_action_map:
+-      permit: 'allow'
+-      deny: 'deny'
+-    policy_action_map:
+-      permit: 'accept'
+-      deny: 'deny'
+-
+-- name: Add intra-zone policy for defined zones, if needed
+-  with_items: "{{ firewall.zonebased.default_rules|default([]) }}"
+-  loop_control:
+-    loop_var: rule
+-  when: "rule.from_zone == rule.to_zone"
+-  set_fact:
+-    intra_zone_policy: "{{ intra_zone_policy | combine( { rule.from_zone: zone_action_map[rule.action] } ) }}"
+-
+-- name: Define Interface-to-Zone mapping
+-  with_items: "{{ interfaces }}"
+-  loop_control:
+-    loop_var: interface
+-  when: "interface.firewall.zone is defined"
+-  set_fact:
+-    # yamllint disable-line rule:line-length
+-    zone_interface_list: "{{ zone_interface_list | combine( { interface.firewall.zone: (zone_interface_list[interface.firewall.zone]|default([]))+([{ 'interface_name' : interface.ifname }]) } ) }}"
+-
+-- name: Reset firewall state for idempotency
+-  block:
+-  - name: Get all firewall policies
+-    fortinet.fortios.fortios_configuration_fact:
+-      vdom: "{{ netlab_vdom }}"
+-      selector: "firewall_policy"
+-    register: firewall_policies
+-  - name: Delete all security policies
+-    with_items: "{{firewall_policies.meta.results}}"
+-    fortinet.fortios.fortios_firewall_policy:
+-      vdom: "{{ netlab_vdom }}"
+-      state: "absent"
+-      firewall_policy:
+-        policyid: "{{item.policyid}}"
+-  - name: Get all firewall zones
+-    fortinet.fortios.fortios_configuration_fact:
+-      vdom: "{{ netlab_vdom }}"
+-      selector: "system_zone"
+-    register: system_zones
+-  - name: Delete all firewall zones
+-    with_items: "{{system_zones.meta.results}}"
+-    fortinet.fortios.fortios_system_zone:
+-      vdom: "{{ netlab_vdom }}"
+-      state: "absent"
+-      system_zone:
+-        name: "{{item.name}}"
+-
+-- name: Create Firewall Zones
+-  with_items: "{{ firewall.zonebased._zones.keys()|default([]) }}"
+-  loop_control:
+-    loop_var: zone
+-  fortinet.fortios.fortios_system_zone:
+-    vdom: "{{ netlab_vdom }}"
+-    state: "present"
+-    system_zone:
+-      intrazone: "{{intra_zone_policy[zone]|default('deny')}}"
+-      name: "{{zone}}"
+-      interface: "{{zone_interface_list[zone]}}"
+-
+-- name: Create non-default Policy Rules
+-  with_items: "{{ firewall.zonebased.default_rules|default([]) }}"
+-  loop_control:
+-    loop_var: rule
+-    index_var: policy_idx
+-  when: "rule.from_zone != rule.to_zone"
+-  fortinet.fortios.fortios_firewall_policy:
+-    vdom: "{{ netlab_vdom }}"
+-    state: "present"
+-    firewall_policy:
+-      policyid: "{{policy_idx*10}}"
+-      name: "{{rule.from_zone}}->{{rule.to_zone}} (default)"
+-      action: "{{policy_action_map[rule.action]}}"
+-      srcintf:
+-      - name: "{{rule.from_zone}}"
+-      srcaddr:
+-      - name: "all"
+-      srcaddr6:
+-      - name: "all"
+-      dstintf:
+-      - name: "{{rule.to_zone}}"
+-      dstaddr:
+-      - name: "all"
+-      dstaddr6:
+-      - name: "all"
+-      service:
+-      - name: "ALL"
+-      schedule: "always"
+-      logtraffic: "all"
+-      logtraffic_start: "enable"
+-      status: "enable"
+diff --git a/netsim/extra/firewall/zonebased/fortios.j2 b/netsim/extra/firewall/zonebased/fortios.j2
+index 5ff6f45..312d6f9 100644
+--- a/netsim/extra/firewall/zonebased/fortios.j2
++++ b/netsim/extra/firewall/zonebased/fortios.j2
+@@ -1,2 +1,112 @@
+-{# dummy #}
++{#
++  firewall.zonebased on FortiOS, as CLI.
+ 
++  This template used to be an empty "dummy" comment, and the zones were left
++  to deploy.fortios.yml (fortinet.fortios REST modules, failures swallowed by a
++  rescue). That task list was never reached (it is removed): the custom
++  config is named `firewall.zonebased`, and the deploy-task lookup
++  (paths.custom.tasks, `<custom_config>/deploy.<device>.yml`) searches
++  extra/firewall.zonebased/, which does not exist. Every lane therefore sent
++  this empty template -- the KNE user_data, the KNE SSH replay, the generic
++  config-script lane -- and no zone was ever created. firewall.policy rules
++  that name a zone then fail on the box (`node_check_object fail! for name
++  LB_DMZ ... Return code -651`). Rendering the model here puts it on the same
++  lanes as every other FortiOS module.
++
++  Semantics are the REST task list's:
++    * one zone per interface firewall.zone, holding those interfaces
++    * intrazone allow|deny from a default rule whose from_zone == to_zone
++      (permit -> allow), else deny
++    * every other default rule is a firewall policy, zone to zone, all/ALL,
++      schedule always, full traffic log, named "<from>-><to> (default)"
++
++  Policy IDs: the REST task used 10 * <index in default_rules>, which starts at
++  0 (`edit 0` on the CLI means "allocate the next free ID", so a replay would
++  add a duplicate) and collides with firewall.policy's 10, 20, ... sequence.
++  Default rules take 10000 + 10 * index instead; the plugin refuses a
++  firewall.policy/nat sequence in that range on FortiOS.
++
++  Evaluation order is list position, not ID. The default rules are catch-alls
++  and must sit BELOW every firewall.policy rule; firewall.policy renders (and
++  is deployed) first, and the `move` lines keep the order when a replay adds a
++  rule to a box that already holds the defaults.
++
++  The zone block is repeated at the top of firewall/policy/fortios.j2 so the
++  zones exist before the first policy that names one (firewall.policy runs
++  before this plugin). Keep the two blocks identical.
++#}
++{% set zb_zones = {} %}
++{% for intf in interfaces|default([]) if intf.firewall.zone is defined %}
++{%   set _ = zb_zones.setdefault(intf.firewall.zone, []).append(intf.ifname) %}
++{% endfor %}
++{% set zb_intra = {} %}
++{% for rule in firewall.zonebased.default_rules|default([]) if rule.from_zone == rule.to_zone %}
++{%   set _ = zb_intra.update({ rule.from_zone: 'allow' if rule.action == 'permit' else 'deny' }) %}
++{% endfor %}
++{% if zb_zones %}
++config system zone
++{%   for zname, zifs in zb_zones.items() %}
++edit "{{ zname }}"
++set intrazone {{ zb_intra[zname]|default('deny') }}
++set interface "{{ zifs|join('" "') }}"
++next
++{%   endfor %}
++end
++{% endif %}
++{% set zb_ids = [] %}
++{% for rule in firewall.zonebased.default_rules|default([]) %}
++{%   if rule.from_zone != rule.to_zone %}
++{%     set _ = zb_ids.append(10000 + loop.index0 * 10) %}
++{%   endif %}
++{% endfor %}
++{% if firewall.zonebased.default_policy|default('deny') == 'permit' %}
++{%   set _ = zb_ids.append(19990) %}
++{% endif %}
++{% if zb_ids %}
++config firewall policy
++{%   for rule in firewall.zonebased.default_rules|default([]) %}
++{%     if rule.from_zone != rule.to_zone %}
++edit {{ 10000 + loop.index0 * 10 }}
++set name "{{ rule.from_zone }}->{{ rule.to_zone }} (default)"
++set srcintf "{{ rule.from_zone }}"
++set dstintf "{{ rule.to_zone }}"
++set action {{ 'accept' if rule.action == 'permit' else 'deny' }}
++set srcaddr "all"
++set dstaddr "all"
++set srcaddr6 "all"
++set dstaddr6 "all"
++set schedule "always"
++set service "ALL"
++set logtraffic all
++set logtraffic-start enable
++set status enable
++next
++{%     endif %}
++{%   endfor %}
++{%   if firewall.zonebased.default_policy|default('deny') == 'permit' %}
++{#     vSRX `default-policy permit-all`: FortiOS has no such knob (its implicit
++       last policy is deny), so permit-all is an explicit any->any accept, last. #}
++edit 19990
++set name "default-policy permit-all"
++set srcintf "any"
++set dstintf "any"
++set action accept
++set srcaddr "all"
++set dstaddr "all"
++set srcaddr6 "all"
++set dstaddr6 "all"
++set schedule "always"
++set service "ALL"
++set logtraffic all
++set status enable
++next
++{%   endif %}
++{%   set ns = namespace(prev=(firewall.policy.rules|default([])|map(attribute='sequence')|list|last) if firewall.policy.rules|default([]) else none) %}
++{%   if ns.prev is not none %}
++{%     for id in zb_ids %}
++move {{ id }} after {{ ns.prev }}
++{%       set ns.prev = id %}
++{%     endfor %}
++{%   endif %}
++end
++{% endif %}
+diff --git a/netsim/extra/firewall/zonebased/panos.j2 b/netsim/extra/firewall/zonebased/panos.j2
+new file mode 100644
+index 0000000..9aa099d
+--- /dev/null
++++ b/netsim/extra/firewall/zonebased/panos.j2
+@@ -0,0 +1,25 @@
++{#
++  firewall.zonebased on PAN-OS, as configuration-mode set commands -- same
++  single-transport port as firewall.policy/panos.j2 (see the header there for
++  the reasoning). Default rules first, then explicit rules; declaration order
++  is evaluation order on a fresh device.
++#}
++{% macro zb_rule(rule, rname) -%}
++set rulebase security rules "{{ rname }}" description "{{ rule.description|default('netlab firewall.zonebased rule') }}"
++set rulebase security rules "{{ rname }}" from [ {{ rule.from_zone }} ]
++set rulebase security rules "{{ rname }}" to [ {{ rule.to_zone }} ]
++set rulebase security rules "{{ rname }}" source [ {{ rule.source|default(['any'])|join(' ') }} ]
++set rulebase security rules "{{ rname }}" destination [ {{ rule.destination|default(['any'])|join(' ') }} ]
++set rulebase security rules "{{ rname }}" application [ {{ rule.application|default(['any'])|join(' ') }} ]
++set rulebase security rules "{{ rname }}" service [ {{ rule.service|default(['application-default'])|join(' ') }} ]
++set rulebase security rules "{{ rname }}" action {{ 'allow' if rule.action == 'permit' else 'deny' }}
++set rulebase security rules "{{ rname }}" rule-type {{ 'intrazone' if rule.from_zone == rule.to_zone else 'interzone' }}
++set rulebase security rules "{{ rname }}" log-start {{ 'yes' if rule.log_start|default(false) else 'no' }}
++set rulebase security rules "{{ rname }}" log-end {{ 'yes' if rule.log_end|default(true) else 'no' }}
++{%- endmacro %}
++{% for rule in firewall.zonebased.default_rules|default([]) %}
++{{ zb_rule(rule, rule.name|default('netlab-default-' ~ (loop.index - 1))) }}
++{% endfor %}
++{% for rule in firewall.zonebased.rules|default([]) %}
++{{ zb_rule(rule, rule.name|default('netlab-rule-' ~ (loop.index - 1))) }}
++{% endfor %}
+diff --git a/netsim/extra/firewall/zonebased/vsrx.j2 b/netsim/extra/firewall/zonebased/vsrx.j2
+index 4a0003c..5aa91e6 100644
+--- a/netsim/extra/firewall/zonebased/vsrx.j2
++++ b/netsim/extra/firewall/zonebased/vsrx.j2
+@@ -24,7 +24,7 @@ security zones security-zone {{ intf.firewall.zone }} interfaces {{ intf.ifname
+ security {
+   delete: policies;
+ }
+-security policies default-policy deny-all;
++security policies default-policy {{ 'permit-all' if firewall.zonebased.default_policy|default('deny') == 'permit' else 'deny-all' }};
+ 
+ {# TODO: specific zone-to-zone rules here #}
+ 
+diff --git a/netsim/extra/ipsec/__init__.py b/netsim/extra/ipsec/__init__.py
+new file mode 100644
+index 0000000..c3f3db6
+--- /dev/null
++++ b/netsim/extra/ipsec/__init__.py
+@@ -0,0 +1,323 @@
++import hashlib
++import json
++import re
++import typing
++
++from box import Box
++
++from netsim import api, data
++from netsim.augment import devices
++from netsim.utils import log
++
++_config_name = "ipsec"
++
++
++def merge_data(base: typing.Optional[Box], extra: typing.Optional[Box]) -> Box:
++  if isinstance(base, Box) and isinstance(extra, Box):
++    return data.get_new_box(base) + extra
++  if isinstance(base, Box):
++    return data.get_new_box(base)
++  if isinstance(extra, Box):
++    return data.get_new_box(extra)
++  return data.get_empty_box()
++
++
++def sanitize_name(value: str) -> str:
++  return re.sub(r"[^a-zA-Z0-9._-]", "-", value)
++
++
++def build_object_name(intf: Box, suffix: str) -> str:
++  return sanitize_name(f"netlab-{intf.node}-{intf.ifname}-{suffix}")
++
++
++def profile_suffix(node: str, category: str, content: typing.Any) -> str:
++  payload = json.dumps(content, sort_keys=True, separators=(",", ":"))
++  digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:8]
++  return sanitize_name(f"netlab-{node}-{category}-{digest}")
++
++
++def normalize_selectors(selectors: list, intf: Box) -> list:
++  result = []
++  for index, selector in enumerate(selectors, start=1):
++    name = selector.get("name", sanitize_name(f"{intf.node}-{intf.ifname}-selector-{index}"))
++    result.append(
++      data.get_box(
++        {
++          "name": name,
++          "local": selector.local,
++          "remote": selector.remote,
++        }
++      )
++    )
++
++  return result
++
++
++def append_unique_named(parent: Box, list_name: str, item: Box) -> None:
++  if list_name not in parent:
++    parent[list_name] = []
++
++  for existing in parent[list_name]:
++    if existing.name == item.name:
++      return
++
++  parent[list_name].append(item)
++
++
++def get_ike_profile_data(tunnel: Box) -> Box:
++  profile = data.get_box({"name": tunnel.ike.crypto_profile})
++  for key in ("authentication", "encryption", "dh_group", "lifetime_days", "lifetime_hours", "lifetime_minutes", "lifetime_seconds"):
++    if key in tunnel.ike:
++      profile[key] = tunnel.ike[key]
++  return profile
++
++
++def get_esp_profile_data(tunnel: Box) -> Box:
++  profile = data.get_box({"name": tunnel.esp.crypto_profile})
++  for key in ("authentication", "encryption", "dh_group", "lifetime_days", "lifetime_hours", "lifetime_minutes", "lifetime_seconds", "lifesize_gb"):
++    if key in tunnel.esp:
++      profile[key] = tunnel.esp[key]
++  return profile
++
++
++def get_transform_set_data(tunnel: Box) -> Box:
++  transform = data.get_box({"name": tunnel.esp.transform_set})
++  for key in ("authentication", "encryption"):
++    if key in tunnel.esp:
++      transform[key] = tunnel.esp[key]
++  return transform
++
++
++def get_peer_interface(link: Box, intf: Box) -> typing.Optional[Box]:
++  for peer_intf in link.interfaces:
++    if peer_intf.node != intf.node:
++      return peer_intf
++
++  return None
++
++
++def validate_ipsec_link(link: Box) -> bool:
++  if link.node_count != 2:
++    log.error(
++      f"IPsec can be used only on point-to-point tunnel links ({link._linkname})",
++      category=log.IncorrectValue,
++      module=_config_name,
++    )
++    return False
++
++  if link.type != "tunnel":
++    log.error(
++      f"IPsec can be used only on tunnel links ({link._linkname})",
++      category=log.IncorrectAttr,
++      module=_config_name,
++    )
++    return False
++
++  if "preshared_key" not in link.ipsec:
++    log.error(
++      f"Missing link-level ipsec.preshared_key on {link._linkname}",
++      category=log.MissingValue,
++      module=_config_name,
++    )
++    return False
++
++  if link.ipsec.get("mode", "route-based") == "policy-based" and "selectors" not in link.ipsec:
++    log.error(
++      f"Policy-based IPsec requires ipsec.selectors on {link._linkname}",
++      category=log.MissingValue,
++      module=_config_name,
++    )
++    return False
++
++  return True
++
++
++def validate_device_support(node: Box, features: Box, params: Box, link: Box, source_from_forward: bool = False) -> bool:
++  if "ipsec" not in features:
++    if source_from_forward:
++      log.warning(
++        text=f"Node {node.name}({node.device}) does not support IPsec tunnels on {link._linkname}",
++        module=_config_name,
++      )
++    else:
++      log.error(
++        f"Node {node.name}({node.device}) does not support IPsec tunnels on {link._linkname}",
++        category=log.IncorrectAttr,
++        module=_config_name,
++      )
++    return False
++
++  f_ipsec = features.ipsec
++  if f_ipsec is True:
++    return True
++
++  mode = params.get("mode", "route-based").replace("-", "_")
++  if not f_ipsec.get(mode, False):
++    if source_from_forward:
++      log.warning(
++        text=f"Node {node.name}({node.device}) does not support {params.get('mode', 'route-based')} IPsec on {link._linkname}",
++        module=_config_name,
++      )
++    else:
++      log.error(
++        f"Node {node.name}({node.device}) does not support {params.get('mode', 'route-based')} IPsec on {link._linkname}",
++        category=log.IncorrectAttr,
++        module=_config_name,
++      )
++    return False
++
++  ike_version = params.get("ike.version", "ikev2")
++  if "ike" in f_ipsec and ike_version not in f_ipsec.ike:
++    if source_from_forward:
++      log.warning(
++        text=f"Node {node.name}({node.device}) does not support {ike_version} IPsec on {link._linkname}",
++        module=_config_name,
++      )
++    else:
++      log.error(
++        f"Node {node.name}({node.device}) does not support {ike_version} IPsec on {link._linkname}",
++        category=log.IncorrectAttr,
++        module=_config_name,
++      )
++    return False
++
++  return True
++
++
++def build_tunnel_entry(link: Box, intf: Box, peer_intf: Box) -> typing.Optional[Box]:
++  params = merge_data(link.ipsec, intf.get("ipsec", None))
++  peer_params = merge_data(link.ipsec, peer_intf.get("ipsec", None))
++
++  if "local_interface" not in params:
++    if "local_address" not in params and "endpoint" not in params:
++      log.error(
++        f"Missing {link._linkname}.{intf.node}.ipsec.local_interface or local_address",
++        category=log.MissingValue,
++        module=_config_name,
++      )
++      return None
++
++  peer_type = params.get("peer_type", "ip")
++  peer_value = params.get("peer", None)
++  if peer_value is None and peer_type != "dynamic":
++    peer_value = peer_params.get("endpoint", None)
++
++  if peer_type != "dynamic" and peer_value is None:
++    log.error(
++      f"Cannot determine IPsec peer for {link._linkname}.{intf.node}; set ipsec.peer or remote ipsec.endpoint",
++      category=log.MissingValue,
++      module=_config_name,
++    )
++    return None
++
++  mode = params.get("mode", "route-based")
++  selectors = params.get("selectors", [])
++  if mode == "policy-based" and not selectors:
++    log.error(
++      f"Policy-based IPsec requires selectors on {link._linkname}.{intf.node}",
++      category=log.MissingValue,
++      module=_config_name,
++    )
++    return None
++
++  tunnel_name = params.get("name", link.ipsec.get("name", build_object_name(intf, "tunnel")))
++  ike_profile = params.get("ike.crypto_profile", None)
++  esp_profile = params.get("esp.crypto_profile", None)
++  ike_custom = "ike" in params and any(k != "version" and k != "enable_nat_traversal" and k != "crypto_profile" for k in params.ike.keys())
++  esp_custom = "esp" in params and any(k != "crypto_profile" for k in params.esp.keys())
++
++  entry = data.get_box(
++    {
++      "name": tunnel_name,
++      "mode": mode,
++      "ifname": intf.ifname,
++      "linkindex": intf.get("linkindex", link.linkindex),
++      "peer_type": peer_type,
++      "preshared_key": params.preshared_key,
++      "ike_gateway": build_object_name(intf, "ike"),
++      "ike": params.get("ike", data.get_empty_box()),
++      "esp": params.get("esp", data.get_empty_box()),
++    }
++  )
++
++  if peer_value is not None:
++    entry.peer = peer_value
++  if "local_interface" in params:
++    entry.local_interface = params.local_interface
++  if "local_address" in params:
++    entry.local_address = params.local_address
++  elif "endpoint" in params:
++    entry.local_address = params.endpoint
++  if "firewall.zone" in intf:
++    entry.zone_name = intf.firewall.zone
++  if "ipv4" in intf:
++    entry.ipv4 = intf.ipv4
++  if "mtu" in intf:
++    entry.mtu = intf.mtu
++  if selectors:
++    entry.selectors = normalize_selectors(selectors, intf)
++  if "local_id_type" in params:
++    entry.local_id_type = params.local_id_type
++  if "local_id_value" in params:
++    entry.local_id_value = params.local_id_value
++  if "peer_id_type" in params:
++    entry.peer_id_type = params.peer_id_type
++  if "peer_id_value" in params:
++    entry.peer_id_value = params.peer_id_value
++
++  if ike_profile:
++    entry.ike.crypto_profile = ike_profile
++  elif ike_custom:
++    entry.ike.crypto_profile = profile_suffix(intf.node, "ike-profile", entry.ike)
++    entry.ike.create_profile = True
++  else:
++    entry.ike.crypto_profile = "default"
++
++  if esp_profile:
++    entry.esp.crypto_profile = esp_profile
++  elif esp_custom:
++    entry.esp.crypto_profile = profile_suffix(intf.node, "ipsec-profile", entry.esp)
++    entry.esp.create_profile = True
++  else:
++    entry.esp.crypto_profile = "default"
++
++  if "version" not in entry.ike:
++    entry.ike.version = "ikev2"
++  entry.ike.policy_name = build_object_name(intf, "ike-policy")
++  entry.ike.keyring_name = build_object_name(intf, "ike-keyring")
++  entry.ike.profile_name = build_object_name(intf, "ikev2-profile")
++  entry.esp.transform_set = profile_suffix(intf.node, "transform-set", get_esp_profile_data(entry))
++  entry.esp.profile_name = build_object_name(intf, "ipsec-profile")
++
++  return entry
++
++
++def post_transform(topology: Box) -> None:
++  for link in topology.get("links", []):
++    if "ipsec" not in link:
++      continue
++    if not validate_ipsec_link(link):
++      continue
++
++    for intf in link.interfaces:
++      node = topology.nodes[intf.node]
++
++      peer_intf = get_peer_interface(link, intf)
++      if peer_intf is None:
++        continue
++
++      tunnel_entry = build_tunnel_entry(link, intf, peer_intf)
++      if tunnel_entry is None:
++        continue
++
++      features = devices.get_device_features(node, topology.defaults)
++      if not validate_device_support(node, features, tunnel_entry, link, source_from_forward="_forward" in node):
++        continue
++
++      data.append_to_list(node, "ipsec.tunnels", tunnel_entry)
++      if tunnel_entry.ike.get("create_profile", False):
++        append_unique_named(node.ipsec, "ike_profiles", get_ike_profile_data(tunnel_entry))
++      if tunnel_entry.esp.get("create_profile", False):
++        append_unique_named(node.ipsec, "esp_profiles", get_esp_profile_data(tunnel_entry))
++        append_unique_named(node.ipsec, "transform_sets", get_transform_set_data(tunnel_entry))
++      api.node_config(node, _config_name)
+diff --git a/netsim/extra/ipsec/asa.j2 b/netsim/extra/ipsec/asa.j2
+new file mode 100644
+index 0000000..e23fc4c
+--- /dev/null
++++ b/netsim/extra/ipsec/asa.j2
+@@ -0,0 +1 @@
++{% include 'asav.j2' %}
+diff --git a/netsim/extra/ipsec/asav.j2 b/netsim/extra/ipsec/asav.j2
+new file mode 100644
+index 0000000..5f1e1f8
+--- /dev/null
++++ b/netsim/extra/ipsec/asav.j2
+@@ -0,0 +1,101 @@
++{% macro ike_encryption(value) -%}
++{%   set enc = {
++       'aes128': 'aes-128',
++       'aes-128-cbc': 'aes-128',
++       'aes192': 'aes-192',
++       'aes-192-cbc': 'aes-192',
++       'aes256': 'aes-256',
++       'aes-256-cbc': 'aes-256'
++     } %}
++{{   enc.get(value, 'aes-256') }}
++{%- endmacro %}
++{% macro ike_integrity(value) -%}
++{%   set alg = {
++       'sha1': 'sha',
++       'sha256': 'sha-256',
++       'sha384': 'sha-384',
++       'sha512': 'sha-512'
++     } %}
++{{   alg.get(value, 'sha-256') }}
++{%- endmacro %}
++{% macro esp_encryption(value) -%}
++{%   set enc = {
++       'aes128': 'aes-128',
++       'aes-128-cbc': 'aes-128',
++       'aes192': 'aes-192',
++       'aes-192-cbc': 'aes-192',
++       'aes256': 'aes-256',
++       'aes-256-cbc': 'aes-256',
++       'aes-128-gcm': 'aes-gcm-128',
++       'aes-256-gcm': 'aes-gcm-256'
++     } %}
++{{   enc.get(value, 'aes-256') }}
++{%- endmacro %}
++{% macro esp_integrity(value) -%}
++{%   set alg = {
++       'sha1': 'sha-1',
++       'sha256': 'sha-256',
++       'sha384': 'sha-384',
++       'sha512': 'sha-512'
++     } %}
++{{   alg.get(value, 'sha-256') }}
++{%- endmacro %}
++{% macro dh_group(value) -%}
++{{ value|replace('group','') }}
++{%- endmacro %}
++!
++{% for tunnel in ipsec.tunnels|default([]) %}
++{%   if tunnel.mode != 'route-based' %}
++! IPsec tunnel {{ tunnel.name }} skipped: ASAv template currently supports only route-based tunnels
++{%   else %}
++!
++crypto ikev2 policy {{ loop.index + 9 }}
++ encryption {{ ike_encryption(tunnel.ike.encryption|default(['aes-256-cbc'])|first) }}
++ integrity {{ ike_integrity(tunnel.ike.authentication|default(['sha256'])|first) }}
++ group {{ dh_group(tunnel.ike.dh_group|default(['group14'])|first) }}
++{%     if tunnel.ike.lifetime_seconds is defined %}
++ lifetime seconds {{ tunnel.ike.lifetime_seconds }}
++{%     elif tunnel.ike.lifetime_minutes is defined %}
++ lifetime seconds {{ tunnel.ike.lifetime_minutes * 60 }}
++{%     elif tunnel.ike.lifetime_hours is defined %}
++ lifetime seconds {{ tunnel.ike.lifetime_hours * 3600 }}
++{%     elif tunnel.ike.lifetime_days is defined %}
++ lifetime seconds {{ tunnel.ike.lifetime_days * 86400 }}
++{%     endif %}
++!
++crypto ipsec ikev2 ipsec-proposal {{ tunnel.esp.crypto_profile }}
++ protocol esp encryption {{ esp_encryption(tunnel.esp.encryption|default(['aes-256-cbc'])|first) }}
++ protocol esp integrity {{ esp_integrity(tunnel.esp.authentication|default(['sha256'])|first) }}
++!
++tunnel-group {{ tunnel.peer }} type ipsec-l2l
++tunnel-group {{ tunnel.peer }} ipsec-attributes
++ ikev2 remote-authentication pre-shared-key {{ tunnel.preshared_key }}
++ ikev2 local-authentication pre-shared-key {{ tunnel.preshared_key }}
++!
++crypto ipsec profile {{ tunnel.esp.profile_name }}
++ set ikev2 ipsec-proposal {{ tunnel.esp.crypto_profile }}
++{%     if tunnel.esp.dh_group is defined and tunnel.esp.dh_group != 'no-pfs' %}
++ set pfs group{{ dh_group(tunnel.esp.dh_group) }}
++{%     endif %}
++{%     if tunnel.esp.lifetime_seconds is defined %}
++ set security-association lifetime seconds {{ tunnel.esp.lifetime_seconds }}
++{%     elif tunnel.esp.lifetime_minutes is defined %}
++ set security-association lifetime seconds {{ tunnel.esp.lifetime_minutes * 60 }}
++{%     elif tunnel.esp.lifetime_hours is defined %}
++ set security-association lifetime seconds {{ tunnel.esp.lifetime_hours * 3600 }}
++{%     elif tunnel.esp.lifetime_days is defined %}
++ set security-association lifetime seconds {{ tunnel.esp.lifetime_days * 86400 }}
++{%     endif %}
++!
++interface {{ tunnel.ifname }}
++{%     if tunnel.ipv4 is defined %}
++ ip address {{ tunnel.ipv4|ansible.utils.ipaddr('address') }} {{ tunnel.ipv4|ansible.utils.ipaddr('netmask') }}
++{%     endif %}
++ tunnel source interface {{ tunnel.local_interface if tunnel.local_interface is defined else tunnel.local_address }}
++ tunnel destination {{ tunnel.peer }}
++ tunnel mode ipsec ipv4
++ tunnel protection ipsec profile {{ tunnel.esp.profile_name }}
++ no shutdown
++!
++{%   endif %}
++{% endfor %}
+diff --git a/netsim/extra/ipsec/defaults.yml b/netsim/extra/ipsec/defaults.yml
+new file mode 100644
+index 0000000..414e5d4
+--- /dev/null
++++ b/netsim/extra/ipsec/defaults.yml
+@@ -0,0 +1,108 @@
++# Generic IPsec tunnel plugin
++#
++---
++devices:
++  none:
++    features.ipsec:
++      route_based: True
++      policy_based: True
++      tunnel: True
++      ike: [ ikev1, ikev2, ikev2-preferred ]
++  panos:
++    features.ipsec:
++      route_based: True
++      policy_based: True
++      tunnel: True
++      ike: [ ikev1, ikev2, ikev2-preferred ]
++  ios:
++    features.ipsec:
++      route_based: True
++      tunnel: True
++      ike: [ ikev2 ]
++
++attributes:
++  link:
++    ipsec: _ipsec_link
++  interface:
++    ipsec: _ipsec_node
++
++  _ipsec_link:
++    mode:
++      type: str
++      valid_values: [ route-based, policy-based ]
++    name: str
++    preshared_key: str
++    peer_type:
++      type: str
++      valid_values: [ ip, dynamic, fqdn ]
++    selectors:
++      type: list
++      _subtype: _ipsec_selector
++    ike: _ipsec_ike
++    esp: _ipsec_esp
++
++  _ipsec_node:
++    mode:
++      type: str
++      valid_values: [ route-based, policy-based ]
++    name: str
++    preshared_key: str
++    local_interface: str
++    local_address: str
++    endpoint: str
++    peer: str
++    peer_type:
++      type: str
++      valid_values: [ ip, dynamic, fqdn ]
++    selectors:
++      type: list
++      _subtype: _ipsec_selector
++    local_id_type:
++      type: str
++      valid_values: [ ipaddr, fqdn, ufqdn, keyid, dn ]
++    local_id_value: str
++    peer_id_type:
++      type: str
++      valid_values: [ ipaddr, fqdn, ufqdn, keyid, dn ]
++    peer_id_value: str
++    ike: _ipsec_ike
++    esp: _ipsec_esp
++
++  _ipsec_ike:
++    version:
++      type: str
++      valid_values: [ ikev1, ikev2, ikev2-preferred ]
++    crypto_profile: str
++    authentication:
++      type: list
++      _subtype: str
++    encryption:
++      type: list
++      _subtype: str
++    dh_group:
++      type: list
++      _subtype: str
++    lifetime_days: int
++    lifetime_hours: int
++    lifetime_minutes: int
++    lifetime_seconds: int
++    enable_nat_traversal: bool
++
++  _ipsec_esp:
++    crypto_profile: str
++    authentication:
++      type: list
++      _subtype: str
++    encryption:
++      type: list
++      _subtype: str
++    dh_group: str
++    lifetime_days: int
++    lifetime_hours: int
++    lifetime_minutes: int
++    lifetime_seconds: int
++    lifesize_gb: int
++
++  _ipsec_selector:
++    local: str
++    remote: str
+diff --git a/netsim/extra/ipsec/ios.j2 b/netsim/extra/ipsec/ios.j2
+new file mode 100644
+index 0000000..e352597
+--- /dev/null
++++ b/netsim/extra/ipsec/ios.j2
+@@ -0,0 +1,111 @@
++{% macro ike_encryption(value) -%}
++{%   set enc = {
++       'aes128': 'aes-cbc-128',
++       'aes-128-cbc': 'aes-cbc-128',
++       'aes192': 'aes-cbc-192',
++       'aes-192-cbc': 'aes-cbc-192',
++       'aes256': 'aes-cbc-256',
++       'aes-256-cbc': 'aes-cbc-256'
++     } %}
++{{   enc.get(value, value) }}
++{%- endmacro %}
++{% macro esp_encryption(value) -%}
++{%   set enc = {
++       'aes128': 'esp-aes 128',
++       'aes-128-cbc': 'esp-aes 128',
++       'aes192': 'esp-aes 192',
++       'aes-192-cbc': 'esp-aes 192',
++       'aes256': 'esp-aes 256',
++       'aes-256-cbc': 'esp-aes 256',
++       'aes-128-gcm': 'esp-gcm 128',
++       'aes-256-gcm': 'esp-gcm 256'
++     } %}
++{{   enc.get(value, 'esp-aes 256') }}
++{%- endmacro %}
++{% macro ike_integrity(value) -%}
++{%   set alg = {
++       'sha1': 'sha1',
++       'sha256': 'sha256',
++       'sha384': 'sha384',
++       'sha512': 'sha512',
++       'md5': 'md5'
++     } %}
++{{   alg.get(value, value) }}
++{%- endmacro %}
++{% macro esp_integrity(value) -%}
++{%   set alg = {
++       'sha1': 'esp-sha-hmac',
++       'sha256': 'esp-sha256-hmac',
++       'sha384': 'esp-sha384-hmac',
++       'sha512': 'esp-sha512-hmac',
++       'md5': 'esp-md5-hmac'
++     } %}
++{{   alg.get(value, '') }}
++{%- endmacro %}
++{% macro dh_group(value) -%}
++{{ value|replace('group','') }}
++{%- endmacro %}
++!
++{% for profile in ipsec.ike_profiles|default([]) %}
++!
++crypto ikev2 proposal {{ profile.name }}
++ encryption {{ ike_encryption(profile.encryption|default(['aes-256-cbc'])|first) }}
++ integrity {{ ike_integrity(profile.authentication|default(['sha256'])|first) }}
++ group {{ dh_group(profile.dh_group|default(['group14'])|first) }}
++{%   if profile.lifetime_seconds is defined %}
++ lifetime {{ profile.lifetime_seconds }}
++{%   elif profile.lifetime_minutes is defined %}
++ lifetime {{ profile.lifetime_minutes * 60 }}
++{%   elif profile.lifetime_hours is defined %}
++ lifetime {{ profile.lifetime_hours * 3600 }}
++{%   elif profile.lifetime_days is defined %}
++ lifetime {{ profile.lifetime_days * 86400 }}
++{%   endif %}
++!
++{% endfor %}
++{% for transform in ipsec.transform_sets|default([]) %}
++!
++crypto ipsec transform-set {{ transform.name }} {{ esp_encryption(transform.encryption|default(['aes-256-cbc'])|first) }}{% set esp_auth = esp_integrity(transform.authentication|default(['sha256'])|first) %}{{ ' ' + esp_auth if esp_auth else '' }}
++ mode tunnel
++!
++{% endfor %}
++{% for tunnel in ipsec.tunnels|default([]) %}
++{%   if tunnel.mode != 'route-based' %}
++! IPsec tunnel {{ tunnel.name }} skipped: IOS template currently supports only route-based tunnels
++{%   else %}
++!
++crypto ikev2 policy {{ tunnel.ike.policy_name }}
++ proposal {{ tunnel.ike.crypto_profile }}
++!
++crypto ikev2 keyring {{ tunnel.ike.keyring_name }}
++ peer {{ tunnel.name }}
++  address {{ tunnel.peer }}
++  pre-shared-key {{ tunnel.preshared_key }}
++!
++crypto ikev2 profile {{ tunnel.ike.profile_name }}
++ match identity remote address {{ tunnel.peer }} 255.255.255.255
++ authentication remote pre-share
++ authentication local pre-share
++ keyring local {{ tunnel.ike.keyring_name }}
++{%   if tunnel.local_interface is defined %}
++ match address local interface {{ tunnel.local_interface }}
++{%   endif %}
++{%   if tunnel.local_id_type|default('') == 'ipaddr' and tunnel.local_id_value is defined %}
++ identity local address {{ tunnel.local_id_value }}
++{%   endif %}
++!
++crypto ipsec profile {{ tunnel.esp.profile_name }}
++ set transform-set {{ tunnel.esp.transform_set }}
++ set ikev2-profile {{ tunnel.ike.profile_name }}
++{%   if tunnel.esp.dh_group is defined and tunnel.esp.dh_group != 'no-pfs' %}
++ set pfs group{{ dh_group(tunnel.esp.dh_group) }}
++{%   endif %}
++!
++interface {{ tunnel.ifname }}
++ tunnel source {{ tunnel.local_interface if tunnel.local_interface is defined else tunnel.local_address }}
++ tunnel destination {{ tunnel.peer }}
++ tunnel mode ipsec ipv4
++ tunnel protection ipsec profile {{ tunnel.esp.profile_name }}
++!
++{%   endif %}
++{% endfor %}
+diff --git a/netsim/extra/ipsec/panos.j2 b/netsim/extra/ipsec/panos.j2
+new file mode 100644
+index 0000000..624c85d
+--- /dev/null
++++ b/netsim/extra/ipsec/panos.j2
+@@ -0,0 +1,91 @@
++{#
++  IPsec on PAN-OS, as configuration-mode set commands -- same single-transport
++  port as firewall.policy/panos.j2. Object order matters for readability, not
++  correctness: everything lands in one candidate and one commit.
++
++  The tunnel interface takes the same implicit-vsys treatment as the initial
++  template: NO `set vsys ... import` (single-vsys VM-Series has no such
++  subtree -- captured "Invalid syntax." from a live device), and zone
++  membership imports the interface implicitly.
++#}
++{% for profile in ipsec.ike_profiles|default([]) %}
++{%   set p = 'set network ike crypto-profiles ike-crypto-profiles "' ~ profile.name ~ '"' %}
++{%   if profile.authentication is defined %}
++{{ p }} hash [ {{ profile.authentication|join(' ') if profile.authentication is not string else profile.authentication }} ]
++{%   endif %}
++{%   if profile.encryption is defined %}
++{{ p }} encryption [ {{ profile.encryption|join(' ') if profile.encryption is not string else profile.encryption }} ]
++{%   endif %}
++{%   if profile.dh_group is defined %}
++{{ p }} dh-group [ {{ profile.dh_group|join(' ') if profile.dh_group is not string else profile.dh_group }} ]
++{%   endif %}
++{%   for unit in ['days','hours','minutes','seconds'] if profile['lifetime_' ~ unit] is defined %}
++{{ p }} lifetime {{ unit }} {{ profile['lifetime_' ~ unit] }}
++{%   endfor %}
++{% endfor %}
++{% for profile in ipsec.esp_profiles|default([]) %}
++{%   set p = 'set network ike crypto-profiles ipsec-crypto-profiles "' ~ profile.name ~ '"' %}
++{%   if profile.authentication is defined %}
++{{ p }} esp authentication [ {{ profile.authentication|join(' ') if profile.authentication is not string else profile.authentication }} ]
++{%   endif %}
++{%   if profile.encryption is defined %}
++{{ p }} esp encryption [ {{ profile.encryption|join(' ') if profile.encryption is not string else profile.encryption }} ]
++{%   endif %}
++{%   if profile.dh_group is defined %}
++{# SCALAR, unlike the ike profile's dh-group: the ipsec-crypto-profile takes
++   ONE group and the list form is rejected token-by-token -- captured live:
++   "[ is not a valid token / Invalid syntax." #}
++{{ p }} dh-group {{ profile.dh_group[0] if profile.dh_group is not string else profile.dh_group }}
++{%   endif %}
++{%   for unit in ['days','hours','minutes','seconds'] if profile['lifetime_' ~ unit] is defined %}
++{{ p }} lifetime {{ unit }} {{ profile['lifetime_' ~ unit] }}
++{%   endfor %}
++{%   if profile.lifesize_gb is defined %}
++{{ p }} lifesize gb {{ profile.lifesize_gb }}
++{%   endif %}
++{% endfor %}
++{% for tunnel in ipsec.tunnels|default([]) %}
++set network interface tunnel units {{ tunnel.ifname }}
++{%   if tunnel.ipv4 is defined %}
++set network interface tunnel units {{ tunnel.ifname }} ip {{ tunnel.ipv4 }}
++{%   endif %}
++{%   if tunnel.mtu is defined and tunnel.mtu <= 1500 %}
++set network interface tunnel units {{ tunnel.ifname }} mtu {{ tunnel.mtu }}
++{%   endif %}
++set network interface tunnel units {{ tunnel.ifname }} comment "{{ tunnel.name }}"
++set network virtual-router {{ panos_virtual_router|default('default') }} interface {{ tunnel.ifname }}
++{%   if tunnel.zone_name is defined %}
++set zone "{{ tunnel.zone_name }}" network layer3 {{ tunnel.ifname }}
++{%   endif %}
++{%   set gw = 'set network ike gateway "' ~ tunnel.ike_gateway ~ '"' %}
++{{ gw }} authentication pre-shared-key key "{{ tunnel.preshared_key }}"
++{{ gw }} local-address interface {{ tunnel.local_interface }}
++{%   if tunnel.peer is defined %}
++{{ gw }} peer-address ip {{ tunnel.peer }}
++{%   else %}
++{{ gw }} peer-address dynamic
++{%   endif %}
++{%   if tunnel.ike.version|default('ikev2') == 'ikev1' %}
++{{ gw }} protocol ikev1 ike-crypto-profile "{{ tunnel.ike.crypto_profile }}"
++{%   else %}
++{{ gw }} protocol ikev2 ike-crypto-profile "{{ tunnel.ike.crypto_profile }}"
++{%   endif %}
++{%   if tunnel.ike.enable_nat_traversal|default(false) %}
++{{ gw }} protocol-common nat-traversal enable yes
++{%   endif %}
++{%   if tunnel.local_id_type is defined %}
++{{ gw }} local-id type {{ tunnel.local_id_type }} id "{{ tunnel.local_id_value }}"
++{%   endif %}
++{%   if tunnel.peer_id_type is defined %}
++{{ gw }} peer-id type {{ tunnel.peer_id_type }} id "{{ tunnel.peer_id_value }}"
++{%   endif %}
++{%   set tn = 'set network tunnel ipsec "' ~ tunnel.name ~ '"' %}
++{{ tn }} tunnel-interface {{ tunnel.ifname }}
++{{ tn }} auto-key ike-gateway "{{ tunnel.ike_gateway }}"
++{{ tn }} auto-key ipsec-crypto-profile "{{ tunnel.esp.crypto_profile }}"
++{%   for selector in tunnel.selectors|default([]) %}
++{{ tn }} auto-key proxy-id "{{ selector.name }}" local {{ selector.local }}
++{{ tn }} auto-key proxy-id "{{ selector.name }}" remote {{ selector.remote }}
++{{ tn }} auto-key proxy-id "{{ selector.name }}" protocol any
++{%   endfor %}
++{% endfor %}
+diff --git a/netsim/extra/loadbalancer/__init__.py b/netsim/extra/loadbalancer/__init__.py
+new file mode 100644
+index 0000000..96e489a
+--- /dev/null
++++ b/netsim/extra/loadbalancer/__init__.py
+@@ -0,0 +1,179 @@
++"""Load-balancer plugin.
++
++Supports the structured `loadbalancer` model used by staged EVE migrations while
++preserving imported `load_balancing` metadata for on-prem parity work.
++"""
++
++from box import Box
++
++from netsim import api
++from netsim.augment import devices
++from netsim.utils import log
++
++_config_name = "loadbalancer"
++
++# Monitor references that need no loadbalancer.monitors entry:
++#   ping    -- the built-in ICMP probe (ACOS: the predefined `ping` monitor)
++#   none    -- health checking explicitly disabled at that level
++#   default -- no binding; the device's own default check applies
++_BUILTIN_MONITORS = ("ping", "none", "default")
++
++
++def _supports_loadbalancer_rendering(features: Box) -> bool:
++  if "loadbalancer" not in features:
++    return False
++  return features.get("loadbalancer") is not False
++
++
++def _validate_load_balancing_data(node: Box) -> None:
++  if not node.get("load_balancing"):
++    return
++
++  if not isinstance(node.load_balancing.get("virtual_servers"), list):
++    log.error(
++      f"Node {node.name} has malformed load_balancing.virtual_servers (expected a list)",
++      category=log.IncorrectType,
++      module=_config_name,
++    )
++
++  if not isinstance(node.load_balancing.get("service_groups"), list):
++    log.error(
++      f"Node {node.name} has malformed load_balancing.service_groups (expected a list)",
++      category=log.IncorrectType,
++      module=_config_name,
++    )
++
++  if not isinstance(node.load_balancing.get("servers"), list):
++    log.error(
++      f"Node {node.name} has malformed load_balancing.servers (expected a list)",
++      category=log.IncorrectType,
++      module=_config_name,
++    )
++
++
++class _LB:
++  @staticmethod
++  def _normalize(node: Box) -> None:
++    node.loadbalancer.setdefault("monitors", [])
++    node.loadbalancer.setdefault("pools", [])
++    node.loadbalancer.setdefault("virtual_servers", [])
++
++    monitor_map = {
++      m.name: m for m in node.loadbalancer.monitors if isinstance(m, Box) and m.get("name")
++    }
++    pool_map = {
++      p.name: p for p in node.loadbalancer.pools if isinstance(p, Box) and p.get("name")
++    }
++
++    for monitor in monitor_map.values():
++      monitor.type = str(monitor.get("type", "tcp")).lower()
++      if monitor.type == "ping":                  # vendor-neutral name for the probe is icmp
++        monitor.type = "icmp"
++      # interval/timeout stay ABSENT unless the user set them: the device
++      # default applies, and a forced default can be invalid (ACOS rejects a
++      # timeout larger than the interval -- the old 10/30 defaults were).
++      if "interval" in monitor and "timeout" in monitor and monitor.timeout > monitor.interval:
++        log.error(
++          f"Node {node.name} monitor {monitor.name}: timeout {monitor.timeout} exceeds interval {monitor.interval}",
++          category=log.IncorrectValue,
++          module=_config_name,
++        )
++    # A tcp monitor with no port cannot be rendered (ACOS: `method tcp port N`).
++    # Before monitors rendered at all, blueprints declared such monitors as
++    # inert placeholders (demo-lab did); keep those loading -- warn and
++    # drop the object -- but binding one is an error below.
++    portless = {
++      name for name, m in monitor_map.items() if m.type == "tcp" and not m.get("port")
++    }
++    for name in portless:
++      log.warning(
++        text=f"Node {node.name} monitor {name}: a tcp monitor needs a port; it is not rendered",
++        module=_config_name,
++      )
++    node.loadbalancer.monitors = [
++      m for m in node.loadbalancer.monitors if not (isinstance(m, Box) and m.get("name") in portless)
++    ]
++
++    def check_monitor_ref(ref, what: str) -> None:
++      if ref in portless:
++        log.error(
++          f"Node {node.name} {what} binds monitor {ref}: a tcp monitor needs a port",
++          category=log.MissingValue,
++          module=_config_name,
++        )
++        return
++      if ref is None or ref in _BUILTIN_MONITORS or ref in monitor_map:
++        return
++      log.error(
++        f"Node {node.name} {what} references missing monitor {ref}",
++        more_hints=[f"Use a loadbalancer.monitors name or one of: {', '.join(_BUILTIN_MONITORS)}"],
++        category=log.IncorrectValue,
++        module=_config_name,
++      )
++
++    for pool in pool_map.values():
++      pool.protocol = str(pool.get("protocol", "tcp")).lower()
++      check_monitor_ref(pool.get("monitor", None), f"pool {pool.name}")
++      check_monitor_ref(pool.get("member_monitor", None), f"pool {pool.name} member_monitor")
++      check_monitor_ref(pool.get("server_monitor", None), f"pool {pool.name} server_monitor")
++      pool.setdefault("members", [])
++      for member in pool.members:
++        member.port = int(member.get("port", 0))
++        # Resolve the pool-level defaults onto each member so templates read
++        # one place: members[].monitor / members[].server_monitor.
++        for attr, pool_attr in (("monitor", "member_monitor"), ("server_monitor", "server_monitor")):
++          if attr not in member and pool.get(pool_attr, None) is not None:
++            member[attr] = pool[pool_attr]
++          check_monitor_ref(member.get(attr, None), f"pool {pool.name} member {member.name} {attr}")
++
++    for vs in node.loadbalancer.virtual_servers:
++      if not isinstance(vs, Box):
++        log.error(
++          f"Node {node.name} has invalid virtual_server entry {vs}",
++          category=log.IncorrectType,
++          module=_config_name,
++        )
++        continue
++      vs.protocol = str(vs.get("protocol", "tcp")).lower()
++      vs.port = int(vs.get("port", 0))
++      if vs.pool not in pool_map:
++        log.error(
++          f"Node {node.name} virtual_server {vs.name} references missing pool {vs.pool}",
++          category=log.IncorrectValue,
++          module=_config_name,
++        )
++
++
++def post_transform(topology: Box) -> None:
++  for node in topology.nodes.values():
++    features = devices.get_device_features(node, topology.defaults)
++
++    if isinstance(node.get("loadbalancer", None), Box):
++      if "loadbalancer" not in features:
++        log.error(
++          f"Node {node.name}({node.device}) does not support loadbalancer plugin",
++          category=log.IncorrectAttr,
++          module=_config_name,
++        )
++        continue
++
++      _LB._normalize(node)
++      api.node_config(node, _config_name)
++      continue
++
++    if not node.get("load_balancing"):
++      continue
++
++    _validate_load_balancing_data(node)
++
++    if node.get("placeholder") or node.get("device", "") == "none":
++      continue
++
++    if _supports_loadbalancer_rendering(features):
++      api.node_config(node, _config_name)
++      continue
++
++    log.warning(
++      text=f"Node {node.name}({node.device}) has load-balancing metadata; rendering of these features is not implemented yet",
++      module=_config_name,
++    )
+diff --git a/netsim/extra/loadbalancer/a10.j2 b/netsim/extra/loadbalancer/a10.j2
+new file mode 100644
+index 0000000..cbe8233
+--- /dev/null
++++ b/netsim/extra/loadbalancer/a10.j2
+@@ -0,0 +1,55 @@
++{#
++  A10 ACOS SLB, rendered from the vendor-neutral loadbalancer model.
++
++  Health checks bind at three ACOS levels, each from its own attribute:
++    slb server <n> <ip>            health-check <m>  <- members[].server_monitor
++      port <p> <proto>             health-check <m>  <- members[].monitor
++    slb service-group <n> <proto>  health-check <m>  <- pools[].monitor
++  (pools[].server_monitor / pools[].member_monitor are resolved onto every
++  member by the plugin.) `ping` is ACOS's predefined ICMP monitor and is never
++  declared; `none` renders health-check-disable; `default`/unset renders
++  nothing, which leaves ACOS's own default -- an L3 ICMP check on the server
++  and an L4 TCP handshake on the port. That default is why a VIP whose members
++  run no listener on the port reads Down while ICMP to them is fine.
++
++  An icmp monitor renders no `method` line: ICMP is the ACOS default method and
++  running-config does not show it (seed: `health monitor hm_... / interval 10`).
++#}
++{% macro hc(ref) %}{{ 'health-check-disable' if ref == 'none' else 'health-check ' ~ ref }}{% endmacro %}
++{% for m in loadbalancer.monitors | default([]) %}
++health monitor {{ m.name }}
++{%   if m.type == 'tcp' %}
++  method tcp port {{ m.port }}
++{%   elif m.type == 'http' %}
++  method http{% if m.port is defined %} port {{ m.port }}{% endif %} url GET {{ m.url | default('/') }}
++{%   endif %}
++{%   if m.interval is defined %}
++  interval {{ m.interval }}{% if m.timeout is defined %} timeout {{ m.timeout }}{% endif %}
++
++{%   endif %}
++{% endfor %}
++{% for pool in loadbalancer.pools | default([]) %}
++{%   for member in pool.members | default([]) %}
++slb server {{ member.name }} {{ member.address }}
++{%     if member.server_monitor | default('default') != 'default' %}
++  {{ hc(member.server_monitor) }}
++{%     endif %}
++  port {{ member.port }} {{ pool.protocol | default('tcp') }}
++{%     if member.monitor | default('default') != 'default' %}
++    {{ hc(member.monitor) }}
++{%     endif %}
++{%   endfor %}
++slb service-group {{ pool.name }} {{ pool.protocol | default('tcp') }}
++{%   if pool.monitor | default('default', true) != 'default' %}
++  {{ hc(pool.monitor) }}
++{%   endif %}
++{%   for member in pool.members | default([]) %}
++  member {{ member.name }} {{ member.port }}
++{%   endfor %}
++{% endfor %}
++
++{% for vs in loadbalancer.virtual_servers | default([]) %}
++slb virtual-server {{ vs.name }} {{ vs.vip }}
++  port {{ vs.port }} {{ vs.protocol | default('tcp') }}
++    service-group {{ vs.pool }}
++{% endfor %}
+diff --git a/netsim/extra/loadbalancer/defaults.yml b/netsim/extra/loadbalancer/defaults.yml
+new file mode 100644
+index 0000000..957d12b
+--- /dev/null
++++ b/netsim/extra/loadbalancer/defaults.yml
+@@ -0,0 +1,110 @@
++# Generic load-balancer plugin
++#
++---
++devices:
++  a10:
++    features.loadbalancer: True
++  none:
++    features.loadbalancer: True
++
++attributes:
++  node:
++    load_balancing:
++      type: dict
++    loadbalancer:
++      monitors: { type: list, _subtype: _lb_monitor }
++      pools: { type: list, _subtype: _lb_pool }
++      virtual_servers: { type: list, _subtype: _lb_virtual_server }
++
++  _lb_monitor:
++    _description: |
++      A named health monitor. `type` is the probe: icmp (ping is accepted as
++      an alias and normalized to icmp), tcp (connect to `port`), or http
++      (GET `url` on `port`). interval/timeout are seconds and are rendered
++      only when set; timeout must not exceed interval. A monitor does
++      nothing until something binds it: pools[].monitor,
++      pools[].member_monitor / members[].monitor, or
++      pools[].server_monitor / members[].server_monitor.
++    name:
++      type: str
++      _required: true
++    type:
++      type: str
++      valid_values: [ icmp, ping, tcp, http ]
++    interval: { type: int, min_value: 1 }
++    timeout: { type: int, min_value: 1 }
++    port: { type: int, min_value: 1, max_value: 65534 }
++    url:
++      type: str
++      _description: HTTP monitor request path (default /), e.g. /index.php
++    send: str
++    receive: str
++
++  _lb_pool:
++    name:
++      type: str
++      _required: true
++    protocol:
++      type: str
++      valid_values: [ tcp, udp ]
++    monitor:
++      type: str
++      _alt_types: [ NoneType ]
++      _description: |
++        Pool-level (service-group) health check: a monitors[] name, `ping`
++        (the built-in ICMP probe), `none` (health checking disabled) or
++        `default` (no binding; the device default applies).
++    member_monitor:
++      type: str
++      _description: |
++        Default per-member SERVICE (ip:port) health check for every member of
++        this pool; same values as monitor. members[].monitor overrides it.
++    server_monitor:
++      type: str
++      _description: |
++        Default per-member SERVER (host/node) health check for every member
++        of this pool; same values as monitor. members[].server_monitor
++        overrides it.
++    members:
++      type: list
++      _subtype: _lb_member
++
++  _lb_member:
++    name:
++      type: str
++      _required: true
++    address:
++      type: ipv4
++      use: interface
++      _required: true
++    port:
++      type: int
++      _required: true
++    monitor:
++      type: str
++      _description: |
++        This member's SERVICE (ip:port) health check -- a monitors[] name,
++        ping, none or default. Overrides the pool's member_monitor.
++    server_monitor:
++      type: str
++      _description: |
++        This member's SERVER (host) health check -- a monitors[] name, ping,
++        none or default. Overrides the pool's server_monitor.
++
++  _lb_virtual_server:
++    name:
++      type: str
++      _required: true
++    vip:
++      type: ipv4
++      use: interface
++      _required: true
++    port:
++      type: int
++      _required: true
++    protocol:
++      type: str
++      valid_values: [ tcp, udp ]
++    pool:
++      type: str
++      _required: true
+diff --git a/netsim/extra/loadbalancer/f5.j2 b/netsim/extra/loadbalancer/f5.j2
+new file mode 100644
+index 0000000..7ad4a20
+--- /dev/null
++++ b/netsim/extra/loadbalancer/f5.j2
+@@ -0,0 +1,51 @@
++{% macro f5_name(value) -%}
++{% if value is string and value.startswith('/') %}
++{{ value }}
++{% else %}
++/Common/{{ value }}
++{% endif %}
++{%- endmacro %}
++{% macro f5_destination(vs) -%}
++{% if vs.destination is defined %}
++{%   if vs.destination.startswith('/') %}
++{{ vs.destination }}
++{%   else %}
++/Common/{{ vs.destination }}
++{%   endif %}
++{% elif vs.vip is defined %}
++/Common/{{ vs.vip }}:{{ vs.port|default('any') }}
++{% else %}
++/Common/0.0.0.0:any
++{% endif %}
++{%- endmacro %}
++{% for server in load_balancing.servers|default([]) %}
++{%   if server.name is defined and server.ip is defined %}
++create ltm node {{ f5_name(server.name) }} address {{ server.ip }}
++{%   endif %}
++{% endfor %}
++{% for group in load_balancing.service_groups|default([]) %}
++{%   if group.name is defined %}
++{%     set members = [] %}
++{%     for member in group.members|default([]) %}
++{%       if member.server is defined and member.port is defined %}
++{%         set _ = members.append(f5_name(member.server) ~ ':' ~ member.port|string) %}
++{%       endif %}
++{%     endfor %}
++{%     if members %}
++create ltm pool {{ f5_name(group.name) }} members add { {{ members|join(' ') }} }
++{%     else %}
++create ltm pool {{ f5_name(group.name) }}
++{%     endif %}
++{%   endif %}
++{% endfor %}
++{% for vs in load_balancing.virtual_servers|default([]) %}
++{%   if vs.name is defined %}
++{%     set protocol = vs.protocol|default('tcp') %}
++{%     set pool_name = f5_name(vs.pool) if vs.pool is defined else '' %}
++{%     if pool_name %}
++create ltm virtual {{ f5_name(vs.name) }} destination {{ f5_destination(vs) }} ip-protocol {{ protocol }} pool {{ pool_name }}
++{%     else %}
++create ltm virtual {{ f5_name(vs.name) }} destination {{ f5_destination(vs) }} ip-protocol {{ protocol }}
++{%     endif %}
++{%   endif %}
++{% endfor %}
+diff --git a/netsim/extra/nat/__init__.py b/netsim/extra/nat/__init__.py
+new file mode 100644
+index 0000000..43d9859
+--- /dev/null
++++ b/netsim/extra/nat/__init__.py
+@@ -0,0 +1,186 @@
++from box import Box
++
++from netsim import api
++from netsim.augment import devices
++from netsim.utils import log
++
++_config_name = "nat"
++
++# NAT does NOT require a firewall. You can translate addresses without having any
++# policy at all -- a switch doing PAT to the outside is the ordinary case, and it
++# has nothing to do with firewall rules.
++#
++# This used to be `_requires = ["firewall.policy"]`, which augment/plugin.py
++# enforces as a HARD dependency:
++#
++#   nat plugin requires firewall.policy plugin which is not included in lab topology
++#
++# So `plugin: [ nat ]` on its own was rejected at compile time and every pure-NAT
++# topology had to carry `plugin: [ firewall.policy, nat ]` for a firewall it never
++# used. Verified against the real compiler before the change: a single-node
++# fortios topology with `plugin: [ nat ]` failed L2-compile.
++#
++# The firewall.policy integration is genuinely OPTIONAL: _promote_policy_nat_rules
++# reads node.firewall.policy.rules through .get() and is a no-op when the plugin
++# is absent, so nothing else here needs the dependency.
++#
++# `_execute_after` preserves the ORDERING that `_requires` was also providing --
++# when both plugins ARE loaded, nat must still run after firewall.policy so the
++# promotion sees its rules. Unlike `_requires` it is not enforced as a dependency:
++# plugin_requires_check only inspects `_requires`, and utils/sort.dependency
++# filters names that are not in the plugin list, so an absent firewall.policy is
++# simply ignored instead of failing the lab.
++_execute_after = ["firewall.policy"]
++
++
++def _as_list(value: object) -> list:
++  if value is None:
++    return []
++  if isinstance(value, list):
++    return list(value)
++  return [value]
++
++
++def _normalize_rule(node: Box, rule: Box, rule_idx: int) -> bool:
++  ok = True
++  if bool(rule.get("nat", False)) and "type" not in rule:
++    # Policy-derived NAT rules are rendered by platform policy templates; they
++    # do not use the standalone NAT rule schema.
++    return True
++
++  if "type" not in rule:
++    log.error(
++      f"Node {node.name} has NAT rule #{rule_idx} without nat.rules[{rule_idx}].type",
++      category=log.MissingValue,
++      module=_config_name,
++    )
++    return False
++
++  if "name" not in rule:
++    rule.name = f"rule_{rule_idx + 1}"
++  if "enabled" not in rule:
++    rule.enabled = True
++
++  for key in ("inside", "outside", "source", "destination", "service"):
++    if key in rule:
++      rule[key] = _as_list(rule[key])
++
++  if rule.type == "source" and "translated_source" not in rule:
++    log.error(
++      f"Node {node.name} source NAT rule {rule.name} is missing translated_source",
++      category=log.MissingValue,
++      module=_config_name,
++    )
++    ok = False
++
++  if rule.type == "destination" and "translated_destination" not in rule:
++    log.error(
++      f"Node {node.name} destination NAT rule {rule.name} is missing translated_destination",
++      category=log.MissingValue,
++      module=_config_name,
++    )
++    ok = False
++
++  if rule.type == "static" and "translated_destination" not in rule and "translated_source" not in rule:
++    log.error(
++      f"Node {node.name} static NAT rule {rule.name} is missing translated_source or translated_destination",
++      category=log.MissingValue,
++      module=_config_name,
++    )
++    ok = False
++
++  return ok
++
++
++def _promote_policy_nat_rules(node: Box) -> None:
++  policy_rules = node.get("firewall.policy.rules", [])
++  if not isinstance(policy_rules, list):
++    return
++
++  nat_rules = [r for r in policy_rules if isinstance(r, Box) and bool(r.get("nat", False))]
++  if not nat_rules:
++    return
++
++  # APPEND, never replace. This was `node.nat.rules = nat_rules`, which meant a
++  # single firewall.policy rule carrying `nat: true` SILENTLY DESTROYED every NAT
++  # rule the author had written under node.nat.rules -- no error, no warning, the
++  # lab just came up without the translation it was asked for.
++  #
++  # That was survivable while the plugin rendered nothing for most platforms. It
++  # is not now: eos, ios, iol and panos all render from node.nat.rules, so on a
++  # firewall carrying both an authored NAT rule and a policy rule flagged
++  # `nat: true`, the authored one vanished from the device configuration.
++  #
++  # Order matters and is deliberate: authored rules first, promoted policy rules
++  # after. FortiOS is why -- nat/fortios.j2 re-enters `config firewall policy`
++  # and matches promoted rules by the `sequence` firewall.policy stamped on them,
++  # so promoted rules must keep their relative order among themselves.
++  existing = node.get("nat.rules", [])
++  if not isinstance(existing, list):
++    existing = []
++  node.nat.rules = list(existing) + nat_rules
++
++
++def post_transform(topology: Box) -> None:
++  for node in topology.nodes.values():
++    features = devices.get_device_features(node, topology.defaults)
++    nat_supported = "nat" in features and features.nat is not False
++
++    if "nat" not in node:
++      node.nat = {}
++    if "_roles" not in node.nat:
++      node.nat._roles = {}
++    if "_zones" not in node.nat:
++      node.nat._zones = {}
++
++    _promote_policy_nat_rules(node)
++    has_nat_rules = bool(node.get("nat.rules", []))
++
++    for intf in node.get("interfaces", []):
++      nat_role = intf.get("nat.role", "")
++      if not nat_role:
++        continue
++      if not nat_supported:
++        log.error(
++          f"Node {node.name}({node.device}) does not support NAT roles used on {intf.name}",
++          category=log.IncorrectAttr,
++          module=_config_name,
++        )
++        continue
++      if nat_role not in ("inside", "outside"):
++        log.error(
++          f"Invalid NAT role {nat_role} on {intf.name}",
++          category=log.IncorrectValue,
++          module=_config_name,
++        )
++        continue
++
++      if nat_role not in node.nat._roles:
++        node.nat._roles[nat_role] = []
++      node.nat._roles[nat_role].append(
++        {
++          "ifname": intf.ifname,
++          "name": intf.get("name", ""),
++        }
++      )
++
++      if "firewall.zone" in intf:
++        if nat_role not in node.nat._zones:
++          node.nat._zones[nat_role] = []
++        zones = node.nat._zones[nat_role]
++        if intf.firewall.zone not in zones:
++          zones.append(intf.firewall.zone)
++
++    if has_nat_rules and not nat_supported:
++      log.error(
++        f"Node {node.name}({node.device}) does not support NAT rules",
++        category=log.IncorrectAttr,
++        module=_config_name,
++      )
++      continue
++
++    for rule_idx, rule in enumerate(node.get("nat.rules", [])):
++      _normalize_rule(node, rule, rule_idx)
++
++    if has_nat_rules:
++      api.node_config(node, _config_name)
+diff --git a/netsim/extra/nat/asa.j2 b/netsim/extra/nat/asa.j2
+new file mode 100644
+index 0000000..24694c7
+--- /dev/null
++++ b/netsim/extra/nat/asa.j2
+@@ -0,0 +1,105 @@
++{#
++  Cisco ASA NAT (8.3+ "twice NAT" / manual NAT).
++
++  NAMED asa.j2, NOT asav.j2. The two lookups use different keys: the plugin
++  checks features under the DEVICE name (asav), while the config template is
++  resolved by device TYPE (asa). Naming this asav.j2 gets the device past
++  validation and then fails the run with "Cannot find nat configuration
++  template for <node>/device asav" -- measured, not theorised.
++
++  SHAPE, and why this is neither ios.j2 nor eos.j2: the ASA names its interfaces
++  with `nameif` and every NAT statement is written in terms of those NAMES, as a
++  (real,mapped) interface PAIR -- `nat (inside,outside) source ...`. There is no
++  per-interface `ip nat inside` marking to emit, and no global statement that
++  works without the pair. What the roles give us here is which nameif goes on
++  each side of that parenthesis.
++
++  Real and mapped addresses must be `object network` definitions; the ASA will
++  not take a bare subnet inline on a manual NAT line. One object per source
++  entry, so a rule listing three subnets renders three unambiguous statements
++  rather than one that depends on object-group semantics differing by release.
++
++  nameif comes from `firewall.zone` when the interface declares one (the same
++  attribute firewall.policy binds its ACLs to) and falls back to the interface
++  name, which is what the initial config uses when no zone is declared.
++#}
++{% set inside = nat._roles.inside | default([]) %}
++{% set outside = nat._roles.outside | default([]) %}
++{% set rules = nat.rules | default([]) | rejectattr('enabled','equalto',False) | list %}
++{#
++  nameif is resolved through the node's OWN interface list, not through
++  nat._roles: the role entries are trimmed copies carrying only ifname and
++  name, so `role.firewall.zone` is always undefined and every translation
++  would silently render against the interface NAME instead of the zone.
++  Measured -- it produced `nat (GigabitEthernet0/0,GigabitEthernet0/1)`.
++#}
++{% set zone_of = {} %}
++{% for intf in interfaces | default([]) %}
++{%   if intf.firewall is defined and intf.firewall.zone is defined %}
++{%     set _ = zone_of.update({intf.ifname: intf.firewall.zone}) %}
++{%   endif %}
++{% endfor %}
++{% macro nameif(intf) %}{{ zone_of.get(intf.ifname, intf.ifname) }}{% endmacro %}
++{#
++  An address object is a SUBNET or a RANGE depending on how it was written.
++  `10.21.3.2-10.21.3.20` is a range on the ASA and has no prefix form, so it
++  cannot be expressed as a subnet without changing which addresses translate.
++#}
++{% macro addr_object(value) %}
++{%- if '-' in value %} range {{ value.split('-')[0] }} {{ value.split('-')[1] }}
++{%- else %} subnet {{ value | ipaddr('network') }} {{ value | ipaddr('netmask') }}
++{%- endif -%}
++{% endmacro %}
++{#
++  A rule may name its own zone PAIR. The DC firewall translates
++  `nat (inside,dmvpn)` for its 1:1 mapping while PATing `(inside,outside)`, so
++  the pair cannot be a property of the node's interface roles alone.
++#}
++{% macro pair(rule, a, b) %}{{ rule.inside | default([a], true) | first }},{{ rule.outside | default([b], true) | first }}{% endmacro %}
++{% if rules and not (inside and outside) %}
++! NAT NOT APPLIED: the ASA writes every translation as an interface PAIR,
++! `nat (real,mapped)`, so it needs BOTH roles. inside={{ inside | length }}
++! outside={{ outside | length }}. Declare nat.role: inside and nat.role: outside
++! on the links, or these {{ rules | length }} rule(s) cannot be programmed.
++{% endif %}
++{% if inside and outside %}
++{%   set in_if = nameif(inside[0]) | trim %}
++{%   set out_if = nameif(outside[0]) | trim %}
++{%   for rule in rules %}
++{%     set base = 'NAT-' ~ (rule.name | upper) %}
++{%     if rule.type == 'source' %}
++{%       for src in rule.source | default([]) %}
++object network {{ base }}-REAL{{ loop.index if rule.source | length > 1 else '' }}
++{{ addr_object(src) }}
++{%       endfor %}
++{%       for src in rule.source | default([]) %}
++{%         set obj = base ~ '-REAL' ~ (loop.index if rule.source | length > 1 else '') %}
++{%         if rule.translated_source is not defined or rule.translated_source == 'interface' %}
++nat ({{ pair(rule, in_if, out_if) }}) source dynamic {{ obj }} interface
++{%         else %}
++object network {{ base }}-PAT{{ loop.index if rule.source | length > 1 else '' }}
++{{ addr_object(rule.translated_source) }}
++nat ({{ pair(rule, in_if, out_if) }}) source dynamic {{ obj }} {{ base }}-PAT{{ loop.index if rule.source | length > 1 else '' }}
++{%         endif %}
++{%       endfor %}
++{%     elif rule.type == 'static' and rule.translated_source is defined %}
++{%       for src in rule.source | default([]) %}
++{%         set sfx = loop.index if rule.source | length > 1 else '' %}
++object network {{ base }}-REAL{{ sfx }}
++{{ addr_object(src) }}
++object network {{ base }}-MAPPED{{ sfx }}
++{{ addr_object(rule.translated_source) }}
++nat ({{ pair(rule, in_if, out_if) }}) source static {{ base }}-REAL{{ sfx }} {{ base }}-MAPPED{{ sfx }}
++{%       endfor %}
++{%     elif rule.type == 'destination' and rule.translated_destination is defined %}
++{%       for dst in rule.destination | default([]) %}
++{%         set sfx = loop.index if rule.destination | length > 1 else '' %}
++object network {{ base }}-DST{{ sfx }}
++{{ addr_object(dst) }}
++object network {{ base }}-DSTMAP{{ sfx }}
++{{ addr_object(rule.translated_destination) }}
++nat ({{ pair(rule, out_if, in_if) }}) source static {{ base }}-DSTMAP{{ sfx }} {{ base }}-DST{{ sfx }}
++{%       endfor %}
++{%     endif %}
++{%   endfor %}
++{% endif %}
+diff --git a/netsim/extra/nat/defaults.yml b/netsim/extra/nat/defaults.yml
+new file mode 100644
+index 0000000..2cdbe8f
+--- /dev/null
++++ b/netsim/extra/nat/defaults.yml
+@@ -0,0 +1,90 @@
++# Generic NAT plugin
++#
++---
++devices:
++  # eos: added by Skyforge (patches/netlab/0026). Arista is INTERFACE-based, so
++  # eos.j2 renders NAT under the interfaces carrying nat.role: outside.
++  #
++  # ⚠️ THIS LIST IS NOT "PLATFORMS WHERE NAT WORKS". Check for a template before
++  # believing an entry. Current state:
++  #
++  #   eos      nat/eos.j2                                  -> renders
++  #   ios      nat/ios.j2                                  -> renders
++  #   iol      nat/iol.j2 (includes ios.j2)                -> renders
++  #   panos    nat/panos.j2, AND __init__.py lifts firewall.policy rules
++  #            carrying `nat: true` into node.nat.rules     -> renders (both paths)
++  #   fortios  nat/fortios.j2 + firewall.policy/fortios.j2  -> renders
++  #   asav     nat/asav.j2                                  -> renders
++  #
++  # Every declared platform now has a template. Keep it that way: a device
++  # listed here without one validates an author's rules, reports features.nat
++  # supported, and emits nothing -- the lab comes up green and does not
++  # translate. If you add a device, add its template in the same commit.
++  eos:
++    features.nat: True
++  # MEASURED FALSE 2026-09-07 on the pinned netlab (f64bc4f3): this entry and
++  # iol.j2 are both INERT. `features` IS inherited through `parent: ios`, and
++  # the template lookup DOES walk the parent chain -- deleting iol.j2 renders
++  # byte-identical NAT on an iol node. Kept because harmless; do NOT cite this
++  # as proof the pattern is required. The previous comment here claimed the
++  # opposite and sent a reader hunting a phantom ipsec/iol gap for a day.
++  iol:
++    features.nat: True
++  panos:
++    features.nat: True
++  fortios:
++    features.nat: True
++  asav:
++    features.nat: True
++  # vsrx: nat/junos.j2 -- source NAT (interface / pool) as a rule-set per rule,
++  # from-zone/to-zone taken from the rule's inside/outside zone names or, when
++  # the rule names none, from the zones of the interfaces carrying nat.role.
++  vsrx:
++    features.nat: True
++  ios:
++    features.nat: True
++  none:
++    features.nat: True
++
++attributes:
++  node:
++    nat: _nat_node
++  interface:
++    nat: _nat_interface
++
++  _nat_interface:
++    role:
++      type: str
++      valid_values: [ inside, outside ]
++
++  _nat_node:
++    rules:
++      type: list
++      _subtype: _nat_rule
++
++  _nat_rule:
++    name: str
++    type:
++      type: str
++      valid_values: [ source, destination, static ]
++    description: str
++    enabled: bool
++    inside:
++      type: list
++      _subtype: str
++    outside:
++      type: list
++      _subtype: str
++    source:
++      type: list
++      _subtype: str
++    destination:
++      type: list
++      _subtype: str
++    service:
++      type: list
++      _subtype: str
++    translated_source: str
++    translated_destination: str
++    translated_service: str
++    nat: bool
+diff --git a/netsim/extra/nat/eos.j2 b/netsim/extra/nat/eos.j2
+new file mode 100644
+index 0000000..4deab30
+--- /dev/null
++++ b/netsim/extra/nat/eos.j2
+@@ -0,0 +1,67 @@
++{#
++  Arista EOS NAT.
++
++  EOS is INTERFACE-BASED, unlike the policy-based fortios template next to this
++  file: every NAT command is applied under an interface, so a rule can only be
++  rendered onto interfaces carrying `nat.role: outside`. Declare roles on the
++  links, e.g.
++
++      nodes:
++        s2:
++          nat.rules:
++            - name: outbound
++              type: source
++              source: [ 10.0.0.0/8 ]
++              translated_source: interface
++      links:
++        - s2:
++            nat.role: outside
++          h1:
++            nat.role: inside
++
++  If a node has NAT rules but NO outside interface, this renders a loud marker
++  comment instead of silently producing nothing -- a NAT config that quietly
++  fails to apply is the worst outcome, because the lab comes up "green" and only
++  the traffic is wrong.
++
++  translated_source: `interface` (or omitted) means PAT/overload onto the outside
++  interface address, which is the common case. An explicit address is rendered as
++  a static translation instead.
++#}
++{% set outside = nat._roles.outside | default([]) %}
++{# Reject only an EXPLICIT enabled:false. A `selectattr('enabled')` filter would
++   also silently drop any rule that never set `enabled` -- policy-derived rules
++   (nat: true) return early from _normalize_rule and never get the default, so
++   filtering on truthiness would quietly discard them. #}
++{% set rules = nat.rules | default([]) | rejectattr('enabled','equalto',False) | list %}
++{% if rules and not outside %}
++! NAT NOT APPLIED: node has {{ rules | length }} NAT rule(s) but no interface with
++! nat.role: outside. EOS applies NAT under an interface -- declare the outside
++! role on a link, or these rules cannot be programmed.
++{% endif %}
++{% for rule in rules %}
++{%   if rule.type == 'source' and rule.source is defined %}
++ip access-list standard NAT-{{ rule.name | upper }}
++{%     for src in rule.source %}
++   permit {{ src }}
++{%     endfor %}
++!
++{%   endif %}
++{% endfor %}
++{% for intf in outside %}
++interface {{ intf.ifname }}
++{%   for rule in rules %}
++{%     if rule.type == 'source' %}
++{%       if rule.translated_source is not defined or rule.translated_source == 'interface' %}
++   ip nat source dynamic access-list NAT-{{ rule.name | upper }} overload
++{%       else %}
++   ip nat source static {{ rule.source | first }} {{ rule.translated_source }}
++{%       endif %}
++{%     elif rule.type == 'static' and rule.translated_source is defined %}
++   ip nat source static {{ rule.source | first }} {{ rule.translated_source }}
++{%     elif rule.type == 'destination' and rule.translated_destination is defined %}
++   ip nat destination static {{ rule.destination | first }} {{ rule.translated_destination }}
++{%     endif %}
++{%   endfor %}
++!
++{% endfor %}
+diff --git a/netsim/extra/nat/fortios.j2 b/netsim/extra/nat/fortios.j2
+new file mode 100644
+index 0000000..0942925
+--- /dev/null
++++ b/netsim/extra/nat/fortios.j2
+@@ -0,0 +1,7 @@
++config firewall policy
++{% for policy in nat.rules | default([]) %}
++edit {{ policy.sequence | default(loop.index * 10) }}
++set nat enable
++next
++{% endfor %}
++end
+diff --git a/netsim/extra/nat/iol.j2 b/netsim/extra/nat/iol.j2
+new file mode 100644
+index 0000000..ac6ff72
+--- /dev/null
++++ b/netsim/extra/nat/iol.j2
+@@ -0,0 +1,15 @@
++{#
++  Cisco IOL (IOS-on-Linux) NAT.
++
++  MEASURED FALSE 2026-09-07 on the pinned netlab (f64bc4f3): this file is INERT.
++  The template lookup DOES walk the `parent: ios` chain, so `ios.j2` is found
++  for an iol node on its own -- deleting this file renders byte-identical NAT.
++  Kept because harmless and explicit; do NOT cite it as proof a per-device
++  template is required, which is what the previous version of this note claimed.
++
++  The NAT config itself is identical to IOS, so include it rather than copying:
++  a duplicated template is two sources of truth that drift the first time only
++  one of them is fixed. If this include ever fails to resolve, Jinja raises
++  TemplateNotFound -- a loud failure, not a silently empty NAT config.
++#}
++{% include "ios.j2" %}
+diff --git a/netsim/extra/nat/ios.j2 b/netsim/extra/nat/ios.j2
+new file mode 100644
+index 0000000..23f4c03
+--- /dev/null
++++ b/netsim/extra/nat/ios.j2
+@@ -0,0 +1,64 @@
++{#
++  Classic Cisco IOS NAT (IOS / IOS-XE / IOL).
++
++  DIFFERENT SHAPE FROM eos.j2, and the difference is the whole reason this is a
++  separate template rather than a copy: IOS needs THREE things, EOS needs one.
++
++    1. every inside interface marked  `ip nat inside`
++    2. every outside interface marked `ip nat outside`
++    3. a GLOBAL `ip nat inside source ...` statement tying them together
++
++  EOS carries the translation on the outside interface alone. So an IOS node with
++  only `nat.role: outside` declared produces a NAT config that cannot translate
++  anything -- it needs BOTH roles. That is checked below and reported loudly
++  rather than rendered as a half-config.
++
++  ACLs are standard ACLs with WILDCARD masks, not prefixes: `permit 10.0.0.0
++  0.255.255.255`. The `ipaddr` filter reaches netaddr.IPNetwork attributes, so
++  `ipaddr('network')` and `ipaddr('hostmask')` give exactly the two halves IOS
++  wants. Verified: 10.0.0.0/8 -> `10.0.0.0 0.255.255.255`, 192.168.1.0/24 ->
++  `192.168.1.0 0.0.0.255`.
++#}
++{% set inside = nat._roles.inside | default([]) %}
++{% set outside = nat._roles.outside | default([]) %}
++{% set rules = nat.rules | default([]) | rejectattr('enabled','equalto',False) | list %}
++{% if rules and not (inside and outside) %}
++! NAT NOT APPLIED: IOS requires BOTH an inside and an outside interface.
++! inside={{ inside | length }} outside={{ outside | length }}. Declare
++! nat.role: inside and nat.role: outside on the links, or these {{ rules | length }}
++! rule(s) cannot be programmed.
++{% endif %}
++{% for rule in rules %}
++{%   if rule.type in ['source','static'] and rule.source is defined %}
++ip access-list standard NAT-{{ rule.name | upper }}
++{%     for src in rule.source %}
++ permit {{ src | ipaddr('network') }} {{ src | ipaddr('hostmask') }}
++{%     endfor %}
++!
++{%   endif %}
++{% endfor %}
++{% for intf in inside %}
++interface {{ intf.ifname }}
++ ip nat inside
++!
++{% endfor %}
++{% for intf in outside %}
++interface {{ intf.ifname }}
++ ip nat outside
++!
++{% endfor %}
++{% if inside and outside %}
++{%   for rule in rules %}
++{%     if rule.type == 'source' %}
++{%       if rule.translated_source is not defined or rule.translated_source == 'interface' %}
++ip nat inside source list NAT-{{ rule.name | upper }} interface {{ outside[0].ifname }} overload
++{%       else %}
++ip nat inside source list NAT-{{ rule.name | upper }} pool {{ rule.translated_source }} overload
++{%       endif %}
++{%     elif rule.type == 'static' and rule.translated_source is defined %}
++ip nat inside source static {{ rule.source | first }} {{ rule.translated_source }}
++{%     elif rule.type == 'destination' and rule.translated_destination is defined %}
++ip nat outside source static {{ rule.destination | first }} {{ rule.translated_destination }}
++{%     endif %}
++{%   endfor %}
++{% endif %}
+diff --git a/netsim/extra/nat/panos.j2 b/netsim/extra/nat/panos.j2
+new file mode 100644
+index 0000000..4aa764d
+--- /dev/null
++++ b/netsim/extra/nat/panos.j2
+@@ -0,0 +1,45 @@
++{#
++  Palo Alto PAN-OS NAT.
++
++  NAT LIVES HERE, NOT IN firewall.policy. PAN-OS NAT is its own rulebase
++  (`rulebase nat rules`), entirely separate from `rulebase security rules`, so it
++  belongs to the nat plugin like every other platform. Before this template
++  existed panos was declared `features.nat: True` and rendered NOTHING: it was
++  easy to assume firewall.policy/panos.j2 covered it, but that template only ever
++  emitted SECURITY rules. One place for NAT, so there is nothing to reconcile.
++
++  PAN-OS is ZONE-based, not interface-based. Zones come from the rule itself
++  (`inside:` / `outside:`, which the plugin normalizes to lists); the outside
++  INTERFACE is still needed for interface-address translation, and comes from
++  nat._roles.outside.
++#}
++{% set rules = nat.rules | default([]) | rejectattr('enabled','equalto',False) | list %}
++{% set outside_if = (nat._roles.outside | default([]))[0] | default({}) %}
++{% for rule in rules %}
++{%   if rule.inside is not defined or rule.outside is not defined %}
++# NAT NOT APPLIED for rule {{ rule.name }}: PAN-OS NAT is zone-based and needs
++# both `inside:` and `outside:` zones on the rule. Got inside={{ rule.inside | default('<unset>') }}
++# outside={{ rule.outside | default('<unset>') }}.
++{%   else %}
++set rulebase nat rules "{{ rule.name }}" from [{% for z in rule.inside %} "{{ z }}"{% endfor %} ]
++set rulebase nat rules "{{ rule.name }}" to "{{ rule.outside | first }}"
++set rulebase nat rules "{{ rule.name }}" source [{% for s in rule.source | default(['any']) %} "{{ s }}"{% endfor %} ]
++set rulebase nat rules "{{ rule.name }}" destination [{% for d in rule.destination | default(['any']) %} "{{ d }}"{% endfor %} ]
++set rulebase nat rules "{{ rule.name }}" service {{ (rule.service | default(['any']) | first) }}
++{%     if rule.type in ['source','static'] %}
++{%       if rule.translated_source is not defined or rule.translated_source == 'interface' %}
++{%         if outside_if.ifname is defined %}
++set rulebase nat rules "{{ rule.name }}" source-translation dynamic-ip-and-port interface-address interface {{ outside_if.ifname }}
++{%         else %}
++# NAT NOT APPLIED for rule {{ rule.name }}: translated_source is `interface` but no
++# interface carries nat.role: outside, so there is no address to translate to.
++{%         endif %}
++{%       else %}
++set rulebase nat rules "{{ rule.name }}" source-translation dynamic-ip-and-port translated-address [ "{{ rule.translated_source }}" ]
++{%       endif %}
++{%     endif %}
++{%     if rule.type in ['destination','static'] and rule.translated_destination is defined %}
++set rulebase nat rules "{{ rule.name }}" destination-translation translated-address "{{ rule.translated_destination }}"
++{%     endif %}
++{%   endif %}
++{% endfor %}
+diff --git a/netsim/extra/nat/vsrx.j2 b/netsim/extra/nat/vsrx.j2
+new file mode 100644
+index 0000000..5679a59
+--- /dev/null
++++ b/netsim/extra/nat/vsrx.j2
+@@ -0,0 +1,70 @@
++{#
++  Junos (vSRX) NAT -- source NAT as `security nat source rule-set`.
++
++  NAMED vsrx.j2, NOT junos.j2. netlab resolves a plugin template by
++  netlab_device_type (vsrx) before ansible_network_os (junos), so both names
++  work at render time -- but the capability projection the server embeds
++  (internal/netlabdefaultsgen) looks for `<device>.j2` and would record
++  `nat declared, renders_config: false` for a junos.j2, which is a lie in a
++  committed artifact. Other Junos-family devices do not declare features.nat.
++
++  Junos NAT is written in ZONE terms: a rule-set is `from zone X to zone Y`
++  and the rule inside it matches source/destination addresses. The zones come
++  from, in order:
++    1. the rule's own inside/outside lists (zone names, as on the ASA), or
++    2. the zones of the interfaces carrying nat.role inside/outside
++       (nat._zones, filled by the plugin from firewall.zone).
++  A rule with neither renders a commented-out stub rather than a rule-set
++  bound to no zone, which Junos would refuse to commit.
++
++  translated_source `interface` -> `then source-nat interface`; any other
++  value is a pool name -> `then source-nat pool <name>` (the pool must exist:
++  this template does not invent pool address ranges).
++  Destination and static NAT are not rendered here (no seed has asked yet).
++#}
++{% set rules = nat.rules | default([]) | rejectattr('enabled','equalto',False) | list %}
++{% set zin = nat._zones.inside | default([]) %}
++{% set zout = nat._zones.outside | default([]) %}
++security {
++  nat {
++    source {
++{% for rule in rules if rule.type | default('') == 'source' %}
++{%   set from_zones = rule.inside | default([], true) or zin %}
++{%   set to_zones = rule.outside | default([], true) or zout %}
++{%   if from_zones and to_zones %}
++      rule-set {{ rule.name }} {
++{%     for z in from_zones %}
++        from zone {{ z }};
++{%     endfor %}
++{%     for z in to_zones %}
++        to zone {{ z }};
++{%     endfor %}
++        rule {{ rule.name }} {
++          match {
++{%     for a in rule.source | default(['0.0.0.0/0'], true) %}
++            source-address {{ a }};
++{%     endfor %}
++{%     for a in rule.destination | default(['0.0.0.0/0'], true) %}
++            destination-address {{ a }};
++{%     endfor %}
++          }
++          then {
++            source-nat {
++{%     if rule.translated_source | default('interface') == 'interface' %}
++              interface;
++{%     else %}
++              pool {
++                {{ rule.translated_source }};
++              }
++{%     endif %}
++            }
++          }
++        }
++      }
++{%   else %}
++      /* NAT rule {{ rule.name }} NOT APPLIED: no from/to zone (set inside/outside on the rule or nat.role + firewall.zone on interfaces) */
++{%   endif %}
++{% endfor %}
++    }
++  }
++}
+diff --git a/tests/topology/expected/ipsec-asav.yml b/tests/topology/expected/ipsec-asav.yml
+new file mode 100644
+index 0000000..c10e793
+--- /dev/null
++++ b/tests/topology/expected/ipsec-asav.yml
+@@ -0,0 +1,309 @@
++input:
++- topology/input/ipsec-asav.yml
++- package:topology-defaults.yml
++links:
++- _linkname: links[1]
++  interfaces:
++  - ifindex: 0
++    ifname: GigabitEthernet0/0
++    ipv4: 192.0.2.1/30
++    node: fw1
++  - ifindex: 0
++    ifname: GigabitEthernet0/0
++    ipv4: 192.0.2.2/30
++    node: fw2
++  linkindex: 1
++  node_count: 2
++  prefix:
++    ipv4: 10.1.0.0/30
++  type: p2p
++- _linkname: links[2]
++  bridge: input_2
++  interfaces:
++  - ifindex: 20000
++    ifname: Tunnel0
++    ipsec:
++      endpoint: 192.0.2.1
++      local_interface: GigabitEthernet0/2
++    ipv4: 10.1.0.5/30
++    node: fw1
++  - ifindex: 20000
++    ifname: Tunnel0
++    ipsec:
++      endpoint: 192.0.2.2
++      local_interface: GigabitEthernet0/2
++    ipv4: 10.1.0.6/30
++    node: fw2
++  ipsec:
++    esp:
++      authentication:
++      - sha256
++      dh_group: group14
++      encryption:
++      - aes-256-cbc
++      lifetime_hours: 1
++    ike:
++      authentication:
++      - sha256
++      dh_group:
++      - group14
++      encryption:
++      - aes-256-cbc
++      lifetime_hours: 8
++      version: ikev2
++    mode: route-based
++    preshared_key: netlab-secret
++  linkindex: 2
++  node_count: 2
++  prefix:
++    ipv4: 10.1.0.4/30
++  type: tunnel
++name: input
++nodes:
++  fw1:
++    af:
++      ipv4: true
++    box: vrnetlab/cisco_asav:9-16-4-57
++    clab:
++      env:
++        CLAB_MGMT_PASSTHROUGH: 'true'
++      kind: cisco_asav
++    config:
++    - ipsec
++    device: asav
++    hostname: clab-input-fw1
++    id: 1
++    interfaces:
++    - ifindex: 0
++      ifname: GigabitEthernet0/0
++      ipv4: 192.0.2.1/30
++      linkindex: 1
++      name: fw1 -> fw2
++      neighbors:
++      - ifname: GigabitEthernet0/0
++        ipv4: 192.0.2.2/30
++        node: fw2
++      type: p2p
++    - ifindex: 20000
++      ifname: Tunnel0
++      ipsec:
++        endpoint: 192.0.2.1
++        esp:
++          authentication:
++          - sha256
++          dh_group: group14
++          encryption:
++          - aes-256-cbc
++          lifetime_hours: 1
++        ike:
++          authentication:
++          - sha256
++          dh_group:
++          - group14
++          encryption:
++          - aes-256-cbc
++          lifetime_hours: 8
++          version: ikev2
++        local_interface: GigabitEthernet0/2
++        mode: route-based
++        preshared_key: netlab-secret
++      ipv4: 10.1.0.5/30
++      linkindex: 2
++      name: fw1 -> fw2
++      neighbors:
++      - ifname: Tunnel0
++        ipv4: 10.1.0.6/30
++        node: fw2
++      type: tunnel
++      virtual_interface: true
++    ipsec:
++      esp_profiles:
++      - authentication:
++        - sha256
++        dh_group: group14
++        encryption:
++        - aes-256-cbc
++        lifetime_hours: 1
++        name: netlab-fw1-ipsec-profile-e3ae90a3
++      ike_profiles:
++      - authentication:
++        - sha256
++        dh_group:
++        - group14
++        encryption:
++        - aes-256-cbc
++        lifetime_hours: 8
++        name: netlab-fw1-ike-profile-48086ece
++      transform_sets:
++      - authentication:
++        - sha256
++        encryption:
++        - aes-256-cbc
++        name: netlab-fw1-transform-set-6e97eb1c
++      tunnels:
++      - esp:
++          authentication:
++          - sha256
++          create_profile: true
++          crypto_profile: netlab-fw1-ipsec-profile-e3ae90a3
++          dh_group: group14
++          encryption:
++          - aes-256-cbc
++          lifetime_hours: 1
++          profile_name: netlab-fw1-Tunnel0-ipsec-profile
++          transform_set: netlab-fw1-transform-set-6e97eb1c
++        ifname: Tunnel0
++        ike:
++          authentication:
++          - sha256
++          create_profile: true
++          crypto_profile: netlab-fw1-ike-profile-48086ece
++          dh_group:
++          - group14
++          encryption:
++          - aes-256-cbc
++          keyring_name: netlab-fw1-Tunnel0-ike-keyring
++          lifetime_hours: 8
++          policy_name: netlab-fw1-Tunnel0-ike-policy
++          profile_name: netlab-fw1-Tunnel0-ikev2-profile
++          version: ikev2
++        ike_gateway: netlab-fw1-Tunnel0-ike
++        ipv4: 10.1.0.5/30
++        linkindex: 2
++        local_address: 192.0.2.1
++        local_interface: GigabitEthernet0/2
++        mode: route-based
++        name: netlab-fw1-Tunnel0-tunnel
++        peer: 192.0.2.2
++        peer_type: ip
++        preshared_key: netlab-secret
++    mgmt:
++      ifname: Management0/0
++      ipv4: 192.168.121.101
++      mac: ca:fe:00:01:00:00
++    name: fw1
++  fw2:
++    af:
++      ipv4: true
++    box: vrnetlab/cisco_asav:9-16-4-57
++    clab:
++      env:
++        CLAB_MGMT_PASSTHROUGH: 'true'
++      kind: cisco_asav
++    config:
++    - ipsec
++    device: asav
++    hostname: clab-input-fw2
++    id: 2
++    interfaces:
++    - ifindex: 0
++      ifname: GigabitEthernet0/0
++      ipv4: 192.0.2.2/30
++      linkindex: 1
++      name: fw2 -> fw1
++      neighbors:
++      - ifname: GigabitEthernet0/0
++        ipv4: 192.0.2.1/30
++        node: fw1
++      type: p2p
++    - ifindex: 20000
++      ifname: Tunnel0
++      ipsec:
++        endpoint: 192.0.2.2
++        esp:
++          authentication:
++          - sha256
++          dh_group: group14
++          encryption:
++          - aes-256-cbc
++          lifetime_hours: 1
++        ike:
++          authentication:
++          - sha256
++          dh_group:
++          - group14
++          encryption:
++          - aes-256-cbc
++          lifetime_hours: 8
++          version: ikev2
++        local_interface: GigabitEthernet0/2
++        mode: route-based
++        preshared_key: netlab-secret
++      ipv4: 10.1.0.6/30
++      linkindex: 2
++      name: fw2 -> fw1
++      neighbors:
++      - ifname: Tunnel0
++        ipv4: 10.1.0.5/30
++        node: fw1
++      type: tunnel
++      virtual_interface: true
++    ipsec:
++      esp_profiles:
++      - authentication:
++        - sha256
++        dh_group: group14
++        encryption:
++        - aes-256-cbc
++        lifetime_hours: 1
++        name: netlab-fw2-ipsec-profile-e3ae90a3
++      ike_profiles:
++      - authentication:
++        - sha256
++        dh_group:
++        - group14
++        encryption:
++        - aes-256-cbc
++        lifetime_hours: 8
++        name: netlab-fw2-ike-profile-48086ece
++      transform_sets:
++      - authentication:
++        - sha256
++        encryption:
++        - aes-256-cbc
++        name: netlab-fw2-transform-set-67b44679
++      tunnels:
++      - esp:
++          authentication:
++          - sha256
++          create_profile: true
++          crypto_profile: netlab-fw2-ipsec-profile-e3ae90a3
++          dh_group: group14
++          encryption:
++          - aes-256-cbc
++          lifetime_hours: 1
++          profile_name: netlab-fw2-Tunnel0-ipsec-profile
++          transform_set: netlab-fw2-transform-set-67b44679
++        ifname: Tunnel0
++        ike:
++          authentication:
++          - sha256
++          create_profile: true
++          crypto_profile: netlab-fw2-ike-profile-48086ece
++          dh_group:
++          - group14
++          encryption:
++          - aes-256-cbc
++          keyring_name: netlab-fw2-Tunnel0-ike-keyring
++          lifetime_hours: 8
++          policy_name: netlab-fw2-Tunnel0-ike-policy
++          profile_name: netlab-fw2-Tunnel0-ikev2-profile
++          version: ikev2
++        ike_gateway: netlab-fw2-Tunnel0-ike
++        ipv4: 10.1.0.6/30
++        linkindex: 2
++        local_address: 192.0.2.2
++        local_interface: GigabitEthernet0/2
++        mode: route-based
++        name: netlab-fw2-Tunnel0-tunnel
++        peer: 192.0.2.1
++        peer_type: ip
++        preshared_key: netlab-secret
++    mgmt:
++      ifname: Management0/0
++      ipv4: 192.168.121.102
++      mac: ca:fe:00:02:00:00
++    name: fw2
++plugin:
++- ipsec
++provider: clab
+diff --git a/tests/topology/expected/ipsec-ios.yml b/tests/topology/expected/ipsec-ios.yml
+new file mode 100644
+index 0000000..eb95187
+--- /dev/null
++++ b/tests/topology/expected/ipsec-ios.yml
+@@ -0,0 +1,508 @@
++input:
++- topology/input/ipsec-ios.yml
++- package:topology-defaults.yml
++links:
++- _linkname: links[1]
++  interfaces:
++  - ifindex: 2
++    ifname: GigabitEthernet2
++    ipv4: 192.0.2.1/30
++    node: r1
++  - ifindex: 2
++    ifname: GigabitEthernet2
++    ipv4: 192.0.2.2/30
++    node: r2
++  linkindex: 1
++  node_count: 2
++  prefix:
++    ipv4: 10.1.0.0/30
++  type: p2p
++- _linkname: links[2]
++  bridge: input_2
++  interfaces:
++  - ifindex: 20000
++    ifname: Tunnel0
++    ipsec:
++      endpoint: 192.0.2.1
++      local_interface: GigabitEthernet2
++    ipv4: 10.1.0.5/30
++    node: r1
++  - ifindex: 20000
++    ifname: Tunnel0
++    ipsec:
++      endpoint: 192.0.2.2
++      local_interface: GigabitEthernet2
++    ipv4: 10.1.0.6/30
++    node: r2
++  ipsec:
++    esp:
++      authentication:
++      - sha256
++      dh_group: group14
++      encryption:
++      - aes-256-cbc
++      lifetime_hours: 1
++    ike:
++      authentication:
++      - sha256
++      dh_group:
++      - group14
++      encryption:
++      - aes-256-cbc
++      lifetime_hours: 8
++      version: ikev2
++    mode: route-based
++    preshared_key: netlab-secret
++  linkindex: 2
++  node_count: 2
++  prefix:
++    ipv4: 10.1.0.4/30
++  type: tunnel
++- _linkname: links[3]
++  bridge: input_3
++  interfaces:
++  - ifindex: 20001
++    ifname: Tunnel1
++    ipsec:
++      endpoint: 192.0.2.1
++      local_interface: GigabitEthernet2
++    ipv4: 10.1.0.9/30
++    node: r1
++  - ifindex: 20001
++    ifname: Tunnel1
++    ipsec:
++      endpoint: 192.0.2.2
++      local_interface: GigabitEthernet2
++    ipv4: 10.1.0.10/30
++    node: r2
++  ipsec:
++    esp:
++      authentication:
++      - sha256
++      dh_group: group14
++      encryption:
++      - aes-256-cbc
++      lifetime_hours: 1
++    ike:
++      authentication:
++      - sha256
++      dh_group:
++      - group14
++      encryption:
++      - aes-256-cbc
++      lifetime_hours: 8
++      version: ikev2
++    mode: route-based
++    preshared_key: netlab-secret
++  linkindex: 3
++  node_count: 2
++  prefix:
++    ipv4: 10.1.0.8/30
++  type: tunnel
++name: input
++nodes:
++  r1:
++    af:
++      ipv4: true
++    box: vrnetlab/vr-csr:17.03.04
++    clab:
++      env:
++        CLAB_MGMT_PASSTHROUGH: 'true'
++      kind: cisco_csr1000v
++    config:
++    - ipsec
++    device: csr
++    hostname: clab-input-r1
++    id: 1
++    interfaces:
++    - clab:
++        name: eth1
++      ifindex: 2
++      ifname: GigabitEthernet2
++      ipv4: 192.0.2.1/30
++      linkindex: 1
++      name: r1 -> r2
++      neighbors:
++      - ifname: GigabitEthernet2
++        ipv4: 192.0.2.2/30
++        node: r2
++      type: p2p
++    - ifindex: 20000
++      ifname: Tunnel0
++      ipsec:
++        endpoint: 192.0.2.1
++        esp:
++          authentication:
++          - sha256
++          dh_group: group14
++          encryption:
++          - aes-256-cbc
++          lifetime_hours: 1
++        ike:
++          authentication:
++          - sha256
++          dh_group:
++          - group14
++          encryption:
++          - aes-256-cbc
++          lifetime_hours: 8
++          version: ikev2
++        local_interface: GigabitEthernet2
++        mode: route-based
++        preshared_key: netlab-secret
++      ipv4: 10.1.0.5/30
++      linkindex: 2
++      name: r1 -> r2
++      neighbors:
++      - ifname: Tunnel0
++        ipv4: 10.1.0.6/30
++        node: r2
++      type: tunnel
++      virtual_interface: true
++    - ifindex: 20001
++      ifname: Tunnel1
++      ipsec:
++        endpoint: 192.0.2.1
++        esp:
++          authentication:
++          - sha256
++          dh_group: group14
++          encryption:
++          - aes-256-cbc
++          lifetime_hours: 1
++        ike:
++          authentication:
++          - sha256
++          dh_group:
++          - group14
++          encryption:
++          - aes-256-cbc
++          lifetime_hours: 8
++          version: ikev2
++        local_interface: GigabitEthernet2
++        mode: route-based
++        preshared_key: netlab-secret
++      ipv4: 10.1.0.9/30
++      linkindex: 3
++      name: r1 -> r2
++      neighbors:
++      - ifname: Tunnel1
++        ipv4: 10.1.0.10/30
++        node: r2
++      type: tunnel
++      virtual_interface: true
++    ipsec:
++      esp_profiles:
++      - authentication:
++        - sha256
++        dh_group: group14
++        encryption:
++        - aes-256-cbc
++        lifetime_hours: 1
++        name: netlab-r1-ipsec-profile-e3ae90a3
++      ike_profiles:
++      - authentication:
++        - sha256
++        dh_group:
++        - group14
++        encryption:
++        - aes-256-cbc
++        lifetime_hours: 8
++        name: netlab-r1-ike-profile-48086ece
++      transform_sets:
++      - authentication:
++        - sha256
++        encryption:
++        - aes-256-cbc
++        name: netlab-r1-transform-set-84bdd2a7
++      tunnels:
++      - esp:
++          authentication:
++          - sha256
++          create_profile: true
++          crypto_profile: netlab-r1-ipsec-profile-e3ae90a3
++          dh_group: group14
++          encryption:
++          - aes-256-cbc
++          lifetime_hours: 1
++          profile_name: netlab-r1-Tunnel0-ipsec-profile
++          transform_set: netlab-r1-transform-set-84bdd2a7
++        ifname: Tunnel0
++        ike:
++          authentication:
++          - sha256
++          create_profile: true
++          crypto_profile: netlab-r1-ike-profile-48086ece
++          dh_group:
++          - group14
++          encryption:
++          - aes-256-cbc
++          keyring_name: netlab-r1-Tunnel0-ike-keyring
++          lifetime_hours: 8
++          policy_name: netlab-r1-Tunnel0-ike-policy
++          profile_name: netlab-r1-Tunnel0-ikev2-profile
++          version: ikev2
++        ike_gateway: netlab-r1-Tunnel0-ike
++        ipv4: 10.1.0.5/30
++        linkindex: 2
++        local_address: 192.0.2.1
++        local_interface: GigabitEthernet2
++        mode: route-based
++        name: netlab-r1-Tunnel0-tunnel
++        peer: 192.0.2.2
++        peer_type: ip
++        preshared_key: netlab-secret
++      - esp:
++          authentication:
++          - sha256
++          create_profile: true
++          crypto_profile: netlab-r1-ipsec-profile-e3ae90a3
++          dh_group: group14
++          encryption:
++          - aes-256-cbc
++          lifetime_hours: 1
++          profile_name: netlab-r1-Tunnel1-ipsec-profile
++          transform_set: netlab-r1-transform-set-84bdd2a7
++        ifname: Tunnel1
++        ike:
++          authentication:
++          - sha256
++          create_profile: true
++          crypto_profile: netlab-r1-ike-profile-48086ece
++          dh_group:
++          - group14
++          encryption:
++          - aes-256-cbc
++          keyring_name: netlab-r1-Tunnel1-ike-keyring
++          lifetime_hours: 8
++          policy_name: netlab-r1-Tunnel1-ike-policy
++          profile_name: netlab-r1-Tunnel1-ikev2-profile
++          version: ikev2
++        ike_gateway: netlab-r1-Tunnel1-ike
++        ipv4: 10.1.0.9/30
++        linkindex: 3
++        local_address: 192.0.2.1
++        local_interface: GigabitEthernet2
++        mode: route-based
++        name: netlab-r1-Tunnel1-tunnel
++        peer: 192.0.2.2
++        peer_type: ip
++        preshared_key: netlab-secret
++    loopback:
++      ifindex: 0
++      ifname: Loopback0
++      ipv4: 10.0.0.1/32
++      neighbors: []
++      type: loopback
++      virtual_interface: true
++    mgmt:
++      ifname: GigabitEthernet1
++      ipv4: 192.168.121.101
++      mac: ca:fe:00:01:00:00
++    min_mtu: 1500
++    name: r1
++    role: router
++  r2:
++    af:
++      ipv4: true
++    box: vrnetlab/vr-csr:17.03.04
++    clab:
++      env:
++        CLAB_MGMT_PASSTHROUGH: 'true'
++      kind: cisco_csr1000v
++    config:
++    - ipsec
++    device: csr
++    hostname: clab-input-r2
++    id: 2
++    interfaces:
++    - clab:
++        name: eth1
++      ifindex: 2
++      ifname: GigabitEthernet2
++      ipv4: 192.0.2.2/30
++      linkindex: 1
++      name: r2 -> r1
++      neighbors:
++      - ifname: GigabitEthernet2
++        ipv4: 192.0.2.1/30
++        node: r1
++      type: p2p
++    - ifindex: 20000
++      ifname: Tunnel0
++      ipsec:
++        endpoint: 192.0.2.2
++        esp:
++          authentication:
++          - sha256
++          dh_group: group14
++          encryption:
++          - aes-256-cbc
++          lifetime_hours: 1
++        ike:
++          authentication:
++          - sha256
++          dh_group:
++          - group14
++          encryption:
++          - aes-256-cbc
++          lifetime_hours: 8
++          version: ikev2
++        local_interface: GigabitEthernet2
++        mode: route-based
++        preshared_key: netlab-secret
++      ipv4: 10.1.0.6/30
++      linkindex: 2
++      name: r2 -> r1
++      neighbors:
++      - ifname: Tunnel0
++        ipv4: 10.1.0.5/30
++        node: r1
++      type: tunnel
++      virtual_interface: true
++    - ifindex: 20001
++      ifname: Tunnel1
++      ipsec:
++        endpoint: 192.0.2.2
++        esp:
++          authentication:
++          - sha256
++          dh_group: group14
++          encryption:
++          - aes-256-cbc
++          lifetime_hours: 1
++        ike:
++          authentication:
++          - sha256
++          dh_group:
++          - group14
++          encryption:
++          - aes-256-cbc
++          lifetime_hours: 8
++          version: ikev2
++        local_interface: GigabitEthernet2
++        mode: route-based
++        preshared_key: netlab-secret
++      ipv4: 10.1.0.10/30
++      linkindex: 3
++      name: r2 -> r1
++      neighbors:
++      - ifname: Tunnel1
++        ipv4: 10.1.0.9/30
++        node: r1
++      type: tunnel
++      virtual_interface: true
++    ipsec:
++      esp_profiles:
++      - authentication:
++        - sha256
++        dh_group: group14
++        encryption:
++        - aes-256-cbc
++        lifetime_hours: 1
++        name: netlab-r2-ipsec-profile-e3ae90a3
++      ike_profiles:
++      - authentication:
++        - sha256
++        dh_group:
++        - group14
++        encryption:
++        - aes-256-cbc
++        lifetime_hours: 8
++        name: netlab-r2-ike-profile-48086ece
++      transform_sets:
++      - authentication:
++        - sha256
++        encryption:
++        - aes-256-cbc
++        name: netlab-r2-transform-set-3bf8e641
++      tunnels:
++      - esp:
++          authentication:
++          - sha256
++          create_profile: true
++          crypto_profile: netlab-r2-ipsec-profile-e3ae90a3
++          dh_group: group14
++          encryption:
++          - aes-256-cbc
++          lifetime_hours: 1
++          profile_name: netlab-r2-Tunnel0-ipsec-profile
++          transform_set: netlab-r2-transform-set-3bf8e641
++        ifname: Tunnel0
++        ike:
++          authentication:
++          - sha256
++          create_profile: true
++          crypto_profile: netlab-r2-ike-profile-48086ece
++          dh_group:
++          - group14
++          encryption:
++          - aes-256-cbc
++          keyring_name: netlab-r2-Tunnel0-ike-keyring
++          lifetime_hours: 8
++          policy_name: netlab-r2-Tunnel0-ike-policy
++          profile_name: netlab-r2-Tunnel0-ikev2-profile
++          version: ikev2
++        ike_gateway: netlab-r2-Tunnel0-ike
++        ipv4: 10.1.0.6/30
++        linkindex: 2
++        local_address: 192.0.2.2
++        local_interface: GigabitEthernet2
++        mode: route-based
++        name: netlab-r2-Tunnel0-tunnel
++        peer: 192.0.2.1
++        peer_type: ip
++        preshared_key: netlab-secret
++      - esp:
++          authentication:
++          - sha256
++          create_profile: true
++          crypto_profile: netlab-r2-ipsec-profile-e3ae90a3
++          dh_group: group14
++          encryption:
++          - aes-256-cbc
++          lifetime_hours: 1
++          profile_name: netlab-r2-Tunnel1-ipsec-profile
++          transform_set: netlab-r2-transform-set-3bf8e641
++        ifname: Tunnel1
++        ike:
++          authentication:
++          - sha256
++          create_profile: true
++          crypto_profile: netlab-r2-ike-profile-48086ece
++          dh_group:
++          - group14
++          encryption:
++          - aes-256-cbc
++          keyring_name: netlab-r2-Tunnel1-ike-keyring
++          lifetime_hours: 8
++          policy_name: netlab-r2-Tunnel1-ike-policy
++          profile_name: netlab-r2-Tunnel1-ikev2-profile
++          version: ikev2
++        ike_gateway: netlab-r2-Tunnel1-ike
++        ipv4: 10.1.0.10/30
++        linkindex: 3
++        local_address: 192.0.2.2
++        local_interface: GigabitEthernet2
++        mode: route-based
++        name: netlab-r2-Tunnel1-tunnel
++        peer: 192.0.2.1
++        peer_type: ip
++        preshared_key: netlab-secret
++    loopback:
++      ifindex: 0
++      ifname: Loopback0
++      ipv4: 10.0.0.2/32
++      neighbors: []
++      type: loopback
++      virtual_interface: true
++    mgmt:
++      ifname: GigabitEthernet1
++      ipv4: 192.168.121.102
++      mac: ca:fe:00:02:00:00
++    min_mtu: 1500
++    name: r2
++    role: router
++plugin:
++- ipsec
++provider: clab
+diff --git a/tests/topology/input/ipsec-asav.yml b/tests/topology/input/ipsec-asav.yml
+new file mode 100644
+index 0000000..5649b5c
+--- /dev/null
++++ b/tests/topology/input/ipsec-asav.yml
+@@ -0,0 +1,38 @@
++---
++plugin: [ ipsec ]
++
++provider: clab
++defaults.device: asav
++
++nodes: [ fw1, fw2 ]
++
++links:
++- fw1:
++    ipv4: 192.0.2.1/30
++  fw2:
++    ipv4: 192.0.2.2/30
++- fw1:
++    ifname: Tunnel0
++    ipsec:
++      local_interface: GigabitEthernet0/2
++      endpoint: 192.0.2.1
++  fw2:
++    ifname: Tunnel0
++    ipsec:
++      local_interface: GigabitEthernet0/2
++      endpoint: 192.0.2.2
++  type: tunnel
++  ipsec:
++    mode: route-based
++    preshared_key: netlab-secret
++    ike:
++      version: ikev2
++      authentication: [ sha256 ]
++      encryption: [ aes-256-cbc ]
++      dh_group: [ group14 ]
++      lifetime_hours: 8
++    esp:
++      authentication: [ sha256 ]
++      encryption: [ aes-256-cbc ]
++      dh_group: group14
++      lifetime_hours: 1
+diff --git a/tests/topology/input/ipsec-ios.yml b/tests/topology/input/ipsec-ios.yml
+new file mode 100644
+index 0000000..06ef8f7
+--- /dev/null
++++ b/tests/topology/input/ipsec-ios.yml
+@@ -0,0 +1,59 @@
++---
++plugin: [ ipsec ]
++
++provider: clab
++defaults.device: csr
++
++nodes: [ r1, r2 ]
++
++links:
++- r1:
++    ipv4: 192.0.2.1/30
++  r2:
++    ipv4: 192.0.2.2/30
++- r1:
++    ipsec:
++      local_interface: GigabitEthernet2
++      endpoint: 192.0.2.1
++  r2:
++    ipsec:
++      local_interface: GigabitEthernet2
++      endpoint: 192.0.2.2
++  type: tunnel
++  ipsec:
++    mode: route-based
++    preshared_key: netlab-secret
++    ike:
++      version: ikev2
++      authentication: [ sha256 ]
++      encryption: [ aes-256-cbc ]
++      dh_group: [ group14 ]
++      lifetime_hours: 8
++    esp:
++      authentication: [ sha256 ]
++      encryption: [ aes-256-cbc ]
++      dh_group: group14
++      lifetime_hours: 1
++- r1:
++    ipsec:
++      local_interface: GigabitEthernet2
++      endpoint: 192.0.2.1
++  r2:
++    ipsec:
++      local_interface: GigabitEthernet2
++      endpoint: 192.0.2.2
++  type: tunnel
++  ipsec:
++    mode: route-based
++    preshared_key: netlab-secret
++    ike:
++      version: ikev2
++      authentication: [ sha256 ]
++      encryption: [ aes-256-cbc ]
++      dh_group: [ group14 ]
++      lifetime_hours: 8
++    esp:
++      authentication: [ sha256 ]
++      encryption: [ aes-256-cbc ]
++      dh_group: group14
++      lifetime_hours: 1
+-- 
+2.56.0
+

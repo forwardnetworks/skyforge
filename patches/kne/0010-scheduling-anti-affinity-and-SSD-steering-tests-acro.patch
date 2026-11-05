@@ -1,0 +1,1200 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 13:47:44 -0500
+Subject: [PATCH 10/35] scheduling: anti-affinity and SSD-steering tests across
+ vendors
+
+---
+diff --git a/topo/node/alpine/node_antiaffinity_test.go b/topo/node/alpine/node_antiaffinity_test.go
+new file mode 100644
+index 0000000..0783114
+--- /dev/null
++++ b/topo/node/alpine/node_antiaffinity_test.go
+@@ -0,0 +1,115 @@
++package alpine
++
++import (
++	"context"
++	"testing"
++
++	tpb "github.com/openconfig/kne/proto/topo"
++	"github.com/openconfig/kne/topo/node"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	kfake "k8s.io/client-go/kubernetes/fake"
++	"k8s.io/client-go/rest"
++)
++
++// THE ANTI-AFFINITY MUST SELECT THE PODS IT REPELS.
++//
++// This pod spec labels itself `topo: <namespace>` and then builds a preferred
++// podAntiAffinity to spread same-lab pods across hosts. Upstream selected
++// `topo In [pb.Name]` -- the pod's own DEVICE name -- which no pod anywhere
++// carries, so the term selected zero pods and repelled nothing.
++//
++// kne 0059 fixed the generic node.Impl.CreatePod. This vendor builds its OWN
++// pod spec from a byte-identical copy of the same literal, and kept the broken
++// value. MEASURED 2026-09-11 on the live demo-lab namespace: all 80 pods
++// labelled topo=<namespace>, 17 selecting the namespace and 40 selecting a
++// device name, with 64 of the 80 packed onto one node.
++//
++// Assert the LABEL and the SELECTOR agree -- the property that makes the term
++// able to bind at all. The control is that this test FAILS when pb.Name is
++// restored: the selector then names the device and the label names the
++// namespace.
++func TestPodAntiAffinitySelectorMatchesTheTopoLabel(t *testing.T) {
++	ctx := context.Background()
++	const ns = "user-x-demo-lab"
++	nImpl := &node.Impl{
++		Namespace:  ns,
++		KubeClient: kfake.NewSimpleClientset(),
++		RestConfig: &rest.Config{},
++		Proto: &tpb.Node{
++			Name:   "cdg-lan-pc01",
++			Vendor: tpb.Vendor_ALPINE,
++			Config: &tpb.Config{Image: "example/alpine:test"},
++		},
++	}
++	n, err := New(nImpl)
++	if err != nil {
++		t.Fatalf("New() failed: %v", err)
++	}
++	if err := n.(*Node).CreatePod(ctx); err != nil {
++		t.Fatalf("creating the pod: %v", err)
++	}
++	pod, err := nImpl.KubeClient.CoreV1().Pods(ns).Get(ctx, nImpl.Proto.Name, metav1.GetOptions{})
++	if err != nil {
++		t.Fatalf("reading back the created pod: %v", err)
++	}
++
++	label, ok := pod.ObjectMeta.Labels["topo"]
++	if !ok {
++		t.Fatal("pod carries no topo label")
++	}
++	terms := pod.Spec.Affinity.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution
++	if len(terms) != 1 {
++		t.Fatalf("anti-affinity terms = %d, want 1", len(terms))
++	}
++	sel := terms[0].PodAffinityTerm.LabelSelector.MatchExpressions[0]
++	if sel.Key != "topo" {
++		t.Fatalf("selector key = %q, want topo", sel.Key)
++	}
++	if len(sel.Values) != 1 || sel.Values[0] != label {
++		t.Fatalf("selector selects %v but the label is %q -- the term matches NOTHING and spreads nothing",
++			sel.Values, label)
++	}
++	if sel.Values[0] != ns {
++		t.Fatalf("selector = %q, want the namespace %q so SAME-LAB pods repel each other", sel.Values[0], ns)
++	}
++	if terms[0].PodAffinityTerm.TopologyKey != "kubernetes.io/hostname" {
++		t.Fatalf("topologyKey = %q, want kubernetes.io/hostname", terms[0].PodAffinityTerm.TopologyKey)
++	}
++}
++
++// This vendor builds its OWN pod spec (byte-identical copy of the generic
++// literal) -- the container soft-avoid-SSD preference has to be wired here
++// too, or it silently half-applies exactly like the anti-affinity fix above
++// once did.
++func TestCreatePodCarriesContainerNodeAffinity(t *testing.T) {
++	ctx := context.Background()
++	t.Setenv("SKYFORGE_KNE_IO_HEAVY_NODE_LABELS_JSON", `{"skyforge.example.com/disk-class":"ssd"}`)
++	const ns = "user-x-demo-lab"
++	nImpl := &node.Impl{
++		Namespace:  ns,
++		KubeClient: kfake.NewSimpleClientset(),
++		RestConfig: &rest.Config{},
++		Proto: &tpb.Node{
++			Name:   "cdg-lan-pc01",
++			Vendor: tpb.Vendor_ALPINE,
++			Config: &tpb.Config{Image: "example/alpine:test"},
++		},
++	}
++	n, err := New(nImpl)
++	if err != nil {
++		t.Fatalf("New() failed: %v", err)
++	}
++	if err := n.(*Node).CreatePod(ctx); err != nil {
++		t.Fatalf("creating the pod: %v", err)
++	}
++	pod, err := nImpl.KubeClient.CoreV1().Pods(ns).Get(ctx, nImpl.Proto.Name, metav1.GetOptions{})
++	if err != nil {
++		t.Fatalf("reading back the created pod: %v", err)
++	}
++	if pod.Spec.Affinity.NodeAffinity == nil {
++		t.Fatal("emitted pod carries no nodeAffinity -- the container soft-avoid-SSD preference steers nothing")
++	}
++	if pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution != nil {
++		t.Fatal("emitted pod carries a REQUIRED node affinity; the policy must only rank")
++	}
++}
+diff --git a/topo/node/cisco/node_antiaffinity_test.go b/topo/node/cisco/node_antiaffinity_test.go
+new file mode 100644
+index 0000000..89d2b78
+--- /dev/null
++++ b/topo/node/cisco/node_antiaffinity_test.go
+@@ -0,0 +1,117 @@
++package cisco
++
++import (
++	"context"
++	"testing"
++
++	tpb "github.com/openconfig/kne/proto/topo"
++	"github.com/openconfig/kne/topo/node"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	kfake "k8s.io/client-go/kubernetes/fake"
++	"k8s.io/client-go/rest"
++)
++
++// THE ANTI-AFFINITY MUST SELECT THE PODS IT REPELS.
++//
++// This pod spec labels itself `topo: <namespace>` and then builds a preferred
++// podAntiAffinity to spread same-lab pods across hosts. Upstream selected
++// `topo In [pb.Name]` -- the pod's own DEVICE name -- which no pod anywhere
++// carries, so the term selected zero pods and repelled nothing.
++//
++// kne 0059 fixed the generic node.Impl.CreatePod. This vendor builds its OWN
++// pod spec from a byte-identical copy of the same literal, and kept the broken
++// value. MEASURED 2026-09-11 on the live demo-lab namespace: all 80 pods
++// labelled topo=<namespace>, 17 selecting the namespace and 40 selecting a
++// device name, with 64 of the 80 packed onto one node.
++//
++// Assert the LABEL and the SELECTOR agree -- the property that makes the term
++// able to bind at all. The control is that this test FAILS when pb.Name is
++// restored: the selector then names the device and the label names the
++// namespace.
++func TestPodAntiAffinitySelectorMatchesTheTopoLabel(t *testing.T) {
++	ctx := context.Background()
++	const ns = "user-x-demo-lab"
++	nImpl := &node.Impl{
++		Namespace:  ns,
++		KubeClient: kfake.NewSimpleClientset(),
++		RestConfig: &rest.Config{},
++		Proto: &tpb.Node{
++			Name:   "att-jfk-pe01",
++			Vendor: tpb.Vendor_CISCO,
++			Model:  "xrd",
++			Config: &tpb.Config{Image: "example/xrd:test"},
++		},
++	}
++	n, err := New(nImpl)
++	if err != nil {
++		t.Fatalf("New() failed: %v", err)
++	}
++	if err := n.Create(ctx); err != nil {
++		t.Fatalf("creating the pod: %v", err)
++	}
++	pod, err := nImpl.KubeClient.CoreV1().Pods(ns).Get(ctx, nImpl.Proto.Name, metav1.GetOptions{})
++	if err != nil {
++		t.Fatalf("reading back the created pod: %v", err)
++	}
++
++	label, ok := pod.ObjectMeta.Labels["topo"]
++	if !ok {
++		t.Fatal("pod carries no topo label")
++	}
++	terms := pod.Spec.Affinity.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution
++	if len(terms) != 1 {
++		t.Fatalf("anti-affinity terms = %d, want 1", len(terms))
++	}
++	sel := terms[0].PodAffinityTerm.LabelSelector.MatchExpressions[0]
++	if sel.Key != "topo" {
++		t.Fatalf("selector key = %q, want topo", sel.Key)
++	}
++	if len(sel.Values) != 1 || sel.Values[0] != label {
++		t.Fatalf("selector selects %v but the label is %q -- the term matches NOTHING and spreads nothing",
++			sel.Values, label)
++	}
++	if sel.Values[0] != ns {
++		t.Fatalf("selector = %q, want the namespace %q so SAME-LAB pods repel each other", sel.Values[0], ns)
++	}
++	if terms[0].PodAffinityTerm.TopologyKey != "kubernetes.io/hostname" {
++		t.Fatalf("topologyKey = %q, want kubernetes.io/hostname", terms[0].PodAffinityTerm.TopologyKey)
++	}
++}
++
++// This vendor builds its OWN pod spec (byte-identical copy of the generic
++// literal) -- the container soft-avoid-SSD preference has to be wired here
++// too, or it silently half-applies exactly like the anti-affinity fix above
++// once did.
++func TestCreatePodCarriesContainerNodeAffinity(t *testing.T) {
++	ctx := context.Background()
++	t.Setenv("SKYFORGE_KNE_IO_HEAVY_NODE_LABELS_JSON", `{"skyforge.example.com/disk-class":"ssd"}`)
++	const ns = "user-x-demo-lab"
++	nImpl := &node.Impl{
++		Namespace:  ns,
++		KubeClient: kfake.NewSimpleClientset(),
++		RestConfig: &rest.Config{},
++		Proto: &tpb.Node{
++			Name:   "att-jfk-pe01",
++			Vendor: tpb.Vendor_CISCO,
++			Model:  "xrd",
++			Config: &tpb.Config{Image: "example/xrd:test"},
++		},
++	}
++	n, err := New(nImpl)
++	if err != nil {
++		t.Fatalf("New() failed: %v", err)
++	}
++	if err := n.Create(ctx); err != nil {
++		t.Fatalf("creating the pod: %v", err)
++	}
++	pod, err := nImpl.KubeClient.CoreV1().Pods(ns).Get(ctx, nImpl.Proto.Name, metav1.GetOptions{})
++	if err != nil {
++		t.Fatalf("reading back the created pod: %v", err)
++	}
++	if pod.Spec.Affinity.NodeAffinity == nil {
++		t.Fatal("emitted pod carries no nodeAffinity -- the container soft-avoid-SSD preference steers nothing")
++	}
++	if pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution != nil {
++		t.Fatal("emitted pod carries a REQUIRED node affinity; the policy must only rank")
++	}
++}
+diff --git a/topo/node/forward/node_antiaffinity_test.go b/topo/node/forward/node_antiaffinity_test.go
+new file mode 100644
+index 0000000..3b05159
+--- /dev/null
++++ b/topo/node/forward/node_antiaffinity_test.go
+@@ -0,0 +1,115 @@
++package forward
++
++import (
++	"context"
++	"testing"
++
++	topopb "github.com/openconfig/kne/proto/topo"
++	"github.com/openconfig/kne/topo/node"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	kfake "k8s.io/client-go/kubernetes/fake"
++	"k8s.io/client-go/rest"
++)
++
++// THE ANTI-AFFINITY MUST SELECT THE PODS IT REPELS.
++//
++// This pod spec labels itself `topo: <namespace>` and then builds a preferred
++// podAntiAffinity to spread same-lab pods across hosts. Upstream selected
++// `topo In [pb.Name]` -- the pod's own DEVICE name -- which no pod anywhere
++// carries, so the term selected zero pods and repelled nothing.
++//
++// kne 0059 fixed the generic node.Impl.CreatePod. This vendor builds its OWN
++// pod spec from a byte-identical copy of the same literal, and kept the broken
++// value. MEASURED 2026-09-11 on the live demo-lab namespace: all 80 pods
++// labelled topo=<namespace>, 17 selecting the namespace and 40 selecting a
++// device name, with 64 of the 80 packed onto one node.
++//
++// Assert the LABEL and the SELECTOR agree -- the property that makes the term
++// able to bind at all. The control is that this test FAILS when pb.Name is
++// restored: the selector then names the device and the label names the
++// namespace.
++func TestPodAntiAffinitySelectorMatchesTheTopoLabel(t *testing.T) {
++	ctx := context.Background()
++	const ns = "user-x-demo-lab"
++	nImpl := &node.Impl{
++		Namespace:  ns,
++		KubeClient: kfake.NewSimpleClientset(),
++		RestConfig: &rest.Config{},
++		Proto: &topopb.Node{
++			Name:   "fwd-collector",
++			Vendor: topopb.Vendor_FORWARD,
++			Config: &topopb.Config{Image: "example/fwd:test"},
++		},
++	}
++	n, err := New(nImpl)
++	if err != nil {
++		t.Fatalf("New() failed: %v", err)
++	}
++	if err := n.(*Node).CreatePod(ctx); err != nil {
++		t.Fatalf("creating the pod: %v", err)
++	}
++	pod, err := nImpl.KubeClient.CoreV1().Pods(ns).Get(ctx, nImpl.Proto.Name, metav1.GetOptions{})
++	if err != nil {
++		t.Fatalf("reading back the created pod: %v", err)
++	}
++
++	label, ok := pod.ObjectMeta.Labels["topo"]
++	if !ok {
++		t.Fatal("pod carries no topo label")
++	}
++	terms := pod.Spec.Affinity.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution
++	if len(terms) != 1 {
++		t.Fatalf("anti-affinity terms = %d, want 1", len(terms))
++	}
++	sel := terms[0].PodAffinityTerm.LabelSelector.MatchExpressions[0]
++	if sel.Key != "topo" {
++		t.Fatalf("selector key = %q, want topo", sel.Key)
++	}
++	if len(sel.Values) != 1 || sel.Values[0] != label {
++		t.Fatalf("selector selects %v but the label is %q -- the term matches NOTHING and spreads nothing",
++			sel.Values, label)
++	}
++	if sel.Values[0] != ns {
++		t.Fatalf("selector = %q, want the namespace %q so SAME-LAB pods repel each other", sel.Values[0], ns)
++	}
++	if terms[0].PodAffinityTerm.TopologyKey != "kubernetes.io/hostname" {
++		t.Fatalf("topologyKey = %q, want kubernetes.io/hostname", terms[0].PodAffinityTerm.TopologyKey)
++	}
++}
++
++// This vendor builds its OWN pod spec (byte-identical copy of the generic
++// literal) -- the container soft-avoid-SSD preference has to be wired here
++// too, or it silently half-applies exactly like the anti-affinity fix above
++// once did.
++func TestCreatePodCarriesContainerNodeAffinity(t *testing.T) {
++	ctx := context.Background()
++	t.Setenv("SKYFORGE_KNE_IO_HEAVY_NODE_LABELS_JSON", `{"skyforge.example.com/disk-class":"ssd"}`)
++	const ns = "user-x-demo-lab"
++	nImpl := &node.Impl{
++		Namespace:  ns,
++		KubeClient: kfake.NewSimpleClientset(),
++		RestConfig: &rest.Config{},
++		Proto: &topopb.Node{
++			Name:   "fwd-collector",
++			Vendor: topopb.Vendor_FORWARD,
++			Config: &topopb.Config{Image: "example/fwd:test"},
++		},
++	}
++	n, err := New(nImpl)
++	if err != nil {
++		t.Fatalf("New() failed: %v", err)
++	}
++	if err := n.(*Node).CreatePod(ctx); err != nil {
++		t.Fatalf("creating the pod: %v", err)
++	}
++	pod, err := nImpl.KubeClient.CoreV1().Pods(ns).Get(ctx, nImpl.Proto.Name, metav1.GetOptions{})
++	if err != nil {
++		t.Fatalf("reading back the created pod: %v", err)
++	}
++	if pod.Spec.Affinity.NodeAffinity == nil {
++		t.Fatal("emitted pod carries no nodeAffinity -- the container soft-avoid-SSD preference steers nothing")
++	}
++	if pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution != nil {
++		t.Fatal("emitted pod carries a REQUIRED node affinity; the policy must only rank")
++	}
++}
+diff --git a/topo/node/juniper/node_antiaffinity_test.go b/topo/node/juniper/node_antiaffinity_test.go
+new file mode 100644
+index 0000000..d7331ab
+--- /dev/null
++++ b/topo/node/juniper/node_antiaffinity_test.go
+@@ -0,0 +1,118 @@
++package juniper
++
++import (
++	"context"
++	"testing"
++
++	tpb "github.com/openconfig/kne/proto/topo"
++	"github.com/openconfig/kne/topo/node"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	kfake "k8s.io/client-go/kubernetes/fake"
++	"k8s.io/client-go/rest"
++)
++
++// THE ANTI-AFFINITY MUST SELECT THE PODS IT REPELS.
++//
++// This pod spec labels itself `topo: <namespace>` and then builds a preferred
++// podAntiAffinity to spread same-lab pods across hosts. Upstream selected
++// `topo In [pb.Name]` -- the pod's own DEVICE name -- which no pod anywhere
++// carries, so the term selected zero pods and repelled nothing.
++//
++// kne 0059 fixed the generic node.Impl.CreatePod. This vendor builds its OWN
++// pod spec from a byte-identical copy of the same literal, and kept the broken
++// value. MEASURED 2026-09-11 on the live demo-lab namespace: all 80 pods
++// labelled topo=<namespace>, 17 selecting the namespace and 40 selecting a
++// device name, with 64 of the 80 packed onto one node.
++//
++// Assert the LABEL and the SELECTOR agree -- the property that makes the term
++// able to bind at all. The control is that this test FAILS when pb.Name is
++// restored: the selector then names the device and the label names the
++// namespace.
++func TestPodAntiAffinitySelectorMatchesTheTopoLabel(t *testing.T) {
++	ctx := context.Background()
++	const ns = "user-x-demo-lab"
++	nImpl := &node.Impl{
++		Namespace:  ns,
++		KubeClient: kfake.NewSimpleClientset(),
++		RestConfig: &rest.Config{},
++		Proto: &tpb.Node{
++			Name:   "lhr-rr-rt01",
++			Vendor: tpb.Vendor_JUNIPER,
++			Model:  "cptx",
++			Config: &tpb.Config{Image: "example/cptx:test"},
++		},
++	}
++	n, err := New(nImpl)
++	if err != nil {
++		t.Fatalf("New() failed: %v", err)
++	}
++	if err := n.Create(ctx); err != nil {
++		t.Fatalf("creating the pod: %v", err)
++	}
++	pod, err := nImpl.KubeClient.CoreV1().Pods(ns).Get(ctx, nImpl.Proto.Name, metav1.GetOptions{})
++	if err != nil {
++		t.Fatalf("reading back the created pod: %v", err)
++	}
++
++	label, ok := pod.ObjectMeta.Labels["topo"]
++	if !ok {
++		t.Fatal("pod carries no topo label")
++	}
++	terms := pod.Spec.Affinity.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution
++	if len(terms) != 1 {
++		t.Fatalf("anti-affinity terms = %d, want 1", len(terms))
++	}
++	sel := terms[0].PodAffinityTerm.LabelSelector.MatchExpressions[0]
++	if sel.Key != "topo" {
++		t.Fatalf("selector key = %q, want topo", sel.Key)
++	}
++	if len(sel.Values) != 1 || sel.Values[0] != label {
++		t.Fatalf("selector selects %v but the label is %q -- the term matches NOTHING and spreads nothing",
++			sel.Values, label)
++	}
++	if sel.Values[0] != ns {
++		t.Fatalf("selector = %q, want the namespace %q so SAME-LAB pods repel each other", sel.Values[0], ns)
++	}
++	if terms[0].PodAffinityTerm.TopologyKey != "kubernetes.io/hostname" {
++		t.Fatalf("topologyKey = %q, want kubernetes.io/hostname", terms[0].PodAffinityTerm.TopologyKey)
++	}
++}
++
++// This vendor builds its OWN pod spec (byte-identical copy of the generic
++// literal) -- the container soft-avoid-SSD preference has to be wired here
++// too, or it silently half-applies exactly like the anti-affinity fix above
++// once did. "cptx" is the container-path model (vjunos-router/-switch/vsrx
++// take the VM path instead).
++func TestCreatePodCarriesContainerNodeAffinity(t *testing.T) {
++	ctx := context.Background()
++	t.Setenv("SKYFORGE_KNE_IO_HEAVY_NODE_LABELS_JSON", `{"skyforge.example.com/disk-class":"ssd"}`)
++	const ns = "user-x-demo-lab"
++	nImpl := &node.Impl{
++		Namespace:  ns,
++		KubeClient: kfake.NewSimpleClientset(),
++		RestConfig: &rest.Config{},
++		Proto: &tpb.Node{
++			Name:   "lhr-rr-rt01",
++			Vendor: tpb.Vendor_JUNIPER,
++			Model:  "cptx",
++			Config: &tpb.Config{Image: "example/cptx:test"},
++		},
++	}
++	n, err := New(nImpl)
++	if err != nil {
++		t.Fatalf("New() failed: %v", err)
++	}
++	if err := n.Create(ctx); err != nil {
++		t.Fatalf("creating the pod: %v", err)
++	}
++	pod, err := nImpl.KubeClient.CoreV1().Pods(ns).Get(ctx, nImpl.Proto.Name, metav1.GetOptions{})
++	if err != nil {
++		t.Fatalf("reading back the created pod: %v", err)
++	}
++	if pod.Spec.Affinity.NodeAffinity == nil {
++		t.Fatal("emitted pod carries no nodeAffinity -- the container soft-avoid-SSD preference steers nothing")
++	}
++	if pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution != nil {
++		t.Fatal("emitted pod carries a REQUIRED node affinity; the policy must only rank")
++	}
++}
+diff --git a/topo/node/kubevirt_same_model_antiaffinity_test.go b/topo/node/kubevirt_same_model_antiaffinity_test.go
+new file mode 100644
+index 0000000..d720b32
+--- /dev/null
++++ b/topo/node/kubevirt_same_model_antiaffinity_test.go
+@@ -0,0 +1,215 @@
++package node
++
++import (
++	"testing"
++
++	topopb "github.com/openconfig/kne/proto/topo"
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++)
++
++func TestKNESameModelPodAntiAffinityMatchesModelLabel(t *testing.T) {
++	got := KNESameModelPodAntiAffinity("fortios")
++	if got == nil {
++		t.Fatal("expected an anti-affinity for a non-empty model")
++	}
++	terms := got.PreferredDuringSchedulingIgnoredDuringExecution
++	if len(terms) != 1 {
++		t.Fatalf("preferred terms = %d, want 1", len(terms))
++	}
++	term := terms[0]
++	if term.Weight != 100 {
++		t.Errorf("weight = %d, want 100", term.Weight)
++	}
++	if term.PodAffinityTerm.TopologyKey != "kubernetes.io/hostname" {
++		t.Errorf("topologyKey = %q, want kubernetes.io/hostname", term.PodAffinityTerm.TopologyKey)
++	}
++	sel := term.PodAffinityTerm.LabelSelector
++	if sel == nil || len(sel.MatchExpressions) != 1 {
++		t.Fatalf("label selector = %#v", sel)
++	}
++	expr := sel.MatchExpressions[0]
++	if expr.Key != kneVMModelLabel {
++		t.Errorf("selector key = %q, want %q -- must match what kubeVirtLabels() sets, or the two policies fork", expr.Key, kneVMModelLabel)
++	}
++	if expr.Operator != "In" || len(expr.Values) != 1 || expr.Values[0] != "fortios" {
++		t.Errorf("selector = %#v, want In [fortios]", expr)
++	}
++}
++
++// Same "must never refuse a lab" contract as its two siblings
++// (KNEIOHeavyNodeAffinity, KNEContainerNodeAffinity). A REQUIRED term here
++// could make a VM unschedulable if every other node were already full.
++func TestKNESameModelPodAntiAffinityIsPreferredNotRequired(t *testing.T) {
++	got := KNESameModelPodAntiAffinity("fortios")
++	if got == nil {
++		t.Fatal("expected an anti-affinity")
++	}
++	if got.RequiredDuringSchedulingIgnoredDuringExecution != nil {
++		t.Fatal("policy emitted a REQUIRED term; it must only ever be a preference")
++	}
++}
++
++func TestKNESameModelPodAntiAffinityFailsOpenOnEmptyModel(t *testing.T) {
++	for name, model := range map[string]string{
++		"empty":      "",
++		"whitespace": "   ",
++	} {
++		t.Run(name, func(t *testing.T) {
++			if got := KNESameModelPodAntiAffinity(model); got != nil {
++				t.Fatalf("expected nil (fail open) for model %q, got %#v", model, got)
++			}
++		})
++	}
++}
++
++func TestKNESameModelPodAntiAffinityUnstructuredMatchesTyped(t *testing.T) {
++	typed := KNESameModelPodAntiAffinity("fortios")
++	if typed == nil {
++		t.Fatal("typed policy returned nil")
++	}
++	rendered := KNESameModelPodAntiAffinityUnstructured("fortios")
++	if rendered == nil {
++		t.Fatal("unstructured policy returned nil while the typed one did not -- the two paths have forked")
++	}
++	terms, ok := rendered["preferredDuringSchedulingIgnoredDuringExecution"].([]any)
++	if !ok {
++		t.Fatalf("rendered anti-affinity has no preferred terms: %#v", rendered)
++	}
++	if len(terms) != len(typed.PreferredDuringSchedulingIgnoredDuringExecution) {
++		t.Fatalf("term count differs: unstructured=%d typed=%d", len(terms), len(typed.PreferredDuringSchedulingIgnoredDuringExecution))
++	}
++	if rendered["requiredDuringSchedulingIgnoredDuringExecution"] != nil {
++		t.Error("rendered anti-affinity carries a REQUIRED term")
++	}
++}
++
++func TestKNESameModelPodAntiAffinityUnstructuredFailsOpen(t *testing.T) {
++	if got := KNESameModelPodAntiAffinityUnstructured(""); got != nil {
++		t.Fatalf("expected nil, got %#v", got)
++	}
++}
++
++// Pins the deliberate weight change (100 -> 25) so a future edit that
++// silently reverts it fails loudly: at 100/100 the anti-affinity can only
++// TIE the SSD preference on a conflicting node, never win it, and two
++// same-model VMs would keep landing on the one SSD node regardless of this
++// whole feature.
++func TestKNEIOHeavyNodeAffinityWeightYieldsToSameModelAntiAffinity(t *testing.T) {
++	setIOHeavyEnv(t, `{"skyforge.example.com/disk-class":"ssd"}`)
++	heavy := KNEIOHeavyNodeAffinity()
++	if heavy == nil {
++		t.Fatal("expected an affinity")
++	}
++	ssdWeight := heavy.PreferredDuringSchedulingIgnoredDuringExecution[0].Weight
++	sameModel := KNESameModelPodAntiAffinity("fortios")
++	if sameModel == nil {
++		t.Fatal("expected an anti-affinity")
++	}
++	conflictWeight := sameModel.PreferredDuringSchedulingIgnoredDuringExecution[0].Weight
++	if ssdWeight >= conflictWeight {
++		t.Fatalf("SSD preference weight (%d) must be LOWER than the same-model anti-affinity weight (%d), or a real conflict can never make the scheduler prefer spreading over co-locating", ssdWeight, conflictWeight)
++	}
++}
++
++func TestKubeVirtLabelsIncludeModel(t *testing.T) {
++	n := &Impl{
++		Namespace: "test",
++		Proto: &topopb.Node{
++			Name:   "sjc-dc1out-forti-fw1",
++			Vendor: topopb.Vendor_FORTINET,
++			Model:  "fortios",
++		},
++	}
++	labels := n.kubeVirtLabels()
++	if got := labels[kneVMModelLabel]; got != "fortios" {
++		t.Fatalf("model label = %q, want fortios", got)
++	}
++}
++
++func TestKubeVirtLabelsOmitModelWhenEmpty(t *testing.T) {
++	n := &Impl{
++		Namespace: "test",
++		Proto: &topopb.Node{
++			Name: "no-model",
++		},
++	}
++	labels := n.kubeVirtLabels()
++	if got, ok := labels[kneVMModelLabel]; ok {
++		t.Fatalf("expected no model label for an empty model, got %q", got)
++	}
++}
++
++// THE COEXISTENCE CASE this whole design depends on: the emitted VM object
++// must carry BOTH the SSD nodeAffinity and the same-model podAntiAffinity
++// together, without one clobbering the other's merge into spec["affinity"].
++func TestKubeVirtVMObjectCarriesNodeAffinityAndPodAntiAffinityTogether(t *testing.T) {
++	setIOHeavyEnv(t, `{"skyforge.example.com/disk-class":"ssd"}`)
++
++	n := &Impl{
++		Namespace: "test",
++		Proto: &topopb.Node{
++			Name:   "director1",
++			Vendor: topopb.Vendor_VERSA,
++			Model:  "director",
++			Config: &topopb.Config{Image: "registry.example.com/skyforge/kubevirt/vr-versa-director:test"},
++		},
++	}
++	vm, err := n.kubeVirtVMObject()
++	if err != nil {
++		t.Fatalf("kubeVirtVMObject() failed: %v", err)
++	}
++
++	if _, found, err := unstructured.NestedSlice(vm.Object,
++		"spec", "template", "spec", "affinity",
++		"nodeAffinity", "preferredDuringSchedulingIgnoredDuringExecution"); err != nil || !found {
++		t.Fatalf("emitted VM carries no nodeAffinity (found=%v err=%v) -- the SSD preference was clobbered", found, err)
++	}
++
++	terms, found, err := unstructured.NestedSlice(vm.Object,
++		"spec", "template", "spec", "affinity",
++		"podAntiAffinity", "preferredDuringSchedulingIgnoredDuringExecution")
++	if err != nil {
++		t.Fatalf("reading podAntiAffinity: %v", err)
++	}
++	if !found {
++		t.Fatal("emitted VM carries no podAntiAffinity -- the same-model preference steers nothing")
++	}
++	if len(terms) != 1 {
++		t.Fatalf("preferred terms = %d, want 1", len(terms))
++	}
++
++	labels, found, err := unstructured.NestedStringMap(vm.Object,
++		"spec", "template", "metadata", "labels")
++	if err != nil || !found {
++		t.Fatalf("reading pod template labels: found=%v err=%v", found, err)
++	}
++	if labels[kneVMModelLabel] != "director" {
++		t.Fatalf("pod template model label = %q, want director", labels[kneVMModelLabel])
++	}
++}
++
++// NEGATIVE CONTROL: a model with no other instance still gets the label and
++// the anti-affinity term (it just never finds a conflicting pod at runtime).
++// This proves the feature is generic, not fortios-special-cased.
++func TestKubeVirtVMObjectCarriesSameModelAntiAffinityForAnyModel(t *testing.T) {
++	setIOHeavyEnv(t, "")
++
++	n := &Impl{
++		Namespace: "test",
++		Proto: &topopb.Node{
++			Name:   "panos1",
++			Vendor: topopb.Vendor_PALOALTO,
++			Model:  "panos",
++			Config: &topopb.Config{Image: "registry.example.com/skyforge/kubevirt/vr-pan:test"},
++		},
++	}
++	vm, err := n.kubeVirtVMObject()
++	if err != nil {
++		t.Fatalf("kubeVirtVMObject() failed: %v", err)
++	}
++	if _, found, err := unstructured.NestedSlice(vm.Object,
++		"spec", "template", "spec", "affinity",
++		"podAntiAffinity", "preferredDuringSchedulingIgnoredDuringExecution"); err != nil || !found {
++		t.Fatalf("panos carries no same-model podAntiAffinity (found=%v err=%v) -- feature must be generic, not fortios-only", found, err)
++	}
++}
+diff --git a/topo/node/node_antiaffinity_test.go b/topo/node/node_antiaffinity_test.go
+new file mode 100644
+index 0000000..e97cc72
+--- /dev/null
++++ b/topo/node/node_antiaffinity_test.go
+@@ -0,0 +1,105 @@
++package node
++
++import (
++	"context"
++	"testing"
++
++	topopb "github.com/openconfig/kne/proto/topo"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	kfake "k8s.io/client-go/kubernetes/fake"
++	"k8s.io/client-go/rest"
++)
++
++// THE ANTI-AFFINITY MUST SELECT THE PODS IT REPELS.
++//
++// Upstream labelled every lab pod `topo: <namespace>` and then selected
++// `topo In [pb.Name]`. Those never match, so the term selected nothing and
++// spread no lab pod -- a constraint that could not bind. Measured on demo-lab:
++// `-l topo=att-jfk-pe01` returned 0 while `-l topo=<namespace>` returned 66,
++// and 59 of 62 containers packed onto one node.
++//
++// Assert the LABEL and the SELECTOR agree, which is the property that makes
++// the term able to fire at all.
++func TestPodAntiAffinitySelectorMatchesTheTopoLabel(t *testing.T) {
++	ctx := context.Background()
++	const ns = "user-x-demo-lab"
++	n := &Impl{
++		Namespace:  ns,
++		KubeClient: kfake.NewSimpleClientset(),
++		RestConfig: &rest.Config{},
++		Proto: &topopb.Node{
++			Name:   "att-jfk-pe01",
++			Vendor: topopb.Vendor_CISCO,
++			Config: &topopb.Config{Image: "example/iol:test"},
++		},
++	}
++	if err := n.CreatePod(ctx); err != nil {
++		t.Fatalf("CreatePod() failed: %v", err)
++	}
++	pod, err := n.KubeClient.CoreV1().Pods(ns).Get(ctx, "att-jfk-pe01", metav1.GetOptions{})
++	if err != nil {
++		t.Fatalf("reading back the created pod: %v", err)
++	}
++
++	label, ok := pod.ObjectMeta.Labels["topo"]
++	if !ok {
++		t.Fatal("pod carries no topo label")
++	}
++	terms := pod.Spec.Affinity.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution
++	if len(terms) != 1 {
++		t.Fatalf("anti-affinity terms = %d, want 1", len(terms))
++	}
++	sel := terms[0].PodAffinityTerm.LabelSelector.MatchExpressions[0]
++	if sel.Key != "topo" {
++		t.Fatalf("selector key = %q, want topo", sel.Key)
++	}
++	if len(sel.Values) != 1 || sel.Values[0] != label {
++		t.Fatalf("selector selects %v but the label is %q -- the term matches NOTHING and spreads nothing",
++			sel.Values, label)
++	}
++	// and it must be the namespace, i.e. lab-wide, not per-pod
++	if sel.Values[0] != ns {
++		t.Fatalf("selector = %q, want the namespace %q so SAME-LAB pods repel each other", sel.Values[0], ns)
++	}
++	if terms[0].PodAffinityTerm.TopologyKey != "kubernetes.io/hostname" {
++		t.Fatalf("topologyKey = %q, want kubernetes.io/hostname", terms[0].PodAffinityTerm.TopologyKey)
++	}
++}
++
++// THE EMITTED POD MUST CARRY THE CONTAINER NODE AFFINITY TOO. Unit tests on
++// KNEContainerNodeAffinity() alone proved nothing about the IO-heavy VM
++// preference until an emitted-object test existed (see
++// TestKubeVirtVMObjectCarriesIOHeavyAffinity) -- apply the same discipline
++// here rather than trusting the policy function in isolation.
++func TestCreatePodCarriesContainerNodeAffinity(t *testing.T) {
++	setIOHeavyEnv(t, `{"skyforge.example.com/disk-class":"ssd"}`)
++	ctx := context.Background()
++	const ns = "user-x-demo-lab"
++	n := &Impl{
++		Namespace:  ns,
++		KubeClient: kfake.NewSimpleClientset(),
++		RestConfig: &rest.Config{},
++		Proto: &topopb.Node{
++			Name:   "att-jfk-pe01",
++			Vendor: topopb.Vendor_CISCO,
++			Config: &topopb.Config{Image: "example/iol:test"},
++		},
++	}
++	if err := n.CreatePod(ctx); err != nil {
++		t.Fatalf("CreatePod() failed: %v", err)
++	}
++	pod, err := n.KubeClient.CoreV1().Pods(ns).Get(ctx, "att-jfk-pe01", metav1.GetOptions{})
++	if err != nil {
++		t.Fatalf("reading back the created pod: %v", err)
++	}
++	if pod.Spec.Affinity.NodeAffinity == nil {
++		t.Fatal("emitted pod carries no nodeAffinity -- the container soft-avoid-SSD preference steers nothing")
++	}
++	terms := pod.Spec.Affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution
++	if len(terms) != 1 {
++		t.Fatalf("preferred terms = %d, want 1", len(terms))
++	}
++	if pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution != nil {
++		t.Fatal("emitted pod carries a REQUIRED node affinity; the policy must only rank")
++	}
++}
+diff --git a/topo/node/node_container_no_ssd_affinity_test.go b/topo/node/node_container_no_ssd_affinity_test.go
+new file mode 100644
+index 0000000..36ba8ed
+--- /dev/null
++++ b/topo/node/node_container_no_ssd_affinity_test.go
+@@ -0,0 +1,74 @@
++package node
++
++import "testing"
++
++func TestKNEContainerNodeAffinityPrefersAvoidingConfiguredLabels(t *testing.T) {
++	setIOHeavyEnv(t, `{"skyforge.example.com/disk-class":"ssd"}`)
++	got := KNEContainerNodeAffinity()
++	if got == nil {
++		t.Fatal("expected an affinity for a container-backed node")
++	}
++	terms := got.PreferredDuringSchedulingIgnoredDuringExecution
++	if len(terms) != 1 {
++		t.Fatalf("preferred terms = %d, want 1", len(terms))
++	}
++	exprs := terms[0].Preference.MatchExpressions
++	if len(exprs) != 1 || exprs[0].Key != "skyforge.example.com/disk-class" {
++		t.Fatalf("match expressions = %#v", exprs)
++	}
++	if exprs[0].Operator != "NotIn" {
++		t.Fatalf("operator = %q, want NotIn -- containers must AVOID the labelled node, not seek it", exprs[0].Operator)
++	}
++	if exprs[0].Values[0] != "ssd" {
++		t.Fatalf("value = %q, want ssd", exprs[0].Values[0])
++	}
++}
++
++// Same contract as the IO-heavy side: a REQUIRED term here could make a
++// container-only lab unschedulable whenever the non-SSD pool is full, for a
++// workload that doesn't need SSD I/O at all. This must only ever rank.
++func TestKNEContainerNodeAffinityIsPreferredNotRequired(t *testing.T) {
++	setIOHeavyEnv(t, `{"skyforge.example.com/disk-class":"ssd"}`)
++	got := KNEContainerNodeAffinity()
++	if got == nil {
++		t.Fatal("expected an affinity")
++	}
++	if got.RequiredDuringSchedulingIgnoredDuringExecution != nil {
++		t.Fatal("policy emitted a REQUIRED term; it must only ever be a preference")
++	}
++}
++
++func TestKNEContainerNodeAffinityFailsOpen(t *testing.T) {
++	for name, labels := range map[string]string{
++		"absent labels":    "",
++		"malformed labels": `{not json`,
++		"empty labels":     `{}`,
++	} {
++		t.Run(name, func(t *testing.T) {
++			setIOHeavyEnv(t, labels)
++			if got := KNEContainerNodeAffinity(); got != nil {
++				t.Fatalf("expected nil (fail open), got %#v", got)
++			}
++		})
++	}
++}
++
++// THE SAME-POLICY-INPUT GUARD. KNEIOHeavyNodeAffinity (In) and
++// KNEContainerNodeAffinity (NotIn) must always name the SAME node label, since
++// both read SKYFORGE_KNE_IO_HEAVY_NODE_LABELS_JSON. If they ever named
++// different nodes, containers could end up preferring the very node the VMs
++// need, defeating the whole point.
++func TestKNEContainerNodeAffinityNamesSameLabelAsIOHeavy(t *testing.T) {
++	setIOHeavyEnv(t, `{"skyforge.example.com/disk-class":"ssd"}`)
++	heavy := KNEIOHeavyNodeAffinity()
++	container := KNEContainerNodeAffinity()
++	if heavy == nil || container == nil {
++		t.Fatal("expected both affinities to be present")
++	}
++	heavyExpr := heavy.PreferredDuringSchedulingIgnoredDuringExecution[0].Preference.MatchExpressions[0]
++	containerExpr := container.PreferredDuringSchedulingIgnoredDuringExecution[0].Preference.MatchExpressions[0]
++	if heavyExpr.Key != containerExpr.Key || heavyExpr.Values[0] != containerExpr.Values[0] {
++		t.Fatalf("heavy names %s=%v, container names %s=%v -- policies have forked",
++			heavyExpr.Key, heavyExpr.Values, containerExpr.Key, containerExpr.Values)
++	}
++}
+diff --git a/topo/node/node_io_heavy_affinity_test.go b/topo/node/node_io_heavy_affinity_test.go
+new file mode 100644
+index 0000000..d5222ed
+--- /dev/null
++++ b/topo/node/node_io_heavy_affinity_test.go
+@@ -0,0 +1,283 @@
++package node
++
++import (
++	"testing"
++
++	topopb "github.com/openconfig/kne/proto/topo"
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++)
++
++const ioHeavyLabelsEnv = "SKYFORGE_KNE_IO_HEAVY_NODE_LABELS_JSON"
++
++func setIOHeavyEnv(t *testing.T, labels string) {
++	t.Helper()
++	t.Setenv(ioHeavyLabelsEnv, labels)
++}
++
++func TestKNEIOHeavyNodeAffinityPrefersConfiguredLabels(t *testing.T) {
++	setIOHeavyEnv(t, `{"skyforge.example.com/disk-class":"ssd"}`)
++	got := KNEIOHeavyNodeAffinity()
++	if got == nil {
++		t.Fatal("expected an affinity for an IO-heavy model")
++	}
++	terms := got.PreferredDuringSchedulingIgnoredDuringExecution
++	if len(terms) != 1 {
++		t.Fatalf("preferred terms = %d, want 1", len(terms))
++	}
++	exprs := terms[0].Preference.MatchExpressions
++	if len(exprs) != 1 || exprs[0].Key != "skyforge.example.com/disk-class" || exprs[0].Values[0] != "ssd" {
++		t.Fatalf("match expressions = %#v", exprs)
++	}
++}
++
++// The whole point of the policy: it must RANK, never REFUSE. A required term
++// here would make a lab undeployable whenever the SSD node is full.
++func TestKNEIOHeavyNodeAffinityIsPreferredNotRequired(t *testing.T) {
++	setIOHeavyEnv(t, `{"skyforge.example.com/disk-class":"ssd"}`)
++	got := KNEIOHeavyNodeAffinity()
++	if got == nil {
++		t.Fatal("expected an affinity")
++	}
++	if got.RequiredDuringSchedulingIgnoredDuringExecution != nil {
++		t.Fatal("policy emitted a REQUIRED term; it must only ever be a preference")
++	}
++}
++
++func TestKNEIOHeavyNodeAffinityFailsOpen(t *testing.T) {
++	for name, labels := range map[string]string{
++		"absent labels":    "",
++		"malformed labels": `{not json`,
++		"empty labels":     `{}`,
++	} {
++		t.Run(name, func(t *testing.T) {
++			setIOHeavyEnv(t, labels)
++			if got := KNEIOHeavyNodeAffinity(); got != nil {
++				t.Fatalf("expected nil (fail open), got %#v", got)
++			}
++		})
++	}
++}
++
++// THE REGRESSION GUARD. The typed value and the unstructured value must stay
++// the SAME policy. This is the test that would have caught the original defect:
++// the preference was applied only on the typed pod path, and every IO-heavy
++// model is a VM, so nothing was ever steered.
++func TestKNEIOHeavyNodeAffinityUnstructuredMatchesTyped(t *testing.T) {
++	setIOHeavyEnv(t, `{"skyforge.example.com/disk-class":"ssd"}`)
++
++	typed := KNEIOHeavyNodeAffinity()
++	if typed == nil {
++		t.Fatal("typed policy returned nil")
++	}
++	rendered := KNEIOHeavyNodeAffinityUnstructured()
++	if rendered == nil {
++		t.Fatal("unstructured policy returned nil while the typed one did not -- the two paths have forked")
++	}
++
++	terms, ok := rendered["preferredDuringSchedulingIgnoredDuringExecution"].([]any)
++	if !ok {
++		t.Fatalf("rendered affinity has no preferred terms: %#v", rendered)
++	}
++	if len(terms) != len(typed.PreferredDuringSchedulingIgnoredDuringExecution) {
++		t.Fatalf("term count differs: unstructured=%d typed=%d", len(terms), len(typed.PreferredDuringSchedulingIgnoredDuringExecution))
++	}
++	term, ok := terms[0].(map[string]any)
++	if !ok {
++		t.Fatalf("term 0 is %T, want map", terms[0])
++	}
++	// json tags, not Go field names -- this is what the apiserver reads.
++	if _, ok := term["weight"]; !ok {
++		t.Errorf("rendered term has no 'weight' key: %#v", term)
++	}
++	if _, ok := term["preference"]; !ok {
++		t.Errorf("rendered term has no 'preference' key: %#v", term)
++	}
++	if rendered["requiredDuringSchedulingIgnoredDuringExecution"] != nil {
++		t.Error("rendered affinity carries a REQUIRED term")
++	}
++}
++
++func TestKNEIOHeavyNodeAffinityUnstructuredFailsOpen(t *testing.T) {
++	setIOHeavyEnv(t, "")
++	if got := KNEIOHeavyNodeAffinityUnstructured(); got != nil {
++		t.Fatalf("expected nil, got %#v", got)
++	}
++}
++
++// THE TEST THAT WOULD HAVE CAUGHT THE ORIGINAL DEFECT.
++//
++// The policy was applied to the five typed CreatePod sites, every IO-heavy
++// model is a VM, and Impl.Create() sends VM models to CreateKubeVirtVM -- so
++// the emitted VirtualMachine carried affinity: null and vManage booted on an
++// HDD node. Unit tests on the policy function all passed. Only the EMITTED
++// OBJECT proves the steering is real, so assert on that.
++func TestKubeVirtVMObjectCarriesIOHeavyAffinity(t *testing.T) {
++	setIOHeavyEnv(t, `{"skyforge.example.com/disk-class":"ssd"}`)
++
++	// An IOHeavy profile (Versa Director; vManage is the other).
++	n := &Impl{
++		Namespace: "test",
++		Proto: &topopb.Node{
++			Name:   "director1",
++			Vendor: topopb.Vendor_VERSA,
++			Model:  "director",
++			Config: &topopb.Config{Image: "registry.example.com/skyforge/kubevirt/vr-versa-director:test"},
++		},
++	}
++	vm, err := n.kubeVirtVMObject()
++	if err != nil {
++		t.Fatalf("kubeVirtVMObject() failed: %v", err)
++	}
++	terms, found, err := unstructured.NestedSlice(vm.Object,
++		"spec", "template", "spec", "affinity",
++		"nodeAffinity", "preferredDuringSchedulingIgnoredDuringExecution")
++	if err != nil {
++		t.Fatalf("reading VM nodeAffinity: %v", err)
++	}
++	if !found {
++		t.Fatal("emitted VM carries NO IO-heavy nodeAffinity -- the preference steers nothing")
++	}
++	if len(terms) != 1 {
++		t.Fatalf("preferred terms = %d, want 1", len(terms))
++	}
++	// It must remain a preference on the emitted object too.
++	if _, required, _ := unstructured.NestedMap(vm.Object,
++		"spec", "template", "spec", "affinity",
++		"nodeAffinity", "requiredDuringSchedulingIgnoredDuringExecution"); required {
++		t.Fatal("emitted VM carries a REQUIRED node affinity; the policy must only rank")
++	}
++}
++
++// NEGATIVE CONTROL for the test above: with the policy disabled, the emitted
++// VM must carry no nodeAffinity. Without this, the assertion could be passing
++// for a reason unrelated to the policy.
++func TestKubeVirtVMObjectOmitsIOHeavyAffinityWhenDisabled(t *testing.T) {
++	setIOHeavyEnv(t, "")
++
++	n := &Impl{
++		Namespace: "test",
++		Proto: &topopb.Node{
++			Name:   "panos1",
++			Vendor: topopb.Vendor_PALOALTO,
++			Model:  "panos",
++			Config: &topopb.Config{Image: "registry.example.com/skyforge/kubevirt/vr-pan:test"},
++		},
++	}
++	vm, err := n.kubeVirtVMObject()
++	if err != nil {
++		t.Fatalf("kubeVirtVMObject() failed: %v", err)
++	}
++	if _, found, _ := unstructured.NestedSlice(vm.Object,
++		"spec", "template", "spec", "affinity",
++		"nodeAffinity", "preferredDuringSchedulingIgnoredDuringExecution"); found {
++		t.Fatal("policy disabled but the emitted VM still carries a nodeAffinity")
++	}
++}
++
++// THE TEST FOR THE NAME-MISMATCH DEFECT.
++//
++// The first fix gated the preference on a MODEL LIST exported by the server,
++// which is keyed on netlab DEVICE KEYS ("cisco_sdwan-manager"). netlab's
++// KNE_NODE_MAP writes a different string into topology.pb.txt: model
++// "vmanage". Two namespaces, never equal -- so vManage, the appliance the
++// entire policy exists for, was the one node it could never steer. Every test
++// passed, because they all used "panos", one of the models where the device
++// key and the KNE model happen to coincide.
++//
++// The list is gone; classification is now "did we build a VM at all". This
++// test pins that by using the model netlab REALLY emits.
++func TestKubeVirtVMObjectSteersRealVManage(t *testing.T) {
++	setIOHeavyEnv(t, `{"skyforge.example.com/disk-class":"ssd"}`)
++
++	// Model and image exactly as netlab's KNE provider emits them.
++	n := &Impl{
++		Namespace: "test",
++		Proto: &topopb.Node{
++			Name:   "vmanage",
++			Vendor: topopb.Vendor_CISCO,
++			Model:  "vmanage",
++			Config: &topopb.Config{
++				Image: "registry.example.com/skyforge/kubevirt/cisco_sdwan-manager:20.18.4-kne-r2",
++			},
++		},
++	}
++	vm, err := n.kubeVirtVMObject()
++	if err != nil {
++		t.Fatalf("kubeVirtVMObject() failed: %v", err)
++	}
++	terms, found, err := unstructured.NestedSlice(vm.Object,
++		"spec", "template", "spec", "affinity",
++		"nodeAffinity", "preferredDuringSchedulingIgnoredDuringExecution")
++	if err != nil {
++		t.Fatalf("reading nodeAffinity: %v", err)
++	}
++	if !found {
++		t.Fatal("a REAL vManage VM carries no IO-heavy nodeAffinity -- the policy cannot steer the one appliance it exists for")
++	}
++	if len(terms) != 1 {
++		t.Fatalf("preferred terms = %d, want 1", len(terms))
++	}
++}
++
++// Same shape for the other two SD-WAN controllers, whose KNE models also
++// differ from their netlab device keys (vbond/vsmart vs
++// cisco_sdwan-validator/-controller).
++// Since 2026-09-23 only IOHeavy profiles are steered: vBond/vSmart boot small
++// and no longer inherit the SSD preference (vManage, the measured 28 GB case,
++// is covered by the IOHeavy profile assertion).
++func TestKubeVirtVMObjectSteersSDWANControllers(t *testing.T) {
++	setIOHeavyEnv(t, `{"skyforge.example.com/disk-class":"ssd"}`)
++
++	for model, image := range map[string]string{
++		"vbond":  "registry.example.com/skyforge/kubevirt/cisco_sdwan-validator:20.18.4-kne-r2",
++		"vsmart": "registry.example.com/skyforge/kubevirt/cisco_sdwan-controller:20.18.4-kne-r2",
++	} {
++		t.Run(model, func(t *testing.T) {
++			n := &Impl{
++				Namespace: "test",
++				Proto: &topopb.Node{
++					Name:   model,
++					Vendor: topopb.Vendor_CISCO,
++					Model:  model,
++					Config: &topopb.Config{Image: image},
++				},
++			}
++			vm, err := n.kubeVirtVMObject()
++			if err != nil {
++				t.Fatalf("kubeVirtVMObject() failed: %v", err)
++			}
++			if _, found, _ := unstructured.NestedSlice(vm.Object,
++				"spec", "template", "spec", "affinity",
++				"nodeAffinity", "preferredDuringSchedulingIgnoredDuringExecution"); found {
++				t.Fatalf("%s carries the SSD nodeAffinity; only IOHeavy profiles may", model)
++			}
++		})
++	}
++}
++
++// SCOPED 2026-09-23: the SSD preference is for appliances whose first boot is a
++// large disk write (IOHeavy profiles). PAN-OS, A10, FortiOS and the rest used to
++// inherit it and crowded the one SSD node for no benefit.
++func TestKubeVirtVMObjectOmitsIOHeavyAffinityForANonIOHeavyModel(t *testing.T) {
++	setIOHeavyEnv(t, `{"skyforge.example.com/disk-class":"ssd"}`)
++	for _, tc := range []struct{ name, model, image string; vendor topopb.Vendor }{
++		{"panos1", "panos", "vr-pan:test", topopb.Vendor_PALOALTO},
++		{"a101", "a10", "a10_vthunder:test", topopb.Vendor_A10},
++	} {
++		n := &Impl{Namespace: "test", Proto: &topopb.Node{Name: tc.name, Vendor: tc.vendor, Model: tc.model,
++			Config: &topopb.Config{Image: "registry.example.com/skyforge/kubevirt/" + tc.image}}}
++		vm, err := n.kubeVirtVMObject()
++		if err != nil {
++			t.Fatalf("%s: kubeVirtVMObject() failed: %v", tc.model, err)
++		}
++		if _, found, _ := unstructured.NestedSlice(vm.Object, "spec", "template", "spec", "affinity",
++			"nodeAffinity", "preferredDuringSchedulingIgnoredDuringExecution"); found {
++			t.Fatalf("%s carries the SSD nodeAffinity; only IOHeavy profiles may", tc.model)
++		}
++	}
++	for _, m := range []string{"vmanage", "director"} {
++		if !kubeVirtHardwareProfileFor(m, "").IOHeavy {
++			t.Fatalf("%s must be IOHeavy", m)
++		}
++	}
++}
+-- 
+2.56.0
+

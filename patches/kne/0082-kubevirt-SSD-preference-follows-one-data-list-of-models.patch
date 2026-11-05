@@ -1,0 +1,190 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 11:01:32 -0500
+Subject: [PATCH] kubevirt: SSD preference follows one data list of models
+ (vmanage, vsmart, vbond, director)
+
+---
+diff --git a/topo/node/kubevirt.go b/topo/node/kubevirt.go
+index 36fb9f0..61cb11a 100644
+--- a/topo/node/kubevirt.go
++++ b/topo/node/kubevirt.go
+@@ -142,15 +142,6 @@ type kubeVirtHardwareProfile struct {
+ 	MachineType           string
+ 	MinimumCPU            int64
+ 	MinimumMemory         string
+-	// IOHeavy opts a model into the SSD node preference (KNEIOHeavyNodeAffinity).
+-	// It is a property of the appliance, declared on its own profile -- keyed by
+-	// the SAME KNE model name as n.Proto.Model, so it cannot suffer the
+-	// netlab-device-key vs KNE-model mismatch that sank the first model list.
+-	// Only appliances whose first boot is a large mandatory disk write earn it
+-	// (vManage: ~28 GB before 443 listens; 7.5 GB/min on SSD vs 2 GB/min
+-	// spinning). Every other VM used to inherit it by default, which pulled
+-	// A10s, PAN-OS, FortiGates and the rest onto the one SSD node for no benefit.
+-	IOHeavy               bool
+ 	Firmware              map[string]any
+ 	RequiredNodeSelector  map[string]string
+ 	UseVirtioTransitional bool
+@@ -198,6 +189,21 @@ var kubeVirtDefaultHardwareProfile = kubeVirtHardwareProfile{
+ 	}},
+ }
+ 
++// kubeVirtIOHeavyModels is the ONE list of KNE models whose first boot is a
++// large mandatory disk write and which therefore prefer the SSD node
++// (KNEIOHeavyNodeAffinity). Keyed by the KNE model name (n.Proto.Model).
++// Adding an image is a one-line change here. Seed 2026-10-29 (owner): vmanage,
++// vsmart (cisco_sdwan-controller), vbond (cisco_sdwan-validator), director
++// (Versa Director). Criterion: a non-NOS VM with a database or similar that
++// takes a while to initialise. Replaces the per-profile IOHeavy bool that
++// patch 0070 introduced; see patch 0082.
++var kubeVirtIOHeavyModels = map[string]bool{
++	"vmanage":  true,
++	"vsmart":   true,
++	"vbond":    true,
++	"director": true,
++}
++
+ var kubeVirtHardwareProfiles = map[string]kubeVirtHardwareProfile{
+ 	"a10": {
+ 		CPUModel:       "host-passthrough",
+@@ -397,7 +403,6 @@ var kubeVirtHardwareProfiles = map[string]kubeVirtHardwareProfile{
+ 		}},
+ 	},
+ 	"vmanage": {
+-		IOHeavy:               true,
+ 		CPUModel: "host-passthrough",
+ 		// e1000 ON BOTH PLANES, and the split it replaces is why.
+ 		//
+@@ -459,7 +464,6 @@ var kubeVirtHardwareProfiles = map[string]kubeVirtHardwareProfile{
+ 		}},
+ 	},
+ 	"director": {
+-		IOHeavy:               true,
+ 		CPUModel:       "host-passthrough",
+ 		InterfaceModel: "virtio",
+ 		MachineType:    "q35",
+@@ -1588,7 +1592,7 @@ const (
+ 	// at first boot; iosxe_config.txt is CVAC's AUTONOMOUS day-0 and cannot
+ 	// change the mode. Same SATA cdrom, same Secret -- only the key differs.
+ 	kubeVirtIOSXESDWANBootstrapFileName = "ciscosdwan_cloud_init.cfg"
+-	kubeVirtASAvDay0FileName       = "day0-config"
++	kubeVirtASAvDay0FileName            = "day0-config"
+ 	// vJunos (router/switch) day-0: the guest's own /home/pfe/riot/rc.juniper
+ 	// mounts /dev/sr0 on first boot and copies a file named EXACTLY
+ 	// "juniper.conf" from the ISO ROOT into the Junos config dir:
+@@ -3920,12 +3924,11 @@ func (n *Impl) kubeVirtVMObject(contract ...kubeVirtVMRenderContract) (*unstruct
+ 						// MERGE, never assign: bootstrap-TFTP models already
+ 						// wrote a podAffinity into spec["affinity"] two lines
+ 						// up, and a bare assignment would silently drop it.
+-						// SCOPED 2026-09-23 (owner): only models whose profile
+-						// declares IOHeavy -- vManage and Versa Director -- are
+-						// steered onto the SSD node. Every other VM gets no SSD
++						// SCOPED to kubeVirtIOHeavyModels (data-driven list, 2026-10-29):
++						// the listed models are steered onto the SSD node. Every other VM gets no SSD
+ 						// preference, so the fast node stays free for the
+ 						// appliances whose first boot actually writes tens of GB.
+-						if nodeAffinity := KNEIOHeavyNodeAffinityUnstructured(); nodeAffinity != nil && kubeVirtHardwareProfileFor(n.Proto.Model, "").IOHeavy {
++						if nodeAffinity := KNEIOHeavyNodeAffinityUnstructured(); nodeAffinity != nil && kubeVirtIOHeavyModels[n.Proto.Model] {
+ 							affinity, _ := spec["affinity"].(map[string]any)
+ 							if affinity == nil {
+ 								affinity = map[string]any{}
+diff --git a/topo/node/node_io_heavy_affinity_test.go b/topo/node/node_io_heavy_affinity_test.go
+index d5222ed..228a182 100644
+--- a/topo/node/node_io_heavy_affinity_test.go
++++ b/topo/node/node_io_heavy_affinity_test.go
+@@ -219,65 +219,46 @@ func TestKubeVirtVMObjectSteersRealVManage(t *testing.T) {
+ 	}
+ }
+ 
+-// Same shape for the other two SD-WAN controllers, whose KNE models also
+-// differ from their netlab device keys (vbond/vsmart vs
+-// cisco_sdwan-validator/-controller).
+-// Since 2026-09-23 only IOHeavy profiles are steered: vBond/vSmart boot small
+-// and no longer inherit the SSD preference (vManage, the measured 28 GB case,
+-// is covered by the IOHeavy profile assertion).
+-func TestKubeVirtVMObjectSteersSDWANControllers(t *testing.T) {
++// The SSD preference follows kubeVirtIOHeavyModels (one data list). The
++// requirement, not the implementation: every listed controller/appliance gets
++// the SSD nodeAffinity, and NOS/appliances outside the list get none.
++// Seeded 2026-10-29 (owner): vmanage, vsmart, vbond, director.
++func TestKubeVirtVMObjectSSDAffinityFollowsIOHeavyList(t *testing.T) {
+ 	setIOHeavyEnv(t, `{"skyforge.example.com/disk-class":"ssd"}`)
+-
+-	for model, image := range map[string]string{
+-		"vbond":  "registry.example.com/skyforge/kubevirt/cisco_sdwan-validator:20.18.4-kne-r2",
+-		"vsmart": "registry.example.com/skyforge/kubevirt/cisco_sdwan-controller:20.18.4-kne-r2",
++	const sdwan = "registry.example.com/skyforge/kubevirt/"
++	for _, tc := range []struct {
++		model, image string
++		vendor       topopb.Vendor
++		want         bool
++	}{
++		{"vmanage", sdwan + "cisco_sdwan-manager:20.18.4-kne-r2", topopb.Vendor_CISCO, true},
++		{"vsmart", sdwan + "cisco_sdwan-controller:20.18.4-kne-r2", topopb.Vendor_CISCO, true},
++		{"vbond", sdwan + "cisco_sdwan-validator:20.18.4-kne-r2", topopb.Vendor_CISCO, true},
++		{"director", "registry.example.com/skyforge/kubevirt/vr-versa-director:test", topopb.Vendor_VERSA, true},
++		{"cat8000v", sdwan + "cat8000v:test", topopb.Vendor_CISCO, false},
++		{"panos", "registry.example.com/skyforge/kubevirt/vr-pan:test", topopb.Vendor_PALOALTO, false},
++		{"a10", "registry.example.com/skyforge/kubevirt/a10_vthunder:test", topopb.Vendor_A10, false},
+ 	} {
+-		t.Run(model, func(t *testing.T) {
++		t.Run(tc.model, func(t *testing.T) {
+ 			n := &Impl{
+ 				Namespace: "test",
+ 				Proto: &topopb.Node{
+-					Name:   model,
+-					Vendor: topopb.Vendor_CISCO,
+-					Model:  model,
+-					Config: &topopb.Config{Image: image},
++					Name:   tc.model,
++					Vendor: tc.vendor,
++					Model:  tc.model,
++					Config: &topopb.Config{Image: tc.image},
+ 				},
+ 			}
+ 			vm, err := n.kubeVirtVMObject()
+ 			if err != nil {
+ 				t.Fatalf("kubeVirtVMObject() failed: %v", err)
+ 			}
+-			if _, found, _ := unstructured.NestedSlice(vm.Object,
++			_, found, _ := unstructured.NestedSlice(vm.Object,
+ 				"spec", "template", "spec", "affinity",
+-				"nodeAffinity", "preferredDuringSchedulingIgnoredDuringExecution"); found {
+-				t.Fatalf("%s carries the SSD nodeAffinity; only IOHeavy profiles may", model)
++				"nodeAffinity", "preferredDuringSchedulingIgnoredDuringExecution")
++			if found != tc.want {
++				t.Fatalf("%s: SSD nodeAffinity present=%v, want %v", tc.model, found, tc.want)
+ 			}
+ 		})
+ 	}
+ }
+-
+-// SCOPED 2026-09-23: the SSD preference is for appliances whose first boot is a
+-// large disk write (IOHeavy profiles). PAN-OS, A10, FortiOS and the rest used to
+-// inherit it and crowded the one SSD node for no benefit.
+-func TestKubeVirtVMObjectOmitsIOHeavyAffinityForANonIOHeavyModel(t *testing.T) {
+-	setIOHeavyEnv(t, `{"skyforge.example.com/disk-class":"ssd"}`)
+-	for _, tc := range []struct{ name, model, image string; vendor topopb.Vendor }{
+-		{"panos1", "panos", "vr-pan:test", topopb.Vendor_PALOALTO},
+-		{"a101", "a10", "a10_vthunder:test", topopb.Vendor_A10},
+-	} {
+-		n := &Impl{Namespace: "test", Proto: &topopb.Node{Name: tc.name, Vendor: tc.vendor, Model: tc.model,
+-			Config: &topopb.Config{Image: "registry.example.com/skyforge/kubevirt/" + tc.image}}}
+-		vm, err := n.kubeVirtVMObject()
+-		if err != nil {
+-			t.Fatalf("%s: kubeVirtVMObject() failed: %v", tc.model, err)
+-		}
+-		if _, found, _ := unstructured.NestedSlice(vm.Object, "spec", "template", "spec", "affinity",
+-			"nodeAffinity", "preferredDuringSchedulingIgnoredDuringExecution"); found {
+-			t.Fatalf("%s carries the SSD nodeAffinity; only IOHeavy profiles may", tc.model)
+-		}
+-	}
+-	for _, m := range []string{"vmanage", "director"} {
+-		if !kubeVirtHardwareProfileFor(m, "").IOHeavy {
+-			t.Fatalf("%s must be IOHeavy", m)
+-		}
+-	}
+-}
+-- 
+2.56.0
+

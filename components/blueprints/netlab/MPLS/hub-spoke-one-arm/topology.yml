@@ -1,0 +1,68 @@
+message: |
+  The lab contains three MPLS/VPN PE-devices with three CE-routers attached to them.
+  The PE-devices implement a one-arm hub-and-spoke VRF: the hub VRF receives all the
+  CE-routes (for hub-to-spoke forwarding) and a default route (for spoke-to-hub
+  forwarding)
+
+defaults.device: iol
+version: 25.09
+
+module: [ bgp ]
+plugin: [ bgp.session, files ]
+
+groups:
+  # netlab 26.08 tightening: the CEs must enable bgp themselves, and node-level
+  # `provider: clab` no longer mixes with the platform kne provider.
+  ce:
+    device: eos
+    members: [ ce_s1, ce_s2, ce_hub ]
+    module: [ bgp ]
+  pe:
+    members: [ pe_a, pe_b, pe_h ]
+    module: [ ospf, bgp, vrf, mpls ]
+    bgp.as: 65000
+    mpls.vpn: True
+
+mpls.ldp: True
+
+vrfs:
+  s_1:
+    links: [ pe_a-ce_s1 ]
+    export: [ 65000:100 ]
+    import: [ 65000:101 ]
+  s_2:
+    links: [ pe_b-ce_s2 ]
+    export: [ 65000:100 ]
+    import: [ 65000:101 ]
+  hub:
+    import: [ 65000:100 ]
+    export: [ 65000:101 ]
+    links:
+    - pe_h:
+      ce_hub:
+        bgp.default_originate: True
+
+nodes:
+  pe_a:
+  pe_b:
+  pe_h:
+  p:
+    module: [ mpls, ospf ]
+  ce_hub:
+    bgp.as: 65100
+  ce_s1:
+    bgp.as: 65101
+  ce_s2:
+    bgp.as: 65102
+
+links: [ pe_a-p, pe_b-p, pe_h-p ]
+
+configlets:
+  # netlab 26.08 tightening: duplicate YAML mapping keys are now fatal — the
+  # two alternative EOS stanzas were collapsed to the one the old YAML loader
+  # actually kept (the last duplicate key won).
+  deflabel:
+    eos: |   # issue: https://registry.example.com/git/skyforge/netlab/issues/10
+      router bgp 65000 vrf hub
+        address-family ipv4
+          label vpn export allocation-mode per-nexthop

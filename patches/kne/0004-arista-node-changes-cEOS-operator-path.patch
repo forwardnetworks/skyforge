@@ -1,0 +1,579 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 13:47:18 -0500
+Subject: [PATCH 04/35] arista: node changes (cEOS operator path)
+
+---
+diff --git a/topo/node/arista/arista.go b/topo/node/arista/arista.go
+index b5e46c2..e3b836d 100644
+--- a/topo/node/arista/arista.go
++++ b/topo/node/arista/arista.go
+@@ -22,6 +22,7 @@ import (
+ 	"os"
+ 	"path/filepath"
+ 	"regexp"
++	"strconv"
+ 	"strings"
+ 	"time"
+ 
+@@ -34,6 +35,7 @@ import (
+ 	"google.golang.org/grpc/codes"
+ 	"google.golang.org/grpc/status"
+ 	"google.golang.org/protobuf/proto"
++	"google.golang.org/protobuf/types/known/anypb"
+ 	corev1 "k8s.io/api/core/v1"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	log "k8s.io/klog/v2"
+@@ -53,7 +55,7 @@ var (
+ 	// for unit testing.
+ 	newClient          = ceosclient.NewForConfig
+ 	defaultConstraints = node.Constraints{
+-		CPU:    "500m", // 500 milliCPUs
++		CPU:    "100m", // 100 milliCPUs
+ 		Memory: "1Gi",  // 1 GB RAM
+ 	}
+ )
+@@ -72,8 +74,9 @@ var (
+ 	_ node.ConfigPusher = (*Node)(nil)
+ 	_ node.Resetter     = (*Node)(nil)
+ 
+-	ethIntfRe  = regexp.MustCompile(`^Ethernet\d+(?:/\d+)?(?:/\d+)?$`)
+-	mgmtIntfRe = regexp.MustCompile(`^Management\d+(?:/\d+)?$`)
++	ethIntfRe    = regexp.MustCompile(`^Ethernet\d+(?:/\d+)?(?:/\d+)?$`)
++	mgmtIntfRe   = regexp.MustCompile(`^Management\d+(?:/\d+)?$`)
++	labelValueRE = regexp.MustCompile(`^(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])?$`)
+ )
+ 
+ var (
+@@ -81,25 +84,35 @@ var (
+ 		Name: "default_ceos_node",
+ 		Services: map[uint32]*tpb.Service{
+ 			443: {
++				Name:   "ssl",
+ 				Names:  []string{"ssl"},
+ 				Inside: 443,
+ 			},
+ 			22: {
++				Name:   "ssh",
+ 				Names:  []string{"ssh"},
+ 				Inside: 22,
+ 			},
+ 			6030: {
++				Name:   "gnmi",
+ 				Names:  []string{"gnmi", "gnoi"},
+ 				Inside: 6030,
+ 			},
+ 			9340: {
++				Name:   "gribi",
+ 				Names:  []string{"gribi"},
+ 				Inside: 9340,
+ 			},
+ 			9559: {
++				Name:   "p4rt",
+ 				Names:  []string{"p4rt"},
+ 				Inside: 9559,
+ 			},
++			161: {
++				Name:   "snmp",
++				Names:  []string{"snmp"},
++				Inside: 161,
++			},
+ 		},
+ 		Constraints: map[string]string{
+ 			"cpu":    defaultConstraints.CPU,
+@@ -159,6 +172,12 @@ func (n *Node) Create(ctx context.Context) error {
+ 	if err := n.CreateCRD(ctx); err != nil {
+ 		return fmt.Errorf("node %s failed to create custom resource definition %w", n.Name(), err)
+ 	}
++	// The CEos operator only models TCP services and reconciles its Service
++	// from CEosLabDevice.Spec.Services. KNE owns the collection Service so
++	// the collector can use one stable host for SSH and SNMP.
++	if err := n.CreateService(ctx); err != nil {
++		return fmt.Errorf("node %s failed to create collection service %w", n.Name(), err)
++	}
+ 	return nil
+ }
+ 
+@@ -237,6 +256,26 @@ func (n *Node) CreateCRD(ctx context.Context) error {
+ 	if linksLen > math.MaxInt32 {
+ 		return fmt.Errorf("links count %d out of range (max: %d)", linksLen, math.MaxInt32)
+ 	}
++	env := map[string]string{}
++	for k, v := range config.GetEnv() {
++		env[k] = v
++	}
++	for _, key := range []string{
++		"SKYFORGE_KNE_NODE_SELECTOR_JSON",
++		"KNE_NODE_SELECTOR_HOSTNAME",
++		"SKYFORGE_KNE_ALLOW_TAINTED_NODES",
++		"SKYFORGE_KNE_TAINT_KEY",
++		"SKYFORGE_KNE_TAINT_VALUE",
++		"SKYFORGE_KNE_TAINT_EFFECT",
++		"SKYFORGE_KNE_PRIORITY_CLASS_NAME",
++	} {
++		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
++			env[key] = value
++		}
++	}
++	if _, ok := env["CLAB_INTFS"]; !ok {
++		env["CLAB_INTFS"] = strconv.Itoa(linksLen)
++	}
+ 	device := &ceos.CEosLabDevice{
+ 		TypeMeta: metav1.TypeMeta{
+ 			APIVersion: "ceoslab.arista.com/v1alpha1",
+@@ -251,7 +290,7 @@ func (n *Node) CreateCRD(ctx context.Context) error {
+ 			},
+ 		},
+ 		Spec: ceos.CEosLabDeviceSpec{
+-			EnvVar:             config.GetEnv(),
++			EnvVar:             env,
+ 			Image:              config.GetImage(),
+ 			InitContainerImage: config.GetInitImage(),
+ 			Args:               config.GetArgs(),
+@@ -261,26 +300,17 @@ func (n *Node) CreateCRD(ctx context.Context) error {
+ 		},
+ 	}
+ 	for label, v := range proto.GetLabels() {
+-		device.ObjectMeta.Labels[label] = v
+-	}
+-	for _, service := range proto.GetServices() {
+-		insidePort := service.Inside
+-		if insidePort > math.MaxUint16 {
+-			return fmt.Errorf("inside port %d out of range (max: %d)", insidePort, math.MaxUint16)
+-		}
+-		outsidePort := service.Outside
+-		if outsidePort > math.MaxUint16 {
+-			return fmt.Errorf("outside port %d out of range (max: %d)", outsidePort, math.MaxUint16)
+-		}
+-		if device.Spec.Services == nil {
+-			device.Spec.Services = map[string]ceos.ServiceConfig{}
++		label = strings.TrimSpace(label)
++		value := strings.TrimSpace(v)
++		if label == "" {
++			continue
+ 		}
+-		device.Spec.Services[service.Name] = ceos.ServiceConfig{
+-			TCPPorts: []ceos.PortConfig{{
+-				In:  int32(insidePort),
+-				Out: int32(outsidePort),
+-			}},
++		// Ignore malformed label values from topology input (for example "<nil>")
++		// so Kubernetes label validation does not reject the CEosLabDevice CR.
++		if value == "<nil>" || !labelValueRE.MatchString(value) {
++			continue
+ 		}
++		device.ObjectMeta.Labels[label] = value
+ 	}
+ 	if cert := config.GetCert(); cert != nil {
+ 		if ssCert := cert.GetSelfSigned(); ssCert != nil {
+@@ -486,6 +516,14 @@ func defaults(pb *tpb.Node) *tpb.Node {
+ 	if pb.Config.Cert == nil {
+ 		pb.Config.Cert = defaultNodeClone.Config.Cert
+ 	}
++	if pb.Config.VendorData == nil {
++		vendorData, err := anypb.New(&cpb.CEosLabConfig{
++			WaitForAgents: []string{"ConfigAgent", "Sysdb"},
++		})
++		if err == nil {
++			pb.Config.VendorData = vendorData
++		}
++	}
+ 	return pb
+ }
+ 
+diff --git a/topo/node/arista/arista_test.go b/topo/node/arista/arista_test.go
+index 1294ea2..e948baa 100644
+--- a/topo/node/arista/arista_test.go
++++ b/topo/node/arista/arista_test.go
+@@ -37,6 +37,7 @@ import (
+ 	corev1 "k8s.io/api/core/v1"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/util/intstr"
+ 	"k8s.io/apimachinery/pkg/watch"
+ 	"k8s.io/client-go/kubernetes/fake"
+ 	"k8s.io/client-go/rest"
+@@ -63,6 +64,13 @@ func (f *fakeWatch) ResultChan() <-chan watch.Event {
+ }
+ 
+ func TestNew(t *testing.T) {
++	defaultVendorData, err := anypb.New(&ceospb.CEosLabConfig{
++		WaitForAgents: []string{"ConfigAgent", "Sysdb"},
++	})
++	if err != nil {
++		t.Fatalf("cannot marshal default CEosLabConfig into \"any\" protobuf: %v", err)
++	}
++
+ 	tests := []struct {
+ 		desc    string
+ 		nImpl   *node.Impl
+@@ -132,7 +140,8 @@ func TestNew(t *testing.T) {
+ 					ConfigPath:   "/mnt/flash",
+ 					ConfigFile:   "startup-config",
+ 					Image:        "ceos:latest",
+-					InitImage:    "us-west1-docker.pkg.dev/kne-external/kne/init-wait:ga",
++					InitImage:    "registry.example.com/skyforge/kne/init-wait:20260925-sandbox-r2",
++					VendorData:   defaultVendorData,
+ 					Cert: &topopb.CertificateCfg{
+ 						Config: &topopb.CertificateCfg_SelfSigned{
+ 							SelfSigned: &topopb.SelfSignedCertCfg{
+@@ -151,30 +160,40 @@ func TestNew(t *testing.T) {
+ 					"ondatra-role": "DUT",
+ 				},
+ 				Constraints: map[string]string{
+-					"cpu":    "500m",
++					"cpu":    "100m",
+ 					"memory": "1Gi",
+ 				},
+ 				Services: map[uint32]*topopb.Service{
+ 					443: {
++						Name:   "ssl",
+ 						Names:  []string{"ssl"},
+ 						Inside: 443,
+ 					},
+ 					22: {
++						Name:   "ssh",
+ 						Names:  []string{"ssh"},
+ 						Inside: 22,
+ 					},
+ 					6030: {
++						Name:   "gnmi",
+ 						Names:  []string{"gnmi", "gnoi"},
+ 						Inside: 6030,
+ 					},
+ 					9340: {
++						Name:   "gribi",
+ 						Names:  []string{"gribi"},
+ 						Inside: 9340,
+ 					},
+ 					9559: {
++						Name:   "p4rt",
+ 						Names:  []string{"p4rt"},
+ 						Inside: 9559,
+ 					},
++					161: {
++						Name:   "snmp",
++						Names:  []string{"snmp"},
++						Inside: 161,
++					},
+ 				},
+ 				Model: "ceos",
+ 				Os:    "eos",
+@@ -213,9 +232,10 @@ func TestNew(t *testing.T) {
+ 				Config: &topopb.Config{
+ 					EntryCommand: fmt.Sprintf("kubectl exec -it %s -- Cli", ""),
+ 					Image:        "foo",
+-					InitImage:    "us-west1-docker.pkg.dev/kne-external/kne/init-wait:ga",
++					InitImage:    "registry.example.com/skyforge/kne/init-wait:20260925-sandbox-r2",
+ 					ConfigPath:   "/mnt/flash",
+ 					ConfigFile:   "startup-config",
++					VendorData:   defaultVendorData,
+ 					Env: map[string]string{
+ 						"CEOS":      "123",
+ 						"container": "test",
+@@ -240,30 +260,40 @@ func TestNew(t *testing.T) {
+ 					"ondatra-role": "DUT",
+ 				},
+ 				Constraints: map[string]string{
+-					"cpu":    "500m",
++					"cpu":    "100m",
+ 					"memory": "1Gi",
+ 				},
+ 				Services: map[uint32]*topopb.Service{
+ 					443: {
++						Name:   "ssl",
+ 						Names:  []string{"ssl"},
+ 						Inside: 443,
+ 					},
+ 					22: {
++						Name:   "ssh",
+ 						Names:  []string{"ssh"},
+ 						Inside: 22,
+ 					},
+ 					6030: {
++						Name:   "gnmi",
+ 						Names:  []string{"gnmi", "gnoi"},
+ 						Inside: 6030,
+ 					},
+ 					9340: {
++						Name:   "gribi",
+ 						Names:  []string{"gribi"},
+ 						Inside: 9340,
+ 					},
+ 					9559: {
++						Name:   "p4rt",
+ 						Names:  []string{"p4rt"},
+ 						Inside: 9559,
+ 					},
++					161: {
++						Name:   "snmp",
++						Names:  []string{"snmp"},
++						Inside: 161,
++					},
+ 				},
+ 			},
+ 		},
+@@ -296,11 +326,7 @@ func TestCRD(t *testing.T) {
+ 	}
+ 	// Fake kubeclient
+ 	name := "device"
+-	ki := fake.NewSimpleClientset(&corev1.Pod{
+-		ObjectMeta: metav1.ObjectMeta{
+-			Name: name,
+-		},
+-	})
++	ns := "default"
+ 	reaction := func(action ktest.Action) (handled bool, ret watch.Interface, err error) {
+ 		f := &fakeWatch{
+ 			e: []watch.Event{{
+@@ -313,7 +339,6 @@ func TestCRD(t *testing.T) {
+ 		}
+ 		return true, f, nil
+ 	}
+-	ki.PrependWatchReactor("*", reaction)
+ 	// Marshal vendor data-- verbose to do inline
+ 	vendorData, err := anypb.New(&ceospb.CEosLabConfig{
+ 		WaitForAgents: []string{"ConfigAgent", "Sysdb"},
+@@ -330,6 +355,7 @@ func TestCRD(t *testing.T) {
+ 		desc       string
+ 		proto      *topopb.Node
+ 		wantDevice *ceos.CEosLabDeviceSpec
++		wantUDP    bool
+ 		wantErr    string
+ 	}{{
+ 		desc: "success",
+@@ -371,9 +397,15 @@ func TestCRD(t *testing.T) {
+ 					Inside:  200,
+ 					Outside: 210,
+ 				},
++				161: {
++					Name:    "snmp",
++					Inside:  161,
++					Outside: 161,
++					Names:   []string{"snmp"},
++				},
+ 			},
+ 			Constraints: map[string]string{
+-				"cpu":    "500m",
++				"cpu":    "100m",
+ 				"memory": "2Gb",
+ 			},
+ 			Vendor:  topopb.Vendor_ARISTA,
+@@ -398,29 +430,16 @@ func TestCRD(t *testing.T) {
+ 		},
+ 		wantDevice: &ceos.CEosLabDeviceSpec{
+ 			EnvVar: map[string]string{
+-				"ENV1": "VAL1",
+-				"ENV2": "VAL2",
++				"CLAB_INTFS": "2",
++				"ENV1":       "VAL1",
++				"ENV2":       "VAL2",
+ 			},
+ 			Image: "test-image",
+ 			Args:  []string{"arg1", "arg2"},
+ 			Resources: map[string]string{
+-				"cpu":    "500m",
++				"cpu":    "100m",
+ 				"memory": "2Gb",
+ 			},
+-			Services: map[string]ceos.ServiceConfig{
+-				"foo": {
+-					TCPPorts: []ceos.PortConfig{{
+-						In:  100,
+-						Out: 110,
+-					}},
+-				},
+-				"gnmi": {
+-					TCPPorts: []ceos.PortConfig{{
+-						In:  200,
+-						Out: 210,
+-					}},
+-				},
+-			},
+ 			InitContainerImage: "test-init-image",
+ 			NumInterfaces:      2,
+ 			Sleep:              1,
+@@ -443,14 +462,124 @@ func TestCRD(t *testing.T) {
+ 				"TestToggle2": false,
+ 			},
+ 		},
++		wantUDP: true,
++		wantErr: "",
++	}, {
++		desc: "success without vendor data uses default waitforagents",
++		proto: &topopb.Node{
++			Type: topopb.Node_ARISTA_CEOS,
++			Labels: map[string]string{
++				"foo": "bar",
++				"biz": "baz",
++			},
++			Config: &topopb.Config{
++				Args:  []string{"arg1", "arg2"},
++				Image: "test-image",
++				Env: map[string]string{
++					"ENV1": "VAL1",
++					"ENV2": "VAL2",
++				},
++				Sleep: 1,
++				Cert: &topopb.CertificateCfg{
++					Config: &topopb.CertificateCfg_SelfSigned{
++						SelfSigned: &topopb.SelfSignedCertCfg{
++							CertName:   "foo",
++							KeyName:    "bar",
++							KeySize:    4096,
++							CommonName: "device",
++						},
++					},
++				},
++				InitImage: "test-init-image",
++			},
++			Services: map[uint32]*topopb.Service{
++				100: {
++					Name:    "foo",
++					Inside:  100,
++					Outside: 110,
++				},
++				200: {
++					Name:    "gnmi",
++					Inside:  200,
++					Outside: 210,
++				},
++				161: {
++					Name:    "snmp",
++					Inside:  161,
++					Outside: 161,
++					Names:   []string{"snmp"},
++				},
++			},
++			Constraints: map[string]string{
++				"cpu":    "100m",
++				"memory": "2Gb",
++			},
++			Vendor:  topopb.Vendor_ARISTA,
++			Model:   "ceoslab",
++			Version: "version-test",
++			Os:      "os-test",
++			Interfaces: map[string]*topopb.Interface{
++				"eth0": {
++					Name: "Management1",
++				},
++				"eth1": {
++					Name:        "Ethernet1/1",
++					PeerIntName: "eth1",
++					PeerName:    "foo",
++				},
++				"eth2": {
++					Name:        "Ethernet1/2",
++					PeerIntName: "eth2",
++					PeerName:    "foo",
++				},
++			},
++		},
++		wantDevice: &ceos.CEosLabDeviceSpec{
++			EnvVar: map[string]string{
++				"CLAB_INTFS": "2",
++				"ENV1":       "VAL1",
++				"ENV2":       "VAL2",
++			},
++			Image: "test-image",
++			Args:  []string{"arg1", "arg2"},
++			Resources: map[string]string{
++				"cpu":    "100m",
++				"memory": "2Gb",
++			},
++			InitContainerImage: "test-init-image",
++			NumInterfaces:      2,
++			Sleep:              1,
++			CertConfig: ceos.CertConfig{
++				SelfSignedCerts: []ceos.SelfSignedCertConfig{{
++					CertName:   "foo",
++					KeyName:    "bar",
++					KeySize:    4096,
++					CommonName: "device",
++				}},
++			},
++			IntfMapping: map[string]string{
++				"eth0": "Management1",
++				"eth1": "Ethernet1/1",
++				"eth2": "Ethernet1/2",
++			},
++			WaitForAgents: []string{"ConfigAgent", "Sysdb"},
++		},
++		wantUDP: true,
+ 		wantErr: "",
+ 	}}
+ 
+ 	ctx := context.Background()
+ 	getOpts := metav1.GetOptions{}
+-	ns := "default"
+ 	for _, tt := range tests {
+ 		t.Run(tt.desc, func(t *testing.T) {
++			ki := fake.NewSimpleClientset(
++				&corev1.Pod{
++					ObjectMeta: metav1.ObjectMeta{
++						Name: name,
++					},
++				},
++			)
++			ki.PrependWatchReactor("*", reaction)
+ 			node := &Node{
+ 				Impl: &node.Impl{
+ 					KubeClient: ki,
+@@ -459,7 +588,8 @@ func TestCRD(t *testing.T) {
+ 				},
+ 			}
+ 			node.Impl.Proto.Name = name
+-			err := node.CreateCRD(ctx)
++			node.Impl.Proto = defaults(node.Impl.Proto)
++			err := node.Create(ctx)
+ 			if s := errdiff.Check(err, tt.wantErr); s != "" {
+ 				t.Errorf("New() unexpected err: %s", s)
+ 			}
+@@ -470,6 +600,44 @@ func TestCRD(t *testing.T) {
+ 			if s := cmp.Diff(tt.wantDevice, &device.Spec); s != "" {
+ 				t.Errorf("New() CEosLabDevice CRDs unexpected diff (-want +got):\n%s", s)
+ 			}
++			if tt.wantUDP {
++				service, err := ki.CoreV1().Services(ns).Get(ctx, fmt.Sprintf("service-%s", name), getOpts)
++				if err != nil {
++					t.Fatalf("Could not get collection service: %v", err)
++				}
++				wantPorts := map[string]corev1.ServicePort{
++					"foo": {
++						Name:       "foo",
++						Protocol:   corev1.ProtocolTCP,
++						Port:       100,
++						TargetPort: intstr.FromInt(100),
++					},
++					"gnmi": {
++						Name:       "gnmi",
++						Protocol:   corev1.ProtocolTCP,
++						Port:       200,
++						TargetPort: intstr.FromInt(200),
++					},
++					"snmp": {
++						Name:       "snmp",
++						Protocol:   corev1.ProtocolUDP,
++						Port:       161,
++						TargetPort: intstr.FromInt(161),
++					},
++				}
++				gotPorts := map[string]corev1.ServicePort{}
++				for _, port := range service.Spec.Ports {
++					gotPorts[port.Name] = corev1.ServicePort{
++						Name:       port.Name,
++						Protocol:   port.Protocol,
++						Port:       port.Port,
++						TargetPort: port.TargetPort,
++					}
++				}
++				if s := cmp.Diff(wantPorts, gotPorts); s != "" {
++					t.Fatalf("collection service ports mismatch (-want +got):\n%s", s)
++				}
++			}
+ 		})
+ 	}
+ }
+-- 
+2.56.0
+

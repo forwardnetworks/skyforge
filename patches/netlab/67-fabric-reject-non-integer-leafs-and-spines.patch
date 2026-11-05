@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 09:23:16 -0600
+Subject: [PATCH] fabric plugin: reject non-integer fabric.leafs /
+ fabric.spines with a readable error
+
+---
+diff --git a/netsim/extra/fabric/__init__.py b/netsim/extra/fabric/__init__.py
+index cd93a36..b33cb97 100644
+--- a/netsim/extra/fabric/__init__.py
++++ b/netsim/extra/fabric/__init__.py
+@@ -4,7 +4,7 @@ from box import Box
+ 
+ from netsim import data
+ from netsim.augment.links import adjust_link_list
+-from netsim.utils import strings
++from netsim.utils import log, strings
+ 
+ _description = 'Build a leaf-and-spine fabric'
+ _config_name = 'fabric'
+@@ -193,6 +193,12 @@ def topology_expand(topology: Box) -> None:
+   l_cnt = topology.get('fabric.leafs',1)                    # Get number of leafs and spines
+   s_cnt = topology.get('fabric.spines',1)                   # Missing values ==> 1, validation code will complain in a minute ;)
+ 
++  for k,v in (('leafs',l_cnt),('spines',s_cnt)):           # fabric.leafs/spines are NUMBERS (the count), not dictionaries
++    if not isinstance(v,int) or isinstance(v,bool):
++      log.error(f'fabric.{k} must be an integer (number of {k}), found {type(v).__name__}. Use fabric.{k[:-1]} for per-{k[:-1]} parameters',
++        log.IncorrectType,'fabric')
++      return
++
+   # Create the fabric groups, nodes and links
+   (grp,nodes,links) = generate_fabric(topology,l_cnt,s_cnt)
+ 
+diff --git a/tests/errors/fabric-count-not-integer-spines.log b/tests/errors/fabric-count-not-integer-spines.log
+new file mode 100644
+index 0000000..b5b1973
+--- /dev/null
++++ b/tests/errors/fabric-count-not-integer-spines.log
+@@ -0,0 +1,2 @@
++IncorrectType in fabric: fabric.spines must be an integer (number of spines), found Box. Use fabric.spine for per-spine parameters
++Fatal error in netlab: Cannot proceed beyond this point due to errors, exiting
+diff --git a/tests/errors/fabric-count-not-integer-spines.yml b/tests/errors/fabric-count-not-integer-spines.yml
+new file mode 100644
+index 0000000..4d6224b
+--- /dev/null
++++ b/tests/errors/fabric-count-not-integer-spines.yml
+@@ -0,0 +1,8 @@
++---
++defaults.device: eos
++plugin: [ fabric ]
++
++fabric:
++  spines:
++    count: 2
++  leafs: 4
+diff --git a/tests/errors/fabric-count-not-integer.log b/tests/errors/fabric-count-not-integer.log
+new file mode 100644
+index 0000000..a2810e3
+--- /dev/null
++++ b/tests/errors/fabric-count-not-integer.log
+@@ -0,0 +1,2 @@
++IncorrectType in fabric: fabric.leafs must be an integer (number of leafs), found Box. Use fabric.leaf for per-leaf parameters
++Fatal error in netlab: Cannot proceed beyond this point due to errors, exiting
+diff --git a/tests/errors/fabric-count-not-integer.yml b/tests/errors/fabric-count-not-integer.yml
+new file mode 100644
+index 0000000..185cecc
+--- /dev/null
++++ b/tests/errors/fabric-count-not-integer.yml
+@@ -0,0 +1,10 @@
++---
++# fabric.leafs and fabric.spines are the NUMBER of leafs/spines; per-device parameters go into fabric.leaf / fabric.spine
++defaults.device: eos
++plugin: [ fabric ]
++
++fabric:
++  spines:
++    count: 2
++  leafs:
++    count: 4
+-- 
+2.56.0
+

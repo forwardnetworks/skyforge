@@ -1,0 +1,36 @@
+message: |
+  This topology sets up a simple network using DHCP relay functionality.
+  It includes a DHCP server (running on Cisco IOSv), DHCP client (also
+  on Cisco IOSv) and an intermediate node.
+
+defaults.attributes:
+  link.dhcp:
+    client: bool
+    server: str
+
+defaults.device: iol
+
+groups:
+  dhcp_server:
+    members: [ srv ]
+    module: [ ospf ]
+    config: [ dhcp-server ]
+    device: iol
+  dhcp_client:
+    members: [ user ]
+    config: [ dhcp-client ]
+    device: iol
+  switch:
+    members: [ relay ]
+    module: [ ospf ]
+    config: [ dhcp-relay ]
+
+nodes: [ srv, relay, user ]
+
+links:
+- relay-srv
+- user:
+    dhcp.client: True
+  relay:
+    dhcp.server: srv
+  type: lan

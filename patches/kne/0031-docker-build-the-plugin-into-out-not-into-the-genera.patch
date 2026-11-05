@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 14:38:14 -0500
+Subject: [PATCH 31/35] docker: build the plugin into /out, not into the
+ generated meshnet/ directory
+
+---
+diff --git a/third_party/meshnet/docker/Dockerfile b/third_party/meshnet/docker/Dockerfile
+index 299991d..821c447 100644
+--- a/third_party/meshnet/docker/Dockerfile
++++ b/third_party/meshnet/docker/Dockerfile
+@@ -43,8 +43,12 @@ COPY utils/ utils/
+ COPY --from=proto_base /src/ .
+ 
+ 
+-RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o meshnet ./plugin && \
+-    GOOS=${TARGETOS} CGO_ENABLED=0 GOARCH=${TARGETARCH} go build -ldflags="-s -w" -o meshnetd daemon/main.go
++# Build into /out. The proto stage copies the generated meshnet/ package tree
++# into this directory, so "-o meshnet" would name a directory and go would
++# write the binary inside it as meshnet/plugin (found 2026-10-20: the plugin
++# shipped as /plugin and /v1beta1 at the image root, and /meshnet was missing).
++RUN mkdir -p /out && GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /out/meshnet ./plugin && \
++    GOOS=${TARGETOS} CGO_ENABLED=0 GOARCH=${TARGETARCH} go build -ldflags="-s -w" -o /out/meshnetd daemon/main.go
+ 
+ 
+ #----------------------------------------------------- Final Container ---------------------------------
+@@ -53,8 +57,8 @@ RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o meshnet ./plugin && \
+ FROM busybox:1.38.0
+ 
+ COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+-COPY --from=build /go/src/github.com/openconfig/kne/third_party/meshnet/meshnet /
+-COPY --from=build /go/src/github.com/openconfig/kne/third_party/meshnet/meshnetd /
++COPY --from=build /out/meshnet /
++COPY --from=build /out/meshnetd /
+ COPY docker/new-entrypoint.sh /entrypoint.sh
+ COPY LICENSE /
+ RUN chmod +x ./entrypoint.sh /meshnetd
+-- 
+2.56.0
+

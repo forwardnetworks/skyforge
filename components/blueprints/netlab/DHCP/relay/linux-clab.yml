@@ -1,0 +1,37 @@
+message: |
+  This topology sets up a simple network using DHCP relay functionality.
+  It includes a DHCP server (running on Cisco IOSv), DHCP client (also
+  on Cisco IOSv) and an intermediate node.
+
+provider: kne
+defaults.attributes:
+  link.dhcp:
+    client: bool
+    server: str
+
+groups:
+  dhcp_server:
+    members: [ srv ]
+    device: linux
+    clab.image: strm/dnsmasq
+    clab.config_templates:
+      "dhcp-server/dnsmasq" : "/etc/dnsmasq.conf"
+  dhcp_client:
+    members: [ user ]
+    config: [ dhcp-client ]
+    device: linux
+    clab.image: alpine
+  switch:
+    members: [ relay ]
+    config: [ dhcp-relay ]
+    device: eos
+
+nodes: [ srv, relay, user ]
+
+links:
+- relay-srv
+- user:
+    dhcp.client: True
+  relay:
+    dhcp.server: srv
+  type: lan

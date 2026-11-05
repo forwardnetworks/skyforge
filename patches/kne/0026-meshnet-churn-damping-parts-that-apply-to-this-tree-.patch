@@ -1,0 +1,159 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 14:15:01 -0500
+Subject: [PATCH 26/35] meshnet: churn damping parts that apply to this tree
+ (M0009, ported in part)
+
+---
+diff --git a/third_party/meshnet/daemon/grpcwire/grpcwire.go b/third_party/meshnet/daemon/grpcwire/grpcwire.go
+index adcfa7f..b4de983 100644
+--- a/third_party/meshnet/daemon/grpcwire/grpcwire.go
++++ b/third_party/meshnet/daemon/grpcwire/grpcwire.go
+@@ -237,11 +237,13 @@ func DeleteWire(wire *GRPCWire) int {
+ // This function clear up the in-memory data base as well as the K8S Datastore.
+ func DeletePodWires(namespace string, podName string) error {
+ 	var errs errlist.List
++	removed := 0
+ 	for {
+ 		aW, _ := ExtractOneWireByPod(namespace, podName)
+ 		if aW == nil {
+ 			break
+ 		}
++		removed++
+ 
+ 		// Since this wire is already extracted, so it no more preset in in-memory-map. Next we need to clear only the K8S data store.
+ 		if err := RemoveWireAcrosAll(aW, false); err != nil {
+@@ -254,7 +256,13 @@ func DeletePodWires(namespace string, podName string) error {
+ 	if errs.Err() != nil {
+ 		return fmt.Errorf("[WIRE-DELETE]:failed to remove all grpc-wires for pod %s@%s: %w", podName, namespace, errs.Err())
+ 	}
+-	grpcOvrlyLogger.Infof("[WIRE-DELETE]:All grpc-wires for pod %s:%s is deleted", namespace, podName)
++	if removed > 0 {
++		grpcOvrlyLogger.Infof("[WIRE-DELETE]:All grpc-wires for pod %s:%s is deleted (%d)", namespace, podName, removed)
++	} else {
++		// A DEL with no wires is the normal case on every sandbox retry. Info here
++		// read as overlay churn in VXLAN labs (M0009).
++		grpcOvrlyLogger.Debugf("[WIRE-DELETE]: no grpc-wires for pod %s:%s", namespace, podName)
++	}
+ 	return nil
+ }
+ 
+diff --git a/third_party/meshnet/daemon/meshnet/handler.go b/third_party/meshnet/daemon/meshnet/handler.go
+index b8924f9..0dff104 100644
+--- a/third_party/meshnet/daemon/meshnet/handler.go
++++ b/third_party/meshnet/daemon/meshnet/handler.go
+@@ -333,7 +333,7 @@ func (m *Meshnet) SkipReverse(ctx context.Context, skip *mpb.SkipQuery) (*mpb.Bo
+ 				mnetdLogger.Errorf("skipReverse : unable to retrieve Skipped: %v", err)
+ 				continue
+ 			}
+-			if skipped.PodName != skip.Peer && skipped.LinkId != skip.LinkId {
++			if keepSkippedEntry(skipped, skip.Peer, skip.LinkId) {
+ 				mnetdLogger.Infof("Appending new element %s@%d", skipped.PodName, skipped.LinkId)
+ 				newThisSkipped = append(newThisSkipped, elSkipped)
+ 			}
+@@ -610,3 +610,12 @@ func (m *Meshnet) repairLinks(ctx context.Context, pod *mpb.PodQuery, topo *unst
+ 	}
+ 	return &mpb.RepairLinkNowResponse{Repaired: int32(len(links))}, nil
+ }
++
++// keepSkippedEntry reports whether a Skipped entry survives a reverse-skip for
++// (peer, linkId). Only the exact pair is removed. The upstream filter used
++// && of two inequalities, so it dropped every entry that shared the peer name
++// OR the link id, and a second link to the same peer lost its skip (M0009,
++// patches/meshnet-cni 0009: SkipReverse's own-list filter, De Morgan bug).
++func keepSkippedEntry(entry v1beta1.Skipped, peer string, linkId int64) bool {
++	return !(entry.PodName == peer && entry.LinkId == linkId)
++}
+diff --git a/third_party/meshnet/daemon/meshnet/handler_skip_test.go b/third_party/meshnet/daemon/meshnet/handler_skip_test.go
+new file mode 100644
+index 0000000..0d96cf8
+--- /dev/null
++++ b/third_party/meshnet/daemon/meshnet/handler_skip_test.go
+@@ -0,0 +1,29 @@
++package meshnet
++
++import (
++	"testing"
++
++	"github.com/openconfig/kne/third_party/meshnet/api/types/v1beta1"
++)
++
++// The requirement (M0009): a reverse-skip removes exactly the (peer, link)
++// entry. An entry for the same peer on another link, or another peer on the
++// same link id, stays.
++func TestKeepSkippedEntryRemovesOnlyExactPair(t *testing.T) {
++	cases := []struct {
++		name  string
++		entry v1beta1.Skipped
++		want  bool
++	}{
++		{name: "exact pair is removed", entry: v1beta1.Skipped{PodName: "b", LinkId: 1}, want: false},
++		{name: "same peer, other link is kept", entry: v1beta1.Skipped{PodName: "b", LinkId: 2}, want: true},
++		{name: "other peer, same link id is kept", entry: v1beta1.Skipped{PodName: "c", LinkId: 1}, want: true},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			if got := keepSkippedEntry(tc.entry, "b", 1); got != tc.want {
++				t.Fatalf("keepSkippedEntry(%+v) = %v, want %v", tc.entry, got, tc.want)
++			}
++		})
++	}
++}
+diff --git a/third_party/meshnet/plugin/meshnet.go b/third_party/meshnet/plugin/meshnet.go
+index 71240ca..f722a76 100644
+--- a/third_party/meshnet/plugin/meshnet.go
++++ b/third_party/meshnet/plugin/meshnet.go
+@@ -411,6 +411,12 @@ func cmdDel(args *skel.CmdArgs) error {
+ 				linkType = "vxlan"
+ 			}
+ 		}
++		if isProtectedIntf(link.LocalIntf) {
++			// A topology that names the pod's default or loopback interface must
++			// not take it down (M0009, defence in depth).
++			log.Errorf("Del: refusing to remove protected interface %q on pod %s", link.LocalIntf, localPod.Name)
++			continue
++		}
+ 		log.Infof("Del: Removing link %s", link.LocalIntf)
+ 		if err := removeLink(args.Netns, link.LocalIntf); err != nil {
+ 			// instead of failing, just log the error and move on
+@@ -488,3 +494,13 @@ func checkCrossNamespaceLinks(localNs string, links []*mpb.Link, linkType string
+ 	}
+ 	return nil
+ }
++
++// isProtectedIntf names the interfaces a CNI DEL never removes: the empty name,
++// the pod's default interface, and loopback.
++func isProtectedIntf(name string) bool {
++	switch name {
++	case "", "eth0", "lo":
++		return true
++	}
++	return false
++}
+diff --git a/third_party/meshnet/plugin/meshnet_protected_test.go b/third_party/meshnet/plugin/meshnet_protected_test.go
+new file mode 100644
+index 0000000..6f29bd7
+--- /dev/null
++++ b/third_party/meshnet/plugin/meshnet_protected_test.go
+@@ -0,0 +1,18 @@
++package main
++
++import "testing"
++
++// The requirement (M0009): the pod's default and loopback interfaces are never
++// removed by a DEL, whatever the topology says. Real link names are not.
++func TestIsProtectedIntf(t *testing.T) {
++	for _, n := range []string{"", "eth0", "lo"} {
++		if !isProtectedIntf(n) {
++			t.Fatalf("isProtectedIntf(%q) = false, want true", n)
++		}
++	}
++	for _, n := range []string{"eth1", "eth14", "pod980816f36b7"} {
++		if isProtectedIntf(n) {
++			t.Fatalf("isProtectedIntf(%q) = true, want false", n)
++		}
++	}
++}
+-- 
+2.56.0
+

@@ -1,0 +1,361 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 13:41:04 -0500
+Subject: [PATCH 22/35] meshnet: peer_namespace on a Link, a cross-namespace
+ link is one link (M0023)
+
+---
+diff --git a/third_party/meshnet/api/types/v1beta1/topology.go b/third_party/meshnet/api/types/v1beta1/topology.go
+index e942d2f..45c1e6e 100644
+--- a/third_party/meshnet/api/types/v1beta1/topology.go
++++ b/third_party/meshnet/api/types/v1beta1/topology.go
+@@ -53,7 +53,10 @@ type Link struct {
+ 	PeerIntf  string `json:"peer_intf"`
+ 	PeerIP    string `json:"peer_ip"`
+ 	PeerPod   string `json:"peer_pod"`
+-	UID       int    `json:"uid"`
++	// PeerNamespace is the namespace of the peer's Topology. Empty means the
++	// same namespace as this Topology (every link KNE generates).
++	PeerNamespace string `json:"peer_namespace,omitempty"`
++	UID           int    `json:"uid"`
+ }
+ 
+ // Topology is the Schema for the topologies API.
+diff --git a/third_party/meshnet/daemon/meshnet/controller.go b/third_party/meshnet/daemon/meshnet/controller.go
+index b1f0cdf..864cb79 100644
+--- a/third_party/meshnet/daemon/meshnet/controller.go
++++ b/third_party/meshnet/daemon/meshnet/controller.go
+@@ -122,12 +122,14 @@ func parsePodLinks(topo *unstructured.Unstructured) ([]wireutil.PodLinkConfig, e
+ 		peerIntf, _, _ := unstructured.NestedString(rl, "peer_intf")
+ 		peerIP, _, _ := unstructured.NestedString(rl, "peer_ip")
+ 		uid, _, _ := unstructured.NestedInt64(rl, "uid")
++		peerNs, _, _ := unstructured.NestedString(rl, "peer_namespace")
+ 
+ 		links = append(links, wireutil.PodLinkConfig{
+ 			PodName:     podName,
+ 			PeerPodName: peerPod,
+ 			LinkUID:     uid,
+ 			KubeNs:      kubeNs,
++			PeerKubeNs:  wireutil.PeerNamespace(kubeNs, peerNs),
+ 			LocalIntf:   localIntf,
+ 			LocalIP:     localIP,
+ 			PeerIntf:    peerIntf,
+@@ -254,15 +256,16 @@ func (m *Meshnet) reconcilePodLinksInternal(ctx context.Context, topo *unstructu
+ 
+ 	sameNodeLinks := make([]wireutil.PodLinkConfig, 0, len(links))
+ 	for _, link := range links {
+-		peerTopo, ok := peerCache[link.PeerPodName]
++		peerKey := link.PeerKubeNs + "/" + link.PeerPodName
++		peerTopo, ok := peerCache[peerKey]
+ 		if !ok {
+ 			var err error
+-			peerTopo, err = m.getPod(ctx, link.PeerPodName, link.KubeNs)
++			peerTopo, err = m.getPod(ctx, link.PeerPodName, link.PeerKubeNs)
+ 			if err != nil {
+-				peerCache[link.PeerPodName] = nil
++				peerCache[peerKey] = nil
+ 				continue
+ 			}
+-			peerCache[link.PeerPodName] = peerTopo
++			peerCache[peerKey] = peerTopo
+ 		}
+ 		if peerTopo == nil {
+ 			continue
+@@ -363,7 +366,8 @@ func (m *Meshnet) reconcilePodLinksInternal(ctx context.Context, topo *unstructu
+ 					IntfName: link.LocalIntf,
+ 					IntfIp:   link.LocalIP,
+ 					PeerVtep: peerSrcIP,
+-					Vni:      link.LinkUID + wireutil.NamespaceVNIOffset(link.KubeNs),
++					// Both ends of a cross-namespace link must derive the same VNI, so the key is the ordered pair.
++					Vni:      link.LinkUID + wireutil.NamespaceVNIOffset(wireutil.LinkKeyNamespace(link.KubeNs, link.PeerKubeNs)),
+ 					KubeNs:   link.KubeNs,
+ 				}
+ 				mnetdLogger.Infof("ReconcilePodLinks: configuring remote VXLAN link for pod %s interface %s (peer %s on VTEP %s, VNI %d)",
+diff --git a/third_party/meshnet/daemon/meshnet/handler.go b/third_party/meshnet/daemon/meshnet/handler.go
+index 68bb2f1..b8924f9 100644
+--- a/third_party/meshnet/daemon/meshnet/handler.go
++++ b/third_party/meshnet/daemon/meshnet/handler.go
+@@ -104,6 +104,7 @@ func (m *Meshnet) Get(ctx context.Context, pod *mpb.PodQuery) (*mpb.Pod, error)
+ 				newLink.LocalIp, _, _ = unstructured.NestedString(remoteLink, "local_ip")
+ 				newLink.PeerIp, _, _ = unstructured.NestedString(remoteLink, "peer_ip")
+ 				newLink.Uid, _, _ = unstructured.NestedInt64(remoteLink, "uid")
++				newLink.PeerNamespace, _, _ = unstructured.NestedString(remoteLink, "peer_namespace")
+ 				links[i] = newLink
+ 			}
+ 		} else {
+diff --git a/third_party/meshnet/daemon/proto/meshnet/v1beta1/meshnet.pb.go b/third_party/meshnet/daemon/proto/meshnet/v1beta1/meshnet.pb.go
+index 3c7b5e2..1b2260b 100644
+--- a/third_party/meshnet/daemon/proto/meshnet/v1beta1/meshnet.pb.go
++++ b/third_party/meshnet/daemon/proto/meshnet/v1beta1/meshnet.pb.go
+@@ -122,13 +122,17 @@ func (x *Pod) GetContainerId() string {
+ }
+ 
+ type Link struct {
+-	state         protoimpl.MessageState `protogen:"open.v1"`
+-	PeerPod       string                 `protobuf:"bytes,1,opt,name=peer_pod,json=peerPod,proto3" json:"peer_pod,omitempty"`
+-	LocalIntf     string                 `protobuf:"bytes,2,opt,name=local_intf,json=localIntf,proto3" json:"local_intf,omitempty"`
+-	PeerIntf      string                 `protobuf:"bytes,3,opt,name=peer_intf,json=peerIntf,proto3" json:"peer_intf,omitempty"`
+-	LocalIp       string                 `protobuf:"bytes,4,opt,name=local_ip,json=localIp,proto3" json:"local_ip,omitempty"`
+-	PeerIp        string                 `protobuf:"bytes,5,opt,name=peer_ip,json=peerIp,proto3" json:"peer_ip,omitempty"`
+-	Uid           int64                  `protobuf:"varint,6,opt,name=uid,proto3" json:"uid,omitempty"`
++	state     protoimpl.MessageState `protogen:"open.v1"`
++	PeerPod   string                 `protobuf:"bytes,1,opt,name=peer_pod,json=peerPod,proto3" json:"peer_pod,omitempty"`
++	LocalIntf string                 `protobuf:"bytes,2,opt,name=local_intf,json=localIntf,proto3" json:"local_intf,omitempty"`
++	PeerIntf  string                 `protobuf:"bytes,3,opt,name=peer_intf,json=peerIntf,proto3" json:"peer_intf,omitempty"`
++	LocalIp   string                 `protobuf:"bytes,4,opt,name=local_ip,json=localIp,proto3" json:"local_ip,omitempty"`
++	PeerIp    string                 `protobuf:"bytes,5,opt,name=peer_ip,json=peerIp,proto3" json:"peer_ip,omitempty"`
++	Uid       int64                  `protobuf:"varint,6,opt,name=uid,proto3" json:"uid,omitempty"`
++	// Namespace of the peer's Topology. Empty means the local namespace. The
++	// sandbox data-plane attach uses it to link a sandbox pod to a pod in
++	// another namespace (field 7 matches the server's generated contract).
++	PeerNamespace string `protobuf:"bytes,7,opt,name=peer_namespace,json=peerNamespace,proto3" json:"peer_namespace,omitempty"`
+ 	unknownFields protoimpl.UnknownFields
+ 	sizeCache     protoimpl.SizeCache
+ }
+@@ -205,6 +209,13 @@ func (x *Link) GetUid() int64 {
+ 	return 0
+ }
+ 
++func (x *Link) GetPeerNamespace() string {
++	if x != nil {
++		return x.PeerNamespace
++	}
++	return ""
++}
++
+ type PodQuery struct {
+ 	state         protoimpl.MessageState `protogen:"open.v1"`
+ 	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+@@ -996,7 +1007,7 @@ const file_daemon_proto_meshnet_v1beta1_meshnet_proto_rawDesc = "" +
+ 	"\x05links\x18\x05 \x03(\v2\x15.meshnet.v1beta1.LinkR\x05links\x12\x17\n" +
+ 	"\anode_ip\x18\x06 \x01(\tR\x06nodeIp\x12\x1b\n" +
+ 	"\tnode_intf\x18\a \x01(\tR\bnodeIntf\x12!\n" +
+-	"\fcontainer_id\x18\b \x01(\tR\vcontainerId\"\xa3\x01\n" +
++	"\fcontainer_id\x18\b \x01(\tR\vcontainerId\"\xca\x01\n" +
+ 	"\x04Link\x12\x19\n" +
+ 	"\bpeer_pod\x18\x01 \x01(\tR\apeerPod\x12\x1d\n" +
+ 	"\n" +
+@@ -1004,7 +1015,8 @@ const file_daemon_proto_meshnet_v1beta1_meshnet_proto_rawDesc = "" +
+ 	"\tpeer_intf\x18\x03 \x01(\tR\bpeerIntf\x12\x19\n" +
+ 	"\blocal_ip\x18\x04 \x01(\tR\alocalIp\x12\x17\n" +
+ 	"\apeer_ip\x18\x05 \x01(\tR\x06peerIp\x12\x10\n" +
+-	"\x03uid\x18\x06 \x01(\x03R\x03uid\"7\n" +
++	"\x03uid\x18\x06 \x01(\x03R\x03uid\x12%\n" +
++	"\x0epeer_namespace\x18\a \x01(\tR\rpeerNamespace\"7\n" +
+ 	"\bPodQuery\x12\x12\n" +
+ 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x17\n" +
+ 	"\akube_ns\x18\x02 \x01(\tR\x06kubeNs\"c\n" +
+diff --git a/third_party/meshnet/daemon/proto/meshnet/v1beta1/meshnet.proto b/third_party/meshnet/daemon/proto/meshnet/v1beta1/meshnet.proto
+index 98dc4e4..2bc6ebe 100644
+--- a/third_party/meshnet/daemon/proto/meshnet/v1beta1/meshnet.proto
++++ b/third_party/meshnet/daemon/proto/meshnet/v1beta1/meshnet.proto
+@@ -23,6 +23,10 @@ message Link {
+   string local_ip = 4;
+   string peer_ip = 5;
+   int64 uid = 6;
++  // Namespace of the peer's Topology. Empty means the local namespace. The
++  // sandbox data-plane attach uses it to link a sandbox pod to a pod in
++  // another namespace (field 7 matches the server's generated contract).
++  string peer_namespace = 7;
+ }
+ 
+ message PodQuery {
+diff --git a/third_party/meshnet/manifests/base/crd.yaml b/third_party/meshnet/manifests/base/crd.yaml
+index 78516e2..6c47163 100644
+--- a/third_party/meshnet/manifests/base/crd.yaml
++++ b/third_party/meshnet/manifests/base/crd.yaml
+@@ -29,6 +29,9 @@ spec:
+                       peer_pod:
+                         description: "Name of the peer pod"
+                         type: string
++                      peer_namespace:
++                        description: "(Optional) Namespace of the peer Topology; empty means this namespace"
++                        type: string
+                       local_intf:
+                         description: "Local interface name"
+                         type: string
+diff --git a/third_party/meshnet/plugin/meshnet.go b/third_party/meshnet/plugin/meshnet.go
+index 422b78a..71240ca 100644
+--- a/third_party/meshnet/plugin/meshnet.go
++++ b/third_party/meshnet/plugin/meshnet.go
+@@ -211,6 +211,10 @@ func cmdAdd(args *skel.CmdArgs) error {
+ 		return types.PrintResult(result, n.CNIVersion)
+ 	}
+ 
++	if err := checkCrossNamespaceLinks(string(cniArgs.K8S_POD_NAMESPACE), localPod.Links, interNodeLinkType); err != nil {
++		return err
++	}
++
+ 	// Finding the source IP and interface for VXLAN VTEP
+ 	srcIP, srcIntf, err := getVxlanSource(localPod.NodeIp, localPod.NodeIntf)
+ 	if err != nil {
+@@ -262,15 +266,17 @@ func cmdAdd(args *skel.CmdArgs) error {
+ 
+ 				// For inter-node gRPC links, check if the gRPC wire is fully established on the daemon
+ 				if interNodeLinkType == wireutil.INTER_NODE_LINK_GRPC {
+-					peerSrcIP, cached := peerNodeCache[link.PeerPod]
++					peerNs := wireutil.PeerNamespace(string(cniArgs.K8S_POD_NAMESPACE), link.PeerNamespace)
++					peerKey := peerNs + "/" + link.PeerPod
++					peerSrcIP, cached := peerNodeCache[peerKey]
+ 					if !cached {
+ 						peerPod, err := meshnetClient.Get(waitCtx, &mpb.PodQuery{
+ 							Name:   link.PeerPod,
+-							KubeNs: string(cniArgs.K8S_POD_NAMESPACE),
++							KubeNs: peerNs,
+ 						})
+ 						if err == nil && peerPod != nil && peerPod.SrcIp != "" {
+ 							peerSrcIP = peerPod.SrcIp
+-							peerNodeCache[link.PeerPod] = peerSrcIP
++							peerNodeCache[peerKey] = peerSrcIP
+ 						}
+ 					}
+ 
+@@ -388,7 +394,7 @@ func cmdDel(args *skel.CmdArgs) error {
+ 		log.Infof("Del: Pod %s is retrieving peer pod %s information from meshnet daemon", string(cniArgs.K8S_POD_NAME), link.PeerPod)
+ 		peerPod, _ := meshnetClient.Get(ctx, &mpb.PodQuery{
+ 			Name:   link.PeerPod, // getting peer pod detail.
+-			KubeNs: string(cniArgs.K8S_POD_NAMESPACE),
++			KubeNs: wireutil.PeerNamespace(string(cniArgs.K8S_POD_NAMESPACE), link.PeerNamespace),
+ 		})
+ 
+ 		if peerPod != nil && peerPod.SrcIp != localPodSrcIp {
+@@ -466,3 +472,19 @@ func cmdGet(args *skel.CmdArgs) error {
+ }
+ 
+ //-------------------------------------------------------------------------------------------------
++
++// checkCrossNamespaceLinks refuses a cross-namespace link on gRPC inter-node
++// wires. The gRPC wire is keyed by pod name, so a peer in another namespace
++// cannot be addressed by it. VXLAN carries these links (patches/meshnet-cni
++// 0023 has the same refusal).
++func checkCrossNamespaceLinks(localNs string, links []*mpb.Link, linkType string) error {
++	if linkType != wireutil.INTER_NODE_LINK_GRPC {
++		return nil
++	}
++	for _, link := range links {
++		if peerNs := wireutil.PeerNamespace(localNs, link.GetPeerNamespace()); peerNs != localNs {
++			return fmt.Errorf("link %d (%s): cross-namespace link to %s/%s needs VXLAN inter-node links, not GRPC", link.GetUid(), link.GetLocalIntf(), peerNs, link.GetPeerPod())
++		}
++	}
++	return nil
++}
+diff --git a/third_party/meshnet/plugin/peer_namespace_test.go b/third_party/meshnet/plugin/peer_namespace_test.go
+new file mode 100644
+index 0000000..faddadf
+--- /dev/null
++++ b/third_party/meshnet/plugin/peer_namespace_test.go
+@@ -0,0 +1,34 @@
++package main
++
++import (
++	"testing"
++
++	mpb "github.com/openconfig/kne/third_party/meshnet/daemon/proto/meshnet/v1beta1"
++	"github.com/openconfig/kne/third_party/meshnet/utils/wireutil"
++)
++
++// The requirement: a cross-namespace link is accepted on VXLAN inter-node
++// links and refused on gRPC inter-node links. A same-namespace link is never
++// refused.
++func TestCheckCrossNamespaceLinks(t *testing.T) {
++	cross := []*mpb.Link{{Uid: 1, PeerPod: "b", LocalIntf: "eth1", PeerNamespace: "sandbox-x"}}
++	same := []*mpb.Link{{Uid: 2, PeerPod: "c", LocalIntf: "eth2"}}
++	cases := []struct {
++		name     string
++		links    []*mpb.Link
++		linkType string
++		wantErr  bool
++	}{
++		{name: "cross-ns on VXLAN is allowed", links: cross, linkType: wireutil.INTER_NODE_LINK_VXLAN},
++		{name: "cross-ns on GRPC is refused", links: cross, linkType: wireutil.INTER_NODE_LINK_GRPC, wantErr: true},
++		{name: "same-ns on GRPC is allowed", links: same, linkType: wireutil.INTER_NODE_LINK_GRPC},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			err := checkCrossNamespaceLinks("lab-a", tc.links, tc.linkType)
++			if (err != nil) != tc.wantErr {
++				t.Fatalf("checkCrossNamespaceLinks = %v, wantErr=%v", err, tc.wantErr)
++			}
++		})
++	}
++}
+diff --git a/third_party/meshnet/utils/wireutil/peer_namespace.go b/third_party/meshnet/utils/wireutil/peer_namespace.go
+new file mode 100644
+index 0000000..6360f5c
+--- /dev/null
++++ b/third_party/meshnet/utils/wireutil/peer_namespace.go
+@@ -0,0 +1,27 @@
++package wireutil
++
++// PeerNamespace is the namespace the link's peer Topology lives in: the
++// declared peer namespace, or the local one when none is declared. Every link
++// KNE generates is same-namespace, so for those this is the local namespace.
++func PeerNamespace(localNs, declaredPeerNs string) string {
++	if declaredPeerNs == "" {
++		return localNs
++	}
++	return declaredPeerNs
++}
++
++// LinkKeyNamespace is the namespace string both ends of a link feed into the
++// VNI. For a same-namespace link it is that namespace, so every existing wire
++// keeps its VNI. A cross-namespace link is declared once in each namespace,
++// and each end only knows its own side, so the key is the ordered pair. Both
++// ends then derive the same VNI without coordinating.
++func LinkKeyNamespace(localNs, declaredPeerNs string) string {
++	peerNs := PeerNamespace(localNs, declaredPeerNs)
++	if peerNs == localNs {
++		return localNs
++	}
++	if peerNs < localNs {
++		return peerNs + "/" + localNs
++	}
++	return localNs + "/" + peerNs
++}
+diff --git a/third_party/meshnet/utils/wireutil/peer_namespace_test.go b/third_party/meshnet/utils/wireutil/peer_namespace_test.go
+new file mode 100644
+index 0000000..bed443c
+--- /dev/null
++++ b/third_party/meshnet/utils/wireutil/peer_namespace_test.go
+@@ -0,0 +1,26 @@
++package wireutil
++
++import "testing"
++
++// The requirement: a same-namespace link keeps its namespace as the VNI key
++// (existing wires do not move), and a cross-namespace link gets the same key
++// from either end.
++func TestPeerNamespaceAndLinkKey(t *testing.T) {
++	if got := PeerNamespace("lab-a", ""); got != "lab-a" {
++		t.Fatalf("undeclared peer ns = %q, want the local ns", got)
++	}
++	if got := PeerNamespace("lab-a", "sandbox-x"); got != "sandbox-x" {
++		t.Fatalf("declared peer ns = %q", got)
++	}
++	if got := LinkKeyNamespace("lab-a", ""); got != "lab-a" {
++		t.Fatalf("same-ns key = %q, want lab-a unchanged", got)
++	}
++	ab := LinkKeyNamespace("lab-a", "sandbox-x")
++	ba := LinkKeyNamespace("sandbox-x", "lab-a")
++	if ab != ba {
++		t.Fatalf("the two ends derive different keys: %q vs %q", ab, ba)
++	}
++	if ab == "lab-a" || ab == "sandbox-x" {
++		t.Fatalf("cross-ns key %q collapses to one namespace", ab)
++	}
++}
+diff --git a/third_party/meshnet/utils/wireutil/veth.go b/third_party/meshnet/utils/wireutil/veth.go
+index 07b71c5..e1a6434 100644
+--- a/third_party/meshnet/utils/wireutil/veth.go
++++ b/third_party/meshnet/utils/wireutil/veth.go
+@@ -19,6 +19,7 @@ type PodLinkConfig struct {
+ 	PeerPodName string // Peer pod name (e.g. "p2")
+ 	LinkUID     int64  // Unique link ID in topology (e.g. 14)
+ 	KubeNs      string // Kubernetes namespace (e.g. "1500links")
++	PeerKubeNs  string // Namespace of the peer Topology (== KubeNs unless cross-namespace)
+ 	LocalIntf   string // Target interface name inside local pod (e.g. "eth14")
+ 	LocalIP     string // Local CIDR (e.g. "10.10.0.1/30")
+ 	PeerIntf    string // Target interface name inside peer pod (e.g. "eth14")
+-- 
+2.56.0
+

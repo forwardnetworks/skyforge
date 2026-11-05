@@ -1,0 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 14:19:59 -0500
+Subject: [PATCH 30/35] docker: build the CNI plugin as a package, not from a
+ file list
+
+---
+diff --git a/third_party/meshnet/docker/Dockerfile b/third_party/meshnet/docker/Dockerfile
+index d24448a..299991d 100644
+--- a/third_party/meshnet/docker/Dockerfile
++++ b/third_party/meshnet/docker/Dockerfile
+@@ -43,7 +43,7 @@ COPY utils/ utils/
+ COPY --from=proto_base /src/ .
+ 
+ 
+-RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o meshnet plugin/meshnet.go plugin/grpcwires-plugin.go && \
++RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o meshnet ./plugin && \
+     GOOS=${TARGETOS} CGO_ENABLED=0 GOARCH=${TARGETARCH} go build -ldflags="-s -w" -o meshnetd daemon/main.go
+ 
+ 
+-- 
+2.56.0
+

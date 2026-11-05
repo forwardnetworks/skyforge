@@ -1,0 +1,33 @@
+module: [ bgp,ospf ]
+
+bgp.as: 65000
+
+groups:
+  all:
+    config: [ loopback, bgp-ipv6 ]
+
+# netlab 26.08 tightening: a topology-level `module:` no longer reaches the
+# nodes, so every node came up with neither bgp nor ospf and both custom
+# templates below rendered against an undefined `bgp` -- netlab reported that as
+# "Error rendering template bgp-ipv6 ... 'as' is undefined", which names the
+# symptom (bgp.as) and not the cause (no bgp module on the node).
+#
+# DECLARED PER NODE, NOT ON groups.all. The platform defaults force
+# `module: [ services ]` onto every node through groups.all so SNMP and gNMI
+# render fleet-wide; setting `module:` there again REPLACES that list and the
+# services attributes are left behind with no module to own them.
+nodes:
+  r1:
+    device: iol
+    module: [ bgp, ospf ]
+  r2:
+    device: iol
+    module: [ bgp, ospf ]
+  s1:
+    device: nxos
+    module: [ bgp, ospf ]
+  s2:
+    device: eos
+    module: [ bgp, ospf ]
+
+links: [ r1-r2, r2-s1, s1-s2, s2-r1 ]

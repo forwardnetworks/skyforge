@@ -1,0 +1,258 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 10:06:23 -0600
+Subject: [PATCH] meshnet: MTU is not a rebuild criterion; keep a wire whose
+ VNI and VTEP match
+
+---
+diff --git a/third_party/meshnet/daemon/meshnet/peer_repair.go b/third_party/meshnet/daemon/meshnet/peer_repair.go
+index d1b6238..b56cc9e 100644
+--- a/third_party/meshnet/daemon/meshnet/peer_repair.go
++++ b/third_party/meshnet/daemon/meshnet/peer_repair.go
+@@ -24,7 +24,7 @@ import (
+ // The old daemon serves RepairLinkNow (patches/meshnet-cni 0024), which
+ // rebuilds the named pod's declared wires at once, without corroboration. The
+ // old repair path calls vxlan.CreateOrUpdate, which is a no-op when the wire
+-// already matches (VNI, VTEP, MTU, bridge): a healthy wire is not rebuilt.
++// already matches (VNI, VTEP, bridge): a healthy wire is not rebuilt.
+ // So this side asks the peer's daemon for RepairLinkNow once per link and
+ // peer netns, after its own VXLAN end is built, and retries for a bounded
+ // time. A peer that does not serve the RPC (Unimplemented) only logs.
+diff --git a/third_party/meshnet/daemon/vxlan/vxlan.go b/third_party/meshnet/daemon/vxlan/vxlan.go
+index 9e15e62..a61f10c 100644
+--- a/third_party/meshnet/daemon/vxlan/vxlan.go
++++ b/third_party/meshnet/daemon/vxlan/vxlan.go
+@@ -85,9 +85,12 @@ func CreateOrUpdate(v *mpb.RemotePod) error {
+ 		}
+ 	}
+ 
+-	// MTU is an attribute: a wire is kept only when VNI, VTEP and MTU match.
+-	vxlanLink, isVxlan := slot.found.(*netlink.Vxlan)
+-	if isVxlan && vxlanAttrsMatch(vxlanLink, vxlan) {
++	// A wire is kept when it is a VXLAN with the right VNI and VTEP. MTU is not
++	// a rebuild criterion (see vxlanAttrsMatch): it is set once, in makeVxLan.
++	vxlanLink, keep := keepWire(slot, vxlan)
++	if keep {
++		vxLanOvrlyLogger.Debugf("Keeping wire %s in %s: VNI %d and VTEP %s match (in-pod MTU %d, fabric %d; MTU is not a rebuild criterion)",
++			vxlanLink.Attrs().Name, v.NetNs, vxlan.ID, vxlan.IPAddr, vxlanLink.Attrs().MTU, vxlan.MTU)
+ 		// Already the wire we want. Keep it under its current name, and only
+ 		// fix its bridge membership when KubeVirt has not enslaved it yet.
+ 		if !slot.bridgeOK() {
+@@ -98,7 +101,8 @@ func CreateOrUpdate(v *mpb.RemotePod) error {
+ 		}
+ 	} else {
+ 		// Absent, stale, or a placeholder: remove what is there, then build.
+-		vxLanOvrlyLogger.Infof("Rebuilding wire %s in %s: found=%v (vxlan=%v)", v.IntfName, v.NetNs, slot.found != nil, isVxlan)
++		_, isVxlan := slot.found.(*netlink.Vxlan)
++		vxLanOvrlyLogger.Infof("Repairing wire %s in %s (missing, not a VXLAN, or wrong VNI/VTEP): found=%v vxlan=%v", v.IntfName, v.NetNs, slot.found != nil, isVxlan)
+ 		if slot.found != nil {
+ 			if err = removeLink(v.NetNs, slot.found.Attrs().Name); err != nil {
+ 				return fmt.Errorf(" MESHNETD: Error when removing %s: %s", slot.found.Attrs().Name, err)
+@@ -289,22 +293,34 @@ func vxlanDifferent(l1 *netlink.Vxlan, l2 VxLan) bool {
+ 	return true
+ }
+ 
+-// vxlanAttrsMatch reports whether an existing VXLAN already is what we want.
+-//
+-// The VNI and remote VTEP must match. The MTU must be at least the fabric MTU.
+-// A wire below the fabric is stale. A wire above it is left alone, because a
+-// NOS may raise its own interface MTU (cEOS lifts a routed port's kernel MTU
+-// when it moves the port into a VRF). Comparing for equality would call that
+-// drift and tear the wire down under the NOS.
++// keepWire is the keep-or-rebuild decision CreateOrUpdate makes for the link
++// it found in the pod: keep it when it is a VXLAN whose attributes match.
++func keepWire(slot wireSlot, want VxLan) (*netlink.Vxlan, bool) {
++	existing, isVxlan := slot.found.(*netlink.Vxlan)
++	if !isVxlan || !vxlanAttrsMatch(existing, want) {
++		return nil, false
++	}
++	return existing, true
++}
++
++// vxlanAttrsMatch reports whether an existing VXLAN already is what we want:
++// the same VNI and the same remote VTEP. Nothing else.
+ //
+-// Source: patches/meshnet-cni/0017 (MTU is an attribute) and 0022 (fabric MTU
+-// is a floor). The 0017 measurement (a wire at 1450 kept by a daemon asking
+-// for 8950) is the reason the MTU is compared at all.
++// MTU IS NOT COMPARED. The wire is created at the fabric MTU (makeVxLan), and
++// after that the in-pod MTU belongs to the NOS. Lower-than-fabric MTUs are
++// deliberate: netlab clamps both ends of a link to the lower device's
++// max_mtu (1500 on non-jumbo devices, 4470 on IOS-XR), cEOS sets 1500 on its
++// interfaces, and the netlab Linux templates set eth1 to 1500. The r7 daemon
++// treated "MTU below the fabric" as stale and rebuilt the wire on every 60 s
++// resync (ReconcilePodLinks calls CreateOrUpdate for every remote link every
++// pass): links flapped every minute and a rebuilt wire came back without the
++// IP and routes the NOS had put on it. The old lineage (patches/meshnet-cni
++// 0015) repaired only a missing end, a wrong VNI or a wrong VTEP; this is that
++// rule again.
+ func vxlanAttrsMatch(existing *netlink.Vxlan, want VxLan) bool {
+ 	if existing == nil {
+ 		return false
+ 	}
+ 	return existing.VxlanId == want.ID &&
+-		existing.Group.Equal(want.IPAddr) &&
+-		existing.Attrs().MTU >= want.MTU
++		existing.Group.Equal(want.IPAddr)
+ }
+diff --git a/third_party/meshnet/daemon/vxlan/vxlan_mtu_test.go b/third_party/meshnet/daemon/vxlan/vxlan_mtu_test.go
+index c8d4a91..0cfe3c3 100644
+--- a/third_party/meshnet/daemon/vxlan/vxlan_mtu_test.go
++++ b/third_party/meshnet/daemon/vxlan/vxlan_mtu_test.go
+@@ -1,12 +1,16 @@
+ package vxlan
+ 
+ import (
++	"fmt"
+ 	"net"
+ 	"testing"
+ 
+ 	"github.com/vishvananda/netlink"
+ )
+ 
++// fabricMTU is the production fabric (MESHNET_FABRIC_MTU, the overlay MTU doc).
++const fabricMTU = 8950
++
+ func existingVxlan(vni int, group string, mtu int) *netlink.Vxlan {
+ 	return &netlink.Vxlan{
+ 		LinkAttrs: netlink.LinkAttrs{MTU: mtu},
+@@ -15,21 +19,23 @@ func existingVxlan(vni int, group string, mtu int) *netlink.Vxlan {
+ 	}
+ }
+ 
+-// The requirement (KNE rebase R8): an existing wire is kept only when its VNI
+-// and VTEP match and its MTU is at least the fabric MTU. Below the fabric is
+-// stale. Above it is a NOS-raised MTU and is kept.
+-func TestVxlanAttrsMatchFabricMTUFloor(t *testing.T) {
+-	want := VxLan{ID: 4096, IPAddr: net.ParseIP("192.0.2.1"), MTU: 1450}
++// The requirement (meshnet MTU hotfix r1, the old meshnet-cni 0015 rule): an
++// existing wire is kept when its VNI and VTEP match, whatever its MTU. MTU is
++// set when the wire is created and is never a reason to rebuild it.
++func TestVxlanAttrsMatchIgnoresMTU(t *testing.T) {
++	want := VxLan{ID: 4096, IPAddr: net.ParseIP("192.0.2.1"), MTU: fabricMTU}
+ 	cases := []struct {
+ 		name     string
+ 		existing *netlink.Vxlan
+ 		want     bool
+ 	}{
+-		{name: "same VNI, VTEP and MTU", existing: existingVxlan(4096, "192.0.2.1", 1450), want: true},
+-		{name: "stale: built at 1400 for a 1450 fabric", existing: existingVxlan(4096, "192.0.2.1", 1400), want: false},
++		{name: "same VNI, VTEP and MTU", existing: existingVxlan(4096, "192.0.2.1", fabricMTU), want: true},
++		{name: "NOS lowered to 1500 is kept", existing: existingVxlan(4096, "192.0.2.1", 1500), want: true},
++		{name: "IOS-XR clamp 4470 is kept", existing: existingVxlan(4096, "192.0.2.1", 4470), want: true},
++		{name: "built at 1400 before a fabric change is kept", existing: existingVxlan(4096, "192.0.2.1", 1400), want: true},
+ 		{name: "NOS raised above the fabric is kept", existing: existingVxlan(4096, "192.0.2.1", 10240), want: true},
+-		{name: "wrong VNI", existing: existingVxlan(4097, "192.0.2.1", 1450), want: false},
+-		{name: "wrong VTEP", existing: existingVxlan(4096, "192.0.2.2", 1450), want: false},
++		{name: "wrong VNI", existing: existingVxlan(4097, "192.0.2.1", fabricMTU), want: false},
++		{name: "wrong VTEP", existing: existingVxlan(4096, "192.0.2.2", fabricMTU), want: false},
+ 		{name: "no existing link", existing: nil, want: false},
+ 	}
+ 	for _, tc := range cases {
+@@ -40,3 +46,103 @@ func TestVxlanAttrsMatchFabricMTUFloor(t *testing.T) {
+ 		})
+ 	}
+ }
++
++// reconcilePass is one ReconcilePodLinks pass over one wire, against a fake pod
++// netns: the production slot lookup and keep decision (resolveSlot, keepWire),
++// and, when the decision is "rebuild", what makeVxLan leaves behind (a new
++// VXLAN at the fabric MTU under the wire's name). It reports whether it rebuilt.
++func reconcilePass(ns fakeNS, linkName string, want VxLan) bool {
++	slot := resolveSlot(ns.lookup, linkName)
++	if _, keep := keepWire(slot, want); keep {
++		return false
++	}
++	ns[linkName] = &netlink.Vxlan{
++		LinkAttrs: netlink.LinkAttrs{Name: linkName, MTU: want.MTU},
++		VxlanId:   want.ID,
++		Group:     want.IPAddr,
++	}
++	return true
++}
++
++// A healthy wire whose in-pod MTU the NOS lowered (cEOS and the netlab Linux
++// templates set 1500; netlab clamps IOS-XR links to 4470) must survive every
++// resync. The r7 daemon rebuilt it on every pass, which flapped the link every
++// 60 s and dropped the IP and routes the NOS had configured on it.
++func TestReconcileKeepsNOSLoweredMTUAcrossPasses(t *testing.T) {
++	want := VxLan{ID: 4096, IPAddr: net.ParseIP("192.0.2.1"), MTU: fabricMTU}
++	for _, nosMTU := range []int{1500, 4470} {
++		for _, name := range []string{"eth1", "pod1a2b3c"} {
++			t.Run(fmt.Sprintf("%s/mtu%d", name, nosMTU), func(t *testing.T) {
++				wire := existingVxlan(4096, "192.0.2.1", nosMTU)
++				wire.Name = name
++				ns := fakeNS{name: wire}
++				for pass := 1; pass <= 5; pass++ {
++					if reconcilePass(ns, name, want) {
++						t.Fatalf("in-pod MTU %d: pass %d rebuilt a wire with the right VNI and VTEP", nosMTU, pass)
++					}
++					if ns[name] != wire {
++						t.Fatalf("in-pod MTU %d: pass %d replaced the wire", nosMTU, pass)
++					}
++				}
++			})
++		}
++	}
++}
++
++// The repairs that must still happen: a missing end, a wrong VNI, a wrong
++// VTEP, or a non-VXLAN under the wire's name is rebuilt once, and the rebuilt
++// wire is then kept, also after the NOS lowers its MTU.
++func TestReconcileRepairsWrongOrMissingWireOnce(t *testing.T) {
++	want := VxLan{ID: 4096, IPAddr: net.ParseIP("192.0.2.1"), MTU: fabricMTU}
++	cases := []struct {
++		name     string
++		existing netlink.Link
++	}{
++		{name: "missing end", existing: nil},
++		{name: "wrong VNI", existing: existingVxlan(4097, "192.0.2.1", 1500)},
++		{name: "wrong VTEP", existing: existingVxlan(4096, "192.0.2.2", 1500)},
++		{name: "not a vxlan", existing: &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "eth1", MTU: 1500}}},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			ns := fakeNS{}
++			if tc.existing != nil {
++				ns["eth1"] = tc.existing
++			}
++			if !reconcilePass(ns, "eth1", want) {
++				t.Fatal("first pass kept a wire that must be repaired")
++			}
++			// The NOS takes the repaired interface over and lowers its MTU.
++			ns["eth1"].Attrs().MTU = 1500
++			for pass := 2; pass <= 4; pass++ {
++				if reconcilePass(ns, "eth1", want) {
++					t.Fatalf("pass %d rebuilt the repaired wire", pass)
++				}
++			}
++		})
++	}
++}
++
++// The KubeVirt renamed slot: virt-launcher moved the wire to "<id>-nic",
++// enslaved it to "k6t-<id>" and left a dummy under "pod<id>". A wire there with
++// the right VNI and VTEP and a lowered MTU is kept and stays enslaved.
++func TestReconcileKeepsRenamedKubeVirtSlotAtLoweredMTU(t *testing.T) {
++	want := VxLan{ID: 4096, IPAddr: net.ParseIP("192.0.2.1"), MTU: fabricMTU}
++	wire := existingVxlan(4096, "192.0.2.1", 1500)
++	wire.Name, wire.Index, wire.MasterIndex = "abc-nic", 9, 7
++	ns := fakeNS{
++		"podabc":  &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "podabc", Index: 8}},
++		"abc-nic": wire,
++		"k6t-abc": &netlink.Bridge{LinkAttrs: netlink.LinkAttrs{Name: "k6t-abc", Index: 7}},
++	}
++	for pass := 1; pass <= 5; pass++ {
++		slot := resolveSlot(ns.lookup, "podabc")
++		got, keep := keepWire(slot, want)
++		if !keep || got != wire {
++			t.Fatalf("pass %d: keep=%v link=%v, want the renamed wire kept", pass, keep, got)
++		}
++		if !slot.bridgeOK() {
++			t.Fatalf("pass %d: kept wire is not enslaved to k6t-abc", pass)
++		}
++	}
++}
+-- 
+2.56.0
+

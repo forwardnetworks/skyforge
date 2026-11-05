@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 12:00:00 +0000
+Subject: [PATCH] vsrx: firewall.zonebased default_rules honour their `name`
+
+SKYFORGE-SPECIFIC: platform behaviour; not for upstream.
+
+---
+diff --git a/netsim/extra/firewall/zonebased/vsrx.j2 b/netsim/extra/firewall/zonebased/vsrx.j2
+index 5aa91e6..15eed6f 100644
+--- a/netsim/extra/firewall/zonebased/vsrx.j2
++++ b/netsim/extra/firewall/zonebased/vsrx.j2
+@@ -33,7 +33,7 @@ security {
+   policies {
+ {% for def_rule in firewall.zonebased.default_rules|default([]) %}
+     from-zone {{def_rule.from_zone}} to-zone {{def_rule.to_zone}} {
+-      policy default {
++      policy {{ def_rule.name|default('default') }} {
+         match {
+           source-address any;
+           destination-address any;
+-- 
+2.56.0
+

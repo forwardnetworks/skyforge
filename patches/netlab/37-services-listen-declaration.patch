@@ -1,0 +1,259 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 12:00:00 +0000
+Subject: [PATCH] services: `services.listen` declares which network services a
+ linux host listens on
+
+SKYFORGE-SPECIFIC: platform behaviour; not for upstream.
+
+---
+diff --git a/netsim/modules/services.py b/netsim/modules/services.py
+index d6945e0..5fb7d87 100644
+--- a/netsim/modules/services.py
++++ b/netsim/modules/services.py
+@@ -252,6 +252,69 @@ def disable_shared_hosts(ndata: Box) -> None:
+   if 'clab.config_templates.hosts' in ndata:
+     ndata.clab.config_templates.hosts = ndata.clab.config_templates.hosts.replace(':shared','')
+ 
++# SKYFORGE: services.listen -- which network services a LINUX host listens on.
++LISTEN_TRANSPORT = { 'https': 'tcp', 'http': 'tcp', 'tcp-echo': 'tcp', 'iperf3': 'tcp', 'udp-echo': 'udp' }
++LISTEN_RESERVED = { ('tcp',22): 'sshd', ('udp',161): 'the SNMP agent' }
++LISTEN_MAX_ENTRIES = 8
++
++def check_listen(ndata: Box) -> None:
++  """
++  Validate services.listen on one node (the schema has already checked proto names and port ranges).
++
++  The declaration is rendered into the linux pod's environment, where a strict parser starts one listener per
++  entry. So what is rejected here is what the image would otherwise silently drop or fail to bind: a device that
++  is not a linux host, a transport+port declared twice (the second bind fails and the first listener serves
++  both entries' names), a port the platform already owns, more entries than the image will start, and more than
++  one iperf3 server per node.
++  """
++  listen = ndata.get('services.listen',None)
++  if not listen:
++    return
++  where = f'node {ndata.name}'
++  if ndata.device != 'linux':
++    log.error(
++      f'services.listen is only supported on linux hosts, not on device {ndata.device} ({where})',
++      category=log.IncorrectValue,
++      module='services')
++    return
++
++  seen: dict = {}
++  iperf = 0
++  for idx,entry in enumerate(listen):
++    proto,port = entry.get('proto'),entry.get('port')
++    transport = LISTEN_TRANSPORT.get(proto)
++    if transport is None or port is None:
++      continue                                    # the schema already reported it
++    key = (transport,port)
++    if key in LISTEN_RESERVED:
++      log.error(
++        f'services.listen[{idx+1}] ({proto}:{port}) on {where} collides with {LISTEN_RESERVED[key]} ({transport}/{port})',
++        category=log.IncorrectValue,
++        module='services')
++      continue
++    if key in seen:
++      log.error(
++        f'services.listen[{idx+1}] ({proto}:{port}) on {where} listens on {transport}/{port}, which '
++        f'services.listen[{seen[key]+1}] already uses',
++        category=log.IncorrectValue,
++        module='services')
++      continue
++    seen[key] = idx
++    if proto == 'iperf3':
++      iperf += 1
++
++  if iperf > 1:
++    log.error(
++      f'services.listen on {where} declares {iperf} iperf3 servers; a node runs at most one',
++      category=log.IncorrectValue,
++      module='services')
++  if len(seen) - iperf > LISTEN_MAX_ENTRIES:
++    log.error(
++      f'services.listen on {where} declares {len(seen) - iperf} listeners besides iperf3; the image starts at most {LISTEN_MAX_ENTRIES}',
++      category=log.IncorrectValue,
++      module='services')
++
++
+ class Services(_Module):
+ 
+   def module_post_transform(self, topology: Box) -> None:
+@@ -277,6 +340,7 @@ class Services(_Module):
+       set_dns_fields(ndata)
+       disable_shared_hosts(ndata)
+       check_feature_support(ndata,svc_data,topology,mod_attr)
++      check_listen(ndata)
+       # Resolve BEFORE the check: a node that named no protocol takes its
+       # device's, and check_flow_protocol then judges the resolved value -- so
+       # the resolution can never hand a template something the device refuses.
+diff --git a/netsim/modules/services.yml b/netsim/modules/services.yml
+index e605491..fd4ef2f 100644
+--- a/netsim/modules/services.yml
++++ b/netsim/modules/services.yml
+@@ -76,6 +76,14 @@ attributes:
+     dns: { copy: global }
+     syslog: { copy: global }
+     flow: { copy: global }
++    # SKYFORGE: network services a LINUX host LISTENS on, declared where netlab can see them (node or group
++    # level). Rendered into the pod env by the KNE linux node adjuster; the declaration also stays in the node
++    # data (host_vars/<node>/topology.json: services.listen) so tooling can answer "which node listens on
++    # which ports". No declaration = no listener.
++    listen:
++      type: list
++      make_list: True
++      _subtype: _services_listen
+     server:
+       dns:
+         type: dict
+@@ -133,6 +141,19 @@ attributes:
+       ignore: []
+       must_have: [ server, ipv4, ipv6 ]
+       check_when: [ _server_list ]
++_top:
++  attributes:
++    _services_listen:
++      proto:
++        type: str
++        valid_values: [ https, http, tcp-echo, udp-echo, iperf3 ]
++        _required: True
++      port:
++        type: int
++        min_value: 1
++        max_value: 65535
++        _required: True
++
+ features:
+   dns: DNS client
+   syslog: syslog client
+diff --git a/tests/test_kne_provider.py b/tests/test_kne_provider.py
+index fa8ad68..5365939 100644
+--- a/tests/test_kne_provider.py
++++ b/tests/test_kne_provider.py
+@@ -1644,6 +1644,121 @@ def test_kne_linux_caldera_agent_env_follows_the_per_run_fact(tmp_path: Path, mo
+   assert 'attacker.example' not in provider_text
+ 
+ 
++
++
++LISTEN_TOPOLOGY = """
++provider: kne
++module: [ services ]
++
++groups:
++  web:
++    members: [ h3, h4 ]
++    node_data:
++      services:
++        listen:
++          - { proto: https, port: 8443 }
++
++nodes:
++  h1:
++    device: linux
++    services:
++      listen:
++        - { proto: https, port: 443 }
++        - { proto: http, port: 80 }
++        - { proto: tcp-echo, port: 7001 }
++        - { proto: udp-echo, port: 7002 }
++        - { proto: iperf3, port: 5201 }
++    kne:
++      env:
++        SKYFORGE_SERVICES: "http:9999"
++        SKYFORGE_IPERF3_SERVER_PORT: "9998"
++        KEEP_ME: "yes"
++  h2:
++    device: linux
++  h3:
++    device: linux
++  h4:
++    device: linux
++"""
++
++
++def test_kne_linux_declared_listeners_stay_in_the_node_data(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.chdir(tmp_path)
++  topology = load_transform(write_topology(tmp_path,LISTEN_TOPOLOGY))
++  assert [ (e.proto,e.port) for e in topology.nodes.h1.services.listen ] == [
++    ('https',443),('http',80),('tcp-echo',7001),('udp-echo',7002),('iperf3',5201) ]
++  assert 'listen' not in topology.nodes.h2.get('services',{})
++  assert topology.nodes.h4.services.listen[0].port == 8443
++
++
++BAD_LISTEN = [
++  ('unknown proto',        '[ { proto: ftp, port: 21 } ]'),
++  ('port 0',               '[ { proto: http, port: 0 } ]'),
++  ('port 65536',           '[ { proto: http, port: 65536 } ]'),
++  ('port is a string',     '[ { proto: http, port: eighty } ]'),
++  ('missing port',         '[ { proto: http } ]'),
++  ('missing proto',        '[ { port: 80 } ]'),
++  ('sshd port',            '[ { proto: http, port: 22 } ]'),
++  ('snmp port',            '[ { proto: udp-echo, port: 161 } ]'),
++  ('duplicate tcp port',   '[ { proto: http, port: 80 }, { proto: https, port: 80 } ]'),
++  ('duplicate entry',      '[ { proto: http, port: 80 }, { proto: http, port: 80 } ]'),
++  ('two iperf3 servers',   '[ { proto: iperf3, port: 5201 }, { proto: iperf3, port: 5202 } ]'),
++  ('too many listeners',   '[ ' + ', '.join('{ proto: http, port: %d }' % (8000+i) for i in range(9)) + ' ]'),
++]
++
++
++@pytest.mark.parametrize('label,listen',BAD_LISTEN,ids=[b[0] for b in BAD_LISTEN])
++def test_kne_linux_services_listen_rejects_bad_declarations(label: str, listen: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.chdir(tmp_path)
++  topo_file = write_topology(tmp_path,f"""
++provider: kne
++module: [ services ]
++
++nodes:
++  h1:
++    device: linux
++    services:
++      listen: {listen}
++""")
++  init_log(raise_error=True)
++  with pytest.raises(log.ErrorAbort):
++    topology = _read.load(str(topo_file),relative_topo_name=True,user_defaults=[])
++    augment.main.transform(topology)
++
++
++def test_kne_linux_services_listen_accepts_tcp_and_udp_on_one_port(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.chdir(tmp_path)
++  topology = load_transform(write_topology(tmp_path,"""
++provider: kne
++module: [ services ]
++
++nodes:
++  h1:
++    device: linux
++    services:
++      listen: [ { proto: tcp-echo, port: 7001 }, { proto: udp-echo, port: 7001 } ]
++"""))
++  assert len(topology.nodes.h1.services.listen) == 2
++
++
++def test_kne_services_listen_is_refused_on_other_devices(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.chdir(tmp_path)
++  topo_file = write_topology(tmp_path,"""
++provider: kne
++module: [ services ]
++
++nodes:
++  r1:
++    device: eos
++    services:
++      listen: [ { proto: http, port: 80 } ]
++""")
++  init_log(raise_error=True)
++  with pytest.raises(log.ErrorAbort):
++    topology = _read.load(str(topo_file),relative_topo_name=True,user_defaults=[])
++    augment.main.transform(topology)
++
++
+ def test_kne_ioll2_uses_distinct_image_contract(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+   monkeypatch.chdir(tmp_path)
+   topo_file = write_topology(tmp_path,"""
+-- 
+2.56.0
+

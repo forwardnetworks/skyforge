@@ -1,0 +1,580 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 12:47:52 -0500
+Subject: [PATCH 15/35] meshnet: converge the CNI chain to wrap multus after
+ boot (R6, M0025)
+
+---
+diff --git a/third_party/meshnet/daemon/cni/cni.go b/third_party/meshnet/daemon/cni/cni.go
+index d8dfd32..2326420 100644
+--- a/third_party/meshnet/daemon/cni/cni.go
++++ b/third_party/meshnet/daemon/cni/cni.go
+@@ -28,14 +28,18 @@ const (
+ 
+ var meshnetCNIPath = filepath.Join(defaultNetDir, defaultCNIFile)
+ 
+-// This is borrowed from https://tinyurl.com/khjhf9xd
+-func loadConfList() (map[string]interface{}, error) {
+-	files, err := libcni.ConfFiles(defaultNetDir, []string{".conf", ".conflist", ".json"})
++// loadConfListFrom picks the base CNI config in dir: the first valid,
++// non-meshnet file in sorted order. This is borrowed from https://tinyurl.com/khjhf9xd
++// Sorting is the whole game: 00-multus sorts before 05-cilium, so a node where
++// multus has written its conf gets multus as the base, and one where it has not
++// gets cilium alone (see WatchMultusWrap).
++func loadConfListFrom(dir string) (map[string]interface{}, error) {
++	files, err := libcni.ConfFiles(dir, []string{".conf", ".conflist", ".json"})
+ 	switch {
+ 	case err != nil:
+ 		return nil, err
+ 	case len(files) == 0:
+-		return nil, libcni.NoConfigsFoundError{Dir: defaultNetDir}
++		return nil, libcni.NoConfigsFoundError{Dir: dir}
+ 	}
+ 
+ 	// Ignore any existing meshnet config files
+@@ -90,15 +94,21 @@ func loadConfList() (map[string]interface{}, error) {
+ 		return conf, err
+ 	}
+ 
+-	return nil, fmt.Errorf("no valid network configurations found in %q", defaultNetDir)
++	return nil, fmt.Errorf("no valid network configurations found in %q", dir)
+ }
+ 
+-func saveConfList(m map[string]interface{}) error {
++func saveConfListTo(path string, m map[string]interface{}) error {
+ 	bytes, err := json.MarshalIndent(m, "", "\t")
+ 	if err != nil {
+ 		return err
+ 	}
+-	return ioutil.WriteFile(meshnetCNIPath, bytes, os.FileMode(06444))
++	// Write-then-rename: the CRI reads this file on every sandbox, and a reader
++	// that lands mid-write sees truncated JSON and skips the file.
++	tmp := path + ".tmp"
++	if err := ioutil.WriteFile(tmp, bytes, os.FileMode(06444)); err != nil {
++		return err
++	}
++	return os.Rename(tmp, path)
+ }
+ 
+ func saveInterNodeLinkConf() error {
+@@ -128,7 +138,7 @@ func Init(ctx context.Context) error {
+ 	defer ticker.Stop()
+ 
+ 	for attempts := 0; ; attempts++ {
+-		conf, err = loadConfList()
++		conf, err = buildMeshnetConf(defaultNetDir)
+ 		if err == nil {
+ 			break
+ 		}
+@@ -142,7 +152,24 @@ func Init(ctx context.Context) error {
+ 		}
+ 	}
+ 
+-	// We can safely access and type-cast since all of the checks have already been done in the `loadConfList()`
++	// TODO: check if we can avoid creating a custom file for propagating value of env INTER_NODE_LINK_TYPE
++	if err := saveInterNodeLinkConf(); err != nil {
++		return err
++	}
++
++	return saveConfListTo(meshnetCNIPath, conf)
++}
++
++// buildMeshnetConf returns the base chain found in dir with the meshnet plugin
++// appended. Init and the multus watcher both use it, so the watcher installs
++// exactly what Init would.
++func buildMeshnetConf(dir string) (map[string]interface{}, error) {
++	conf, err := loadConfListFrom(dir)
++	if err != nil {
++		return nil, err
++	}
++
++	// We can safely access and type-cast since all of the checks have already been done in the `loadConfListFrom()`
+ 	plugins := conf["plugins"].([]interface{})
+ 
+ 	plugins = append(plugins, &types.NetConf{
+@@ -152,13 +179,102 @@ func Init(ctx context.Context) error {
+ 
+ 	conf["cniVersion"] = "0.3.0"
+ 	conf["plugins"] = plugins
++	return conf, nil
++}
+ 
+-	// TODO: check if we can avoid creating a custom file for propagating value of env INTER_NODE_LINK_TYPE
+-	if err := saveInterNodeLinkConf(); err != nil {
+-		return err
++const (
++	multusConfName      = "00-multus.conflist"
++	multusWatchInterval = 5 * time.Second
++)
++
++// needsMultusRewrap reports whether dir holds a meshnet conflist that was
++// installed before multus wrote its own conf, so that it does not wrap multus.
++//
++// Init picks its base once, at meshnetd start. On a node reboot meshnetd can
++// start while 05-cilium.conflist exists and 00-multus.conflist does not, so the
++// base is cilium alone and the installed chain never runs multus. Nothing
++// re-ran Init afterwards, so every sandbox on that node lost its secondary
++// interfaces until someone restarted the pod. This check is the trigger for
++// converging on the right chain instead.
++//
++// It returns false when there is no multus conf to wrap yet, when the multus
++// conf does not parse (a write in progress: wait for the complete file, do not
++// rebuild from cilium alone), and when there is no meshnet conf to fix.
++func needsMultusRewrap(dir string) (bool, error) {
++	multusPath := filepath.Join(dir, multusConfName)
++	if _, err := os.Stat(multusPath); err != nil {
++		if os.IsNotExist(err) {
++			return false, nil
++		}
++		return false, err
++	}
++	if _, err := libcni.ConfListFromFile(multusPath); err != nil {
++		return false, nil
++	}
++
++	meshnetPath := filepath.Join(dir, defaultCNIFile)
++	raw, err := os.ReadFile(meshnetPath)
++	if os.IsNotExist(err) {
++		return false, nil
++	}
++	if err != nil {
++		return false, err
++	}
++	var installed struct {
++		Plugins []struct {
++			Type string `json:"type"`
++		} `json:"plugins"`
++	}
++	if err := json.Unmarshal(raw, &installed); err != nil {
++		// Unparseable: Init will replace it, so treat it as needing a rewrap.
++		return true, nil
++	}
++	for _, p := range installed.Plugins {
++		if p.Type == "multus" {
++			return false, nil
++		}
+ 	}
++	return true, nil
++}
+ 
+-	return saveConfList(conf)
++// reconcileMultusWrap runs one convergence step on dir. It rewrites
++// 00-meshnet.conflist only when needsMultusRewrap says so, and reports whether
++// it did. A healthy dir is left untouched (no write, no mtime change).
++func reconcileMultusWrap(dir string) (bool, error) {
++	need, err := needsMultusRewrap(dir)
++	if err != nil || !need {
++		return false, err
++	}
++	conf, err := buildMeshnetConf(dir)
++	if err != nil {
++		return false, err
++	}
++	if err := saveConfListTo(filepath.Join(dir, defaultCNIFile), conf); err != nil {
++		return false, err
++	}
++	return true, nil
++}
++
++// WatchMultusWrap converges 00-meshnet.conflist onto a multus-wrapped chain
++// after boot. It runs until ctx is done.
++func WatchMultusWrap(ctx context.Context) {
++	ticker := time.NewTicker(multusWatchInterval)
++	defer ticker.Stop()
++	for {
++		select {
++		case <-ctx.Done():
++			return
++		case <-ticker.C:
++		}
++		rewrote, err := reconcileMultusWrap(defaultNetDir)
++		if err != nil {
++			log.Warnf("converging %s onto a multus wrap: %v", meshnetCNIPath, err)
++			continue
++		}
++		if rewrote {
++			log.Infof("re-installed %s to wrap multus: %s appeared after meshnet's first install", meshnetCNIPath, multusConfName)
++		}
++	}
+ }
+ 
+ // Cleanup removes meshnet CNI configuration
+diff --git a/third_party/meshnet/daemon/cni/cni_multus_idempotent_test.go b/third_party/meshnet/daemon/cni/cni_multus_idempotent_test.go
+new file mode 100644
+index 0000000..14aa386
+--- /dev/null
++++ b/third_party/meshnet/daemon/cni/cni_multus_idempotent_test.go
+@@ -0,0 +1,71 @@
++package cni
++
++import (
++	"encoding/json"
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++// The requirement: when multus has written its conf before meshnet installs,
++// the installed chain already wraps multus once, and the watcher must not
++// rewrite it (no double multus, no rewrite loop on its own output).
++func TestMultusPresentAtBootIsInstalledOnceAndNotRewritten(t *testing.T) {
++	dir := writeDir(t, map[string]string{
++		"05-cilium.conflist": fixtureCilium,
++		"00-multus.conflist": fixtureMultus,
++	})
++	meshnetPath := filepath.Join(dir, defaultCNIFile)
++
++	conf, err := buildMeshnetConf(dir)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := saveConfListTo(meshnetPath, conf); err != nil {
++		t.Fatal(err)
++	}
++	if got := readFirstType(t, meshnetPath); got != "multus" {
++		t.Fatalf("boot with multus present: first plugin = %q, want multus", got)
++	}
++	if n := countPluginType(t, meshnetPath, "multus"); n != 1 {
++		t.Fatalf("multus plugins in installed chain = %d, want exactly 1", n)
++	}
++
++	old := setOldMtime(t, meshnetPath)
++	for i := 0; i < 3; i++ {
++		if rewrote, err := reconcileMultusWrap(dir); err != nil || rewrote {
++			t.Fatalf("reconcile %d = %v, %v; want false, nil", i, rewrote, err)
++		}
++	}
++	assertMtime(t, meshnetPath, old)
++}
++
++func countPluginType(t *testing.T, path, typ string) int {
++	t.Helper()
++	raw, err := readFileForTest(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	n := 0
++	for _, p := range raw.Plugins {
++		if p.Type == typ {
++			n++
++		}
++	}
++	return n
++}
++
++type installedChain struct {
++	Plugins []struct {
++		Type string `json:"type"`
++	} `json:"plugins"`
++}
++
++func readFileForTest(path string) (installedChain, error) {
++	var c installedChain
++	raw, err := os.ReadFile(path)
++	if err != nil {
++		return c, err
++	}
++	return c, json.Unmarshal(raw, &c)
++}
+diff --git a/third_party/meshnet/daemon/cni/cni_multus_wrap_test.go b/third_party/meshnet/daemon/cni/cni_multus_wrap_test.go
+new file mode 100644
+index 0000000..3c342c5
+--- /dev/null
++++ b/third_party/meshnet/daemon/cni/cni_multus_wrap_test.go
+@@ -0,0 +1,278 @@
++package cni
++
++import (
++	"encoding/json"
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++)
++
++// Fixtures are the two shapes recorded on the fleet (2026-10-19 evidence):
++// the cilium conf meshnet read on the broken node, and the multus conf that
++// thin_entrypoint writes with cilium as its delegate.
++const (
++	fixtureCilium = `{
++  "cniVersion": "0.3.0",
++  "name": "cilium",
++  "plugins": [{"type": "cilium-cni", "enable-debug": false}]
++}`
++	fixtureMultus = `{
++  "cniVersion": "1.0.0",
++  "name": "multus-cni-network",
++  "plugins": [{
++    "type": "multus",
++    "logLevel": "verbose",
++    "logFile": "/var/log/multus.log",
++    "kubeconfig": "/etc/cni/net.d/multus.d/multus.kubeconfig",
++    "delegates": [{"cniVersion": "1.0.0", "name": "cilium",
++      "plugins": [{"type": "cilium-cni"}]}]
++  }]
++}`
++	// The broken shape: cilium then meshnet, no multus anywhere.
++	meshnetCiliumOnly = `{
++  "cniVersion": "0.3.0",
++  "name": "cilium",
++  "plugins": [{"type": "cilium-cni"}, {"type": "meshnet", "name": "meshnet"}]
++}`
++	// The converged shape: multus (delegate cilium) then meshnet.
++	meshnetWrapped = `{
++  "cniVersion": "0.3.0",
++  "name": "multus-cni-network",
++  "plugins": [{"type": "multus", "delegates": [{"name": "cilium"}]}, {"type": "meshnet", "name": "meshnet"}]
++}`
++)
++
++func writeDir(t *testing.T, files map[string]string) string {
++	t.Helper()
++	dir := t.TempDir()
++	for name, body := range files {
++		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
++			t.Fatal(err)
++		}
++	}
++	return dir
++}
++
++// The boot race: meshnet starts with only cilium present. This is the state
++// that produced the broken chain, so the base must be cilium here.
++func TestBaseIsCiliumWhenMultusNotWrittenYet(t *testing.T) {
++	dir := writeDir(t, map[string]string{"05-cilium.conflist": fixtureCilium})
++	conf, err := loadConfListFrom(dir)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := firstPluginType(t, conf); got != "cilium-cni" {
++		t.Fatalf("base first plugin = %q, want cilium-cni", got)
++	}
++}
++
++// Once multus has written 00-multus.conflist it sorts first and must be the
++// base. That is what makes the converged chain start with multus.
++func TestBaseIsMultusWhenMultusWritten(t *testing.T) {
++	dir := writeDir(t, map[string]string{
++		"05-cilium.conflist": fixtureCilium,
++		"00-multus.conflist": fixtureMultus,
++	})
++	conf, err := loadConfListFrom(dir)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := firstPluginType(t, conf); got != "multus" {
++		t.Fatalf("base first plugin = %q, want multus", got)
++	}
++}
++
++func TestNeedsRewrapWhenMeshnetLacksMultus(t *testing.T) {
++	dir := writeDir(t, map[string]string{
++		"05-cilium.conflist":  fixtureCilium,
++		"00-multus.conflist":  fixtureMultus,
++		"00-meshnet.conflist": meshnetCiliumOnly,
++	})
++	need, err := needsMultusRewrap(dir)
++	if err != nil || !need {
++		t.Fatalf("needsMultusRewrap = %v, %v; want true, nil", need, err)
++	}
++}
++
++// Positive control for the same fixture set: a converged node must not be
++// rewritten, so a healthy fleet does no writes.
++func TestNoRewrapWhenMeshnetAlreadyWrapsMultus(t *testing.T) {
++	dir := writeDir(t, map[string]string{
++		"05-cilium.conflist":  fixtureCilium,
++		"00-multus.conflist":  fixtureMultus,
++		"00-meshnet.conflist": meshnetWrapped,
++	})
++	need, err := needsMultusRewrap(dir)
++	if err != nil || need {
++		t.Fatalf("needsMultusRewrap = %v, %v; want false, nil", need, err)
++	}
++}
++
++// Before multus has written anything there is nothing to wrap: no rewrite.
++func TestNoRewrapBeforeMultusWritten(t *testing.T) {
++	dir := writeDir(t, map[string]string{
++		"05-cilium.conflist":  fixtureCilium,
++		"00-meshnet.conflist": meshnetCiliumOnly,
++	})
++	need, err := needsMultusRewrap(dir)
++	if err != nil || need {
++		t.Fatalf("needsMultusRewrap = %v, %v; want false, nil", need, err)
++	}
++}
++
++// A multus conf still being written must not be used as the base: it would
++// fail to parse and the rewrite would rebuild the broken cilium-only chain.
++func TestNoRewrapOnTruncatedMultusConf(t *testing.T) {
++	dir := writeDir(t, map[string]string{
++		"05-cilium.conflist":  fixtureCilium,
++		"00-multus.conflist":  fixtureMultus[:40],
++		"00-meshnet.conflist": meshnetCiliumOnly,
++	})
++	need, err := needsMultusRewrap(dir)
++	if err != nil || need {
++		t.Fatalf("needsMultusRewrap = %v, %v; want false, nil", need, err)
++	}
++}
++
++func TestNoRewrapWithoutMeshnetConf(t *testing.T) {
++	dir := writeDir(t, map[string]string{
++		"05-cilium.conflist": fixtureCilium,
++		"00-multus.conflist": fixtureMultus,
++	})
++	need, err := needsMultusRewrap(dir)
++	if err != nil || need {
++		t.Fatalf("needsMultusRewrap = %v, %v; want false, nil", need, err)
++	}
++}
++
++func firstPluginType(t *testing.T, conf map[string]interface{}) string {
++	t.Helper()
++	plugins, ok := conf["plugins"].([]interface{})
++	if !ok || len(plugins) == 0 {
++		t.Fatalf("no plugins in %v", conf)
++	}
++	first, ok := plugins[0].(map[string]interface{})
++	if !ok {
++		t.Fatalf("first plugin is %T", plugins[0])
++	}
++	typ, _ := first["type"].(string)
++	return typ
++}
++
++// The boot sequence end to end, on a real directory: meshnet installs from
++// cilium alone, multus writes its conf later, the watcher step converges, and
++// a converged dir is never written again.
++func TestReconcileConvergesAfterMultusWritesLater(t *testing.T) {
++	dir := writeDir(t, map[string]string{"05-cilium.conflist": fixtureCilium})
++	meshnetPath := filepath.Join(dir, defaultCNIFile)
++
++	conf, err := buildMeshnetConf(dir)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := saveConfListTo(meshnetPath, conf); err != nil {
++		t.Fatal(err)
++	}
++	if got := readFirstType(t, meshnetPath); got != "cilium-cni" {
++		t.Fatalf("boot-race install first plugin = %q, want cilium-cni", got)
++	}
++
++	// Multus has not written yet: a reconcile step must not touch the file.
++	old := setOldMtime(t, meshnetPath)
++	if rewrote, err := reconcileMultusWrap(dir); err != nil || rewrote {
++		t.Fatalf("reconcile before multus = %v, %v; want false, nil", rewrote, err)
++	}
++	assertMtime(t, meshnetPath, old)
++
++	// Multus writes its conf: the next step must converge the file.
++	if err := os.WriteFile(filepath.Join(dir, multusConfName), []byte(fixtureMultus), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	if rewrote, err := reconcileMultusWrap(dir); err != nil || !rewrote {
++		t.Fatalf("reconcile after multus = %v, %v; want true, nil", rewrote, err)
++	}
++	if got := readFirstType(t, meshnetPath); got != "multus" {
++		t.Fatalf("converged first plugin = %q, want multus", got)
++	}
++	if !hasPluginType(t, meshnetPath, defaultPluginName) {
++		t.Fatal("converged chain lost the meshnet plugin")
++	}
++
++	// Converged: no further writes.
++	old = setOldMtime(t, meshnetPath)
++	if rewrote, err := reconcileMultusWrap(dir); err != nil || rewrote {
++		t.Fatalf("reconcile on converged dir = %v, %v; want false, nil", rewrote, err)
++	}
++	assertMtime(t, meshnetPath, old)
++}
++
++func TestSaveConfListLeavesNoTempFile(t *testing.T) {
++	dir := writeDir(t, map[string]string{})
++	path := filepath.Join(dir, defaultCNIFile)
++	if err := saveConfListTo(path, map[string]interface{}{"cniVersion": "0.3.0"}); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
++		t.Fatalf("temp file left behind: %v", err)
++	}
++	if _, err := os.Stat(path); err != nil {
++		t.Fatalf("target missing: %v", err)
++	}
++}
++
++func readFirstType(t *testing.T, path string) string {
++	t.Helper()
++	raw, err := os.ReadFile(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var conf map[string]interface{}
++	if err := json.Unmarshal(raw, &conf); err != nil {
++		t.Fatal(err)
++	}
++	return firstPluginType(t, conf)
++}
++
++func hasPluginType(t *testing.T, path, typ string) bool {
++	t.Helper()
++	raw, err := os.ReadFile(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var conf struct {
++		Plugins []struct {
++			Type string `json:"type"`
++		} `json:"plugins"`
++	}
++	if err := json.Unmarshal(raw, &conf); err != nil {
++		t.Fatal(err)
++	}
++	for _, p := range conf.Plugins {
++		if p.Type == typ {
++			return true
++		}
++	}
++	return false
++}
++
++var oldMtime = time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC)
++
++func setOldMtime(t *testing.T, path string) time.Time {
++	t.Helper()
++	if err := os.Chtimes(path, oldMtime, oldMtime); err != nil {
++		t.Fatal(err)
++	}
++	return oldMtime
++}
++
++func assertMtime(t *testing.T, path string, want time.Time) {
++	t.Helper()
++	st, err := os.Stat(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !st.ModTime().Equal(want) {
++		t.Fatalf("file was rewritten: mtime %v, want untouched %v", st.ModTime(), want)
++	}
++}
+diff --git a/third_party/meshnet/daemon/main.go b/third_party/meshnet/daemon/main.go
+index 6586606..d60cb58 100644
+--- a/third_party/meshnet/daemon/main.go
++++ b/third_party/meshnet/daemon/main.go
+@@ -62,6 +62,10 @@ func main() {
+ 
+ 	go m.RunControllerLoop(ctx)
+ 
++	// Converge the CNI chain once multus has written its conf (see
++	// cni.WatchMultusWrap): meshnetd can start before multus does at node boot.
++	go cni.WatchMultusWrap(ctx)
++
+ 	if err := m.Serve(); err != nil {
+ 		log.Errorf("daemon exited badly: %v", err)
+ 		os.Exit(1)
+-- 
+2.56.0
+

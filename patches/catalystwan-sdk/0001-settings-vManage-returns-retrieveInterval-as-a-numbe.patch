@@ -1,0 +1,10 @@
+settings: vManage returns retrieveInterval as a NUMBER, and the model refuses it
+
+--- a/catalystwan/endpoints/configuration_settings.py
++++ b/catalystwan/endpoints/configuration_settings.py
+@@ -50,4 +50,4 @@
+ class Certificate(BaseModel):
+-    model_config = ConfigDict(populate_by_name=True)
++    model_config = ConfigDict(populate_by_name=True, coerce_numbers_to_str=True)
+     certificate_signing: str = Field(serialization_alias="certificateSigning", validation_alias="certificateSigning")
+     validity_period: Optional[str] = Field(

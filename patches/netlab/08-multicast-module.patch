@@ -1,0 +1,752 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 12:00:00 +0000
+Subject: [PATCH] multicast: new module (PIM sparse/bidir, IGMP, static RP) for
+ EOS and IOS
+
+---
+diff --git a/docs/netlab-multicast-plan.md b/docs/netlab-multicast-plan.md
+new file mode 100644
+index 0000000..632235b
+--- /dev/null
++++ b/docs/netlab-multicast-plan.md
+@@ -0,0 +1,27 @@
++# Netlab Multicast Plan
++
++## Summary
++
++Add IPv4 multicast support to the vendored netlab tree for Skyforge, scoped to Cisco IOL and Arista EOS. The goal is configuration parity with multicast behavior the collector already parses: PIM, static RP, IGMP receiver joins, VRF multicast, static multicast RPF routes, and EOS bidirectional PIM.
++
++## Implementation
++
++- Add a `multicast` module with node, VRF, and interface attributes for PIM mode, static RP entries, static multicast routes, and IGMP options.
++- Enable the module only on `iol` and `eos`; explicitly keep `ioll2` unsupported.
++- Render IOS/IOL commands with `ip multicast-routing`, `ip pim rp-address`, interface `ip pim ...-mode`, IGMP options, and `ip mroute`.
++- Render EOS commands with `router multicast`, `router pim sparse-mode` or `router pim bidirectional`, interface PIM/IGMP commands, and static mroutes.
++- Validate multicast group prefixes, non-multicast RPF source prefixes, unsupported PIM modes, unsupported VRF multicast, and unsupported bidir use.
++
++## Tests
++
++- Add focused pytest coverage for IOL transform and rendered config.
++- Add EOS rendered-config coverage for VRF multicast and bidirectional PIM.
++- Run targeted multicast tests plus the documented transform/error test slice when a Python 3.10+ environment with test dependencies is available.
++
++## Out Of Scope
++
++- IPv6 PIM and MLD.
++- MSDP.
++- NX-OS TRM or MVPN.
++- IGMP snooping-only Layer 2 behavior.
++- Live multicast traffic validation.
+diff --git a/netsim/ansible/templates/multicast/eos.j2 b/netsim/ansible/templates/multicast/eos.j2
+new file mode 100644
+index 0000000..f57d8de
+--- /dev/null
++++ b/netsim/ansible/templates/multicast/eos.j2
+@@ -0,0 +1,53 @@
++!
++{% if multicast is defined or vrfs|default({})|selectattr('multicast','defined')|list %}
++router multicast
++{%   if multicast is defined %}
++  ipv4
++    routing
++{%   endif %}
++{%   for vname,vdata in vrfs|default({})|dictsort if vdata.multicast is defined %}
++  vrf {{ vname }}
++    ipv4
++      routing
++{%   endfor %}
++!
++{% endif %}
++{% set pim = namespace(bidir=false) %}
++{% for rp in multicast.rp|default([]) if rp.bidir|default(False) %}
++{%   set pim.bidir = true %}
++{% endfor %}
++{% for vname,vdata in vrfs|default({})|dictsort if vdata.multicast is defined %}
++{%   for rp in vdata.multicast.rp|default([]) if rp.bidir|default(False) %}
++{%     set pim.bidir = true %}
++{%   endfor %}
++{% endfor %}
++router pim {{ 'bidirectional' if pim.bidir else 'sparse-mode' }}
++{% for rp in multicast.rp|default([]) %}
++  ip pim rp-address {{ rp.address }} {{ rp.group }}{{ ' bidir' if rp.bidir|default(False) else '' }}
++{% endfor %}
++{% for vname,vdata in vrfs|default({})|dictsort if vdata.multicast is defined %}
++  vrf {{ vname }}
++{%   for rp in vdata.multicast.rp|default([]) %}
++    ip pim rp-address {{ rp.address }} {{ rp.group }}{{ ' bidir' if rp.bidir|default(False) else '' }}
++{%   endfor %}
++{% endfor %}
++!
++{% for intf in netlab_interfaces if intf.multicast is defined %}
++interface {{ intf.ifname }}
++ ip pim {{ 'bidirectional' if intf.multicast.mode == 'bidir' else intf.multicast.mode + '-mode' }}
++{%   if intf.multicast.igmp.router_alert|default(False) %}
++ ip igmp router-alert optional
++{%   endif %}
++{%   for group in intf.multicast.igmp.groups|default([]) %}
++ ip igmp static-group {{ group }}
++{%   endfor %}
++!
++{% endfor %}
++{% for route in multicast.static|default([]) %}
++ip mroute {{ route.source }} {{ route.next_hop }}
++{% endfor %}
++{% for vname,vdata in vrfs|default({})|dictsort if vdata.multicast is defined %}
++{%   for route in vdata.multicast.static|default([]) %}
++ip mroute vrf {{ vname }} {{ route.source }} {{ route.next_hop }}
++{%   endfor %}
++{% endfor %}
+diff --git a/netsim/ansible/templates/multicast/ios.j2 b/netsim/ansible/templates/multicast/ios.j2
+new file mode 100644
+index 0000000..c418040
+--- /dev/null
++++ b/netsim/ansible/templates/multicast/ios.j2
+@@ -0,0 +1,41 @@
++!
++{% if multicast is defined %}
++ip multicast-routing
++{% endif %}
++{% for vname,vdata in vrfs|default({})|dictsort if vdata.multicast is defined %}
++ip multicast-routing vrf {{ vname }} DISTRIBUTED
++{% endfor %}
++!
++{% set acl = namespace(id=79) %}
++{% for rp in multicast.rp|default([]) %}
++{%   set acl.id = acl.id + 1 %}
++access-list {{ acl.id }} permit {{ rp.group|ansible.utils.ipaddr('address') }}
++ip pim rp-address {{ rp.address }} {{ acl.id }}{{ ' override' if rp.override|default(False) else '' }}
++{% endfor %}
++{% for vname,vdata in vrfs|default({})|dictsort if vdata.multicast is defined %}
++{%   for rp in vdata.multicast.rp|default([]) %}
++{%     set acl.id = acl.id + 1 %}
++access-list {{ acl.id }} permit {{ rp.group|ansible.utils.ipaddr('address') }}
++ip pim vrf {{ vname }} rp-address {{ rp.address }} {{ acl.id }}{{ ' override' if rp.override|default(False) else '' }}
++{%   endfor %}
++{% endfor %}
++!
++{% for intf in netlab_interfaces if intf.multicast is defined %}
++interface {{ intf.ifname }}
++ ip pim {{ intf.multicast.mode }}-mode
++{%   if intf.multicast.igmp.router_alert|default(False) and netlab_device_type|default('') != 'iol' %}
++ ip igmp router-alert optional
++{%   endif %}
++{%   for group in intf.multicast.igmp.groups|default([]) %}
++ ip igmp join-group {{ group }}
++{%   endfor %}
++!
++{% endfor %}
++{% for route in multicast.static|default([]) %}
++ip mroute {{ route.source|ansible.utils.ipaddr('network') }} {{ route.source|ansible.utils.ipaddr('netmask') }} {{ route.next_hop }}
++{% endfor %}
++{% for vname,vdata in vrfs|default({})|dictsort if vdata.multicast is defined %}
++{%   for route in vdata.multicast.static|default([]) %}
++ip mroute vrf {{ vname }} {{ route.source|ansible.utils.ipaddr('network') }} {{ route.source|ansible.utils.ipaddr('netmask') }} {{ route.next_hop }}
++{%   endfor %}
++{% endfor %}
+diff --git a/netsim/devices/eos.yml b/netsim/devices/eos.yml
+index ab731a2..ca53f20 100644
+--- a/netsim/devices/eos.yml
++++ b/netsim/devices/eos.yml
+@@ -101,6 +101,13 @@ features:
+     bgp: true
+     ldp: true
+     vpn: true
++  multicast:
++    modes: [ sparse, bidir ]
++    rp: true
++    static: true
++    vrf: true
++    igmp: true
++    bidir: true
+   netmiko:
+     device_type: arista_eos
+     error_regexp: "^%.*"
+diff --git a/netsim/devices/iol.yml b/netsim/devices/iol.yml
+index a169e79..4044ed0 100644
+--- a/netsim/devices/iol.yml
++++ b/netsim/devices/iol.yml
+@@ -41,6 +41,12 @@ features:
+       unnumbered: true
+   bgp:
+     tcp_ao: True
++  multicast:
++    modes: [ sparse, sparse-dense ]
++    rp: true
++    static: true
++    vrf: true
++    igmp: true
+   sr:
+     af: [ ipv4 ]
+     protocol: [ isis, ospfv2 ]
+diff --git a/netsim/devices/ioll2.yml b/netsim/devices/ioll2.yml
+index 20ce92d..77d432b 100644
+--- a/netsim/devices/ioll2.yml
++++ b/netsim/devices/ioll2.yml
+@@ -8,6 +8,7 @@ features:
+     # SNMP agent: this device answers an NMS. Ported from the
+     # snmp_config custom config module.
+     server.snmp: True
++  multicast: false
+   initial:
+     generate_mac: [ ethernet, svi ]
+     normalize: true
+diff --git a/netsim/modules/multicast.py b/netsim/modules/multicast.py
+new file mode 100644
+index 0000000..3a17ddf
+--- /dev/null
++++ b/netsim/modules/multicast.py
+@@ -0,0 +1,145 @@
++#
++# IPv4 multicast transformation module
++#
++
++import ipaddress
++import typing
++
++from box import Box
++
++from .. import data
++from ..augment import devices
++from ..utils import log
++from . import _Module, _routing
++
++
++def _rp_instances(node: Box) -> typing.Generator:
++  if isinstance(node.get("multicast", None), Box):
++    yield (node.multicast, "global")
++
++  for vname, vdata in node.get("vrfs", {}).items():
++    if isinstance(vdata.get("multicast", None), Box):
++      yield (vdata.multicast, f"VRF {vname}")
++
++
++def _multicast_group(value: str) -> bool:
++  net = ipaddress.ip_network(value)
++  return isinstance(net, ipaddress.IPv4Network) and net.subnet_of(ipaddress.IPv4Network("224.0.0.0/4"))
++
++
++def _unicast_source(value: str) -> bool:
++  return not ipaddress.ip_network(value).overlaps(ipaddress.ip_network("224.0.0.0/4"))
++
++
++def _normalize_interface(intf: Box, node: Box) -> None:
++  if "multicast" not in intf:
++    return
++
++  if intf.multicast is True:
++    intf.multicast = data.get_empty_box()
++  if not isinstance(intf.multicast, Box):
++    intf.pop("multicast", None)
++    return
++
++  src = node.multicast
++  if intf.get("vrf", None) and isinstance(node.vrfs[intf.vrf].get("multicast", None), Box):
++    src = node.vrfs[intf.vrf].multicast
++
++  if "mode" not in intf.multicast and "mode" in src:
++    intf.multicast.mode = src.mode
++
++
++def _check_mode(node: Box, features: Box, mode: str, where: str) -> None:
++  if mode not in features.multicast.get("modes", []):
++    log.error(
++      f"Device {node.device} (node {node.name}) does not support multicast mode {mode}",
++      category=log.IncorrectValue,
++      module="multicast",
++      more_data=where,
++    )
++
++
++def _check_rp(node: Box, features: Box) -> None:
++  for mdata, where in _rp_instances(node):
++    if mdata.get("rp", []) and not features.multicast.get("rp", False):
++      log.error(
++        f"Device {node.device} (node {node.name}) does not support static multicast RP configuration",
++        category=log.IncorrectValue,
++        module="multicast",
++        more_data=where,
++      )
++      continue
++
++    for rp in mdata.get("rp", []):
++      if not _multicast_group(rp.group):
++        log.error(
++          f"Multicast RP group {rp.group} on node {node.name} is not an IPv4 multicast prefix",
++          category=log.IncorrectValue,
++          module="multicast",
++          more_data=where,
++        )
++      if rp.get("bidir", False) and not features.multicast.get("bidir", False):
++        log.error(
++          f"Device {node.device} (node {node.name}) does not support bidirectional PIM",
++          category=log.IncorrectValue,
++          module="multicast",
++          more_data=where,
++        )
++
++
++def _check_static(node: Box, features: Box) -> None:
++  for mdata, where in _rp_instances(node):
++    if mdata.get("static", []) and not features.multicast.get("static", False):
++      log.error(
++        f"Device {node.device} (node {node.name}) does not support static multicast routes",
++        category=log.IncorrectValue,
++        module="multicast",
++        more_data=where,
++      )
++      continue
++
++    for route in mdata.get("static", []):
++      if not _unicast_source(route.source):
++        log.error(
++          f"Static multicast source {route.source} on node {node.name} cannot be a multicast prefix",
++          category=log.IncorrectValue,
++          module="multicast",
++          more_data=where,
++        )
++
++
++class Multicast(_Module):
++  def node_post_transform(self, node: Box, topology: Box) -> None:
++    features = devices.get_device_features(node, topology.defaults)
++
++    for intf in node.get("interfaces", []):
++      if _routing.external(intf, "multicast"):
++        continue
++      if "multicast" in intf and "ipv4" not in intf:
++        intf.pop("multicast", None)
++        continue
++      _normalize_interface(intf, node)
++
++    if any("vrf" in intf and "multicast" in intf for intf in node.get("interfaces", [])) and not features.multicast.get(
++      "vrf", False
++    ):
++      log.error(
++        f"Device {node.device} (node {node.name}) does not support multicast in VRFs",
++        category=log.IncorrectValue,
++        module="multicast",
++      )
++
++    for intf in node.get("interfaces", []):
++      if "multicast" not in intf:
++        continue
++      _check_mode(node, features, intf.multicast.mode, f"interface {intf.ifname} ({intf.name})")
++      if intf.get("multicast.igmp", {}) and not features.multicast.get("igmp", False):
++        log.error(
++          f"Device {node.device} (node {node.name}) does not support IGMP multicast options",
++          category=log.IncorrectValue,
++          module="multicast",
++          more_data=f"interface {intf.ifname} ({intf.name})",
++        )
++
++    _check_rp(node, features)
++    _check_static(node, features)
+diff --git a/netsim/modules/multicast.yml b/netsim/modules/multicast.yml
+new file mode 100644
+index 0000000..9872ef2
+--- /dev/null
++++ b/netsim/modules/multicast.yml
+@@ -0,0 +1,78 @@
++# IPv4 multicast default settings and attributes
++#
++---
++transform_after: [ vlan, vrf ]
++config_after: [ vlan, vrf, routing ]
++mode: sparse
++
++attributes:
++  can_be_true: [ link, interface ]
++  global:
++    mode: { type: str, valid_values: [ sparse, sparse-dense, bidir ] }
++    rp:
++      type: list
++      make_list: True
++      _subtype: _multicast_rp
++    static:
++      type: list
++      make_list: True
++      _subtype: _multicast_static
++  node:
++    mode: { copy: global }
++    rp: { copy: global }
++    static: { copy: global }
++  vrf:
++    mode: { copy: global }
++    rp: { copy: global }
++    static: { copy: global }
++  link:
++    _alt_types: [ bool ]
++    mode: { type: str, valid_values: [ sparse, sparse-dense, bidir ] }
++    igmp:
++      router_alert: bool
++      groups:
++        type: list
++        make_list: True
++        _subtype: { type: ipv4, use: address }
++  interface:
++    _alt_types: [ bool ]
++    mode: { type: str, valid_values: [ sparse, sparse-dense, bidir ] }
++    igmp:
++      router_alert: bool
++      groups:
++        type: list
++        make_list: True
++        _subtype: { type: ipv4, use: address }
++
++_top:
++  attributes:
++    _multicast_rp:
++      address:
++        type: ipv4
++        use: address
++        _required: True
++      group:
++        type: ipv4
++        use: prefix
++        _required: True
++      override: bool
++      bidir: bool
++    _multicast_static:
++      source:
++        type: ipv4
++        use: prefix
++        _required: True
++      next_hop:
++        type: ipv4
++        use: address
++        _required: True
++
++features:
++  mode: PIM interface modes
++  rp: Static rendezvous points
++  static: Static multicast RPF routes
++  vrf: VRF multicast routing
++  igmp: IGMP interface options
++
++warnings:
++  inactive: True
+diff --git a/tests/coverage/errors/validate-list.log b/tests/coverage/errors/validate-list.log
+index 072ba0b..2dbfc53 100644
+--- a/tests/coverage/errors/validate-list.log
++++ b/tests/coverage/errors/validate-list.log
+@@ -1,3 +1,4 @@
+ IncorrectValue in groups: attribute groups.g1.module has invalid value(s): a
++... valid values are: bfd, bgp, dhcp, eigrp, evpn, gateway, isis, lag, mpls, multicast, ospf, ripv2, routing, services, sr, srv6, stp, vlan, vrf, vxlan
+ IncorrectType in groups: attribute 'groups.g2.module' must be a scalar or a list, found dictionary
+ Fatal error in netlab: Cannot proceed beyond this point due to errors, exiting
+diff --git a/tests/errors/invalid-module.log b/tests/errors/invalid-module.log
+index c968761..3de5f72 100644
+--- a/tests/errors/invalid-module.log
++++ b/tests/errors/invalid-module.log
+@@ -1,3 +1,4 @@
+ IncorrectValue in topology: attribute nodes.r2.module has invalid value(s): whatever
++... valid values are: bfd, bgp, dhcp, eigrp, evpn, gateway, isis, lag, mpls, multicast, ospf, ripv2, routing, services, sr, srv6, stp, vlan, vrf, vxlan
+ IncorrectValue in topology: attribute module has invalid value(s): provider
+ Fatal error in netlab: Cannot proceed beyond this point due to errors, exiting
+diff --git a/tests/errors/module-missing-prerequisite.log b/tests/errors/module-missing-prerequisite.log
+index d0bc68f..d598f63 100644
+--- a/tests/errors/module-missing-prerequisite.log
++++ b/tests/errors/module-missing-prerequisite.log
+@@ -1,2 +1,3 @@
+ IncorrectValue in topology: attribute nodes.r1.module has invalid value(s): mody
++... valid values are: bfd, bgp, dhcp, eigrp, evpn, gateway, isis, lag, modx, mpls, multicast, ospf, ripv2, routing, services, sr, srv6, stp, vlan, vrf, vxlan
+ Fatal error in netlab: Cannot proceed beyond this point due to errors, exiting
+diff --git a/tests/integration/multicast/01-eos-basic.yml b/tests/integration/multicast/01-eos-basic.yml
+new file mode 100644
+index 0000000..af3385f
+--- /dev/null
++++ b/tests/integration/multicast/01-eos-basic.yml
+@@ -0,0 +1,49 @@
++---
++message: |
++  Use this topology to test basic Arista EOS IPv4 multicast configuration.
++  The validation checks whether the DUT has multicast routing, PIM, RP,
++  static IGMP group, router-alert, and static multicast route configuration.
++
++defaults.sources.extra: [ ../wait_times.yml, ../warnings.yml ]
++
++provider: clab
++module: [ multicast ]
++defaults.device: eos
++
++multicast:
++  rp:
++  - address: 1.1.2.1
++    group: 224.1.1.1/32
++  static:
++  - source: 3.3.3.0/24
++    next_hop: 2.2.2.2
++
++nodes:
++  dut:
++    loopback.ipv4: 1.1.2.1/32
++
++links:
++- dut:
++    ipv4: 1.1.1.1/30
++    multicast:
++      igmp:
++        router_alert: true
++        groups: [ 224.1.1.1 ]
++- dut:
++    ipv4: 2.2.2.1/30
++    multicast: true
++
++validate:
++  config:
++    description: Check EOS multicast configuration
++    nodes: [ dut ]
++    devices: [ eos ]
++    exec: show running-config
++    valid: >-
++      'router multicast' in stdout and
++      'rpf route 3.3.3.0/24 2.2.2.2' in stdout and
++      'router pim sparse-mode' in stdout and
++      'rp address 1.1.2.1 224.1.1.1/32' in stdout and
++      'ip igmp static-group 224.1.1.1' in stdout and
++      'ip igmp router-alert optional' in stdout and
++      'pim ipv4 sparse-mode' in stdout
+diff --git a/tests/integration/multicast/02-iol-basic.yml b/tests/integration/multicast/02-iol-basic.yml
+new file mode 100644
+index 0000000..3dadce0
+--- /dev/null
++++ b/tests/integration/multicast/02-iol-basic.yml
+@@ -0,0 +1,51 @@
++---
++message: |
++  Use this topology to test basic Cisco IOL IPv4 multicast configuration.
++  The validation checks whether the DUT has multicast routing, PIM, RP,
++  IGMP group, and static multicast route configuration.
++
++defaults.sources.extra: [ ../wait_times.yml, ../warnings.yml ]
++
++provider: clab
++module: [ multicast ]
++defaults.device: iol
++
++multicast:
++  mode: sparse-dense
++  rp:
++  - address: 1.1.2.1
++    group: 224.1.1.1/32
++    override: true
++  static:
++  - source: 3.3.3.0/24
++    next_hop: 2.2.2.2
++
++nodes:
++  dut:
++    loopback.ipv4: 1.1.2.1/32
++
++links:
++- dut:
++    ipv4: 1.1.1.1/30
++    multicast:
++      igmp:
++        router_alert: true
++        groups: [ 224.1.1.1 ]
++- dut:
++    ipv4: 2.2.2.1/30
++    multicast: true
++
++validate:
++  config:
++    description: Check IOL multicast configuration
++    nodes: [ dut ]
++    devices: [ iosv, iol ]
++    exec: show running-config
++    valid: >-
++      'ip multicast-routing' in stdout and
++      'access-list 80 permit 224.1.1.1' in stdout and
++      'ip pim rp-address 1.1.2.1 80 override' in stdout and
++      'ip pim sparse-dense-mode' in stdout and
++      'ip igmp router-alert optional' not in stdout and
++      'ip igmp join-group 224.1.1.1' in stdout and
++      'ip mroute 3.3.3.0 255.255.255.0 2.2.2.2' in stdout
+diff --git a/tests/test_multicast.py b/tests/test_multicast.py
+new file mode 100644
+index 0000000..36c1c79
+--- /dev/null
++++ b/tests/test_multicast.py
+@@ -0,0 +1,177 @@
++import textwrap
++from pathlib import Path
++
++from box import Box
++
++from netsim import augment
++from netsim.cli import create
++from netsim.utils import log
++from netsim.utils import read as _read
++
++
++def init_log(raise_error: bool = False) -> None:
++  log.init_log_system(header=False)
++  log.set_flag(quiet=False, raise_error=raise_error, warning=False, logging=False, verbose=0)
++
++
++def write_topology(tmp_path: Path, topology: str) -> Path:
++  topo_file = tmp_path / "topology.yml"
++  topo_file.write_text(textwrap.dedent(topology).strip() + "\n")
++  return topo_file
++
++
++def load_transform(topology_file: Path) -> Box:
++  init_log()
++  topology = _read.load(str(topology_file), relative_topo_name=True, user_defaults=[])
++  log.exit_on_error()
++  augment.main.transform(topology)
++  log.exit_on_error()
++  return topology
++
++
++def create_configs(topo_file: Path, tmp_path: Path, monkeypatch) -> None:
++  monkeypatch.chdir(tmp_path)
++  init_log()
++  create.run(["-o", "config", str(topo_file)])
++
++
++def test_iol_multicast_transform_and_config(tmp_path: Path, monkeypatch) -> None:
++  topo_file = write_topology(
++    tmp_path,
++    """
++provider: clab
++module: [ multicast ]
++defaults.device: iol
++
++multicast:
++  mode: sparse-dense
++  rp:
++  - address: 1.1.2.1
++    group: 224.1.1.1/32
++    override: true
++  static:
++  - source: 3.3.3.0/24
++    next_hop: 2.2.2.2
++
++nodes:
++  r1:
++    loopback.ipv4: 1.1.2.1/32
++
++links:
++- r1:
++    ipv4: 1.1.1.1/30
++    multicast:
++      igmp:
++        router_alert: true
++        groups: [ 224.1.1.1 ]
++- r1:
++    ipv4: 2.2.2.1/30
++    multicast: true
++""",
++  )
++
++  topology = load_transform(topo_file)
++  node = topology.nodes.r1
++  assert node.interfaces[0].multicast.mode == "sparse-dense"
++  assert node.interfaces[0].multicast.igmp.groups == ["224.1.1.1"]
++
++  create_configs(topo_file, tmp_path, monkeypatch)
++  cfg = (tmp_path / "node_files" / "r1" / "multicast").read_text()
++  assert "ip multicast-routing" in cfg
++  assert "access-list 80 permit 224.1.1.1" in cfg
++  assert "ip pim rp-address 1.1.2.1 80 override" in cfg
++  assert "interface Ethernet0/1" in cfg
++  assert " ip pim sparse-dense-mode" in cfg
++  assert " ip igmp router-alert optional" not in cfg
++  assert " ip igmp join-group 224.1.1.1" in cfg
++  assert "ip mroute 3.3.3.0 255.255.255.0 2.2.2.2" in cfg
++
++
++def test_eos_multicast_vrf_bidir_config(tmp_path: Path, monkeypatch) -> None:
++  topo_file = write_topology(
++    tmp_path,
++    """
++provider: clab
++module: [ vrf, multicast ]
++defaults.device: eos
++
++vrfs:
++  red:
++    rd: 65000:1
++    multicast:
++      rp:
++      - address: 1.1.2.1
++        group: 224.1.1.1/32
++        bidir: true
++
++nodes:
++  r1:
++    loopback.ipv4: 1.1.2.1/32
++
++links:
++- r1:
++    vrf: red
++    ipv4: 1.1.1.1/30
++    multicast:
++      mode: bidir
++      igmp:
++        router_alert: true
++        groups: [ 224.1.1.1 ]
++- r1:
++    vrf: red
++    ipv4: 2.2.2.1/30
++    multicast:
++      mode: bidir
++""",
++  )
++
++  topology = load_transform(topo_file)
++  node = topology.nodes.r1
++  assert node.vrfs.red.multicast.rp[0].bidir is True
++  assert node.interfaces[0].multicast.mode == "bidir"
++
++  create_configs(topo_file, tmp_path, monkeypatch)
++  cfg = (tmp_path / "node_files" / "r1" / "multicast").read_text()
++  assert "router multicast" in cfg
++  assert "  vrf red" in cfg
++  assert "router pim bidirectional" in cfg
++  assert "    ip pim rp-address 1.1.2.1 224.1.1.1/32 bidir" in cfg
++  assert "interface Ethernet1" in cfg
++  assert " ip pim bidirectional" in cfg
++  assert " ip igmp router-alert optional" in cfg
++  assert " ip igmp static-group 224.1.1.1" in cfg
++
++
++def test_multicast_rejects_non_multicast_group(tmp_path: Path) -> None:
++  topo_file = write_topology(
++    tmp_path,
++    """
++provider: clab
++module: [ multicast ]
++defaults.device: eos
++
++multicast:
++  rp:
++  - address: 1.1.2.1
++    group: 192.0.2.0/24
++
++nodes:
++  r1:
++  r2:
++
++links:
++- r1:
++    multicast: true
++  r2:
++""",
++  )
++
++  init_log(raise_error=True)
++  topology = _read.load(str(topo_file), relative_topo_name=True, user_defaults=[])
++  try:
++    augment.main.transform(topology)
++  except log.ErrorAbort:
++    errors = "\n".join(log.get_error_log())
++    assert "is not an IPv4 multicast prefix" in errors
++  else:
++    raise AssertionError("invalid multicast group was accepted")
+-- 
+2.56.0
+

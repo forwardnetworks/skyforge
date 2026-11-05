@@ -1,0 +1,458 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 12:00:00 +0000
+Subject: [PATCH] devices: A10 vThunder (a10)
+
+---
+diff --git a/docs/plugins/loadbalancer.md b/docs/plugins/loadbalancer.md
+index dd2e926..cc60a4e 100644
+--- a/docs/plugins/loadbalancer.md
++++ b/docs/plugins/loadbalancer.md
+@@ -21,6 +21,29 @@ nodes:
+ 
+ Malformed structures are reported as transformation errors.
+ 
++### Structured model and VIP advertisement
++
++The structured `loadbalancer` node attribute (`monitors`, `pools`,
++`virtual_servers`) is what the device templates render. A virtual server can
++set `advertise: true` to inject its VIP into the node's routing protocols:
++
++```yaml
++nodes:
++  lb1:
++    device: a10
++    module: [ ospf ]
++    loadbalancer:
++      pools:
++      - name: web
++        members: [ { name: s1, address: 10.0.0.11, port: 80 } ]
++      virtual_servers:
++      - { name: vip1, vip: 203.0.113.10, port: 80, pool: web, advertise: true }
++```
++
++On A10 ACOS this renders `redistribution-flagged` on that virtual server and
++`redistribute vip only-flagged` under `router ospf`; virtual servers without
++`advertise` stay local.
++
+ ### Health monitors
+ 
+ `loadbalancer.monitors` declares named probes and three attributes bind them,
+@@ -86,6 +109,9 @@ To onboard a new load-balancer device:
+ 1. Add/extend device definition in `netsim/devices/<device>.yml`
+    - include `features.loadbalancer: {}`
+ 2. Add template in `netsim/extra/loadbalancer/<device>.j2`
++3. Ensure the device has a delivery lane: an Ansible deploy path (`deploy-config/<device>.yml`) or
++   `netlab_config_mode: netmiko`. Without one netlab renders the template and silently skips the push
++   (A10 is delivered over netmiko, device type `a10`, saved with `netmiko_save_command`)
+ 4. Add/update tests:
+    - positive rendering test (`netlab create ...` without warning)
+    - negative/unsupported test (warning still emitted when capability is missing)
+diff --git a/netsim/ansible/tasks/readiness-check/a10.yml b/netsim/ansible/tasks/readiness-check/a10.yml
+new file mode 100644
+index 0000000..f2d244f
+--- /dev/null
++++ b/netsim/ansible/tasks/readiness-check/a10.yml
+@@ -0,0 +1,28 @@
++# A10 vThunder (ACOS) readiness: SSH is not enough.
++#
++# vThunder accepts SSH (and even logs in) while its configuration subsystem is
++# still LOADING; a config push in that window fails on the first submode. The
++# `ssh` readiness step (connect-only, netlab_check_command: "") runs first and
++# proves the management plane; this step then proves what the deploy lane
++# actually needs -- enable mode with the blank enable password, and a
++# `configure terminal` session that opens and closes -- over the same
++# a10.acos_cli network_cli connection the deploy uses.
++#
++# Retry budget comes from a10_config_retries / a10_config_delay (device or
++# runtime group_vars) so the wait is declared data, not a deploy-time retry.
++---
++- name: "Wait for {{ inventory_hostname }} ACOS enable + configure terminal"
++  a10.acos_cli.acos_command:
++    commands:
++    - show version
++    - configure terminal
++    - end
++  become: "{{ ansible_become | default(true) }}"
++  register: a10_ready
++  until: a10_ready is succeeded
++  retries: "{{ a10_config_retries | default(30) }}"
++  delay: "{{ a10_config_delay | default(20) }}"
++
++- name: Confirm {{ inventory_hostname }} ACOS CLI is ready
++  debug:
++    msg: "Node {{ inventory_hostname }} is ready (ACOS enable + configure terminal)."
+diff --git a/netsim/ansible/templates/initial/a10.j2 b/netsim/ansible/templates/initial/a10.j2
+new file mode 100644
+index 0000000..581a2e9
+--- /dev/null
++++ b/netsim/ansible/templates/initial/a10.j2
+@@ -0,0 +1,13 @@
++hostname {{ inventory_hostname }}
++{# LLDP. Global `lldp enable rx tx` plus the same per-interface line, the
++   exact seed syntax (demo-lab atl-dc1-a10-lb1_shared configuration.txt).
++   Without this the device never sources or is sourced by any LLDP-derived
++   adjacency, dropping every neighbor link a collector infers from LLDP
++   alone. #}
++lldp enable rx tx
++{% for l in interfaces | default([]) if l.ipv4 is defined and l.ipv4 | ansible.utils.ipv4 %}
++interface ethernet {{ l.ifindex }}
++  enable
++  lldp enable rx tx
++  ip address {{ l.ipv4 | ansible.utils.ipaddr('address') }} /{{ l.ipv4 | ansible.utils.ipaddr('prefix') }}
++{% endfor %}
+diff --git a/netsim/ansible/templates/loadbalancer/a10.j2 b/netsim/ansible/templates/loadbalancer/a10.j2
+index 4e304a9..dc39bde 100644
+--- a/netsim/ansible/templates/loadbalancer/a10.j2
++++ b/netsim/ansible/templates/loadbalancer/a10.j2
+@@ -28,12 +28,31 @@ health monitor {{ m.name }}
+ 
+ {%   endif %}
+ {% endfor %}
++{% for pool in loadbalancer.pools | default([]) %}
++{%   for member in pool.members | default([]) %}
++slb server {{ member.name }} {{ member.address }}
+ {%     if member.server_monitor | default('default') != 'default' %}
+   {{ hc(member.server_monitor) }}
+ {%     endif %}
++  port {{ member.port }} {{ pool.protocol | default('tcp') }}
+ {%     if member.monitor | default('default') != 'default' %}
+     {{ hc(member.monitor) }}
+ {%     endif %}
++{%   endfor %}
++slb service-group {{ pool.name }} {{ pool.protocol | default('tcp') }}
+ {%   if pool.monitor | default('default', true) != 'default' %}
+   {{ hc(pool.monitor) }}
+ {%   endif %}
++{%   for member in pool.members | default([]) %}
++  member {{ member.name }} {{ member.port }}
++{%   endfor %}
++{% endfor %}
++
++{% for vs in loadbalancer.virtual_servers | default([]) %}
++slb virtual-server {{ vs.name }} {{ vs.vip }}
++{%   if vs.advertise | default(false) %}
++  redistribution-flagged
++{%   endif %}
++  port {{ vs.port }} {{ vs.protocol | default('tcp') }}
++    service-group {{ vs.pool }}
++{% endfor %}
+diff --git a/netsim/ansible/templates/ospf/a10.j2 b/netsim/ansible/templates/ospf/a10.j2
+new file mode 100644
+index 0000000..ef48b47
+--- /dev/null
++++ b/netsim/ansible/templates/ospf/a10.j2
+@@ -0,0 +1,21 @@
++router ospf {{ ospf.process | default(1) }}
++{% if ospf.router_id is defined %}
++  router-id {{ ospf.router_id }}
++{% endif %}
++{% for intf in netlab_interfaces | default([]) if intf.ospf is defined and intf.ipv4 is defined %}
++  network {{ intf.ipv4 | ansible.utils.ipaddr('subnet') }} area {{ intf.ospf.area | default('0.0.0.0') }}
++{%   if intf.ospf.passive | default(false) %}
++  passive-interface ethernet {{ intf.ifindex }}
++{%   endif %}
++{% endfor %}
++{#
++    VIP redistribution. ACOS injects a VIP into a routing protocol only when
++    the protocol redistributes `vip`; `only-flagged` limits that to virtual
++    servers marked redistribution-flagged, which the loadbalancer template
++    renders from loadbalancer.virtual_servers[].advertise. Keyed off the same
++    attribute so the two halves cannot disagree.
++#}
++{% set _lb_vs = loadbalancer.virtual_servers|default([]) if loadbalancer is defined else [] %}
++{% if _lb_vs | selectattr('advertise','defined') | selectattr('advertise') | list %}
++  redistribute vip only-flagged
++{% endif %}
+diff --git a/netsim/ansible/templates/routing/a10.j2 b/netsim/ansible/templates/routing/a10.j2
+new file mode 100644
+index 0000000..d937030
+--- /dev/null
++++ b/netsim/ansible/templates/routing/a10.j2
+@@ -0,0 +1,3 @@
++{% for route in routing.static | default([]) %}
++ip route {{ route.ipv4|ansible.utils.ipaddr('network') }} /{{ route.ipv4|ansible.utils.ipaddr('prefix') }} {{ route.nexthop.ipv4 }}
++{% endfor %}
+diff --git a/netsim/ansible/templates/services/a10.j2 b/netsim/ansible/templates/services/a10.j2
+new file mode 100644
+index 0000000..e33a8ed
+--- /dev/null
++++ b/netsim/ansible/templates/services/a10.j2
+@@ -0,0 +1,23 @@
++{% if services.server.snmp is defined %}
++{#
++    SNMP agent. The community is a parameter defaulting to `skyforge` -- the
++    community the collector's collectors poll with. Any other default leaves every
++    device reachable and unpollable.
++
++    TOP-LEVEL `snmp-server community read`, deliberately, NOT the SNMPv1-v2c
++    submode this was first ported as. Per A10's own AXAPI schema (vendored at
++    a10/acos_axapi), these are two DIFFERENT objects:
++      /snmp-server/community/read/{user}   user = "SNMPv1/v2c community string"
++      /snmp-server/SNMPv1-v2c/user/{user}  user = "community configuration key",
++                                           whose value comes from `passwd`
++    so `community read` is not a child of the SNMPv1-v2c submode in either
++    form. The submode version could only ever be pushed by a bespoke
++    snmp_config deploy playbook, which the services module has no equivalent
++    of -- the rendered file goes out as FLAT config lines, where the indented
++    line lands in plain (config) mode and ACOS answers
++    `% Unrecognized command`. This form needs no deploy override at all.
++#}
++snmp-server enable service
++snmp-server community read {{ services.server.snmp.community|default('skyforge') }}
++lldp enable rx tx
++{% endif %}
+diff --git a/netsim/devices/a10.yml b/netsim/devices/a10.yml
+new file mode 100644
+index 0000000..7999fe2
+--- /dev/null
++++ b/netsim/devices/a10.yml
+@@ -0,0 +1,84 @@
++---
++description: A10 vThunder load balancer
++support:
++  level: minimal
++  caveats:
++  - A10 vThunder configuration is deployed with netmiko (device type `a10`, enable mode) for
++    every module template and saved with `write memory` unless `netlab_save_config` is false.
++    Readiness is still checked with the a10.acos_cli collection.
++  - Load-balancer VIPs marked `advertise` are flagged for redistribution and injected into OSPF
++    with `redistribute vip only-flagged`.
++interface_name: ethernet {ifindex}
++mgmt_if: management
++role: host
++clab:
++  image: vrnetlab/a10_vthunder:5.2.0
++  node:
++    kind: a10_vthunder
++    env:
++      PASSWORD: a10
++      QEMU_MEMORY: "4096"
++      QEMU_SMP: "4"
++      QEMU_CPU: host
++  interface:
++    name: eth{ifindex}
++group_vars:
++  ansible_network_os: acos
++  ansible_user: admin
++  ansible_password: a10
++  ansible_ssh_pass: a10
++  ansible_connection: network_cli
++  collections:
++  - a10.acos_cli
++  - a10.acos_axapi
++  ansible_become: yes
++  ansible_become_method: enable
++  # The default vThunder enable password is blank. The A10 terminal plugin uses
++  # enable mode to disable CLI paging before running show/config commands.
++  ansible_become_password: ""
++  ansible_timeout: 180
++  ansible_command_timeout: 180
++  # ACOS accepts SSH before the interactive CLI can return ssh-exec output.
++  # Use netlab's connect-only SSH readiness contract; the configuration is
++  # applied over netmiko after management is reachable.
++  netlab_check_command: ""
++  ansible_ssh_common_args: >-
++    -o StrictHostKeyChecking=no
++    -o UserKnownHostsFile=/dev/null
++    -o ConnectTimeout=30
++    -o ConnectionAttempts=10
++  netlab_ssh_args: -tt
++  netlab_device_type: a10
++  netlab_config_mode: netmiko
++  netmiko_device_type: a10
++  netmiko_error_regexp:
++  - '% Invalid input'
++  - '% Incomplete command'
++  - Unrecognized command
++  # netmiko's A10 driver cannot save_config()
++  netmiko_save_command: write memory
++  netlab_console_connection: ssh
++  # ssh first (connect-only, above), then readiness-check/a10.yml proves enable
++  # mode and a configure-terminal session before netmiko pushes the config.
++  netlab_ready: [ ssh, ansible ]
++  netlab_check_retries: 90
++  netlab_check_delay: 10
++external:
++  image: none
++graphite.icon: server
++features:
++  services:
++    # SNMP agent: this device answers an NMS. Ported from the
++    # snmp_config custom config module.
++    server.snmp: True
++  loadbalancer: true
++  initial:
++    config_mode: [ netmiko ]
++    roles: [ host ]
++  ospf:
++    ipv4: true
++  routing:
++    static: true
++
++kne:
++  interface.name: eth{ifindex}
+diff --git a/netsim/extra/loadbalancer/a10.j2 b/netsim/extra/loadbalancer/a10.j2
+index cbe8233..dc39bde 100644
+--- a/netsim/extra/loadbalancer/a10.j2
++++ b/netsim/extra/loadbalancer/a10.j2
+@@ -50,6 +50,9 @@ slb service-group {{ pool.name }} {{ pool.protocol | default('tcp') }}
+ 
+ {% for vs in loadbalancer.virtual_servers | default([]) %}
+ slb virtual-server {{ vs.name }} {{ vs.vip }}
++{%   if vs.advertise | default(false) %}
++  redistribution-flagged
++{%   endif %}
+   port {{ vs.port }} {{ vs.protocol | default('tcp') }}
+     service-group {{ vs.pool }}
+ {% endfor %}
+diff --git a/netsim/extra/loadbalancer/defaults.yml b/netsim/extra/loadbalancer/defaults.yml
+index 957d12b..b5c9884 100644
+--- a/netsim/extra/loadbalancer/defaults.yml
++++ b/netsim/extra/loadbalancer/defaults.yml
+@@ -108,3 +108,9 @@ attributes:
+     pool:
+       type: str
+       _required: true
++    advertise:
++      type: bool
++      _description: |
++        Advertise the VIP into the node's routing protocols. On A10 ACOS the
++        virtual server is marked redistribution-flagged and OSPF gets
++        `redistribute vip only-flagged`; unflagged VIPs stay local.
+diff --git a/tests/test_a10_deploy_and_vip_advertise.py b/tests/test_a10_deploy_and_vip_advertise.py
+new file mode 100644
+index 0000000..279f63c
+--- /dev/null
++++ b/tests/test_a10_deploy_and_vip_advertise.py
+@@ -0,0 +1,127 @@
++#!/usr/bin/env python3
++"""
++A10 vThunder (ACOS):
++
++  * every module template the a10 device renders must be delivered -- when
++    deploy-config/a10.yml was missing, deploy-module.yml found the template,
++    found no deploy script and SKIPPED it, and the lab reported configured while
++    the vThunder ran its factory config. It is now delivered over netmiko, so
++    every module must map to the netmiko lane;
++  * loadbalancer.virtual_servers[].advertise renders BOTH halves of ACOS VIP
++    redistribution: `redistribution-flagged` on that virtual server and
++    `redistribute vip only-flagged` under router ospf. Unflagged VIPs stay
++    local, and a node with no flagged VIP gets no redistribution at all.
++"""
++
++import textwrap
++from pathlib import Path
++
++import pytest
++import yaml
++
++from netsim.augment import devices
++from netsim.cli import create
++from netsim.utils import log
++
++NETSIM = Path(__file__).resolve().parents[1] / 'netsim'
++
++
++def init_log(raise_error: bool = False) -> None:
++  log.init_log_system(header=False)
++  log.set_flag(quiet=True,raise_error=raise_error,warning=False,logging=False,verbose=0)
++
++
++def write_topology(tmp_path: Path, advertise: str) -> Path:
++  topo_file = tmp_path / 'topology.yml'
++  topo_file.write_text(textwrap.dedent(f"""
++    provider: kne
++    plugin: [ loadbalancer ]
++    module: [ ospf ]
++    nodes:
++      lb:
++        device: a10
++        module: [ ospf ]              # the demo-lab A10s list their modules too
++        ospf.router_id: 10.254.2.6
++        loadbalancer:
++          pools:
++          - name: web
++            members:
++            - {{ name: s1, address: 10.55.101.11, port: 80 }}
++          virtual_servers:
++          - {{ name: flagged_vip, vip: 210.140.140.140, port: 80, pool: web {advertise} }}
++          - {{ name: local_vip, vip: 210.140.140.141, port: 80, pool: web }}
++      r1: {{ device: iol }}
++    links: [ lb-r1 ]
++    """).strip() + '\n')
++  return topo_file
++
++
++def module_cfg(node: str, module: str) -> str:
++  return Path(f'node_files/{node}/{module}').read_text()
++
++
++def test_a10_vip_advertise_renders_flag_and_ospf_redistribution(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.chdir(tmp_path)
++  init_log()
++  create.run(['-o','config','-o','provider',str(write_topology(tmp_path,', advertise: true'))])
++
++  lb = module_cfg('lb','loadbalancer')
++  assert 'slb virtual-server flagged_vip 210.140.140.140\n  redistribution-flagged\n  port 80 tcp\n' in lb
++  assert 'slb virtual-server local_vip 210.140.140.141\n  port 80 tcp\n' in lb   # unflagged stays local
++  assert lb.count('redistribution-flagged') == 1
++
++  ospf = module_cfg('lb','ospf')
++  assert ospf.startswith('router ospf 1\n')
++  assert '  redistribute vip only-flagged\n' in ospf
++
++
++def test_a10_without_advertise_renders_no_redistribution(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.chdir(tmp_path)
++  init_log()
++  create.run(['-o','config','-o','provider',str(write_topology(tmp_path,''))])
++
++  assert 'redistribution-flagged' not in module_cfg('lb','loadbalancer')
++  ospf = module_cfg('lb','ospf')
++  assert 'router ospf 1' in ospf                                          # positive control: OSPF did render
++  assert 'redistribute vip' not in ospf
++
++
++def test_a10_advertise_must_be_a_bool(tmp_path: Path) -> None:
++  init_log(raise_error=True)
++  with pytest.raises(log.ErrorAbort):
++    create.run(['-o','none',str(write_topology(tmp_path,', advertise: sometimes'))])
++
++
++def test_every_a10_module_template_is_delivered_over_netmiko(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.chdir(tmp_path)
++  init_log()
++  topology = create.run(['-o','config','-o','provider',str(write_topology(tmp_path,', advertise: true'))])
++  lb = topology.nodes.lb
++
++  assert devices.get_node_group_var(lb,'netlab_config_mode',topology.defaults) == 'netmiko'
++  modules = ['initial','ospf','loadbalancer']
++  for m in modules:
++    assert lb._node_config[m] == ':netmiko', m
++    assert Path(f'node_files/lb/{m}').exists(), m
++  assert set(lb.netlab_ansible_skip_module) >= set(modules)   # nothing left for the Ansible lane
++
++  device = yaml.safe_load((NETSIM / 'devices' / 'a10.yml').read_text())
++  assert device['group_vars']['netmiko_device_type'] == 'a10'
++  assert device['group_vars']['netmiko_save_command'] == 'write memory'
++  # The acos_config lane is retired, not dormant
++  assert not (NETSIM / 'ansible' / 'tasks' / 'deploy-config' / 'a10.yml').exists()
++  assert not (NETSIM / 'ansible' / 'tasks' / 'a10').exists()
++
++  templates = sorted(p.parent.name for p in (NETSIM / 'ansible' / 'templates').glob('*/a10.j2'))
++  assert {'initial','ospf','routing','services','loadbalancer'} <= set(templates)
++
++
++def test_a10_readiness_proves_the_cli_not_just_ssh() -> None:
++  device = yaml.safe_load((NETSIM / 'devices' / 'a10.yml').read_text())
++  assert device['group_vars']['netlab_ready'] == ['ssh','ansible']
++  ready = yaml.safe_load((NETSIM / 'ansible' / 'tasks' / 'readiness-check' / 'a10.yml').read_text())
++  probe = ready[0]
++  cmds = probe['a10.acos_cli.acos_command']['commands']
++  assert 'configure terminal' in cmds and cmds[-1] == 'end'
++  assert probe['until'] == 'a10_ready is succeeded'
++  assert 'a10_config_retries' in str(probe['retries'])
+-- 
+2.56.0
+

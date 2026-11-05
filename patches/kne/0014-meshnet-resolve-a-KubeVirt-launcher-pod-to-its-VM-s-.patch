@@ -1,0 +1,130 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 12:46:56 -0500
+Subject: [PATCH 14/35] meshnet: resolve a KubeVirt launcher pod to its VM's
+ Topology (R5)
+
+---
+diff --git a/third_party/meshnet/daemon/meshnet/handler.go b/third_party/meshnet/daemon/meshnet/handler.go
+index c8a29c8..0fd8c86 100644
+--- a/third_party/meshnet/daemon/meshnet/handler.go
++++ b/third_party/meshnet/daemon/meshnet/handler.go
+@@ -11,6 +11,7 @@ import (
+ 	"github.com/openconfig/kne/third_party/meshnet/daemon/vxlan"
+ 
+ 	log "github.com/sirupsen/logrus"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+ 	"k8s.io/apimachinery/pkg/runtime"
+@@ -30,12 +31,40 @@ func (m *Meshnet) getPod(ctx context.Context, name, ns string) (*unstructured.Un
+ 	}
+ 	mnetdLogger.Debugf("Reading pod %s from K8s", name)
+ 	topo, err := m.tClient.Topology(ns).Unstructured(ctx, name, metav1.GetOptions{})
++	if err != nil && apierrors.IsNotFound(err) && m.kClient != nil {
++		// A KubeVirt virt-launcher pod has a generated name, but its Topology
++		// CR is named after the VM. Resolve through the VM label so meshnet
++		// wires the launcher's links to the VM's topology (KNE rebase R5).
++		if aliased, ok, aliasErr := m.topologyForLauncher(ctx, name, ns); ok {
++			topo, err = aliased, aliasErr
++		}
++	}
+ 	if err == nil && topo != nil && m.topoCache != nil {
+ 		m.topoCache.Put(topo)
+ 	}
+ 	return topo, err
+ }
+ 
++// topologyForLauncher returns the Topology CR of the VM that owns the
++// virt-launcher pod name, when that pod carries the vm.kubevirt.io/name label.
++// ok is false when the pod is not a launcher or the VM has no topology.
++func (m *Meshnet) topologyForLauncher(ctx context.Context, podName, ns string) (*unstructured.Unstructured, bool, error) {
++	kpod, err := m.kClient.CoreV1().Pods(ns).Get(ctx, podName, metav1.GetOptions{})
++	if err != nil {
++		return nil, false, nil
++	}
++	vmName := kpod.Labels["vm.kubevirt.io/name"]
++	if vmName == "" || vmName == podName {
++		return nil, false, nil
++	}
++	mnetdLogger.Infof("Resolved pod %s to topology %s via label vm.kubevirt.io/name", podName, vmName)
++	aliased, aliasErr := m.tClient.Topology(ns).Unstructured(ctx, vmName, metav1.GetOptions{})
++	if apierrors.IsNotFound(aliasErr) {
++		return nil, false, nil
++	}
++	return aliased, true, aliasErr
++}
++
+ func (m *Meshnet) updateStatus(ctx context.Context, obj *unstructured.Unstructured, ns string) error {
+ 	if m.tClient == nil {
+ 		return fmt.Errorf("topology client not initialized")
+diff --git a/third_party/meshnet/daemon/meshnet/handler_launcher_test.go b/third_party/meshnet/daemon/meshnet/handler_launcher_test.go
+new file mode 100644
+index 0000000..f61da9a
+--- /dev/null
++++ b/third_party/meshnet/daemon/meshnet/handler_launcher_test.go
+@@ -0,0 +1,61 @@
++package meshnet
++
++import (
++	"context"
++	"testing"
++
++	fakeTopology "github.com/openconfig/kne/third_party/meshnet/api/clientset/v1beta1/fake"
++	topologyv1 "github.com/openconfig/kne/third_party/meshnet/api/types/v1beta1"
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	fakekube "k8s.io/client-go/kubernetes/fake"
++)
++
++// The requirement: a virt-launcher pod (generated name) resolves to the
++// Topology CR named after its VM, through the vm.kubevirt.io/name label.
++func newLauncherMeshnet(t *testing.T, launcher *corev1.Pod) *Meshnet {
++	t.Helper()
++	InitLogger()
++	vmTopo := &topologyv1.Topology{
++		ObjectMeta: metav1.ObjectMeta{Name: "vm1", Namespace: "default"},
++		Status:     topologyv1.TopologyStatus{SrcIP: "/proc/1/ns/net"},
++	}
++	topoClient, err := fakeTopology.NewSimpleClientset(vmTopo)
++	if err != nil {
++		t.Fatalf("topology clientset: %v", err)
++	}
++	return &Meshnet{tClient: topoClient, kClient: fakekube.NewSimpleClientset(launcher)}
++}
++
++func launcherPod(name string, labels map[string]string) *corev1.Pod {
++	return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", Labels: labels}}
++}
++
++func TestGetPodResolvesLauncherToVMTopology(t *testing.T) {
++	m := newLauncherMeshnet(t, launcherPod("virt-launcher-vm1-x7k2p", map[string]string{"vm.kubevirt.io/name": "vm1"}))
++	topo, err := m.getPod(context.Background(), "virt-launcher-vm1-x7k2p", "default")
++	if err != nil {
++		t.Fatalf("getPod: %v", err)
++	}
++	if topo.GetName() != "vm1" {
++		t.Fatalf("resolved topology = %q, want vm1", topo.GetName())
++	}
++}
++
++// Negative control: a pod without the label is not aliased, so the original
++// NotFound is what the caller sees.
++func TestGetPodDoesNotAliasUnlabelledPod(t *testing.T) {
++	m := newLauncherMeshnet(t, launcherPod("plain-pod", nil))
++	if _, err := m.getPod(context.Background(), "plain-pod", "default"); err == nil {
++		t.Fatal("getPod(plain-pod) succeeded; want NotFound")
++	}
++}
++
++// A direct topology by the pod's own name wins; no alias lookup is needed.
++func TestGetPodDirectTopologyUnchanged(t *testing.T) {
++	m := newLauncherMeshnet(t, launcherPod("unused", nil))
++	topo, err := m.getPod(context.Background(), "vm1", "default")
++	if err != nil || topo.GetName() != "vm1" {
++		t.Fatalf("getPod(vm1) = %v, %v", topo, err)
++	}
++}
+-- 
+2.56.0
+

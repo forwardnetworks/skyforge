@@ -1,0 +1,269 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 00:00:00 +0000
+Subject: [PATCH] SKYFORGE-SPECIFIC: KNE config-exec bulkhead gets a second,
+ higher plain-exec lane (cEOS, linux); console lane unchanged at 12
+
+---
+diff --git a/netsim/providers/kne.py b/netsim/providers/kne.py
+index ccc05b4..62bcb28 100644
+--- a/netsim/providers/kne.py
++++ b/netsim/providers/kne.py
+@@ -482,22 +482,85 @@ KNE_KUBECTL_OP_KILL_GRACE = 10
+ KNE_CONFIG_EXEC_PARALLELISM = int(os.environ.get('SKYFORGE_KNE_CONFIG_EXEC_PARALLELISM','12') or 0)
+ _kne_config_exec_semaphore = threading.Semaphore(KNE_CONFIG_EXEC_PARALLELISM) if KNE_CONFIG_EXEC_PARALLELISM > 0 else None
+ 
++# SKYFORGE-SPECIFIC: TWO bulkhead lanes instead of one.
++#
++# The 12 above was set for CONSOLE-attach devices (IOL: one exclusive attach chain per node, orphans that hold the
++# lock). The fragments it also throttles for cEOS and linux hosts are plain `kubectl exec`, with no per-node lock
++# and no orphan to leak. fleet40 (2026-10-10): 436 fragments went through 12 slots in 17 s, ~25 per second; the
++# profile projects ~520 s of fan-out at 4,000 nodes for a pool that is idle on the cluster side.
++#
++# lane 'console' keeps SKYFORGE_KNE_CONFIG_EXEC_PARALLELISM (default 12) and takes every node that is not plain-exec.
++# lane 'plain' is linux-lineage hosts and cEOS (ansible_network_os linux / eos). Its limit:
++#   SKYFORGE_KNE_CONFIG_EXEC_PARALLELISM_PLAIN  default 32, always BOUNDED to 1..64 (0, junk and negative mean the
++#   default; there is no 'unbounded' for this lane). 32 is also the default size of the thread pool that calls us
++#   (concurrent.futures.ThreadPoolExecutor: min(32, cpus + 4)), i.e. what plain exec ran at before the bulkhead existed.
++# If SKYFORGE_KNE_CONFIG_EXEC_PARALLELISM is set explicitly to a positive number and the PLAIN variable is not, the plain
++# lane follows it, still capped at the plain maximum: an operator who throttled the one knob to calm the cluster gets the
++# same calm in both lanes. Setting it to 0 (no console bulkhead) does NOT remove the plain bound; the plain lane then keeps
++# its default.
++# The lanes are separate semaphores, so a wedged console lane can no longer starve plain fragments, and the plain
++# bound keeps a runaway pool from opening an unbounded number of exec streams (see the 2026-08-17 starvation above).
++KNE_CONFIG_EXEC_PLAIN_DEFAULT = 32
++KNE_CONFIG_EXEC_PLAIN_MAX = 64
++KNE_CONFIG_EXEC_PLAIN_DEVICES = ('linux', 'eos')
++
++def config_exec_plain_limit(plain_raw, console_raw, console_limit: int) -> int:
++  """Slots for the plain-exec lane. Always 1..KNE_CONFIG_EXEC_PLAIN_MAX: there is no 'unbounded' plain lane."""
++  plain_raw = str(plain_raw or '').strip()
++  if plain_raw:
++    try:
++      value = int(plain_raw)
++    except ValueError:
++      value = 0
++    if value <= 0:
++      return KNE_CONFIG_EXEC_PLAIN_DEFAULT
++    return min(value,KNE_CONFIG_EXEC_PLAIN_MAX)
++  if str(console_raw or '').strip() and console_limit > 0:
++    return min(console_limit,KNE_CONFIG_EXEC_PLAIN_MAX)
++  return KNE_CONFIG_EXEC_PLAIN_DEFAULT
++
++KNE_CONFIG_EXEC_PARALLELISM_PLAIN = config_exec_plain_limit(
++  os.environ.get('SKYFORGE_KNE_CONFIG_EXEC_PARALLELISM_PLAIN'),
++  os.environ.get('SKYFORGE_KNE_CONFIG_EXEC_PARALLELISM'),
++  KNE_CONFIG_EXEC_PARALLELISM)
++_kne_config_exec_semaphores = {
++  'console': _kne_config_exec_semaphore,
++  'plain': threading.Semaphore(KNE_CONFIG_EXEC_PARALLELISM_PLAIN) if KNE_CONFIG_EXEC_PARALLELISM_PLAIN > 0 else None,
++}
++_kne_config_exec_limits = {'console': KNE_CONFIG_EXEC_PARALLELISM, 'plain': KNE_CONFIG_EXEC_PARALLELISM_PLAIN}
++
++def kne_config_exec_lane(node: Box, topology: Box) -> str:
++  """'plain' for nodes configured by a plain `kubectl exec` (linux lineage, cEOS), 'console' for everything else."""
++  try:
++    os_name = devices.get_node_group_var(node,'ansible_network_os',topology.defaults)
++  except Exception:
++    return 'console'
++  return 'plain' if os_name in KNE_CONFIG_EXEC_PLAIN_DEVICES else 'console'
++
+ 
+ @contextlib.contextmanager
+-def kne_config_exec_slot(node_name: str, mod_name: str):
++def kne_config_exec_slot(node_name: str, mod_name: str, lane: str = 'console'):
+   """Hold a bulkhead slot for one config-fragment exec (no-op when disabled)."""
+-  if _kne_config_exec_semaphore is None:
++  semaphore = _kne_config_exec_semaphores.get(lane)
++  if semaphore is None:
+     yield
+     return
+   waited_from = time.time()
+-  with _kne_config_exec_semaphore:
+-    waited = time.time() - waited_from
++  with semaphore:
++    acquired = time.time()
++    waited = acquired - waited_from
+     # Only report a wait that a human would notice; a quiet run stays quiet.
+     if waited >= 5:
+       log.info(
+         f'config exec bulkhead: {node_name}/{mod_name} waited {waited:.0f}s for one of '
+-        f'{KNE_CONFIG_EXEC_PARALLELISM} slots')
+-    yield
++        f'{_kne_config_exec_limits.get(lane)} {lane} slots')
++    try:
++      yield
++    finally:
++      held = time.time() - acquired
++      # Per-fragment cost is the missing number in the fan-out profile; report only the slow ones.
++      if held >= 5:
++        log.info(f'config exec bulkhead: {node_name}/{mod_name} held a {lane} slot for {held:.0f}s')
+ def dns_1035_name(value: str, prefix: str = 'n') -> str:
+   value = value.lower()
+   value = re.sub(r'[^a-z0-9-]+','-',value)
+@@ -3174,7 +3237,7 @@ class KNE(_Provider):
+         else:
+           config_cmd.append(cfg_item.target)
+         log.info(f'Executing {mod_name} configuration for node {node.name}')
+-        with kne_config_exec_slot(node.name, mod_name):
++        with kne_config_exec_slot(node.name, mod_name, kne_config_exec_lane(node, topology)):
+           (status,run_stdout,run_stderr) = run_kubectl_with_retries(config_cmd)
+         if status == 0:
+           append_to_list(node._deploy,'success',mod_name)
+diff --git a/tests/test_kne_config_exec_lanes.py b/tests/test_kne_config_exec_lanes.py
+new file mode 100644
+index 0000000..9a72508
+--- /dev/null
++++ b/tests/test_kne_config_exec_lanes.py
+@@ -0,0 +1,148 @@
++"""KNE config-exec bulkhead lanes (SKYFORGE-SPECIFIC).
++
++Requirement: cEOS and linux fragments (plain `kubectl exec`) get a higher, BOUNDED concurrency limit than the
++console-bound lane (default 12, unchanged); the limit is configurable; a stuck console lane cannot starve the plain
++lane; and an operator who throttled the old single knob keeps getting that throttle in both lanes.
++"""
++
++import importlib
++import threading
++import time
++
++import pytest
++from box import Box
++
++
++def load(monkeypatch, console=None, plain=None):
++    for name, value in (("SKYFORGE_KNE_CONFIG_EXEC_PARALLELISM", console),
++                        ("SKYFORGE_KNE_CONFIG_EXEC_PARALLELISM_PLAIN", plain)):
++        if value is None:
++            monkeypatch.delenv(name, raising=False)
++        else:
++            monkeypatch.setenv(name, value)
++    from netsim.providers import kne
++    return importlib.reload(kne)
++
++
++@pytest.fixture(autouse=True)
++def restore(monkeypatch):
++    yield
++    for name in ("SKYFORGE_KNE_CONFIG_EXEC_PARALLELISM", "SKYFORGE_KNE_CONFIG_EXEC_PARALLELISM_PLAIN"):
++        monkeypatch.delenv(name, raising=False)
++    from netsim.providers import kne
++    importlib.reload(kne)
++
++
++def peak_concurrency(kne, lane, workers, hold=0.05):
++    lock, state = threading.Lock(), {"now": 0, "peak": 0}
++
++    def work(i):
++        with kne.kne_config_exec_slot(f"n{i}", "initial", lane):
++            with lock:
++                state["now"] += 1
++                state["peak"] = max(state["peak"], state["now"])
++            time.sleep(hold)
++            with lock:
++                state["now"] -= 1
++
++    threads = [threading.Thread(target=work, args=(i,)) for i in range(workers)]
++    [t.start() for t in threads]
++    [t.join() for t in threads]
++    return state["peak"]
++
++
++def test_defaults_are_12_for_console_and_32_for_plain(monkeypatch):
++    kne = load(monkeypatch)
++    assert (kne.KNE_CONFIG_EXEC_PARALLELISM, kne.KNE_CONFIG_EXEC_PARALLELISM_PLAIN) == (12, 32)
++
++
++def test_the_two_lanes_really_admit_their_own_number_of_fragments(monkeypatch):
++    kne = load(monkeypatch)
++    assert peak_concurrency(kne, "console", 60) == 12, "the console lane keeps its historical bulkhead"
++    assert peak_concurrency(kne, "plain", 100) == 32, "the plain lane admits its own limit and no more"
++
++
++@pytest.mark.parametrize("raw,expected", [("8", 8), ("64", 64), ("500", 64), ("0", 32), ("-3", 32), ("junk", 32), ("  16 ", 16)])
++def test_plain_limit_is_configurable_and_always_bounded(monkeypatch, raw, expected):
++    kne = load(monkeypatch, plain=raw)
++    assert kne.KNE_CONFIG_EXEC_PARALLELISM_PLAIN == expected
++    assert kne.KNE_CONFIG_EXEC_PARALLELISM == 12, "the plain knob never moves the console lane"
++
++
++def test_an_explicit_old_knob_throttles_both_lanes_unless_plain_is_set(monkeypatch):
++    kne = load(monkeypatch, console="4")
++    assert (kne.KNE_CONFIG_EXEC_PARALLELISM, kne.KNE_CONFIG_EXEC_PARALLELISM_PLAIN) == (4, 4)
++    kne = load(monkeypatch, console="4", plain="20")
++    assert (kne.KNE_CONFIG_EXEC_PARALLELISM, kne.KNE_CONFIG_EXEC_PARALLELISM_PLAIN) == (4, 20)
++
++
++@pytest.mark.parametrize("console,plain_expected", [("500", 64), ("64", 64), ("65", 64), ("0", 32), ("-2", 32)])
++def test_the_plain_lane_is_bounded_whatever_the_old_knob_says(monkeypatch, console, plain_expected):
++    """The old knob can raise or disable the CONSOLE lane; it must never make the plain lane unbounded or wider than
++    the plain maximum (the 2026-08-17 exec-pool starvation hazard)."""
++    kne = load(monkeypatch, console=console)
++    assert kne.KNE_CONFIG_EXEC_PARALLELISM_PLAIN == plain_expected
++    assert 1 <= kne.KNE_CONFIG_EXEC_PARALLELISM_PLAIN <= 64
++
++
++def test_a_full_console_lane_does_not_starve_the_plain_lane(monkeypatch):
++    kne = load(monkeypatch)
++    release = threading.Event()
++    held = threading.Semaphore(0)
++
++    def wedge(i):
++        with kne.kne_config_exec_slot(f"iol{i}", "initial", "console"):
++            held.release()
++            release.wait(30)
++
++    wedged = [threading.Thread(target=wedge, args=(i,)) for i in range(12)]
++    [t.start() for t in wedged]
++    for _ in range(12):
++        assert held.acquire(timeout=5)
++    got = threading.Event()
++
++    def plain():
++        with kne.kne_config_exec_slot("ceos1", "initial", "plain"):
++            got.set()
++
++    t = threading.Thread(target=plain)
++    t.start()
++    assert got.wait(2), "plain fragments must proceed while every console slot is held"
++    release.set()
++    [x.join() for x in wedged + [t]]
++
++
++def test_unknown_lane_and_disabled_console_bulkhead_do_not_block(monkeypatch):
++    kne = load(monkeypatch, console="0")
++    assert kne.KNE_CONFIG_EXEC_PARALLELISM == 0, "an operator may still disable the console bulkhead as before"
++    assert kne.KNE_CONFIG_EXEC_PARALLELISM_PLAIN == 32, "...but never the plain one"
++    assert peak_concurrency(kne, "plain", 100) == 32
++    with kne.kne_config_exec_slot("n", "m", "console"):
++        with kne.kne_config_exec_slot("n", "m", "plain"):
++            with kne.kne_config_exec_slot("n", "m", "no-such-lane"):
++                pass
++
++
++@pytest.mark.parametrize("os_name,lane", [("linux", "plain"), ("eos", "plain"), ("ios", "console"), ("frr", "console"),
++                                         ("iosxr", "console"), ("panos", "console"), ("", "console")])
++def test_lane_follows_the_nodes_network_os(monkeypatch, os_name, lane):
++    kne = load(monkeypatch)
++    monkeypatch.setattr(kne.devices, "get_node_group_var", lambda node, key, defaults: os_name)
++    assert kne.kne_config_exec_lane(Box({"name": "n", "device": "x"}), Box({"defaults": {}})) == lane
++
++
++def test_a_lookup_failure_falls_back_to_the_conservative_lane(monkeypatch):
++    kne = load(monkeypatch)
++
++    def boom(node, key, defaults):
++        raise KeyError(key)
++
++    monkeypatch.setattr(kne.devices, "get_node_group_var", boom)
++    assert kne.kne_config_exec_lane(Box({"name": "n"}), Box({"defaults": {}})) == "console"
++
++
++def test_the_deploy_path_picks_the_lane_per_node():
++    import inspect
++    from netsim.providers import kne
++    source = inspect.getsource(kne.KNE.deploy_node_config)
++    assert "kne_config_exec_slot(node.name, mod_name, kne_config_exec_lane(node, topology))" in source
+-- 
+2.56.0
+

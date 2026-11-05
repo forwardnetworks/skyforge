@@ -1,0 +1,37 @@
+# iol-slots — the purpose-built probe for the IOL multi-slot NETMAP fix.
+#
+# WHY THIS EXISTS SEPARATELY FROM ANY REAL LAB
+#
+# demo-lab cannot show the bug. Every IOL node in it has <=3 data links and one
+# slot BY CONSTRUCTION, because the high-degree switches were worked around
+# when the ceiling was thought to be a hard limit. A lab that cannot express
+# the failure cannot prove the fix, so this topology exists only to put a
+# single IOL node past the ceiling.
+#
+# hub has FIVE data links. With one slot that is two links past the end:
+# Ethernet0/1..0/3 are the only ports behind slot 0 (0/0 is management), so
+# links 4 and 5 land on Ethernet1/0 and Ethernet1/1.
+#
+# EXPECTED, fix working:  hub reaches ready, `show ip interface brief` lists
+#                         Ethernet1/0 and Ethernet1/1, and every spoke pings.
+# EXPECTED, fix broken:   on iol it fails SILENTLY -- hub boots, netlab initial
+#                         reports "% Invalid input" for each Ethernet1/x, and
+#                         spoke4/spoke5 simply have no adjacency. So DO NOT read
+#                         "deploy succeeded" as proof; read the interface list.
+name: iol_slots
+provider: kne
+
+nodes:
+  hub: { device: iol }
+  spoke1: { device: iol }
+  spoke2: { device: iol }
+  spoke3: { device: iol }
+  spoke4: { device: iol }
+  spoke5: { device: iol }
+
+links:
+- [hub, spoke1]
+- [hub, spoke2]
+- [hub, spoke3]
+- [hub, spoke4]
+- [hub, spoke5]

@@ -1,0 +1,14 @@
+Skyforge (open-source release)
+Copyright 2026 Forward Networks, Inc.
+
+The documentation and tooling in this repository are licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Each directory under patches/ is a patch series for a third-party project. A patch is a derivative work of the
+project it modifies and stays under that project's licence; see UPSTREAM.md for the licence of each upstream.
+
+components/blueprints/netlab/ is derived from ipspace/netlab-examples, Copyright (c) 2020-2025 Ivan Pepelnjak
+(ipSpace.net AG) and contributors, and stays under that project's licence (components/blueprints/netlab/LICENSE.md):
+a permissive notice WITH a restriction on offering the software as a hosted or SaaS service. It is not an OSI
+open-source licence and it is not Apache-2.0.
+
+Nothing in this repository relicenses any upstream code.

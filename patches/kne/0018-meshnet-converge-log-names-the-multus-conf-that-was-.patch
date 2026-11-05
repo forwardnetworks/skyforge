@@ -1,0 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 13:26:59 -0500
+Subject: [PATCH 18/35] meshnet: converge log names the multus conf that was
+ found, not the conflist name
+
+---
+diff --git a/third_party/meshnet/daemon/cni/cni.go b/third_party/meshnet/daemon/cni/cni.go
+index 02c4a48..885764c 100644
+--- a/third_party/meshnet/daemon/cni/cni.go
++++ b/third_party/meshnet/daemon/cni/cni.go
+@@ -294,7 +294,7 @@ func WatchMultusWrap(ctx context.Context) {
+ 			continue
+ 		}
+ 		if rewrote {
+-			log.Infof("re-installed %s to wrap multus: %s appeared after meshnet's first install", meshnetCNIPath, multusConfName)
++			log.Infof("re-installed %s to wrap multus: a multus conf appeared after meshnet's first install", meshnetCNIPath)
+ 		}
+ 	}
+ }
+-- 
+2.56.0
+

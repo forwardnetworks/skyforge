@@ -1,0 +1,22 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 15:26:21 -0500
+Subject: [PATCH 32/35] meshnet: RBAC may read nodes (the M0012 underlay
+ contract needs it)
+
+---
+diff --git a/third_party/meshnet/manifests/base/rbac.yaml b/third_party/meshnet/manifests/base/rbac.yaml
+index f5c9a42..9adacd0 100644
+--- a/third_party/meshnet/manifests/base/rbac.yaml
++++ b/third_party/meshnet/manifests/base/rbac.yaml
+@@ -21,6 +21,7 @@ rules:
+       - ""
+     resources:
+       - pods
++      - nodes
+     verbs:
+       - get
+       - list
+-- 
+2.56.0
+

@@ -1,0 +1,30 @@
+#
+# Using FRR on containerlab to make it fast
+#
+defaults.device: iol
+#
+module: [ isis, bgp ]
+
+bgp.as: 65000
+
+nodes:
+  # netlab 26.08 tightening: a node using module attributes must enable the
+  # module itself, and `bgp.rr_cluster_id: False` (= every RR uses its own
+  # router ID) is gone — the same distinct-cluster-ID setup is now spelled out
+  # with explicit per-RR cluster IDs matching each RR's router ID.
+  rr1:
+    module: [ isis, bgp ]
+    id: 1
+    bgp.rr: True
+    bgp.rr_cluster_id: 10.0.0.1
+  rr2:
+    module: [ isis, bgp ]
+    id: 2
+    bgp.rr: True
+    bgp.rr_cluster_id: 10.0.0.2
+  pe1:
+    module: [ isis, bgp ]
+  pe2:
+    module: [ isis, bgp ]
+
+links: [ rr1-pe1, rr1-pe2, rr2-pe1, rr2-pe2 ]

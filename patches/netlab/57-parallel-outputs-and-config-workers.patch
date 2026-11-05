@@ -1,0 +1,819 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 14:30:00 +0000
+Subject: [PATCH] netlab create: output modules and per-node config rendering
+ run in forked workers, byte-identical output
+
+SKYFORGE-SPECIFIC: platform behaviour; not for upstream.
+
+---
+diff --git a/netsim/cli/create.py b/netsim/cli/create.py
+index e891b06..b5f56ec 100644
+--- a/netsim/cli/create.py
++++ b/netsim/cli/create.py
+@@ -22,6 +22,7 @@ from ..utils import log, strings
+ from ..utils import read as _read
+ from . import common_parse_args, error_and_exit, lab_status_log, load_topology, topology_parse_args
+ from ._hooks import cli_plugin_hooks
++from . import parallel_outputs
+ 
+ 
+ #
+@@ -200,18 +201,21 @@ def run(cli_args: typing.List[str],
+   # are used in search paths
+   augment.config.make_paths_absolute(topology.defaults.paths)
+ 
+-  for output_format in args.output:
+-    output_param = get_output_parameter(output_format,args.output)
+-    if not output_param:
+-      continue
+-    output_module = _TopologyOutput.load(output_param,topology.defaults.outputs[output_param.split(':')[0]])
+-    if output_module:
+-      memo.invalidate()                         # SKYFORGE-SPECIFIC: outputs work on copies of the topology, don't keep them alive
+-      output_module.write(topology)
+-      memo.invalidate()
+-      log.exit_on_error()
+-    else:
+-      log.error('Unknown output format %s' % output_format,log.IncorrectValue,'create')
++  if parallel_outputs.usable(args,topology):     # SKYFORGE-SPECIFIC (patch 57): independent outputs run concurrently
++    parallel_outputs.run(args,topology)
++  else:
++    for output_format in args.output:
++      output_param = get_output_parameter(output_format,args.output)
++      if not output_param:
++        continue
++      output_module = _TopologyOutput.load(output_param,topology.defaults.outputs[output_param.split(':')[0]])
++      if output_module:
++        memo.invalidate()                       # SKYFORGE-SPECIFIC: outputs work on copies of the topology, don't keep them alive
++        output_module.write(topology)
++        memo.invalidate()
++        log.exit_on_error()
++      else:
++        log.error('Unknown output format %s' % output_format,log.IncorrectValue,'create')
+ 
+   cli_plugin_hooks(topology,'create','post_output')
+ 
+diff --git a/netsim/cli/parallel_outputs.py b/netsim/cli/parallel_outputs.py
+new file mode 100644
+index 0000000..e9a2e2f
+--- /dev/null
++++ b/netsim/cli/parallel_outputs.py
+@@ -0,0 +1,109 @@
++#
++# SKYFORGE-SPECIFIC (patch 57): run the 'netlab create' output modules concurrently.
++#
++# WHY. On a large lab the output modules are about a third of the compile (measured at 512 nodes in the runtime
++# image, patches 1-55: config 17.4%, provider 7.8%, pickle 5.2%, ansible 2.9%) and most of them only read the
++# transformed topology.
++#
++# HOW. The loop below is the original output loop (create.run) with one change: a module that comes after the
++# barrier ('config') and does not change the topology has its write() run in a forked worker instead of inline.
++# Everything else happens in this process, in the original order: loading each module (which can add an empty
++# defaults.outputs.<name> entry to the topology), 'config' (later modules read the node_files it writes: the KNE
++# provider assembles each startup-config from them), and 'pickle' (it puts the provider instance cache back into
++# topology._Providers, so it must change THIS process's topology). A worker forked at module N therefore sees exactly
++# the topology the sequential loop handed module N. Each module's stdout/stderr, errors and warnings are replayed in
++# module order (utils/forkrun.py), so the console output and exit status match the sequential loop and the files are
++# byte-identical (patch tests + the Rolex ladder + the blueprint corpus).
++#
++# WHEN NOT (create.run's original loop runs instead):
++#   * SKYFORGE_NETLAB_PARALLEL_OUTPUTS=0;
++#   * the process cannot fork safely (no fork, or more than one thread);
++#   * -o on the command line, --devices, an output with options or a filename, or an unknown output module:
++#     keep netlab's exact behaviour;
++#   * fewer than two modules after the barrier.
++# One difference on FAILURE only: with sequential outputs, modules after a failing one never run; here the concurrent
++# ones may already have written their files when the error is reported. Messages and exit status are the same.
++#
++import importlib.util
++import os
++import tempfile
++import typing
++
++from box import Box
++
++from ..data import memo
++from ..outputs import _TopologyOutput
++from ..utils import forkrun, log
++
++IN_PROCESS = {'pickle'}                         # changes the topology it is handed: must run here
++BARRIER = 'config'                              # later modules read the files it writes
++
++
++def enabled() -> bool:
++  return os.environ.get('SKYFORGE_NETLAB_PARALLEL_OUTPUTS', '1') != '0'
++
++
++def usable(args: typing.Any, topology: Box) -> bool:
++  if not enabled() or not forkrun.fork_ok() or getattr(args, 'devices', None):
++    return False
++  if not isinstance(args.output, Box):          # -o on the command line: the user asked for something specific
++    return False
++  names = []
++  for name in args.output:
++    value = args.output[name]
++    if value is False:
++      continue
++    if value or ':' in name or '=' in name:     # options or an output file: not the plain default
++      return False
++    if importlib.util.find_spec(f'netsim.outputs.{name}') is None:
++      return False
++    names.append(name)
++  rest = names[names.index(BARRIER) + 1:] if BARRIER in names else names
++  return len([ n for n in rest if n not in IN_PROCESS ]) >= 1 and len(rest) >= 2
++
++
++def _write(module: typing.Any, topology: Box) -> typing.Callable[[], None]:
++  def fn() -> None:
++    memo.invalidate()                           # patch 54: the caches must not outlive a module
++    module.write(topology)
++    memo.invalidate()
++  return fn
++
++
++def run(args: typing.Any, topology: Box) -> None:
++  from .create import get_output_parameter
++
++  barrier_passed = BARRIER not in args.output
++  with tempfile.TemporaryDirectory(prefix='netlab-outputs-') as tmpdir:
++    pending: list = []                          # (tag, pid or None, local result or None, what, module)
++    for idx, output_format in enumerate(args.output):
++      output_param = get_output_parameter(output_format, args.output)
++      if not output_param:
++        continue
++      output_module = _TopologyOutput.load(output_param, topology.defaults.outputs[output_param.split(':')[0]])
++      if not output_module:                     # usable() checked the names; keep the original behaviour anyway
++        log.error('Unknown output format %s' % output_format, log.IncorrectValue, 'create')
++        continue
++      tag = f'o{idx}'
++      if not barrier_passed or output_format in IN_PROCESS:
++        if not pending:                         # nothing concurrent yet: exactly the original inline step
++          _write(output_module, topology)()
++          log.exit_on_error()
++        else:
++          pending.append((tag, None, forkrun.run_captured(_write(output_module, topology), tmpdir, tag), output_format, output_module))
++      else:
++        pending.append((tag, forkrun.start(_write(output_module, topology), tmpdir, tag), None, output_format, output_module))
++      if output_format == BARRIER:
++        barrier_passed = True
++
++    results = [ local if pid is None else forkrun.collect(pid, tmpdir, tag, f'output module {what}')
++                for tag, pid, local, what, _ in pending ]
++    for (tag, pid, _, what, module), result in zip(pending, results):   # replay in module order
++      if pid is not None and not forkrun.clean(result):
++        # The worker logged something (an error, a warning, a hint): what netlab prints once per process can only
++        # be printed right by this process, so this module runs again here, at its place in the order. The output
++        # modules after the barrier only read the topology, so the re-run writes the same files.
++        _write(module, topology)()
++        log.exit_on_error()
++      else:
++        forkrun.replay(result)
+diff --git a/netsim/outputs/config.py b/netsim/outputs/config.py
+index 23c5d9e..f3bbcf7 100644
+--- a/netsim/outputs/config.py
++++ b/netsim/outputs/config.py
+@@ -11,6 +11,7 @@ from ..augment import devices, groups, nodes
+ from ..providers import SHARED_PREFIX, SHARED_SUFFIX, get_provider_module
+ from ..utils import log, strings, templates
+ from . import _TopologyOutput, check_writeable
++from . import parallel_config
+ from . import common as output_common
+ 
+ 
+@@ -18,18 +19,25 @@ class ConfigurationFiles(_TopologyOutput):
+ 
+   DESCRIPTION :str = 'Create device configuration files'
+ 
+-  def write(self, topology: Box) -> None:
++  @staticmethod
++  def _shared_sources(n_data: Box, topology: Box) -> list:
++    """SKYFORGE-SPECIFIC (patch 57): the shared config templates one_node() would reach for this node, in order.
++
++    Mirrors the shared-template branch of the node loop exactly, so a parallel run can hand every node the
++    shared_list the sequential loop would have had when it got to that node."""
++    n_provider = devices.get_provider(n_data,topology.defaults)
++    skip_config = n_data.get('skip_config',[])
++    out = []
++    for cfg_item in n_data.get(f'{n_provider}.config_templates',[]):
++      cfg_source = cfg_item if isinstance(cfg_item,str) else cfg_item.get('source',getattr(cfg_item,'source',None))
++      cfg_mode = '' if isinstance(cfg_item,str) else cfg_item.get('mode','')
++      if not cfg_source or cfg_source in skip_config:
++        continue
++      if cfg_mode == SHARED_SUFFIX:
++        out.append(cfg_source)
++    return out
+ 
+-    def do_config(t_name: str, f_name: str, cfg_mode: str) -> bool:
+-      return templates.create_config_file(
+-        node=n_data,
+-        node_dict=node_dict,
+-        topology=topology,
+-        module=t_name,
+-        provider_path=provider_path,
+-        output_path=node_files,
+-        output_file=f_name,
+-        config_mode=cfg_mode)
++  def write(self, topology: Box) -> None:
+ 
+     check_writeable('device configuration files')
+ 
+@@ -53,12 +61,23 @@ class ConfigurationFiles(_TopologyOutput):
+     else:
+       unprovisioned = []
+ 
+-    for n_name,n_data in topology.nodes.items():
++    def one_node(n_name: str, n_data: Box, shared_list: list) -> None:
+       n_provider = devices.get_provider(n_data,topology.defaults)
+       p = get_provider_module(topology,n_provider)
+       provider_path = p.get_full_template_path()
+       node_dict = templates.template_node_data(n_data,topology)       # The dictionary used in templates
+ 
++      def do_config(t_name: str, f_name: str, cfg_mode: str) -> bool:
++        return templates.create_config_file(
++          node=n_data,
++          node_dict=node_dict,
++          topology=topology,
++          module=t_name,
++          provider_path=provider_path,
++          output_path=node_files,
++          output_file=f_name,
++          config_mode=cfg_mode)
++
+       create_list = []
+       skip_config = n_data.get('skip_config',[])
+       for cfg_item in n_data.get(f'{n_provider}.config_templates',[]):
+@@ -85,7 +104,7 @@ class ConfigurationFiles(_TopologyOutput):
+             (node_files / cfg_path).chmod(0o755)
+ 
+       if n_name in unprovisioned:
+-        continue
++        return
+ 
+       mod_list = ['initial']
+       if devices.get_device_attribute(n_data,'features.initial.normalize',topology.defaults):
+@@ -109,3 +128,11 @@ class ConfigurationFiles(_TopologyOutput):
+       if not log.VERBOSE and create_list:
+         strings.print_colored_text(strings.pad_err_code('CONFIG',10),'green')
+         print(f"{n_name}: {','.join(create_list)}")
++
++    # SKYFORGE-SPECIFIC (patch 57): render the nodes in forked workers when the lab is big enough (exact same files,
++    # same console lines in the same order); otherwise the original loop.
++    if parallel_config.usable(topology):
++      parallel_config.run(topology,one_node,lambda n_data: self._shared_sources(n_data,topology))
++    else:
++      for n_name,n_data in topology.nodes.items():
++        one_node(n_name,n_data,shared_list)
+diff --git a/netsim/outputs/parallel_config.py b/netsim/outputs/parallel_config.py
+new file mode 100644
+index 0000000..bb9532a
+--- /dev/null
++++ b/netsim/outputs/parallel_config.py
+@@ -0,0 +1,76 @@
++#
++# SKYFORGE-SPECIFIC (patch 57): render node configuration files in forked workers.
++#
++# The node loop in outputs/config.py is independent per node except for one piece of shared state: the list of
++# "shared" config templates already written. The parent computes, for every node, exactly the shared_list the
++# sequential loop would have had on reaching that node, then hands contiguous chunks of nodes to workers. Each worker
++# writes its nodes' files; its console lines, errors and warnings are replayed in chunk order (utils/forkrun.py), so
++# the files, the CONFIG lines and the exit status are the same as the sequential loop.
++#
++# Used only when the lab has at least SKYFORGE_NETLAB_PARALLEL_CONFIG_MIN nodes (default 64), forking is safe, and
++# SKYFORGE_NETLAB_PARALLEL_OUTPUTS is not 0. Workers: SKYFORGE_NETLAB_CONFIG_WORKERS (default min(8, CPUs)).
++#
++import os
++import shutil
++import tempfile
++import typing
++
++from box import Box
++
++from ..utils import forkrun
++
++
++def _workers() -> int:
++  try:
++    want = int(os.environ.get('SKYFORGE_NETLAB_CONFIG_WORKERS', '0'))
++  except ValueError:
++    want = 0
++  cpus = len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else (os.cpu_count() or 1)
++  return max(1, want if want > 0 else min(8, cpus))
++
++
++def usable(topology: Box) -> bool:
++  if os.environ.get('SKYFORGE_NETLAB_PARALLEL_OUTPUTS', '1') == '0' or not forkrun.fork_ok():
++    return False
++  try:
++    min_nodes = int(os.environ.get('SKYFORGE_NETLAB_PARALLEL_CONFIG_MIN', '64'))
++  except ValueError:
++    min_nodes = 64
++  return len(topology.nodes) >= min_nodes and _workers() > 1
++
++
++def run(topology: Box, one_node: typing.Callable, shared_sources: typing.Callable) -> None:
++  names = list(topology.nodes.keys())
++  shared: list = []                             # simulate the sequential loop's shared_list
++  start_state = {}
++  for n_name in names:
++    start_state[n_name] = list(shared)
++    for src in shared_sources(topology.nodes[n_name]):
++      if src not in shared:
++        shared.append(src)
++
++  w = min(_workers(), len(names))
++  size = -(-len(names) // w)
++  chunks = [ names[i:i + size] for i in range(0, len(names), size) ]
++
++  def chunk_fn(chunk: list) -> typing.Callable[[], None]:
++    def fn() -> None:
++      for n_name in chunk:
++        one_node(n_name, topology.nodes[n_name], list(start_state[n_name]))
++    return fn
++
++  with tempfile.TemporaryDirectory(prefix='netlab-config-') as tmpdir:
++    pids = [ forkrun.start(chunk_fn(c), tmpdir, f'c{i}') for i, c in enumerate(chunks) ]
++    results = [ forkrun.collect(pid, tmpdir, f'c{i}', 'config worker') for i, pid in enumerate(pids) ]
++    if all(forkrun.clean(r) for r in results):
++      for r in results:
++        forkrun.replay(r, exit_on_error=False)  # the output loop checks errors after the module, as before
++      return
++
++  # A worker logged something (an error, a warning, a hint). What netlab prints once per process can only be printed
++  # right by this process: start the node files again and render every node here, exactly as the original loop does.
++  if os.path.exists('node_files'):
++    shutil.rmtree('node_files')
++  shared_list: list = []
++  for n_name in names:
++    one_node(n_name, topology.nodes[n_name], shared_list)
+diff --git a/netsim/utils/forkrun.py b/netsim/utils/forkrun.py
+new file mode 100644
+index 0000000..5197afe
+--- /dev/null
++++ b/netsim/utils/forkrun.py
+@@ -0,0 +1,128 @@
++#
++# SKYFORGE-SPECIFIC (patch 57): run pieces of 'netlab create' in forked workers while keeping the console output,
++# the error/warning logs and the exit behaviour exactly as if they had run one after the other in this process.
++#
++# A task is a zero-argument callable. Each one runs with fd 1/2 redirected to files; what it printed, the errors and
++# warnings it logged and any exception it raised are collected, then replay() feeds them back IN TASK ORDER.
++#
++import gc
++import os
++import pickle
++import sys
++import threading
++import typing
++
++from . import log
++
++
++def fork_ok() -> bool:
++  """Forking is only safe from a single-threaded process."""
++  return hasattr(os, 'fork') and threading.active_count() == 1
++
++
++def run_captured(fn: typing.Callable[[], None], tmpdir: str, tag: str) -> dict:
++  out_path, err_path = os.path.join(tmpdir, f'{tag}.out'), os.path.join(tmpdir, f'{tag}.err')
++  n_err, n_warn = len(log._ERROR_LOG), len(log._WARNING_LOG)
++  header = log._error_header_printed
++  sys.stdout.flush()
++  sys.stderr.flush()
++  saved = (os.dup(1), os.dup(2))
++  saved_streams = (sys.stdout, sys.stderr)
++  result: dict = {'exc': None}
++  with open(out_path, 'wb') as fo, open(err_path, 'wb') as fe:
++    os.dup2(fo.fileno(), 1)
++    os.dup2(fe.fileno(), 2)
++    # The python-level streams too: something (a test harness, a wrapper) may have pointed sys.stdout at a file
++    # object that does not go through fd 1, and output written there would bypass the capture and lose its order.
++    sys.stdout = open(1, 'w', encoding=getattr(saved_streams[0], 'encoding', None) or 'utf-8', closefd=False)
++    sys.stderr = open(2, 'w', encoding=getattr(saved_streams[1], 'encoding', None) or 'utf-8', closefd=False)
++    try:
++      fn()
++    except BaseException as ex:                   # SystemExit from log.fatal, ErrorAbort under RAISE_ON_ERROR, bugs
++      result['exc'] = ex
++    finally:
++      sys.stdout.flush()
++      sys.stderr.flush()
++      sys.stdout, sys.stderr = saved_streams
++      os.dup2(saved[0], 1)
++      os.dup2(saved[1], 2)
++      os.close(saved[0])
++      os.close(saved[1])
++  result['errors'] = log._ERROR_LOG[n_err:]
++  result['warnings'] = log._WARNING_LOG[n_warn:]
++  result['header'] = log._error_header_printed and not header
++  result['out'], result['err'] = out_path, err_path
++  # Taken back out: the caller re-adds them at this task's place in the order (replay)
++  del log._ERROR_LOG[n_err:]
++  del log._WARNING_LOG[n_warn:]
++  log._error_header_printed = header
++  return result
++
++
++def start(fn: typing.Callable[[], None], tmpdir: str, tag: str) -> int:
++  """Fork a worker that runs fn captured and writes its result file. Returns the pid."""
++  sys.stdout.flush()
++  sys.stderr.flush()
++  gc.freeze()                                   # the child's collector must not walk (and so copy) the parent's pages
++  pid = os.fork()
++  if pid:
++    return pid
++  gc.disable()                                  # short-lived worker: no cyclic collection of the inherited heap
++  code = 0
++  try:
++    result = run_captured(fn, tmpdir, tag)
++    exc = result['exc']
++    if exc is not None:
++      try:
++        pickle.dumps(exc)
++      except Exception:
++        result['exc'] = RuntimeError(f'{type(exc).__name__}: {exc}')
++    with open(os.path.join(tmpdir, f'{tag}.result'), 'wb') as f:
++      pickle.dump(result, f)
++  except BaseException:
++    code = 70
++  finally:
++    os._exit(code)
++
++
++def collect(pid: int, tmpdir: str, tag: str, what: str) -> dict:
++  _, status = os.waitpid(pid, 0)
++  gc.unfreeze()
++  rpath = os.path.join(tmpdir, f'{tag}.result')
++  if not os.path.exists(rpath):
++    log.fatal(f'{what}: worker died (wait status {status})', module='create')
++  with open(rpath, 'rb') as f:
++    return pickle.load(f)
++
++
++def clean(result: dict) -> bool:
++  """A task that logged nothing, wrote nothing to stderr and raised nothing.
++
++  Only a clean task's captured output can be replayed as is: netlab prints some things once per process (the
++  'Errors encountered' header, documentation hints, repeated warnings), and a worker that started from a copy of this
++  process cannot know whether an earlier task printed them. Callers re-run an unclean task in this process instead."""
++  if result.get('exc') is not None or result['errors'] or result['warnings'] or result['header']:
++    return False
++  return os.path.getsize(result['err']) == 0
++
++
++def replay(result: dict, exit_on_error: bool = True) -> None:
++  """Print what the task printed, re-add its errors/warnings, re-raise its exception, then check for errors."""
++  for path, stream in ((result['out'], sys.stdout), (result['err'], sys.stderr)):
++    with open(path, 'rb') as f:
++      data = f.read()
++    if data:
++      stream.flush()
++      if hasattr(stream, 'buffer'):
++        stream.buffer.write(data)
++      else:
++        stream.write(data.decode(getattr(stream, 'encoding', None) or 'utf-8', errors='replace'))
++      stream.flush()
++  log._ERROR_LOG.extend(result['errors'])
++  log._WARNING_LOG.extend(result['warnings'])
++  if result['header']:
++    log._error_header_printed = True
++  if result.get('exc') is not None:
++    raise result['exc']
++  if exit_on_error:
++    log.exit_on_error()
+diff --git a/tests/test_parallel_outputs.py b/tests/test_parallel_outputs.py
+new file mode 100644
+index 0000000..bcc3558
+--- /dev/null
++++ b/tests/test_parallel_outputs.py
+@@ -0,0 +1,329 @@
++#!/usr/bin/env python3
++"""
++Parallel outputs (SKYFORGE-SPECIFIC, patch 57): running the output modules (and the per-node config rendering) in
++forked workers must change how long 'netlab create' takes, never what it produces: not the files, not the console
++output, not the topology create.run() returns, not the exit behaviour on an error.
++
++Every test compares a run with the parallel paths ON against the same run with them OFF
++(SKYFORGE_NETLAB_PARALLEL_OUTPUTS=0, the original sequential loop).
++"""
++
++import pickle
++import textwrap
++import threading
++from pathlib import Path
++
++import pytest
++
++from netsim.cli import create, parallel_outputs
++from netsim.data import memo
++from netsim.outputs import parallel_config
++from netsim.utils import forkrun, log
++
++_TOPOLOGY = """
++provider: kne
++module: [ ospf, bgp, vxlan, evpn, vlan ]
++bgp.as: 65000
++addressing:
++  loopback: { ipv4: 10.0.0.0/16, prefix: 32 }
++  mgmt: { ipv4: 10.200.0.0/14 }
++vlans:
++  tenant0: { id: 100, mode: bridge, prefix: 10.100.0.0/24 }
++  tenant1: { id: 101, mode: bridge, prefix: 10.104.0.0/24 }
++defaults.device: eos
++nodes:
++  s1: { bgp.rr: true }
++  s2: { bgp.rr: true }
++  l1: { vlans: { tenant0: {}, tenant1: {} } }
++  l2: { vlans: { tenant0: {}, tenant1: {} } }
++  h1: { device: linux }
++  h2: { device: linux }
++  h3: { device: linux }
++links:
++- { s1: , l1: }
++- { s1: , l2: }
++- { s2: , l1: }
++- { s2: , l2: }
++- { l1: , h1: , vlan.access: tenant0 }
++- { l1: , h2: , vlan.access: tenant1 }
++- { l2: , h3: , vlan.access: tenant0 }
++"""
++
++
++def _init_log() -> None:
++  log.init_log_system(header=False)
++  log.set_flag(quiet=False, raise_error=False, warning=False, logging=False, verbose=0)
++
++
++def _compile(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture, name: str,
++             parallel: bool, topology_text: str = _TOPOLOGY) -> tuple:
++  lab = tmp_path / name / 'lab'
++  lab.mkdir(parents=True)
++  monkeypatch.chdir(lab)
++  monkeypatch.setenv('SKYFORGE_NETLAB_PARALLEL_OUTPUTS', '1' if parallel else '0')
++  monkeypatch.setenv('SKYFORGE_NETLAB_PARALLEL_CONFIG_MIN', '1')    # exercise the per-node workers on a small lab
++  monkeypatch.setenv('SKYFORGE_NETLAB_CONFIG_WORKERS', '3')
++  memo.invalidate()
++  (lab / 'topology.yml').write_text(textwrap.dedent(topology_text).strip() + '\n')
++  _init_log()
++  capfd.readouterr()
++  topology = create.run([str(lab / 'topology.yml')])              # default outputs: config, provider, pickle, tools, ansible
++  out, err = capfd.readouterr()
++  return lab, topology, out.replace(str(tmp_path / name), '<ROOT>'), err.replace(str(tmp_path / name), '<ROOT>')
++
++
++def _tree(lab: Path, root: Path) -> dict:
++  out = {}
++  for p in sorted(lab.rglob('*')):
++    if p.is_file() and '__pycache__' not in p.parts:
++      rel = str(p.relative_to(lab))
++      raw = p.read_bytes()
++      if rel.endswith('.pickle'):
++        data = pickle.loads(raw)
++        data.get('defaults', {}).get('_cache', {}).pop('timestamp', None)
++        raw = repr(data).encode()
++      out[rel] = (raw.replace(str(root).encode(), b'<ROOT>'), p.stat().st_mode)
++  return out
++
++
++def _plain(topology) -> dict:
++  d = topology.to_dict()
++  providers = d.pop('_Providers', {})
++  d['_Providers'] = sorted(providers)                              # provider objects: compare which, not identity
++  d.get('defaults', {}).get('_cache', {}).pop('timestamp', None)   # wall-clock time of the run
++  return d
++
++
++@pytest.fixture
++def warm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture) -> None:
++  """netlab caches the parsed defaults on first use and the key order of a cold and a warm start differ: compare warm starts."""
++  _compile(tmp_path, monkeypatch, capfd, 'warmup', parallel=False)
++
++
++def test_parallel_outputs_are_used_for_a_default_create(warm, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
++                                                        capfd: pytest.CaptureFixture) -> None:
++  """Positive control for the equality tests below: the parallel paths really run."""
++  calls = {'outputs': 0, 'config': 0}
++  real_out, real_cfg = parallel_outputs.run, parallel_config.run
++  monkeypatch.setattr(parallel_outputs, 'run', lambda *a: (calls.__setitem__('outputs', calls['outputs'] + 1), real_out(*a)))
++  monkeypatch.setattr(parallel_config, 'run', lambda *a: (calls.__setitem__('config', calls['config'] + 1), real_cfg(*a)))
++  _compile(tmp_path, monkeypatch, capfd, 'on', parallel=True)
++  assert calls == {'outputs': 1, 'config': 1}
++
++
++def test_files_console_and_returned_topology_are_identical(warm, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
++                                                           capfd: pytest.CaptureFixture) -> None:
++  lab_off, topo_off, out_off, err_off = _compile(tmp_path, monkeypatch, capfd, 'off', parallel=False)
++  lab_on, topo_on, out_on, err_on = _compile(tmp_path, monkeypatch, capfd, 'on', parallel=True)
++  off, on = _tree(lab_off, tmp_path / 'off'), _tree(lab_on, tmp_path / 'on')
++  assert set(on) == set(off) and len(on) > 20
++  assert [k for k in on if on[k] != off[k]] == []
++  assert out_on == out_off and 'CONFIG' in out_on
++  assert err_on == err_off
++  assert repr(_plain(topo_on)).replace(str(tmp_path / 'on'), '<ROOT>') == \
++         repr(_plain(topo_off)).replace(str(tmp_path / 'off'), '<ROOT>')
++
++
++def test_provider_output_reads_the_files_config_writes(warm, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
++                                                       capfd: pytest.CaptureFixture) -> None:
++  """Why 'config' is a barrier: the KNE provider builds each startup-config from the node_files 'config' writes, so
++  'provider' without 'config' first writes different files."""
++  lab_full, _, _, _ = _compile(tmp_path, monkeypatch, capfd, 'full', parallel=False)
++  lab = tmp_path / 'provider-only' / 'lab'
++  lab.mkdir(parents=True)
++  monkeypatch.chdir(lab)
++  memo.invalidate()
++  (lab / 'topology.yml').write_text(textwrap.dedent(_TOPOLOGY).strip() + '\n')
++  _init_log()
++  create.run(['-o', 'provider', str(lab / 'topology.yml')])
++  full, alone = _tree(lab_full, tmp_path / 'full'), _tree(lab, tmp_path / 'provider-only')
++  startup = [ k for k in full if k.endswith('/startup-config') ]
++  assert startup and all(full[k][0] for k in startup)
++  assert [ k for k in startup if alone.get(k) != full[k] ] == startup
++
++
++def test_provider_starts_only_after_config_has_finished(warm, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
++                                                        capfd: pytest.CaptureFixture) -> None:
++  """The barrier itself, independent of timing luck: a slow 'config' must have finished before 'provider' starts."""
++  import time
++  from netsim.outputs import config as config_output, provider as provider_output
++  events = tmp_path / 'events'
++
++  def traced(cls, name, delay=0.0):
++    real = cls.write
++    def write(self, topology) -> None:
++      with open(events, 'a') as f: f.write(f'{name} start\n')
++      time.sleep(delay)
++      real(self, topology)
++      with open(events, 'a') as f: f.write(f'{name} end\n')
++    monkeypatch.setattr(cls, 'write', write)
++
++  traced(config_output.ConfigurationFiles, 'config', delay=1.0)
++  traced(provider_output.ProviderConfiguration, 'provider')
++  _compile(tmp_path, monkeypatch, capfd, 'on', parallel=True)
++  order = events.read_text().split('\n')
++  assert order.index('config end') < order.index('provider start')
++
++
++def test_pickle_runs_in_process_so_the_returned_topology_matches(warm, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
++                                                                 capfd: pytest.CaptureFixture) -> None:
++  """'pickle' changes the topology it writes (provider cache back into _Providers); in a worker that change would be
++  lost and create.run() would return a different topology."""
++  _, topo_off, _, _ = _compile(tmp_path, monkeypatch, capfd, 'off', parallel=False)
++  monkeypatch.setattr(parallel_outputs, 'IN_PROCESS', set())
++  _, topo_on, _, _ = _compile(tmp_path, monkeypatch, capfd, 'on', parallel=True)
++  assert repr(_plain(topo_on)).replace(str(tmp_path / 'on'), '<ROOT>') != \
++         repr(_plain(topo_off)).replace(str(tmp_path / 'off'), '<ROOT>')
++
++
++def test_an_error_in_a_worker_fails_the_run_like_the_sequential_loop(warm, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
++                                                                     capfd: pytest.CaptureFixture) -> None:
++  from netsim.outputs import ansible as ansible_output
++
++  def broken(self, topology) -> None:
++    log.error('ansible output broke on purpose', log.IncorrectValue, 'ansible')
++
++  monkeypatch.setattr(ansible_output.AnsibleInventory, 'write', broken)
++  results = {}
++  for name, parallel in (('off', False), ('on', True)):
++    with pytest.raises(SystemExit) as ex:
++      _compile(tmp_path, monkeypatch, capfd, name, parallel=parallel)
++    results[name] = (ex.value.code, capfd.readouterr())
++  assert results['on'][0] == results['off'][0] != 0
++  err = { k: v[1].err.replace(str(tmp_path / k), '<ROOT>') for k, v in results.items() }
++  assert err['on'] == err['off'] and 'broke on purpose' in err['on']
++
++
++def test_once_only_messages_are_printed_once(warm, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
++                                             capfd: pytest.CaptureFixture) -> None:
++  """netlab prints the 'Errors encountered' header and each documentation hint once per process. Two config workers
++  that each hit a missing template must not print them twice (found on the blueprint corpus: demo-lab/full)."""
++  broken = _TOPOLOGY.replace('  s1: { bgp.rr: true }', '  s1: { bgp.rr: true, config: [ no_such_template ] }') \
++                    .replace('  h3: { device: linux }', '  h3: { device: linux, config: [ no_such_template ] }')
++  assert broken != _TOPOLOGY
++  results = {}
++  for name, parallel in (('off', False), ('on', True)):
++    with pytest.raises(SystemExit):
++      _compile(tmp_path, monkeypatch, capfd, name, parallel=parallel, topology_text=broken)
++    results[name] = capfd.readouterr()
++  err = { k: v.err.replace(str(tmp_path / k), '<ROOT>') for k, v in results.items() }
++  assert err['off'].count("--debug template") == 1 and 'no_such_template' in err['off']
++  assert err['on'] == err['off']
++  assert results['on'].out.replace(str(tmp_path / 'on'), '<ROOT>') == results['off'].out.replace(str(tmp_path / 'off'), '<ROOT>')
++
++
++def test_once_only_messages_across_output_modules(warm, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
++                                                  capfd: pytest.CaptureFixture) -> None:
++  """Same as above across two output-module workers: the first one warns, the second one fails. The header and the
++  hint must appear once, in the sequential order."""
++  from netsim.outputs import ansible as ansible_output, provider as provider_output
++  real_provider = provider_output.ProviderConfiguration.write
++
++  hint = 'a hint netlab prints once per process'
++
++  def warn_then_write(self, topology) -> None:
++    log.warning(text='provider output warns on purpose', module='provider', more_hints=[hint])
++    real_provider(self, topology)
++
++  def broken(self, topology) -> None:
++    log.error('ansible output broke on purpose', log.IncorrectValue, 'ansible', more_hints=[hint])
++
++  monkeypatch.setattr(provider_output.ProviderConfiguration, 'write', warn_then_write)
++  monkeypatch.setattr(ansible_output.AnsibleInventory, 'write', broken)
++  results = {}
++  for name, parallel in (('off', False), ('on', True)):
++    with pytest.raises(SystemExit):
++      _compile(tmp_path, monkeypatch, capfd, name, parallel=parallel)
++    results[name] = capfd.readouterr()
++  err = { k: v.err.replace(str(tmp_path / k), '<ROOT>') for k, v in results.items() }
++  assert 'warns on purpose' in err['off'] and 'broke on purpose' in err['off'] and err['off'].count(hint) == 1
++  assert err['on'] == err['off']
++
++
++def test_shared_templates_see_the_sequential_shared_list() -> None:
++  """The per-node workers must hand each node exactly the shared_list the sequential loop had on reaching it."""
++
++  class Topo(dict):
++    pass
++
++  nodes = {f'n{i}': {'shared': src} for i, src in
++           enumerate([['a'], [], ['a', 'b'], ['b'], ['c', 'a', 'c'], [], ['d'], ['a', 'd', 'e']])}
++  topo = Topo(nodes=nodes)
++  topo.nodes = nodes
++
++  def run_sequential() -> dict:
++    seen, shared = {}, []
++    for name, data in nodes.items():
++      seen[name] = list(shared)
++      for src in data['shared']:
++        if src not in shared:
++          shared.append(src)
++    return seen
++
++  seen: dict = {}
++
++  def one_node(name, data, shared_list) -> None:
++    seen[name] = list(shared_list)
++
++  # run the parallel planner in-process (no fork) by replacing the worker start with a direct call
++  results = []
++
++  def start(fn, tmpdir, tag):
++    fn()
++    results.append(tag)
++    return len(results)
++
++  orig = (forkrun.start, forkrun.collect, forkrun.replay, forkrun.clean)
++  try:
++    forkrun.start = start
++    forkrun.collect = lambda pid, tmpdir, tag, what: {}
++    forkrun.replay = lambda r, exit_on_error=True: None
++    forkrun.clean = lambda r: True
++    parallel_config.run(topo, one_node, lambda d: d['shared'])
++  finally:
++    forkrun.start, forkrun.collect, forkrun.replay, forkrun.clean = orig
++  assert seen == run_sequential()
++
++
++def test_no_fork_while_threads_are_running() -> None:
++  stop = threading.Event()
++  t = threading.Thread(target=stop.wait)
++  t.start()
++  try:
++    assert forkrun.fork_ok() is False
++  finally:
++    stop.set()
++    t.join()
++  assert forkrun.fork_ok() is True
++
++
++def test_explicit_outputs_keep_the_sequential_loop() -> None:
++  from box import Box
++
++  class Args:
++    devices = None
++
++  args = Args()
++  args.output = Box({'config': None, 'provider': None, 'pickle': None, 'tools': None, 'ansible': None})
++  assert parallel_outputs.usable(args, Box()) is True               # the defaults, as netlab create uses them
++  args.output = ['config', 'provider', 'pickle', 'ansible']          # the same modules, named with -o
++  assert parallel_outputs.usable(args, Box()) is False
++  args.output = Box({'config': None, 'provider': None, 'ansible': 'dir'})   # an output with an option
++  assert parallel_outputs.usable(args, Box()) is False
++  args.output = Box({'config': None, 'provider': None, 'no_such_output': None})
++  assert parallel_outputs.usable(args, Box()) is False
++  args.output = Box({'config': None, 'provider': None, 'pickle': None, 'tools': None, 'ansible': None})
++  args.devices = ['r1']
++  assert parallel_outputs.usable(args, Box()) is False
++
++
++def test_a_worker_sees_the_keys_earlier_module_loads_added(warm, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
++                                                          capfd: pytest.CaptureFixture) -> None:
++  """Loading an output module can add an empty defaults.outputs.<name> entry to the topology, and the pickle written
++  after it records that. Modules must therefore be loaded in this process, in order: loading them all up front made
++  the pickle differ on every blueprint (found on the corpus run)."""
++  lab_off, _, _, _ = _compile(tmp_path, monkeypatch, capfd, 'off', parallel=False)
++  lab_on, _, _, _ = _compile(tmp_path, monkeypatch, capfd, 'on', parallel=True)
++  off = pickle.loads((lab_off / 'netlab.snapshot.pickle').read_bytes())
++  on = pickle.loads((lab_on / 'netlab.snapshot.pickle').read_bytes())
++  assert list(on['defaults']['outputs'].keys()) == list(off['defaults']['outputs'].keys())
+-- 
+2.56.0
+

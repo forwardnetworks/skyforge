@@ -1,0 +1,61 @@
+message: |
+  This topology sets up a simple VXLAN network using DHCP relay
+  functionality. It includes a DHCP server (running on Cisco
+  IOSv), DHCP client (also on Cisco IOSv) and two intermediate
+  VXLAN-enabled switches.
+
+defaults.attributes:
+  link.dhcp:
+    client: bool
+    server: str
+
+groups:
+  dhcp_server:
+    members: [ srv ]
+    module: [ ospf ]
+    config: [ dhcp-server ]
+    device: iol
+  dhcp_client:
+    members: [ cl_a, cl_b ]
+    config: [ dhcp-client ]
+    device: iol
+  switch:
+    members: [ sw1, sw2 ]
+    module: [ ospf,vlan,vxlan,gateway ]
+    config: [ dhcp-relay ]
+    device: eos
+
+vlans:
+  client:
+    gateway: True
+    ospf.passive: True
+
+gateway.id: 1
+
+nodes:
+  srv:
+  # netlab 26.08 tightening: attributes of an irb VLAN interface must be set in
+  # the node's vlans dictionary, not on the access-link interface — the relay
+  # target moved from the links below onto the switch SVIs.
+  sw1:
+    vlans.client.dhcp.server: srv
+  sw2:
+    vlans.client.dhcp.server: srv
+  cl_a:
+  cl_b:
+
+links:
+- srv-sw1
+- srv-sw2
+- sw1-sw2
+- cl_a:
+    dhcp.client: True
+  sw1:
+  vlan.access: client
+- cl_b:
+    dhcp.client: True
+  sw2:
+  vlan.access: client
+
+defaults.outputs:
+  _include: [ outputs/format.yml ]

@@ -1,0 +1,78 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Thu, 4 Sep 2026 21:40:00 -0500
+Subject: [PATCH] catalystwan: read the generated CSR back from the device record
+
+---
+diff --git a/plugins/modules/devices_certificates.py b/plugins/modules/devices_certificates.py
+--- a/plugins/modules/devices_certificates.py
++++ b/plugins/modules/devices_certificates.py
+@@ -213,6 +213,32 @@
+             module.exit_json(**result.model_dump(mode="json"))
+ 
+         payload = TargetDevice(deviceIP=target_device_details.device_ip)
++
++        # SKYFORGE FIX: READ THE CSR BACK FROM THE DEVICE RECORD.
++        #
++        # The generate call itself is left ALONE, deliberately. The SDK splits
++        # this one endpoint in two, by version:
++        #
++        #   @versions("<20.16")  @post("/certificate/generate/csr", "data")
++        #   def generate_csr(...)      -> DataSequence[DeviceCsrGenerationResponse]
++        #
++        #   @versions(">=20.16") @post("/certificate/generate/csr")
++        #   def generate_csr_task(...) -> CertActionResponse   # id: UUID
++        #
++        # and it is tempting to read that as "dispatch on the Manager version".
++        # WE TRIED THAT AND IT WAS WRONG. Measured against live vManage 20.18.4,
++        # the endpoint returns the LEGACY GRID -- {"header": {...}, "data": [...]}
++        # -- which is precisely what the pre-20.16 signature unwraps. Routing a
++        # 20.18 Manager to generate_csr_task made the SDK parse that grid as a
++        # task object and it died on the missing id, turning a recoverable empty
++        # result into a hard failure mid-enrolment. The @versions annotations
++        # describe the SDK's model of the appliance, not the appliance.
++        #
++        # What IS real is that the grid row carries no CSR: the columns are
++        # inventory fields (host-name, deviceIP, ...). vManage generates the CSR
++        # ON THE DEVICE and stores it on the DEVICE RECORD, so read it from
++        # there and publish it under the same response key. That is the whole
++        # defect -- the module reported "no CSR" for a CSR that exists.
+         module.send_request_safely(
+             result=result,
+             action_name="Generate CSR for vManage",
+@@ -221,6 +247,33 @@
+             response_key="generate_csr",
+         )
+ 
++        # RESTORE THE LEGACY RESPONSE SHAPE so a caller reading
++        # response.generate_csr[0].deviceCSR works on every Manager version and
++        # never needs to know which endpoint ran.
++        #
++        # Both spellings are emitted: the pydantic alias is deviceCSR, the model
++        # field is device_csr. Callers in the wild read either, and emitting one
++        # would silently break the other. The read never overwrites a CSR the
++        # generate call already returned, and a failed read cannot mask a
++        # generate that already succeeded.
++        try:
++            regenerated = get_target_device(module=module, device_category="controllers")
++            device_csr = getattr(regenerated, "device_csr", None)
++            if device_csr:
++                existing = result.response.get("generate_csr")
++                already_has_csr = (
++                    isinstance(existing, list)
++                    and existing
++                    and isinstance(existing[0], dict)
++                    and (existing[0].get("deviceCSR") or existing[0].get("device_csr"))
++                )
++                if not already_has_csr:
++                    result.response["generate_csr"] = [
++                        {"deviceCSR": device_csr, "device_csr": device_csr}
++                    ]
++        except Exception:  # noqa: BLE001 - the generate call already succeeded; this is enrichment
++            pass
++
+     if module.params.get("send_to_controllers"):
+         module.execute_action_safely(
+             result,
+-- 
+2.51.0

@@ -1,0 +1,30 @@
+{#
+  RFC 8212 SEMANTICS BUILT BY HAND, because Arista EOS has no default-deny.
+
+  This is NOT the FRR arrangement this lab started from. FRR implements RFC 8212
+  and netlab turns it off (`no bgp ebgp-requires-policy`, netsim/ansible/
+  templates/bgp/frr.j2), so 8212-default/frr.j2 next to this file only has to
+  re-render the BGP block WITHOUT that line and the default comes back. EOS has
+  nothing to switch on: netsim/ansible/templates/bgp/eos.j2 contains no such
+  knob because the platform does not implement the behaviour. So here the
+  behaviour is CONSTRUCTED -- an explicit deny in both directions on every EBGP
+  session, which is what RFC 8212 mandates until an operator writes policy.
+
+  DENY IN *AND* OUT, AND ON EVERY EBGP SESSION. Out alone would stop the leak,
+  but RFC 8212 is not "do not re-advertise" -- it is "no prefix crosses an EBGP
+  session in either direction until you say so", and the customer's own
+  10.0.0.1/32 is covered by that too. Denying inbound as well is what makes the
+  lab show the real rule rather than a targeted fix for one symptom.
+
+  IBGP IS DELIBERATELY UNTOUCHED (`n.type == 'ebgp'`). RFC 8212 is an EBGP rule;
+  applying it to IBGP would break the lab the moment anyone adds a second
+  customer router.
+#}
+route-map RFC8212-DENY deny 10
+!
+router bgp {{ bgp.as }}
+ address-family ipv4
+{% for n in bgp.neighbors if n.type == 'ebgp' and n.ipv4 is defined %}
+  neighbor {{ n.ipv4 }} route-map RFC8212-DENY in
+  neighbor {{ n.ipv4 }} route-map RFC8212-DENY out
+{% endfor %}

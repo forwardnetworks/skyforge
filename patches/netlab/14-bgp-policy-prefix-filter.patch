@@ -1,0 +1,129 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 12:00:00 +0000
+Subject: [PATCH] bgp.policy: prefix_filter
+
+---
+diff --git a/docs/plugins/bgp.policy.md b/docs/plugins/bgp.policy.md
+index d4d5a8b..b6fc335 100644
+--- a/docs/plugins/bgp.policy.md
++++ b/docs/plugins/bgp.policy.md
+@@ -25,6 +25,7 @@ The plugin adds the following BGP link attributes:
+ * **bgp.locpref** is an integer attribute that sets default local preference when applied to a node, or sets local preference on BGP updates received from an EBGP neighbor.
+ * **bgp.med** is an integer attribute that sets the MED attribute on BGP updates sent to an EBGP neighbor.
+ * **bgp.policy** is a dictionary that applies [predefined routing policies](generic-routing-policies) to inbound (**in**) or outbound (**out**) BGP updates.
++* **bgp.prefix_filter** is a dictionary that applies [prefix filters](generic-routing-prefixes) directly to inbound (**in**) or outbound (**out**) BGP updates of an EBGP neighbor, without a route map (Cisco IOS/IOS XE `neighbor prefix-list`). Combine it with a [declared prefix-list name](routing-prefix-name) when the configured object must keep its declared name.
+ * **bgp.prepend** is a dictionary configuring outbound AS-path prepending. It can contain a **count** attribute (number of times the node AS is prepended) or a **path** attribute (the prepended AS-path as a string[^ASPS])
+ * **bgp.weight** is an integer attribute that sets per-neighbor weight.
+ * **bgp.role** -- the local BGP role for an EBGP session (RFC 9234). Specify a role name (**provider**, **customer**, **peer**, **rs-server**, **rs-client**) or a dictionary with **name** (same values) and optional **strict** set to _true_ for RFC 9234 strict mode.
+@@ -49,6 +50,7 @@ The following table describes where you could apply individual attributes:
+ | locpref    |  ✅  |    ✅     |  ❌  |
+ | med        |  ❌   |    ✅     |  ❌  |
+ | policy     |  ❌   |    ✅     |  ❌  |
++| prefix_filter |  ❌   |    ✅     |  ❌  |
+ | prepend    |  ❌   |    ✅     |  ❌  |
+ | role       |  ✅  |    ✅     |  ❌  |
+ | weight     |  ❌   |    ✅     |  ❌  |
+diff --git a/netsim/devices/ios.yml b/netsim/devices/ios.yml
+index 8936fed..fb9df2d 100644
+--- a/netsim/devices/ios.yml
++++ b/netsim/devices/ios.yml
+@@ -67,6 +67,7 @@ features:
+     timers: true
+     _default_locpref: true
+     aggregate: true
++    prefix_filter: true     # neighbor X prefix-list NAME in|out (bgp.policy)
+     bandwidth:
+       in: auto
+     multihop.vrf: true
+diff --git a/netsim/extra/bgp/policy/__init__.py b/netsim/extra/bgp/policy/__init__.py
+index 5b450d1..cdd8a96 100644
+--- a/netsim/extra/bgp/policy/__init__.py
++++ b/netsim/extra/bgp/policy/__init__.py
+@@ -6,7 +6,7 @@ from netsim import api, data
+ from netsim.augment import devices
+ from netsim.data import types
+ from netsim.modules import get_effective_module_attribute
+-from netsim.modules.routing.policy import check_routing_policy, import_routing_policy
++from netsim.modules.routing.policy import check_routing_policy, import_match_filters, import_routing_policy
+ from netsim.utils import log
+ from netsim.utils import routing as _bgp
+ 
+@@ -270,6 +270,33 @@ def apply_bgp_routing_policy(ndata: Box,ngb: Box,intf: Box,topology: Box) -> Non
+     ngb.policy[direction] = intf.bgp.policy[direction]      # Copy interface BGP routing policy into a neighbor
+     apply_config(ndata,ngb)                                 # Remember that we have to do extra configuration
+ 
++'''
++apply_bgp_prefix_filter: import the prefix filters that bgp.prefix_filter applies directly to a neighbor
++
++bgp.prefix_filter is one of the p_attr.direct attributes (applied to the neighbor as-is, no route
++map). Upstream reserved the name in defaults.yml but never gave it an attribute or a template; this
++makes it real: the interface attribute is validated ({ in: <prefix filter>, out: <prefix filter> }),
++the referenced global/node prefix filters are imported, normalized, checked and expanded into the
++node exactly like a route map's match.prefix (import_match_filters), and apply_policy_attributes
++then copies the attribute onto the neighbor and checks the device feature bgp.prefix_filter.
++'''
++def apply_bgp_prefix_filter(ndata: Box,ngb: Box,intf: Box,topology: Box) -> None:
++  pf = intf.get('bgp.prefix_filter',{})
++  if not pf:
++    return
++
++  if 'routing' not in ndata.get('module', []):
++    log.error(
++      f"You cannot use 'bgp.prefix_filter' interface attribute on a node that does not use 'routing' module",
++      more_data=[ f'node {ndata.name} neighbor {ngb.name}' ],
++      category=log.IncorrectType,
++      module='bgp.policy')
++    return
++
++  for direction in ['in','out']:
++    if direction in pf:
++      import_match_filters(filter=pf[direction],r_object='prefix',node=ndata,topology=topology)
++
+ '''
+ Process routing aggregation requests:
+ 
+@@ -347,6 +374,8 @@ def post_transform(topology: Box) -> None:
+         intf.bgp.role = role
+       if intf.get('bgp.policy',{}):
+         apply_bgp_routing_policy(ndata,ngb,intf,topology)
++      if intf.get('bgp.prefix_filter',{}):
++        apply_bgp_prefix_filter(ndata,ngb,intf,topology)
+       if apply_policy_attributes(ndata,ngb,intf,topology):  # If we applied at least some bgp.policy attribute to the neighbor
+         p_name = bgp_policy_name(intf,ngb,policy_idx)       # Get the routing policy name
+         create_routing_policy(ndata,ngb,p_name)             # and try to create the route map
+diff --git a/netsim/extra/bgp/policy/defaults.yml b/netsim/extra/bgp/policy/defaults.yml
+index 0a81fcf..fd135f0 100644
+--- a/netsim/extra/bgp/policy/defaults.yml
++++ b/netsim/extra/bgp/policy/defaults.yml
+@@ -57,6 +57,9 @@ bgp:
+       policy:
+         in: str
+         out: str
++      prefix_filter:            # Prefix filters applied directly to the neighbor (no route map)
++        in: id
++        out: id
+       bandwidth:
+         _alt_types: [ autobw ]
+         in: autobw
+diff --git a/netsim/extra/bgp/policy/ios.j2 b/netsim/extra/bgp/policy/ios.j2
+index 3469009..02e707d 100644
+--- a/netsim/extra/bgp/policy/ios.j2
++++ b/netsim/extra/bgp/policy/ios.j2
+@@ -6,6 +6,13 @@
+ {%   if 'bandwidth' in n %}
+     neighbor {{ n[af] }} dmzlink-bw
+ {%   endif %}
++{%   if 'prefix_filter' in n %}
++{#     the device-visible list name: '<name>-<af>' unless the filter declared a name (routing.prefix.name) #}
++{%     set pfx_names = routing._prefix_name|default({}) if routing is defined else {} %}
++{%     for direction in ['in','out'] if direction in n.prefix_filter %}
++    neighbor {{ n[af] }} prefix-list {{ pfx_names.get(af,{}).get(n.prefix_filter[direction],n.prefix_filter[direction] ~ '-' ~ af) }} {{ direction }}
++{%     endfor %}
++{%   endif %}
+ {{   routemap.apply_route_map(n,af,True) }}
+ {%- endmacro %}
+ !
+-- 
+2.56.0
+

@@ -1,0 +1,39 @@
+#
+# Plugin example: remove IBGP sessions between anycast nodes
+#
+# Anycast nodes are in AS 65101, core network is AS 65000
+# Anycast prefixes are advertised via EBGP
+#
+
+plugin: [ bgp-anycast ]
+
+module: [ ospf, bgp ]
+
+defaults:
+  device: iol
+
+bgp:
+  as_list:
+    65000:
+      members: [ l1, l2, l3, s1 ]
+      rr: [ s1 ]
+    65101:
+      members: [ a1,a2,a3 ]
+
+groups:
+  # netlab 26.08 tightening: nodes must enable the modules their (as_list-
+  # derived) bgp attributes use; topology `module:` no longer reaches nodes,
+  # and the auto-created asNNNN groups cannot carry `module` (memberless at
+  # check time), so an explicit group does.
+  routers:
+    members: [ l1, l2, l3, s1, a1, a2, a3 ]
+    module: [ ospf, bgp ]
+  as65000:
+    config: [ bgp-addpath ]
+  as65101:
+    bgp.anycast: 10.42.42.42/32
+
+nodes: 
+  [ l1, l2, l3, s1, a1, a2, a3 ]
+
+links: [ s1-l1, s1-l2, s1-l3, l2-a1, l2-a2, l3-a3 ]

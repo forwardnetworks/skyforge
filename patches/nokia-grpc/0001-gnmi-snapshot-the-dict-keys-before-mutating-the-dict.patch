@@ -1,0 +1,19 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Fri, 5 Sep 2026 12:00:00 -0500
+Subject: [PATCH] gnmi: snapshot the dict keys before mutating the dict during
+ iteration
+
+---
+diff --git a/plugins/connection/gnmi.py b/plugins/connection/gnmi.py
+--- a/plugins/connection/gnmi.py
++++ b/plugins/connection/gnmi.py
+@@ -497,7 +497,7 @@ class Connection(NetworkConnectionBase):
+             raise AnsibleConnectionFailure("Ansible gNMI plugin does not support encoding for value: %s" % json.dumps(val))
+
+     def _dictToList(self, aDict):
+-        for key in aDict.keys():
++        for key in list(aDict.keys()):  # list() snapshot avoids RuntimeError when del modifies dict during iteration
+             if key.startswith('___'):
+                 aDict[key[3:]] = [self._dictToList(val) if isinstance(val, dict) else val for val in aDict[key].values()]
+                 del aDict[key]

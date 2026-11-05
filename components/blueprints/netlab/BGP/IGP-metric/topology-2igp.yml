@@ -1,0 +1,30 @@
+defaults:
+  device: iol
+
+module: [ eigrp, ospf, bgp ]
+
+bgp:
+  as: 65000
+  advertise_loopback: False
+
+ospf:
+  reference_bandwidth: 10000
+
+nodes:
+  e1:
+    bgp:
+      originate: [ 172.16.0.0/16 ]
+  e2:
+    module: [ ospf, bgp ]
+    bgp:
+      originate: [ 172.16.0.0/16 ]
+  pe1:
+
+links:
+- pe1:
+  e1:
+  ospf.cost: 1
+- pe1:
+  e2:
+  bandwidth: 100000
+  eigrp: False

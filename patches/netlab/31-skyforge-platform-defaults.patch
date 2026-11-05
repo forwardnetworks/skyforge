@@ -1,0 +1,1165 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 12:00:00 +0000
+Subject: [PATCH] skyforge platform defaults (provider kne, mgmt pool, KNE
+ provider settings, credentials)
+
+SKYFORGE-SPECIFIC: platform behaviour; not for upstream.
+
+---
+diff --git a/netsim/defaults/addressing.yml b/netsim/defaults/addressing.yml
+index 4cea7a8..56c9243 100644
+--- a/netsim/defaults/addressing.yml
++++ b/netsim/defaults/addressing.yml
+@@ -10,7 +10,7 @@ lan:
+ p2p:
+   ipv4: 10.1.0.0/16
+ mgmt:
+-  ipv4: 192.168.121.0/24
++  ipv4: 172.20.20.0/22
+   start: 100
+   mac: CA-FE-00-00-00-00
+ l2only:
+diff --git a/netsim/defaults/const.yml b/netsim/defaults/const.yml
+index fb3925a..3f855eb 100644
+--- a/netsim/defaults/const.yml
++++ b/netsim/defaults/const.yml
+@@ -7,5 +7,5 @@ multi_provider: [ libvirt, clab ]
+ ifname:
+   neighbors: 5
+   maxlength: 255
+-MAX_NODE_ID: 150
++MAX_NODE_ID: 250
+ doc_url_prefix: https://netlab.tools/
+diff --git a/netsim/devices/a10.yml b/netsim/devices/a10.yml
+index 7999fe2..0e5b6f8 100644
+--- a/netsim/devices/a10.yml
++++ b/netsim/devices/a10.yml
+@@ -23,7 +23,14 @@ clab:
+   interface:
+     name: eth{ifindex}
+ group_vars:
+-  ansible_network_os: acos
++  # FQCN, not the bare short name. The acos cliconf/terminal plugins live in
++  # the vendored a10.acos_cli collection and its meta/runtime.yml declares NO
++  # redirect for the short name, so `acos` alone does not resolve and ansible
++  # fails the very first task with "network os acos is not supported" -- an
++  # UNREACHABLE verdict, which reads as the appliance never booting rather
++  # than as a plugin-resolution error. Verified present in the netlab image:
++  # vendor/ansible_collections/a10/acos_cli/plugins/{cliconf,terminal}/acos.py
++  ansible_network_os: a10.acos_cli.acos
+   ansible_user: admin
+   ansible_password: a10
+   ansible_ssh_pass: a10
+@@ -61,8 +68,17 @@ group_vars:
+   # ssh first (connect-only, above), then readiness-check/a10.yml proves enable
+   # mode and a configure-terminal session before netmiko pushes the config.
+   netlab_ready: [ ssh, ansible ]
+-  netlab_check_retries: 90
++  # Full-scale KNE runs can delay vThunder SSH readiness well beyond 30m.
++  # Keep the contract in defaults (not upstream netlab code) and allow up
++  # to 60m before failing netlab initial readiness.
++  netlab_check_retries: 360
+   netlab_check_delay: 10
++  # vThunder can accept SSH before config submodes leave LOADING state.
++  # The vendor readiness probe must wait for enable-mode success before
++  # config apply, instead of mutating topology or adding Skyforge-side
++  # retry behavior.
++  a10_config_retries: 30
++  a10_config_delay: 20
+ external:
+   image: none
+ graphite.icon: server
+diff --git a/netsim/devices/asav.yml b/netsim/devices/asav.yml
+index 7a5be2c..e560751 100644
+--- a/netsim/devices/asav.yml
++++ b/netsim/devices/asav.yml
+@@ -8,18 +8,58 @@ interface_name: GigabitEthernet0/{ifindex}
+ ifindex_offset: 0
+ mgmt_if: Management0/0
+ group_vars:
+-  ansible_user: vagrant
+-  ansible_ssh_pass: vagrant1
++  # These are the cisco_asav image's real defaults and are also rendered
++  # explicitly into day-0 so readiness and post-boot automation agree.
++  ansible_user: admin
++  ansible_ssh_pass: CiscoAsa1!
+   ansible_become_method: enable
+-  ansible_become_password: vagrant1
++  ansible_become_password: CiscoAsa1!
+   ansible_network_os: asa
+   ansible_connection: network_cli
+   # yamllint disable-line rule:line-length
+   netlab_ssh_args: "-o KexAlgorithms=+diffie-hellman-group14-sha1 -o PubkeyAcceptedKeyTypes=+ssh-rsa -o HostKeyAlgorithms=+ssh-rsa"
+-  netlab_check_retries: 50
++  # ASAv first boot on Kubernetes can take several minutes and may include
++  # internal restart phases before management SSH is reachable. Keep the
++  # public Skyforge device key as asav.
++  #
++  # 360x5s = 1800s, ALIGNED WITH THE VM-NOS DEPLOY BUDGET. These two numbers
++  # are the same claim about the same device and must not disagree:
++  # vmNOSPerNodeDeployBudgetSeconds["asav"] is 1800 because ASAv is slow,
++  # while this readiness gate used to give up at 1200s -- ten minutes BEFORE
++  # the budget said the device was even expected to be ready. netlab
++  # therefore failed the topology while the platform was still patiently
++  # waiting, and the error blamed SSH rather than the mismatch.
++  #
++  # MEASURED 2026-08-27 on demo-lab: the job failed at 23 minutes with "SSH
++  # server did not start in time on node(s) cdg-fw01,jfk-dc-fw01". The same
++  # topology had brought both ASAvs up on earlier runs -- what changed is
++  # that vManage finally BOOTS now (its containerDisk fix landed), adding
++  # 4 vCPU and 32Gi of real load and pushing ASAv first boot past the
++  # shorter window.
++  #
++  # Corroborating: the per-NOS SMOKE topology for asav already overrides
++  # this to 400 (blueprints netlab/_smoke/nos/asav/topology.yml). The
++  # override existed because ASAv needs the longer window; the shared
++  # default never followed, so every topology that did NOT override -- like
++  # demo-lab -- inherited a window the device cannot meet.
++  #
++  # THIS FIXES A CONTRADICTION, NOT ASAv. asav is certified only l1
++  # ("native/profile proof") on talos, so its boot time on this substrate
++  # is uncharacterised and 1800s is an alignment, not a measurement. The
++  # l3 certification lane is the thing that will produce a real number;
++  # this value should be revisited against that evidence rather than
++  # treated as validated.
++  netlab_check_retries: 360
+   netlab_initial: always
+   netlab_check_command: |
+     exit
++  ansible_password: CiscoAsa1!
++  netlab_ready: [ ssh ]
++  netlab_check_delay: 5
++  # RSA-4096 keygen inside the initial config can exceed ansible's 60s
++  # default command timeout on a virtual appliance. Same remedy a10
++  # already uses (180s).
++  ansible_command_timeout: 180
+ external:
+   image: none
+ features:
+@@ -47,6 +87,7 @@ features:
+     collect: true
+     reload: true
+     config_mode: [ netmiko ]
++    max_mtu: 1500
+   bgp:
+     advertise: true
+     caveats:
+diff --git a/netsim/devices/cat8000v.yml b/netsim/devices/cat8000v.yml
+index e4c87d9..fd63eda 100644
+--- a/netsim/devices/cat8000v.yml
++++ b/netsim/devices/cat8000v.yml
+@@ -24,6 +24,34 @@ libvirt:
+   create_iso: cat8000v
+ group_vars:
+   netlab_device_type: cat8000v
++  # The cat8000v IOS-XE day-0 (netlab initial/ios.j2:8 -> "username admin privilege
++  # 15 secret admin" + "enable secret admin") creates admin/admin, NOT vagrant. This
++  # is the OPPOSITE of nxos (whose day-0 makes vagrant): match the credentials the
++  # box actually has so netlab-initial / the collector can log in once the config-drive
++  # day-0 ingests.
++  ansible_user: admin
++  ansible_ssh_pass: admin
++  ansible_password: admin
++  ansible_network_os: ios
++  ansible_connection: network_cli
++  netlab_ready: [ ssh ]
++  # The management VRF initial/ios.j2 puts GigabitEthernet1 in (same var, same
++  # name, same reason as iol above): the services templates read it to put the
++  # syslog host and flow exporter destination IN that VRF. Without the VRF the
++  # DHCP default on Gi1 (AD 254) lost to the lab's BGP default and management
++  # replies left through the data plane -- five of nine c8000v unreachable on
++  # :22 with a fully applied config (measured 2026-09-14).
++  netlab_mgmt_vrf: MGMT
++  # BOOT BUDGET for the startup-config readiness gate (netlab initial --ready).
++  # netlab's default is 50 x 5 s = 250 s, sized for a container. A c8000v
++  # reaches SSH about 6 minutes after the VMI is created when nine boot at
++  # once (measured 2026-09-14, c8k-9node-scale: first four at +5m50s), and
++  # the gate starts only after every pod is Ready, so 120 x 5 s = 10 minutes
++  # covers the slow tail without hiding a hung guest for very long.
++  netlab_check_retries: 120
++  netlab_check_delay: 5
++  # Catalyst 8000v uses the legacy IOS/IOS-XE SSH negotiation profile.
++  netlab_ssh_args: "-o KexAlgorithms=+diffie-hellman-group-exchange-sha1 -o PubkeyAcceptedKeyTypes=+ssh-rsa -o HostKeyAlgorithms=+ssh-rsa"
+ node:
+   min_mtu: 1500
+ features:
+@@ -57,5 +85,13 @@ features:
+     asymmetrical_irb: true
+     irb: true
+     transport: [ vxlan, mpls, sr ]
++  initial:
++    max_mtu: 1500
+ kne:
+   interface.name: eth{ifindex-1}
++  group_vars:
++    # STARTUP FIRST, NETMIKO FOR RECONFIGURE (owner, 2026-09-27). Bring-up
++    # boots the whole config from the config-drive day-0 (initial_policy
++    # never: nothing is pushed after boot); a warm reconfigure is delivered
++    # over netmiko to the running VM. Before this it had no reconfigure lane.
++    netlab_reconfigure_mode: netmiko
+diff --git a/netsim/devices/cisco_sdwan-controller.yml b/netsim/devices/cisco_sdwan-controller.yml
+index 4ab7174..6448a99 100644
+--- a/netsim/devices/cisco_sdwan-controller.yml
++++ b/netsim/devices/cisco_sdwan-controller.yml
+@@ -10,6 +10,15 @@ clab:
+     kind: cisco_sdwan
+     type: controller
+   image: registry.example.com/skyforge/kubevirt/cisco_sdwan-controller:20.7.1-kne-r1
++  features:
++    initial:
++      # Same startup-only day-0 contract as cat8000v above (and dellos10
++      # in the vendor tree): no viptela ansible support exists, so the node
++      # must never enter the ansible initial limit.
++      config_mode: [ startup ]
++  group_vars:
++    # VM NOS: startup/config-drive is the only pre-SSH apply path.
++    netlab_config_mode: startup
+ group_vars:
+   ansible_user: admin
+   ansible_ssh_pass: admin
+@@ -17,6 +26,32 @@ group_vars:
+   netlab_device_type: cisco_sdwan-controller
+   ansible_network_os: viptela
+   ansible_connection: network_cli
++  netlab_ready: [ ssh ]
++  # SSH READINESS BUDGET. Without these netlab's generic ssh readiness check
++  # (netsim/ansible/tasks/readiness-check/ssh.yml) falls back to
++  # `netlab_check_retries|default(20)` x `netlab_check_delay|default(5)` =
++  # 100 SECONDS -- and this is a KubeVirt VM, not a container.
++  #
++  # vSmart reaches "System Ready" on the serial console at ~100s (measured
++  # 2026-08-15), and sshd accepts only AFTER that, so the default budget
++  # expires almost exactly when the NOS becomes usable. Deployment
++  # 484d7fbf died on precisely this:
++  #   FatalError in topology: SSH server did not start in time on node(s) ve1
++  # The failure is a stopwatch, not a NOS fault -- it names the device and
++  # reads like the image is broken.
++  #
++  # Every other VM NOS already declares a boot-sized budget (asav 240x5 =
++  # 1200s, csrx 60x5 = 300s); these two were the only ones left on the
++  # container-sized default.
++  #
++  # 180x5 = 900s, NOT asav's 240x5. The first attempt used 1200s and made
++  # things worse: the k8s Job that runs bring-up has its own 20m (1200s)
++  # runtime budget, so an inner wait equal to the outer one can never
++  # finish -- deployment d634bdbe died with "job runtime timed out after
++  # 20m0s" instead of a readiness verdict. A nested budget must leave room
++  # for the stages around it (~2 min here).
++  netlab_check_retries: 180
++  netlab_check_delay: 5
+ features:
+   # STATIC ROUTES, for one declaration only: `routing.static` with a default
+   # route toward the site/DC exit, which the sdwan module renders into VPN 0
+@@ -40,3 +75,12 @@ features:
+     types: [ controller, validator ]
+ kne:
+   node.type: controller
++  features:
++    initial:
++      # Same startup-only day-0 contract as cat8000v above (and dellos10
++      # in the vendor tree): no viptela ansible support exists, so the node
++      # must never enter the ansible initial limit.
++      config_mode: [ startup ]
++  group_vars:
++    # VM NOS: startup/config-drive is the only pre-SSH apply path.
++    netlab_config_mode: startup
+diff --git a/netsim/devices/cisco_sdwan-manager.yml b/netsim/devices/cisco_sdwan-manager.yml
+index 9bc3652..cbf0ef9 100644
+--- a/netsim/devices/cisco_sdwan-manager.yml
++++ b/netsim/devices/cisco_sdwan-manager.yml
+@@ -10,6 +10,14 @@ clab:
+     kind: cisco_sdwan
+     type: manager
+   image: registry.example.com/skyforge/kubevirt/cisco_sdwan-manager:20.7.1-kne-r1
++  features:
++    initial:
++      # Same startup-only day-0 contract as cat8000v and cisco_sdwan-controller: there
++      # is no viptela ansible network_os, so the initial play would die at
++      # first contact. This keeps the node OUT of the ansible initial limit.
++      config_mode: [ startup ]
++  group_vars:
++    netlab_config_mode: startup
+ group_vars:
+   ansible_user: admin
+   # CONTAINERLAB DEFAULT. admin/admin is what containerlab/vrnetlab ships for
+@@ -21,8 +29,20 @@ group_vars:
+   # (USER0002 "Password for admin user cannot be configured to default/last
+   # password"). If that reproduces, the declared value belongs in the
+   # deployment layer that owns per-lab credentials -- NOT hardcoded here.
+-  ansible_ssh_pass: admin
+-  ansible_password: admin
++  # vMANAGE CANNOT USE THE FACTORY admin/admin FOR ITS API. Measured live
++  # 2026-09-02: after login the whole /dataservice API 302-redirects to
++  # passwordReset.html until admin leaves the default -- vManage policy USER0002,
++  # "Password for admin user cannot be configured to default/last password".
++  # vManage has ONE admin credential (console + API), so it must be non-default
++  # everywhere. This is NOT an invented literal: it is the platform's PAN-OS
++  # value (defaults.devices.panos.group_vars.ansible_password), reused because
++  # PAN-OS forces a first-login change for the same reason. Seeding vManage
++  # non-default from first boot means the reset gate never arms (proven: a
++  # seeded box returns 200 on /dataservice/system/device/controllers, no
++  # redirect). vSmart/vBond (cisco_sdwan-controller/-validator) have no such
++  # gate and keep admin/admin -- this override is per-DEVICE, manager only.
++  ansible_ssh_pass: Admin@123
++  ansible_password: Admin@123
+   netlab_device_type: cisco_sdwan-manager
+   ansible_network_os: viptela
+   # LOCAL, not network_cli. network_cli refuses unknown network_os at task
+@@ -30,6 +50,14 @@ group_vars:
+   # and the manager MUST: its sdwan module lane drives the vManage REST API
+   # (delegated uri calls, no device connection). PAN-OS/A10 precedent.
+   ansible_connection: local
++  netlab_ready: [ ssh ]
++  # vManage is a far heavier appliance than vSmart or vEdge (it carries the
++  # NMS, its own datastore and the GUI), so it boots slower. 240x5 = 1200s
++  # would collide with the k8s bring-up Job's own 20m budget -- the mistake
++  # already recorded on cat8000v above -- so this stays at 210x5 = 1050s,
++  # longer than the controllers but still inside the outer budget.
++  netlab_check_retries: 210
++  netlab_check_delay: 5
+ features:
+   # STATIC ROUTES, for one declaration only: `routing.static` with a default
+   # route toward the site/DC exit, which the sdwan module renders into VPN 0
+@@ -53,3 +81,11 @@ features:
+     types: [ manager ]
+ kne:
+   node.type: manager
++  features:
++    initial:
++      # Same startup-only day-0 contract as cat8000v and cisco_sdwan-controller: there
++      # is no viptela ansible network_os, so the initial play would die at
++      # first contact. This keeps the node OUT of the ansible initial limit.
++      config_mode: [ startup ]
++  group_vars:
++    netlab_config_mode: startup
+diff --git a/netsim/devices/cisco_sdwan-validator.yml b/netsim/devices/cisco_sdwan-validator.yml
+index 189fad8..d9ccfd2 100644
+--- a/netsim/devices/cisco_sdwan-validator.yml
++++ b/netsim/devices/cisco_sdwan-validator.yml
+@@ -10,6 +10,15 @@ clab:
+     kind: cisco_sdwan
+     type: validator
+   image: registry.example.com/skyforge/kubevirt/cisco_sdwan-validator:20.7.1-kne-r1
++  features:
++    initial:
++      # Same startup-only day-0 contract as cisco_sdwan-controller and
++      # -manager: there is no viptela ansible network_os, so the initial
++      # play dies at first contact. Keeps the node OUT of the ansible
++      # initial limit; day-0 arrives through the KNE serial injector.
++      config_mode: [ startup ]
++  group_vars:
++    netlab_config_mode: startup
+ group_vars:
+   netlab_device_type: cisco_sdwan-validator
+   ansible_network_os: viptela
+@@ -17,6 +26,27 @@ group_vars:
+   ansible_user: admin
+   ansible_ssh_pass: admin
+   ansible_password: admin
++  # NOT [ ssh ], unlike the controller and manager blocks this was copied
++  # from. NOTHING NEEDS SSH TO THE vBOND:
++  #   - netlab initial does not: config_mode is startup, so the node is
++  #     deliberately outside the ansible limit;
++  #   - vManage enrolls it over the lab network itself, not through us;
++  #   - the collector models the validator as an ENDPOINT, not an SSH-collected
++  #     device.
++  # The gate was pure copy-paste, and it is the only thing that ever
++  # demanded the port: bring-up died on "SSH server did not start in time
++  # on node(s) vbond" (run 74071) for a service no consumer wants. Waiting
++  # on a port nothing uses is not a readiness check, it is a coin flip that
++  # fails the lab.
++  netlab_ready: [ none ]
++  # vBond is the LIGHTEST of the three (vEdge software, no NMS, no OMP
++  # policy engine), so it boots fastest -- but it is still a KubeVirt VM,
++  # not a container, and the generic default is 20x5 = 100s. Matching the
++  # controller's 180x5 = 900s rather than inventing a third budget: it is
++  # inside the bring-up Job's 20m outer budget, with room for the stages
++  # around it.
++  netlab_check_retries: 180
++  netlab_check_delay: 5
+ features:
+   # STATIC ROUTES, for one declaration only: `routing.static` with a default
+   # route toward the site/DC exit, which the sdwan module renders into VPN 0
+@@ -41,3 +71,8 @@ features:
+     types: [ validator ]
+ kne:
+   node.type: validator
++  features:
++    initial:
++      config_mode: [ startup ]
++  group_vars:
++    netlab_config_mode: startup
+diff --git a/netsim/devices/eos.yml b/netsim/devices/eos.yml
+index 5ad477c..0aff4fb 100644
+--- a/netsim/devices/eos.yml
++++ b/netsim/devices/eos.yml
+@@ -8,14 +8,29 @@ tunnel_interface_name: Tunnel{ifindex}
+ lag_interface_name: "port-channel{lag.ifindex}"
+ role: router
+ group_vars:
+-  ansible_user: vagrant
+-  ansible_ssh_pass: vagrant
++  ansible_user: admin
++  ansible_ssh_pass: admin
+   ansible_network_os: eos
+   ansible_connection: network_cli
+   netlab_config_remove:
+   - no lldp transmit
+   - no lldp receive
+-  netlab_config_mode: netmiko
++  ansible_password: admin
++  netlab_config_mode: sh
++  # Skip netlab's SSH readiness gate under KNE. That gate probes the topology
++  # mgmt.ipv4 (a clab mgmt-bridge address, e.g. 192.168.167.x) which KNE never
++  # assigns — devices are reachable only at their pod IP — so it always times
++  # out and kills `netlab initial` before the provider-native day-0 apply runs.
++  # cEOS day-0 config (config_mode: sh) is applied over the KNE container shell
++  # (kubectl/FastCli exec), NOT over mgmt SSH, so the gate is pure dead weight
++  # here. netlab_ready: none makes deploy.run proceed straight to
++  # deploy_provider_config. See the netlab-KNE mgmt-address analysis 2026-07-16.
++  netlab_ready: [ none ]
++  # KNE cEOS links need EOS PHY control messages disabled so control-plane
++  # frames such as IS-IS leave the container dataplane. Valid on the pinned
++  # cEOS 4.34.2f (netlab's reference cEOS); the newer 4.36.0.1f REJECTED it
++  # (% Invalid input), which is one reason we pin 4.34.2f platform-wide.
++  netlab_phy_control: false
+ features:
+   initial:
+     system_mtu: true
+@@ -201,7 +216,7 @@ clab:
+       ipv4: False
+       ipv6: False
+     initial:
+-      config_mode: [ netmiko, sh ]
++      config_mode: [ sh ]
+   interface:
+     name: et{ifindex}
+   node:
+@@ -216,7 +231,18 @@ clab:
+     ansible_ssh_pass: admin
+     ansible_become: yes
+     ansible_become_method: enable
+-    netlab_ready: [ ssh ]
++    # netlab_ready MUST be overridden at the clab-provider level, not just the
++    # device level below. get_device_attribute() resolves a KNE node's
++    # group_vars as `value + pvalue`, where value = devices.eos.group_vars
++    # (device-level) and pvalue = devices.eos.clab.group_vars (KNE falls back
++    # to the clab provider block). pvalue (clab) WINS the merge, so the
++    # built-in eos.yml clab.group_vars.netlab_ready: [ssh] shadowed our
++    # device-level [none] and kept the SSH readiness gate alive — it timed out
++    # against the unreachable KNE mgmt IP and killed `netlab initial` even
++    # though `kne create` succeeded. Overriding here makes [none] actually win
++    # for KNE eos nodes. (cEOS day-0 is pushed over the container shell in
++    # config_mode: sh, so the SSH gate is pure dead weight.)
++    netlab_ready: [ none ]
+     netlab_config_path: /mnt/flash/             # These variables are used when netlab_config_mode == 'sh'
+     netlab_config_wrapper: |
+       {% if netlab_need_shebang %}
+@@ -289,7 +315,18 @@ kne:
+     ansible_ssh_pass: admin
+     ansible_become: yes
+     ansible_become_method: enable
+-    netlab_ready: [ ssh ]
++    # netlab_ready MUST be overridden at the clab-provider level, not just the
++    # device level below. get_device_attribute() resolves a KNE node's
++    # group_vars as `value + pvalue`, where value = devices.eos.group_vars
++    # (device-level) and pvalue = devices.eos.clab.group_vars (KNE falls back
++    # to the clab provider block). pvalue (clab) WINS the merge, so the
++    # built-in eos.yml clab.group_vars.netlab_ready: [ssh] shadowed our
++    # device-level [none] and kept the SSH readiness gate alive — it timed out
++    # against the unreachable KNE mgmt IP and killed `netlab initial` even
++    # though `kne create` succeeded. Overriding here makes [none] actually win
++    # for KNE eos nodes. (cEOS day-0 is pushed over the container shell in
++    # config_mode: sh, so the SSH gate is pure dead weight.)
++    netlab_ready: [ none ]
+     netlab_config_path: /mnt/flash/             # These variables are used when netlab_config_mode == 'sh'
+     netlab_config_wrapper: |
+       {% if netlab_need_shebang %}
+diff --git a/netsim/devices/fortios.yml b/netsim/devices/fortios.yml
+index b65350e..e9c6508 100644
+--- a/netsim/devices/fortios.yml
++++ b/netsim/devices/fortios.yml
+@@ -22,8 +22,8 @@ clab:
+       healthcheck: true
+ group_vars:
+   ansible_user: admin
+-  ansible_password: admin
+-  ansible_ssh_pass: admin
++  ansible_password: Admin@123
++  ansible_ssh_pass: Admin@123
+   ansible_network_os: fortinet.fortios.fortios
+   ansible_connection: httpapi
+   collections:
+@@ -80,7 +80,53 @@ features:
+   initial:
+     collect: true
+     config_mode: [ netmiko ]
++    # STARTUP-ONLY (netlab device feature, read by the KNE provider's
++    # startup_only check). The boot applied the whole config from
++    # user_data, so bring-up skips the Ansible/netmiko replay, exactly as
++    # for iol. The reconfigure lane is netlab_reconfigure_mode above, not a
++    # second flag: the old startup_read_once (which kept an SSH CLI lane,
++    # deploy-config/fortios-kne.yml, alive on reconfigure renders) is gone
++    # from the provider, and that deploy file with it.
++    #
++    # features.initial.config_mode is deliberately NOT declared here. The
++    # device file owns it ([ netmiko ]); declaring it again here would make
++    # this file a second source, and the generated catalog reads THIS
++    # file's value first (netlabdefaultsgen parseDeviceOverrides). CHECKED
++    # 2026-09-27 against internal/netlabdefaultsgen/generator.go
++    # deriveInitialPolicy: only a "startup" mode maps to initial_policy
++    # never, "sh" maps to always, and any other mode -- netmiko included --
++    # falls through to netlabDefaultInitialPolicy, "always". So [ netmiko ]
++    # keeps fortios a netlab-initial (reconfigure) target. The earlier note
++    # here, that declaring config_mode would read as "never", is only true
++    # of [ startup ].
++    startup_only: true
+ graphite.icon: firewall
+ 
+ kne:
+   interface.name: eth{ifindex}
++  group_vars:
++    # BOOT = STARTUP. On KNE the FortiGate boots its WHOLE rendered config:
++    # the KNE provider (generate_fortios_bootstrap) puts initial plus every
++    # module into the cloud-init user_data, which FortiOS reads once, at
++    # first boot of a factory disk. That is netlab's startup mode, declared
++    # here rather than left to get_node_config_mode's fallthrough. KNE-only:
++    # clab has no user_data path for fortios.
++    netlab_config_mode: startup
++    # RECONFIGURE = NETMIKO (owner, 2026-09-27: "startup first, netmiko for
++    # reconfigure"). A running FortiGate never re-reads the regenerated
++    # user_data, so on a reconfigure render (NETLAB_KNE_RECONFIGURE=1) the
++    # KNE provider moves the node to this mode (add_default_config_mode ->
++    # _kne_boot_config_mode=startup, netlab_config_mode=netmiko) and
++    # `netlab initial` pushes the changed node over netmiko
++    # (netmiko_device_type fortinet, from the device file). It connects to
++    # the SSH service port the provider publishes as `netmiko_port`, NOT
++    # ansible_port: on KNE the provider points ansible_port at the
++    # management service, which for fortios is httpapi, not SSH -- see
++    # post_start_lab's netmiko_port branch in kne.py. netmiko must be
++    # in features.initial.config_mode (the device file declares
++    # [ netmiko ]) or the provider rejects the mode.
++    #
++    # The runtime judges that push like cat8000v's (no reboot or replace
++    # contract): accepted -> SKIPPED with removals NOT verified, rejected ->
++    # a named failure. See _verify_reconfigure_push_node.
++    netlab_reconfigure_mode: netmiko
+diff --git a/netsim/devices/iol.yml b/netsim/devices/iol.yml
+index 4044ed0..a9b50f2 100644
+--- a/netsim/devices/iol.yml
++++ b/netsim/devices/iol.yml
+@@ -7,6 +7,15 @@ clab:
+   group_vars:
+     netlab_device_type: iol
+     netlab_check_retries: 20
++    netlab_config_mode: startup
++    # The management VRF our initial/ios.j2 puts Ethernet0/0 in. Named
++    # here, once, so the services templates can put the syslog host and
++    # the flow exporter destination IN it: without `vrf MGMT` they resolve
++    # 198.19.255.x in the global table and the exporter counts "No FIB"
++    # (measured on demo-lab lhr-dis-rt01, 2026-09-12: 22 sends, 0
++    # delivered; syslog "started" and nothing left the box). netlab's own
++    # name for the concept (frr uses it the same way).
++    netlab_mgmt_vrf: MGMT
+   interface.name: Ethernet{ifindex // 4}/{ifindex % 4}
+   build: https://containerlab.dev/manual/kinds/cisco_iol/
+   image: vrnetlab/cisco_iol:17.16.01a
+@@ -14,6 +23,7 @@ clab:
+     kind: cisco_iol
+     config_templates:
+       ifstate: /iol/ifstate.cfg
++      netlab-config: null
+ 
+ features:
+   services:
+@@ -39,6 +49,7 @@ features:
+     max_mtu: 1500
+     ipv4:
+       unnumbered: true
++    startup_only: true
+   bgp:
+     tcp_ao: True
+   multicast:
+@@ -69,4 +80,54 @@ kne:
+   group_vars:
+     netlab_device_type: iol
+     netlab_check_retries: 20
++    netlab_config_mode: startup
++    # STARTUP FIRST, NETMIKO FOR RECONFIGURE (owner, 2026-09-27). Bring-up
++    # boots the whole config; a warm reconfigure cannot re-boot a running
++    # node's config, so the KNE provider delivers it over netmiko instead
++    # (netlab lists netmiko for every ios device). KNE-only by design.
++    netlab_reconfigure_mode: netmiko
++    # COPIED from vendor netsim/devices/ios.yml clab.group_vars: this kne:
++    # block hides clab: from netlab, so without them a KNE IOL node has no
++    # login for netmiko (the server's credential resolver walks the clab
++    # chain and finds these same values, which is why it never showed).
++    ansible_user: admin
++    ansible_ssh_pass: admin
++    ansible_become_password: admin
++    # The management VRF our initial/ios.j2 puts Ethernet0/0 in. Named
++    # here, once, so the services templates can put the syslog host and
++    # the flow exporter destination IN it: without `vrf MGMT` they resolve
++    # 198.19.255.x in the global table and the exporter counts "No FIB"
++    # (measured on demo-lab lhr-dis-rt01, 2026-09-12: 22 sends, 0
++    # delivered; syslog "started" and nothing left the box). netlab's own
++    # name for the concept (frr uses it the same way).
++    netlab_mgmt_vrf: MGMT
+   interface.name: Ethernet{ifindex // 4}/{ifindex % 4}
++      # STARTUP-CONFIG MODE (owner decision, 2026-08-28), the same shape ioll2
++      # has run in all along. The whole rendered config -- initial plus every
++      # module -- boots with the device via IOL's native `-c config` loader.
++      # There is no post-boot apply, so there is no exec lane, no console
++      # attach, no ssh driver, no bulkhead and no readiness race in bring-up.
++      #
++      # WHY THE sh LANE IS GONE. Every IOL incident on record lived in it: the
++      # 600s exec hang (one orphaned dtach), the console applies that were
++      # never slow (an orphaned attach starving the exec pool), and the
++      # exit-137/143 teardowns of 2026-08-28 that killed labs whose config had
++      # ALREADY LANDED ("fragment applied" then SIGKILL). Each fix added a
++      # layer onto a mechanism that is inherently racy: interactive sessions
++      # driven through kubectl exec at fleet scale.
++      #
++      # The reboot proof, iol-postfix-a/core-rtr1 2026-08-28: update the
++      # node's startup ConfigMap, restart the CONTAINER (not the pod) by
++      # ending the dtach master the entrypoint waits on, and the device boots
++      # the new config with podIP, uid and every veth unchanged. That is the
++      # reconfigure primitive for this mode (per-node reboot); until its
++      # executor lands, iol is PENDING in the reconfigure-target policy and
++      # a reconfigure takes the rebuild fallback.
++      #
++      # What the proof also showed: the sh-mode node came back from a restart
++      # with a 31-line bootstrap and every interface administratively down --
++      # all of its post-boot config was gone. A startup-mode node comes back
++      # whole.
++  node:
++    config_templates:
++      netlab-config: null
+diff --git a/netsim/devices/ioll2.yml b/netsim/devices/ioll2.yml
+index 77d432b..dad3eb2 100644
+--- a/netsim/devices/ioll2.yml
++++ b/netsim/devices/ioll2.yml
+@@ -12,6 +12,7 @@ features:
+   initial:
+     generate_mac: [ ethernet, svi ]
+     normalize: true
++    startup_only: true
+   vlan:
+     model: l3-switch
+     svi_interface_name: Vlan{vlan}
+@@ -30,14 +31,83 @@ features:
+ clab:
+   group_vars:
+     netlab_device_type: ioll2
++    netlab_config_mode: startup
++    # The management VRF our initial/ios.j2 puts Ethernet0/0 in. Named
++    # here, once, so the services templates can put the syslog host and
++    # the flow exporter destination IN it: without `vrf MGMT` they resolve
++    # 198.19.255.x in the global table and the exporter counts "No FIB"
++    # (measured on demo-lab lhr-dis-rt01, 2026-09-12: 22 sends, 0
++    # delivered; syslog "started" and nothing left the box). netlab's own
++    # name for the concept (frr uses it the same way).
++    netlab_mgmt_vrf: MGMT
+   build: https://containerlab.dev/manual/kinds/cisco_iol/
+   image: vrnetlab/cisco_iol:L2-17.16.01a
+   mtu: 1500
+   node:
+     kind: cisco_iol
+     type: l2
++    config_templates:
++      # ioll2 declares `parent: iol` (vendor netsim/devices/ioll2.yml), so it
++      # INHERITS the iol block's netlab-config registration above. netlab
++      # resolves a config template by DEVICE DIRECTORY only --
++      # config_template_paths() sets path_suffix = [node.device], with no
++      # parent-chain fallback -- and there is no templates/ioll2/. Every
++      # ioll2 topology therefore died at compile with
++      #   "Cannot find netlab-config configuration template for <n>/device ioll2"
++      # which is FATAL, so the 17 access switches of the demo-lab import could
++      # not be authored as ioll2 at all and had to fall back to iol (routers).
++      # The registration is dead weight here regardless: iol needs the sh
++      # wrapper because it is netlab_config_mode: sh (a config-replace
++      # reconfigure target); ioll2 is startup mode below and applies its
++      # day-0 through the KNE startup config, never through the wrapper.
++      # Explicit null removes the inherited key. Proven against the real
++      # in-cluster netlab compiler 2026-08-15 by passing the identical
++      # override as topology-level `defaults:` -- red before, green after,
++      # then a 67-node demo-lab with 17 real ioll2 switches compiled.
++      netlab-config: null
+ 
+ kne:
+   group_vars:
+     netlab_device_type: ioll2
++    netlab_config_mode: startup
++    # STARTUP FIRST, NETMIKO FOR RECONFIGURE (owner, 2026-09-27). Bring-up
++    # boots the whole config; a warm reconfigure cannot re-boot a running
++    # node's config, so the KNE provider delivers it over netmiko instead
++    # (netlab lists netmiko for every ios device). KNE-only by design.
++    netlab_reconfigure_mode: netmiko
++    # COPIED from vendor netsim/devices/ios.yml clab.group_vars: this kne:
++    # block hides clab: from netlab, so without them a KNE IOL node has no
++    # login for netmiko (the server's credential resolver walks the clab
++    # chain and finds these same values, which is why it never showed).
++    ansible_user: admin
++    ansible_ssh_pass: admin
++    ansible_become_password: admin
++    # The management VRF our initial/ios.j2 puts Ethernet0/0 in. Named
++    # here, once, so the services templates can put the syslog host and
++    # the flow exporter destination IN it: without `vrf MGMT` they resolve
++    # 198.19.255.x in the global table and the exporter counts "No FIB"
++    # (measured on demo-lab lhr-dis-rt01, 2026-09-12: 22 sends, 0
++    # delivered; syslog "started" and nothing left the box). netlab's own
++    # name for the concept (frr uses it the same way).
++    netlab_mgmt_vrf: MGMT
++  node:
++    config_templates:
++      # ioll2 declares `parent: iol` (vendor netsim/devices/ioll2.yml), so it
++      # INHERITS the iol block's netlab-config registration above. netlab
++      # resolves a config template by DEVICE DIRECTORY only --
++      # config_template_paths() sets path_suffix = [node.device], with no
++      # parent-chain fallback -- and there is no templates/ioll2/. Every
++      # ioll2 topology therefore died at compile with
++      #   "Cannot find netlab-config configuration template for <n>/device ioll2"
++      # which is FATAL, so the 17 access switches of the demo-lab import could
++      # not be authored as ioll2 at all and had to fall back to iol (routers).
++      # The registration is dead weight here regardless: iol needs the sh
++      # wrapper because it is netlab_config_mode: sh (a config-replace
++      # reconfigure target); ioll2 is startup mode below and applies its
++      # day-0 through the KNE startup config, never through the wrapper.
++      # Explicit null removes the inherited key. Proven against the real
++      # in-cluster netlab compiler 2026-08-15 by passing the identical
++      # override as topology-level `defaults:` -- red before, green after,
++      # then a 67-node demo-lab with 17 real ioll2 switches compiled.
++      netlab-config: null
+   node.type: l2
+diff --git a/netsim/devices/ios.yml b/netsim/devices/ios.yml
+index 67c894e..2cf7c24 100644
+--- a/netsim/devices/ios.yml
++++ b/netsim/devices/ios.yml
+@@ -20,6 +20,7 @@ group_vars:
+   netlab_config_mode: netmiko
+   # yamllint disable-line rule:line-length
+   netlab_ssh_args: "-o KexAlgorithms=+diffie-hellman-group-exchange-sha1 -o PubkeyAcceptedKeyTypes=ssh-rsa -o HostKeyAlgorithms=+ssh-rsa"
++  netlab_cdp_enable: true
+ 
+ clab:
+   group_vars:
+diff --git a/netsim/devices/iosxr.yml b/netsim/devices/iosxr.yml
+index a6a10f7..7e5d0ee 100644
+--- a/netsim/devices/iosxr.yml
++++ b/netsim/devices/iosxr.yml
+@@ -38,6 +38,28 @@ clab:
+     ansible_become_password: clab@123
+     netlab_config_path: /config/netlab/
+     netlab_default_shebang: '#!/config/netlab/netlab-config.sh'
++    # Config-deploy mode = sh (CLI-over-container-shell), NOT the default
++    # 'startup' (ZTP startup-config injection). This is the authoritative knob:
++    # kne.py get_node_config_mode() reads netlab_config_mode FIRST, before any
++    # feature/default fallback. Under provider=kne the upstream iosxr.yml clab
++    # feature `initial.config_mode: [sh]` is NOT merged onto the node (get_device
++    # _features resolves only the active provider's data), so without this line
++    # iosxr falls through to 'startup' — netlab bakes the FULL day-0 as the XRd
++    # startup-config and XRd's boot ZTP applies it via `/pkg/bin/config -p15 -X`.
++    # That ZTP config-apply SIGBUSes ("Bus error", 5-6 deterministic retries,
++    # then FatalError: initial configuration failed) under concurrent-boot memory
++    # pressure: /pkg/bin/config faults a page on a Memory-backed tmpfs segment the
++    # cgroup can't grow → SIGBUS. (Empirically the XRd binary itself is fine on
++    # this kernel-6.18 runtime — `/pkg/bin/config -X` and `xrapply` both apply
++    # config cleanly POST-boot; it is only the early-boot ZTP apply that walls.)
++    # config_mode: sh moves the heavy day-0 to a POST-boot `xrapply` over the KNE
++    # container shell (netlab-config.sh → xrapply, no ZTP), leaving only the tiny
++    # xrd-bootstrap (kne provider add_iosxr_bootstrap: hostname + clab creds + SSH)
++    # at boot. Mirrors the proven eos config_mode: sh pattern above. With day-0
++    # now applying, patch 0017's VRF-netns L3VPN dataplane permit is finally
++    # exercised. netlab_ready: none stays — sh applies over kubectl exec, not SSH.
++    netlab_config_mode: sh
++    netlab_ready: [ none ]
+ 
+ features:
+   # Routed VLANs only. XRd Control Plane forwards through an L3-only Linux
+@@ -85,4 +107,26 @@ kne:
+     ansible_become_password: clab@123
+     netlab_config_path: /config/netlab/
+     netlab_default_shebang: '#!/config/netlab/netlab-config.sh'
++    # Config-deploy mode = sh (CLI-over-container-shell), NOT the default
++    # 'startup' (ZTP startup-config injection). This is the authoritative knob:
++    # kne.py get_node_config_mode() reads netlab_config_mode FIRST, before any
++    # feature/default fallback. Under provider=kne the upstream iosxr.yml clab
++    # feature `initial.config_mode: [sh]` is NOT merged onto the node (get_device
++    # _features resolves only the active provider's data), so without this line
++    # iosxr falls through to 'startup' — netlab bakes the FULL day-0 as the XRd
++    # startup-config and XRd's boot ZTP applies it via `/pkg/bin/config -p15 -X`.
++    # That ZTP config-apply SIGBUSes ("Bus error", 5-6 deterministic retries,
++    # then FatalError: initial configuration failed) under concurrent-boot memory
++    # pressure: /pkg/bin/config faults a page on a Memory-backed tmpfs segment the
++    # cgroup can't grow → SIGBUS. (Empirically the XRd binary itself is fine on
++    # this kernel-6.18 runtime — `/pkg/bin/config -X` and `xrapply` both apply
++    # config cleanly POST-boot; it is only the early-boot ZTP apply that walls.)
++    # config_mode: sh moves the heavy day-0 to a POST-boot `xrapply` over the KNE
++    # container shell (netlab-config.sh → xrapply, no ZTP), leaving only the tiny
++    # xrd-bootstrap (kne provider add_iosxr_bootstrap: hostname + clab creds + SSH)
++    # at boot. Mirrors the proven eos config_mode: sh pattern above. With day-0
++    # now applying, patch 0017's VRF-netns L3VPN dataplane permit is finally
++    # exercised. netlab_ready: none stays — sh applies over kubectl exec, not SSH.
++    netlab_config_mode: sh
++    netlab_ready: [ none ]
+   interface.name: Gi0-0-0-{ifindex}
+diff --git a/netsim/devices/linux.yml b/netsim/devices/linux.yml
+index 0747e45..683b849 100644
+--- a/netsim/devices/linux.yml
++++ b/netsim/devices/linux.yml
+@@ -16,12 +16,16 @@ features:
+       lla: true
+       use_ra: true
+     roles: [ host ]
++    mgmt_vrf: True
+   lag:
+     passive: False
+   netmiko:
+     device_type: linux
+   routing:
+     static: true
++  services:
++    dns:
++      transport_vrf: false
+ libvirt:
+   image: bento/ubuntu-24.04
+   create_image: netlab/linux
+@@ -83,6 +87,7 @@ clab:
+     ansible_connection: docker
+     ansible_user: root
+     netlab_linux_distro: vanilla
++    ansible_ssh_pass: admin
+ kne:
+   image: registry.example.com/skyforge/skyforge-linux-host:20261012-linux-host-lldp-r1
+   # VLAN on a KNE linux host, DECLARED HERE. netlab derives a module's
+@@ -109,6 +114,12 @@ kne:
+     ansible_ssh_pass: admin
+     ansible_password: admin
+     netlab_linux_distro: vanilla
++    # Destinations that must keep using the MANAGEMENT interface once the
++    # default route moves to the lab: pod network and service network.
++    # Declared here so a cluster with different ranges is a CONFIG change,
++    # not a template edit.
++    skyforge_mgmt_cidrs: [ 198.18.0.0/16, 198.19.0.0/16 ]
++    netlab_lldp_enable: true
+ external:
+   image: none
+ graphite.icon: server
+diff --git a/netsim/devices/nxos.yml b/netsim/devices/nxos.yml
+index 6b70b16..14832cb 100644
+--- a/netsim/devices/nxos.yml
++++ b/netsim/devices/nxos.yml
+@@ -14,12 +14,25 @@ clab:
+     ansible_ssh_pass: admin
+     ansible_user: admin
+     netlab_ready: [ ssh, command ]
++    netlab_ssh_args: "-o KexAlgorithms=+diffie-hellman-group14-sha1 -o PubkeyAcceptedKeyTypes=+ssh-rsa -o HostKeyAlgorithms=+ssh-rsa"
++    # SSH-readiness window for netlab's `initial` gate (netsim/cli/initial/ready.py:74
++    # wait = netlab_check_retries * netlab_check_delay). THIS is the authoritative
++    # site: under KNE, get_device_attribute() merges this clab.group_vars over the
++    # base netsim/devices/nxos.yml group_vars, so retries here overrides the base 50.
++    # delay is inherited from the base nxos.yml (10) -- pinned explicitly below so the
++    # window can't silently halve if that base default drifts. nxos boot-to-SSH has
++    # been measured ~856s and has blown past 900s; 180 * 10 = 1800s gives 2x headroom.
++    # NOTE: components/server/internal/taskengine/netlab_device_defaults.json's
++    # netlab_check_retries is informational only (UI catalog / resource-estimate); it
++    # is NOT injected into the netlab topology and does NOT affect this gate.
++    netlab_check_retries: 180
++    netlab_check_delay: 10
+   image: vrnetlab/vr-n9kv:9.3.8
+   features:
+     initial:
+       healthcheck: true
+   node:
+-    kind: cisco_n9kv
++    kind: nxos
+     env:
+       CLAB_MGMT_PASSTHROUGH: "true"
+   interface.name: eth{ifindex}
+@@ -35,6 +48,7 @@ group_vars:
+   netlab_config_mode: netmiko
+   # yamllint disable-line rule:line-length
+   netlab_ssh_args: "-o KexAlgorithms=+diffie-hellman-group14-sha1 -o PubkeyAcceptedKeyTypes=+ssh-rsa -o HostKeyAlgorithms=+ssh-rsa"
++  netlab_cdp_enable: true     # see the CDP note on devices.ios
+ bfd:           # NXOS requires lower default timer values
+   min_rx: 500
+ evpn._start_transit_vlan: 3800
+@@ -135,4 +149,19 @@ kne:
+     ansible_ssh_pass: admin
+     ansible_user: admin
+     netlab_ready: [ ssh, ansible ]
++    netlab_ssh_args: "-o KexAlgorithms=+diffie-hellman-group14-sha1 -o PubkeyAcceptedKeyTypes=+ssh-rsa -o HostKeyAlgorithms=+ssh-rsa"
++    # SSH-readiness window for netlab's `initial` gate (netsim/cli/initial/ready.py:74
++    # wait = netlab_check_retries * netlab_check_delay). THIS is the authoritative
++    # site: under KNE, get_device_attribute() merges this clab.group_vars over the
++    # base netsim/devices/nxos.yml group_vars, so retries here overrides the base 50.
++    # delay is inherited from the base nxos.yml (10) -- pinned explicitly below so the
++    # window can't silently halve if that base default drifts. nxos boot-to-SSH has
++    # been measured ~856s and has blown past 900s; 180 * 10 = 1800s gives 2x headroom.
++    # NOTE: components/server/internal/taskengine/netlab_device_defaults.json's
++    # netlab_check_retries is informational only (UI catalog / resource-estimate); it
++    # is NOT injected into the netlab topology and does NOT affect this gate.
++    netlab_check_retries: 180
++    netlab_check_delay: 10
+   interface.name: eth{ifindex}
++  node:
++    kind: nxos
+diff --git a/netsim/devices/panos.yml b/netsim/devices/panos.yml
+index 707a57a..e7336b7 100644
+--- a/netsim/devices/panos.yml
++++ b/netsim/devices/panos.yml
+@@ -102,3 +102,10 @@ features:
+ 
+ kne:
+   interface.name: eth{ifindex}
++# PAN-OS boots with the factory default admin/admin on first login; the
++# readiness path promotes it to the configured API password before config.
++# Do not include "admin" in the configured password: PAN-OS first-login
++# password policy can reject passwords derived from the username.
++ansible_password: Admin@123
++ansible_ssh_private_key_file: "{{ lookup('env', 'SKYFORGE_NETLAB_SSH_KEY_FILE') | default('/skyforge-secrets/netlab-runner-rsa', true) }}"
++netlab_ready: [ ansible ]
+diff --git a/netsim/devices/sros.yml b/netsim/devices/sros.yml
+index 7aacfbd..fae75c7 100644
+--- a/netsim/devices/sros.yml
++++ b/netsim/devices/sros.yml
+@@ -176,7 +176,7 @@ clab:
+   node:
+     kind: vr-sros
+     type: sr-1                # By default emulate SR-1; override per-node for other chassis variants
+-    license: /Projects/SR_OS_VSR-SIM_license.txt
++    license: cf3:\lic
+     env:
+       CLAB_MGMT_PASSTHROUGH: "true"
+     hardware:
+@@ -191,6 +191,7 @@ clab:
+     name: eth{ifindex}
+   group_vars:
+     sros_grpc_port: 57400
++    license_source_mode: image-local
+ external:
+   image: none
+ graphite.icon: router
+@@ -198,6 +199,25 @@ graphite.icon: router
+ kne:
+   group_vars:
+     sros_grpc_port: 57400
++    ansible_user: admin
++    ansible_ssh_pass: admin
++    # Preserve the image-local SR OS startup config by default; TFTP
++    # primary-config is an explicit opt-in contract only.
++    netlab_ready: [ ssh, ansible, sros ]
++    netlab_check_command: ""
++    netlab_ssh_args: "-o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa"
++    # SR OS config deployment uses gNMI, so KNE readiness must prove both
++    # SSH host-key compatibility and the gNMI service before netlab initial.
++    netlab_check_retries: 360
++    netlab_check_delay: 10
++    license_source_mode: image-local
++    # The post-license activation branch can take longer than the generic
++    # SSH drop probe defaults, so keep the license-reboot wait aligned with
++    # the main SR OS readiness budget.
++    sros_license_reboot_drop_retries: 60
++    sros_license_reboot_drop_delay: 5
++    sros_license_reboot_retries: 360
++    sros_license_reboot_delay: 10
+   node.type: sr-1
+   variant_contracts: {ixr-e-big: {timos_line: slot=A chassis=ixr-e card=cpm-ixr-e}, ixr-e-small: {timos_line: slot=A
+       chassis=ixr-e card=imm14-10g-sfp++4-1g-tx}, ixr-e2: {timos_line: chassis=ixr-e2
+diff --git a/netsim/devices/versa-flexvnf.yml b/netsim/devices/versa-flexvnf.yml
+index 1662b7e..bfd3d8c 100644
+--- a/netsim/devices/versa-flexvnf.yml
++++ b/netsim/devices/versa-flexvnf.yml
+@@ -13,6 +13,7 @@ group_vars:
+   netlab_device_type: versa-flexvnf
+   ansible_network_os: versa
+   ansible_connection: network_cli
++  netlab_ready: [ ssh ]
+ features:
+   # Declares that this device SUPPORTS the services module, which is what puts
+   # it in services.supported_on and lets `netlab create` proceed -- groups.all
+diff --git a/netsim/providers/clab.yml b/netsim/providers/clab.yml
+index 0185970..efce9cc 100644
+--- a/netsim/providers/clab.yml
++++ b/netsim/providers/clab.yml
+@@ -13,19 +13,7 @@ start: containerlab deploy --reconfigure -t clab.yml
+ stop: containerlab destroy --cleanup -t clab.yml
+ act_probe: "docker ps"
+ act_title: "Running containers"
+-probe:
+-- cmd: "containerlab version"
+-  err: "Containerlab is not installed"
+-- cmd: "docker version"
+-  err: >-
+-    Cannot run 'docker version'. Install Docker or podman-docker and
+-    ensure you can access the Docker/Podman socket.
+-- cmd: [ bash, '-c', "(groups | grep -w clab_admins) || (whoami | grep -w root)"]
+-  err: >-
+-    You are not a member of the clab_admins group.
+-    See https://netlab.tools/labs/clab/ for details
+-- cmd: [ bash, '-c', "[[ `containerlab version|awk '/version/ {print $2}'` > '0.79.99' ]] && echo OK" ]
+-  err: "Containerlab version is too old, please upgrade to 0.80.0 or later with 'sudo containerlab version upgrade'"
++probe: [ ]
+ 
+ cleanup: [ clab.yml, clab_files ]
+ bridge_type: bridge # Use 'ovs-bridge' to create Openvswitch bridges
+diff --git a/netsim/providers/kne.yml b/netsim/providers/kne.yml
+index 42a61cb..6fcd80c 100644
+--- a/netsim/providers/kne.yml
++++ b/netsim/providers/kne.yml
+@@ -4,9 +4,93 @@
+ description: Kubernetes Network Emulation
+ config: topology.pb.txt
+ template: topology.pb.txt.j2
+-start: kne create topology.pb.txt
++start: kne create --timeout 20m topology.pb.txt
+ stop: kne delete topology.pb.txt
+ cleanup: [ topology.pb.txt ]
+ probe:
+ - cmd: [ kne, --help ]
+   err: "KNE CLI is not installed"
++# This value is the declarative meshnet fabric contract. It MUST equal
++# skyforge.kne.meshnet.fabricMTU in the chart: koko applies it to both
++# same-node veth wires and cross-node VXLAN interfaces, while netlab applies
++# it to the NOS-facing routed interfaces.
++#
++# link_mtu is the UNDERLAY/transport ceiling: it is the largest frame a
++# routed fabric link (leaf<->spine) can carry. Routed/underlay interfaces are
++# clamped to this value. The safe fleet default remains 1450: a 1500-byte
++# IPv4 underlay minus Ethernet(14)+IPv4(20)+UDP(8)+VXLAN(8) overhead.
++#
++# overlay_mtu_headroom reserves room for the NOS's OWN overlay encapsulation
++# (EVPN VXLAN, MPLS/SR labels, GRE, IPsec, ...) on top of the fabric. Any
++# interface that carries pre-encap overlay payload (bridged/IRB access ports
++# and host/CE links) is clamped to (link_mtu - overlay_mtu_headroom), floored
++# at the IPv6 minimum (1280). 90B of headroom covers VXLAN(50)/MPLS/GRE/IPsec
++# and moderate SRv6; exotic stacking (deep classic-SRv6 SID lists,
++# tunnel-in-tunnel) PMTUDs cleanly rather than blackholing.
++# The jumbo target is 8950 (9000-byte underlay minus the same 50 bytes). Flip
++# both declarative values atomically only after eligible nodes advertise
++# skyforge.example.com/meshnet-fabric-mtu=8950 and every L2 hop is
++# validated. At >1450, taskengine restricts cross-node placement to nodes
++# carrying the exact label; otherwise it pins the whole lab to one node.
++#
++# FLIPPED TO 8950 on 2026-08-12, with that precondition MET, not assumed:
++#   - mgmt05 (the single Cisco Nexus 3048TP-1GE every node hangs off) now
++#     carries a system-wide network-qos jumbo policy.
++#   - All four nodes run eno1 at MTU 9000, persisted in machine config.
++#   - Full-mesh DF-set 8972 (9000 on the wire) passes in EVERY direction,
++#     16/16 pairs, including node-a.
++#   - All four advertise meshnet-fabric-mtu=8950 + meshnet-underlay-interface=eno1.
++# Do NOT read the switch's CDP MTU TLV as confirmation: on NX-OS it tracks
++# the L2 port setting and still reports 1500 under a network-qos policy.
++# This MUST stay equal to skyforge.kne.meshnet.fabricMTU in the chart; they
++# were raised in the same change.
++link_mtu: 8950
++overlay_mtu_headroom: 90
++    # Per-device INTERFACE (L3) MTU ceilings for NOS whose media MTU caps BELOW
++    # the global jumbo link_mtu above. apply_kne_link_mtu lowers a link to the
++    # smallest ceiling among its attached devices (both ends stay symmetric so
++    # OSPF/IS-IS adjacency + PMTUD hold); devices not listed keep link_mtu.
++    #   iosxr (XRd): the containerized IOS-XR control plane rejects any media
++    #     MTU > 9000 ("valid media MTU range is from 64 to 9000"). netlab's
++    #     iosxr initial template emits media MTU = interface_mtu + 14 (its L2
++    #     kludge), so the interface MTU must stay <= 8986 to land media == 9000.
++    #     Without this, link_mtu 9214 -> "mtu 9228" and `netlab initial` dies on
++    #     the very first interface, before the XRd dataplane/VRF-netns (and thus
++    #     patches/kne/0017) is ever reached. 8986 keeps XRd jumbo (media 9000)
++    #     while EOS/etc. keep 9214. Enforced by patches/netlab/0006.
++    # ⚠️ MEASURED 2026-08-13 -- XRd's own error text LIES about its limit.
++    # XRd reports "valid media MTU range is from 64 to 9000" and then CRASHES
++    # applying much above ~4500: /pkg/bin/config dies with SIGBUS partway
++    # through `netlab initial`, retries 5-6 times, then FatalError. Cisco
++    # documents no maximum; netlab's caveats page records none for iosxr
++    # either (CSR1000v is capped there at 1500).
++    #
++    # One variable, same host/image/digest. interface -> rendered media (+14):
++    #   1500 -> 1514 applies    5000 -> 5014 SIGBUS
++    #   4000 -> 4014 applies    6000 -> 6014 SIGBUS
++    #   4500 -> 4514 applies    8000 -> 8014 SIGBUS
++    #        (highest proven)   8950 -> 8964 SIGBUS  <- the fleet value
++    #
++    # True ceiling is between 4500 and 5000; 4500 is the largest PROVEN
++    # value. Do NOT raise it toward 9000 on the strength of XRd's error
++    # text -- that is exactly what 8986 was, and it made every jumbo XRd
++    # lab fail to configure from 2026-08-12 until this change.
++device_link_mtu:
++  iosxr: 4470
++# tcp_mss_clamp is the TCP MSS ceiling endpoints are forced down to so they
++# never emit a segment the fabric silently blackholes. The MTU clamp above
++# only sizes the *interface* MTU; it cannot stop an MPLS-VPN transit LSR from
++# PMTUD-blackholing a full-MTU TCP segment once label-stack (+meshnet VXLAN)
++# overhead pushes the on-wire frame past the underlay. MSS clamping is the
++# standard fix and is the single source of truth for every per-NOS clamp line.
++#
++# Derivation, anchored once and referenced by each NOS's group_vars below so
++# it stays correct if link_mtu changes:
++#   tcp_mss_clamp = link_mtu - 40 (IPv4+TCP headers) - 20 (MPLS label stack
++#   + margin) = 1450 - 60 = 1390.
++# If you change link_mtu, update this value with it (same contract as
++# overlay_mtu_headroom). netlab has no native MSS knob, so the clamp is
++# emitted by Skyforge's own per-NOS templates (templates/eos/initial.j2,
++# templates/initial/<nos>.j2); a new NOS adds one clamp line referencing
++# {{ tcp_mss_clamp }}, which reaches the template via that NOS's group_vars.
++tcp_mss_clamp: &tcp_mss_clamp 1390
+diff --git a/netsim/topology-defaults.yml b/netsim/topology-defaults.yml
+index 0d22acc..e63bb19 100644
+--- a/netsim/topology-defaults.yml
++++ b/netsim/topology-defaults.yml
+@@ -2,7 +2,7 @@
+ # Global topology defaults
+ #
+ ---
+-provider: libvirt
++provider: kne
+ 
+ # Include core defaults and configuration modules
+ #
+@@ -45,3 +45,43 @@ outputs:
+ tools:
+   _include:
+   - tools/*.yml
++plugin: [ files ]
++groups:
++  all:
++    # Generalized per-NOS management-protocol enablement, applied to every node.
++    # netlab renders the matching <nos>.j2 from each config module. snmp_config
++    # enables SNMP for the collector collection; gnmi_config enables the gNMI/gRPC
++    # server for the skyforge gNMI perf receiver. Add a NOS by dropping in
++    # snmp_config/<nos>.j2 or gnmi_config/<nos>.j2 — no per-lab custom config.
++    # snmp_config is GONE: SNMP moved into the netlab `services` module
++    # (patches/netlab/0031), which every device auto-enables via node.module.
++    # Leaving it here would configure SNMP twice.
++    #
++    # gnmi_config STAYS. Four of its templates carry live config and only three
++    # are ported so far -- sros' gNMI/SNMP config is a gNMI `updates:` YAML
++    # document rather than CLI and needs its own delivery path. Removing it now
++    # would silently disable gNMI on sros.
++    # EMPTY ON PURPOSE. SNMP and gNMI both moved into the netlab `services`
++    # module (patches/netlab/0031, 0032), which every device auto-enables via
++    # node.module, so neither needs a custom config module any more.
++    #
++    # Keeping snmp_config/gnmi_config here would configure both TWICE. The
++    # template directories are retained for one release as a rollback path; the
++    # COPY lines in the runtime Dockerfile can go once a lab has confirmed the
++    # services path on real hardware.
++    # ⚠️ DECLARING THE DEVICE FEATURE IS NOT ENOUGH. features.services.server.snmp
++    # says a device SUPPORTS the agent and node.module enables the module, but the
++    # templates gate on `services.server.snmp is defined` -- the ATTRIBUTE must be
++    # set on the node or NOTHING renders. Without this block SNMP and gNMI silently
++    # stop being configured fleet-wide: every device comes up reachable and
++    # unpollable and the collector collection goes dark with no error anywhere. This is
++    # what preserves the old snmp_config/gnmi_config behaviour, which applied to
++    # every node because those modules were listed in `config:` right here.
++    #
++    # The community MUST stay `skyforge`: it is what the collector's collectors poll with.
++    module: [ services ]
++    services:
++      server:
++        snmp:
++          community: skyforge
++        gnmi: True
+-- 
+2.56.0
+

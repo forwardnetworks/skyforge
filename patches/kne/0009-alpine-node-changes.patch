@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 13:47:41 -0500
+Subject: [PATCH 09/35] alpine: node changes
+
+---
+diff --git a/topo/node/alpine/alpine.go b/topo/node/alpine/alpine.go
+index 476ac6a..452f2fc 100644
+--- a/topo/node/alpine/alpine.go
++++ b/topo/node/alpine/alpine.go
+@@ -226,8 +226,11 @@ func (n *Node) CreatePod(ctx context.Context) error {
+ 			Containers:                    alpineContainers,
+ 			TerminationGracePeriodSeconds: pointer.Int64(0),
+ 			EnableServiceLinks:            pointer.Bool(false),
+-			NodeSelector:                  map[string]string{},
++			PriorityClassName:             node.KNEPriorityClassName(),
++			NodeSelector:                  node.KNENodeSelector(),
++			Tolerations:                   node.KNETolerations(),
+ 			Affinity: &corev1.Affinity{
++				NodeAffinity: node.KNEContainerNodeAffinity(),
+ 				PodAntiAffinity: &corev1.PodAntiAffinity{
+ 					PreferredDuringSchedulingIgnoredDuringExecution: []corev1.WeightedPodAffinityTerm{{
+ 						Weight: 100,
+@@ -248,22 +251,11 @@ func (n *Node) CreatePod(ctx context.Context) error {
+ 	}
+ 
+ 	if pb.Config.ConfigData != nil {
+-		vol, err := n.CreateConfig(ctx)
+-		if err != nil {
++		if err := n.AttachStartupConfig(ctx, pod, pb.Config.ConfigPath+"/"+pb.Config.ConfigFile); err != nil {
+ 			return err
+ 		}
+-		pod.Spec.Volumes = append(pod.Spec.Volumes, *vol)
+-		vm := corev1.VolumeMount{
+-			Name:      node.ConfigVolumeName,
+-			MountPath: pb.Config.ConfigPath + "/" + pb.Config.ConfigFile,
+-			ReadOnly:  true,
+-		}
+-		if vol.VolumeSource.ConfigMap != nil {
+-			vm.SubPath = pb.Config.ConfigFile
+-		}
+ 		for i, c := range pod.Spec.Containers {
+-			pod.Spec.Containers[i].VolumeMounts = append(c.VolumeMounts, vm)
+-			pod.Spec.Containers[i].Args = append(pod.Spec.Containers[i].Args, fmt.Sprintf("--config_file=%s/%s", pb.Config.ConfigPath, pb.Config.ConfigFile))
++			pod.Spec.Containers[i].Args = append(c.Args, fmt.Sprintf("--config_file=%s/%s", pb.Config.ConfigPath, pb.Config.ConfigFile))
+ 		}
+ 	}
+ 	pod.Spec.Volumes = append(pod.Spec.Volumes, extraVolumes...)
+diff --git a/topo/node/alpine/alpine_test.go b/topo/node/alpine/alpine_test.go
+index 7f7c262..cc79abd 100644
+--- a/topo/node/alpine/alpine_test.go
++++ b/topo/node/alpine/alpine_test.go
+@@ -249,10 +249,8 @@ func TestCreatePod(t *testing.T) {
+ 				Privileged: pointer.Bool(true),
+ 			},
+ 			VolumeMounts: []corev1.VolumeMount{{
+-				Name:      "startup-config-volume",
+-				ReadOnly:  true,
+-				MountPath: "/etc/sonic/config_db.json",
+-				SubPath:   "config_db.json",
++				Name:      "startup-config-persistence",
++				MountPath: "/etc/sonic",
+ 			}},
+ 		},
+ 		wantCustomContainers: []corev1.Container{{
+@@ -270,10 +268,8 @@ func TestCreatePod(t *testing.T) {
+ 				Name:      "files",
+ 				MountPath: "/files",
+ 			}, {
+-				Name:      "startup-config-volume",
+-				ReadOnly:  true,
+-				MountPath: "/etc/sonic/config_db.json",
+-				SubPath:   "config_db.json",
++				Name:      "startup-config-persistence",
++				MountPath: "/etc/sonic",
+ 			}},
+ 		}},
+ 	}, {
+-- 
+2.56.0
+

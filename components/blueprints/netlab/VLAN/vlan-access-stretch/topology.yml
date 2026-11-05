@@ -1,0 +1,25 @@
+provider: kne
+nodes: [ h1, h2, s1, s2 ]
+
+groups:
+  hosts:
+    members: [ h1, h2 ]
+    device: linux
+  switches:
+    members: [ s1, s2 ]
+    module: [ vlan ]
+    device: eos
+
+vlans:
+  red:
+
+links:
+- h1:
+  s1:
+    vlan.access: red
+- s1:
+  s2:
+  vlan.access: red
+- s2:
+    vlan.access: red
+  h2:

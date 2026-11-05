@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 18:26:06 -0500
+Subject: [PATCH] vxlan: the fabric MTU is a floor, not a ceiling
+
+---
+diff --git a/daemon/vxlan/vxlan.go b/daemon/vxlan/vxlan.go
+index cdc05e4..9a97178 100644
+--- a/daemon/vxlan/vxlan.go
++++ b/daemon/vxlan/vxlan.go
+@@ -120,7 +120,9 @@ func CreateOrUpdate(v *mpb.RemotePod) error {
+ 		//
+ 		// Comparing MTU makes the wire self-heal: a stale one is torn down and
+ 		// rebuilt at the current fabric MTU, which is what every other
+-		// attribute mismatch here already does.
++		// attribute mismatch here already does. Only BELOW the fabric is
++		// stale; an MTU the NOS raised above it is left alone (see
++		// vxlanAttrsMatch).
+ 		//
+ 		// A wire the VM cannot reach counts as a mismatch too: right VNI,
+ 		// right VTEP, right MTU, but not enslaved to the KubeVirt bridge
+@@ -130,7 +132,7 @@ func CreateOrUpdate(v *mpb.RemotePod) error {
+ 		if !vxlanAttrsMatch(vxlanLink, vxlan) || unbridged { // If Vxlan attrs are different
+ 
+ 			// We remove the existing link and add a new one
+-			vxLanOvrlyLogger.Infof("Vxlan attrs are different: %d!=%d or %v!=%v or mtu %d!=%d or unbridged=%v", vxlanLink.VxlanId, vxlan.ID, vxlanLink.Group, vxlan.IPAddr, vxlanLink.Attrs().MTU, vxlan.MTU, unbridged)
++			vxLanOvrlyLogger.Infof("Vxlan attrs are different: %d!=%d or %v!=%v or mtu %d<%d or unbridged=%v", vxlanLink.VxlanId, vxlan.ID, vxlanLink.Group, vxlan.IPAddr, vxlanLink.Attrs().MTU, vxlan.MTU, unbridged)
+ 			if err = removeExistingWire(veth, link, kokoRemoveVethLink); err != nil {
+ 				return fmt.Errorf(" MESHNETD: Error when removing an old Vxlan interface with koko: %s", err)
+ 			}
+@@ -344,11 +346,24 @@ func vxlanDifferent(l1 *netlink.Vxlan, l2 api.VxLan) bool {
+ // current fabric MTU -- the same correction it already applies to every other
+ // attribute mismatch, so a stale wire self-heals instead of pinning a lab to an
+ // MTU nobody chose.
++//
++// BUT THE FABRIC MTU IS A FLOOR, NOT A CEILING. The interface belongs to the
++// NOS once it is in the pod, and a NOS may raise it: cEOS lifts a routed
++// port's kernel ethN to 10240 when it moves the port into a VRF (a macvlan
++// passthru into ns-<vrf> at the configured IP MTU). Measured 2026-09-22 on
++// user-alice-demo-lab: atl-dc1-veos-wanleaf1 eth4 (same-node veth)
++// sat at 10240 with its VRF macvlan in place. Cross-node wires could not be
++// raised at all until koko 0015 stopped binding them to the underlay; once
++// they can, comparing MTU for equality would call the NOS's own change drift
++// and the next Update() for the link would rip the wire out from under the
++// VRF. So only an MTU BELOW the fabric is stale. The wire's form (bound to the
++// underlay or not, koko 0015) is deliberately not compared either: pre-rollout
++// wires are bound, and comparing it would rebuild every live cross-node wire.
+ func vxlanAttrsMatch(existing *netlink.Vxlan, want api.VxLan) bool {
+ 	if existing == nil {
+ 		return false
+ 	}
+ 	return existing.VxlanId == want.ID &&
+ 		existing.Group.Equal(want.IPAddr) &&
+-		existing.Attrs().MTU == want.MTU
++		existing.Attrs().MTU >= want.MTU
+ }
+diff --git a/daemon/vxlan/vxlan_mtu_test.go b/daemon/vxlan/vxlan_mtu_test.go
+index 2267610..7a16243 100644
+--- a/daemon/vxlan/vxlan_mtu_test.go
++++ b/daemon/vxlan/vxlan_mtu_test.go
+@@ -64,3 +64,30 @@ func TestVxlanAttrsMatchComparesMTU(t *testing.T) {
+ 		t.Error("a nil link must not match")
+ 	}
+ }
++
++// THE FABRIC MTU IS A FLOOR, NOT A CEILING. user-alice-demo-lab,
++// 2026-09-22: cEOS raises a routed port's kernel ethN to 10240 to move it into
++// a VRF (macvlan passthru into ns-<vrf>). Once koko builds cross-node wires
++// unbound (koko 0015) that raise succeeds -- and an exact-MTU comparison here
++// would then call the NOS's own interface drift, and the next Update() for the
++// link would tear the wire out from under the VRF and rebuild it at 8950.
++func TestVxlanAttrsMatchAcceptsAnMTUTheNOSRaised(t *testing.T) {
++	const (
++		vni    = 10641554
++		fabric = 8950
++	)
++	peer := net.ParseIP("10.99.65.203")
++	want := api.VxLan{ID: vni, IPAddr: peer, MTU: fabric}
++	raised := &netlink.Vxlan{VxlanId: vni, Group: peer}
++	raised.LinkAttrs.MTU = 10240
++	if !vxlanAttrsMatch(raised, want) {
++		t.Fatalf("a wire the NOS raised to %d above the fabric %d must be left alone, not rebuilt", raised.MTU, fabric)
++	}
++	// Bound or unbound is not an attribute either: a pre-rollout wire (bound
++	// to the underlay) must keep matching, or the rollout rebuilds every wire.
++	legacy := &netlink.Vxlan{VxlanId: vni, Group: peer, VtepDevIndex: 2}
++	legacy.LinkAttrs.MTU = fabric
++	if !vxlanAttrsMatch(legacy, want) {
++		t.Fatalf("a legacy bound wire at the fabric MTU must match")
++	}
++}
+-- 
+2.55.0
+

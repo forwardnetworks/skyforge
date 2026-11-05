@@ -1,0 +1,106 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 19:47:41 -0500
+Subject: [PATCH 40/41] meshnet: derive the VXLAN VNI the production way
+ (mixed-version safe)
+
+---
+diff --git a/third_party/meshnet/daemon/meshnet/controller.go b/third_party/meshnet/daemon/meshnet/controller.go
+index 0e88bad..c06e588 100644
+--- a/third_party/meshnet/daemon/meshnet/controller.go
++++ b/third_party/meshnet/daemon/meshnet/controller.go
+@@ -386,7 +386,7 @@ func (m *Meshnet) reconcilePodLinksInternal(ctx context.Context, topo *unstructu
+ 					// empty keeps the default-route lookup on unlabelled nodes.
+ 					NodeIntf: m.nodeIntf,
+ 					// Both ends of a cross-namespace link must derive the same VNI, so the key is the ordered pair.
+-					Vni:    link.LinkUID + wireutil.NamespaceVNIOffset(wireutil.LinkKeyNamespace(link.KubeNs, link.PeerKubeNs)),
++					Vni:    int64(wireutil.VxlanID(wireutil.LinkKeyNamespace(link.KubeNs, link.PeerKubeNs), link.LinkUID)),
+ 					KubeNs: link.KubeNs,
+ 				}
+ 				mnetdLogger.Infof("ReconcilePodLinks: configuring remote VXLAN link for pod %s interface %s (peer %s on VTEP %s, VNI %d)",
+diff --git a/third_party/meshnet/utils/wireutil/vxlan_id.go b/third_party/meshnet/utils/wireutil/vxlan_id.go
+new file mode 100644
+index 0000000..817fbc0
+--- /dev/null
++++ b/third_party/meshnet/utils/wireutil/vxlan_id.go
+@@ -0,0 +1,35 @@
++package wireutil
++
++import (
++	"encoding/binary"
++	"hash/fnv"
++)
++
++// VxlanBaseMin and VxlanBaseMax bound the VXLAN network identifiers a wire can
++// take. They match the production meshnet image (patches/meshnet-cni 0006).
++const (
++	VxlanBaseMin = 4096
++	VxlanBaseMax = 1<<24 - 1
++)
++
++// VxlanID returns the VNI for a link. Both daemons and the CNI plugin must call
++// this with the same key, or the two ends of a wire sit on different VNIs.
++//
++// Mixed-version rule (found 2026-10-21 on the kne-mixed scratch cluster): a
++// production daemon and this daemon must derive the same VNI for the same link.
++// The earlier NamespaceVNIOffset formula (uid + offset) did not, so a link
++// created by one version was rebuilt by the other with a different VNI and went
++// dead. Do not change this function without re-running the mixed-version test.
++//
++// key is LinkKeyNamespace(localNs, peerNs): the namespace for a same-namespace
++// link, the ordered pair for a cross-namespace one.
++func VxlanID(key string, uid int64) int {
++	h := fnv.New32a()
++	_, _ = h.Write([]byte(key))
++	_, _ = h.Write([]byte{0})
++	var uidBytes [8]byte
++	binary.LittleEndian.PutUint64(uidBytes[:], uint64(uid))
++	_, _ = h.Write(uidBytes[:])
++
++	return VxlanBaseMin + int(h.Sum32()%uint32(VxlanBaseMax-VxlanBaseMin))
++}
+diff --git a/third_party/meshnet/utils/wireutil/vxlan_id_test.go b/third_party/meshnet/utils/wireutil/vxlan_id_test.go
+new file mode 100644
+index 0000000..931fdff
+--- /dev/null
++++ b/third_party/meshnet/utils/wireutil/vxlan_id_test.go
+@@ -0,0 +1,39 @@
++package wireutil
++
++import "testing"
++
++// Golden values are the VNIs the PRODUCTION meshnet image (digest 7f5f569c,
++// patches/meshnet-cni 0006) put on both ends of a same-namespace link, observed
++// on the kne-mixed scratch cluster. They are the requirement: a link built by
++// the production daemon must be matched, not rebuilt, by this one.
++func TestVxlanIDMatchesProductionImage(t *testing.T) {
++	cases := []struct {
++		ns  string
++		uid int64
++		vni int
++	}{
++		{"ctl-old", 1, 7380585},
++		{"m1", 1, 13196755},
++		{"m2", 1, 1383090},
++		{"m3", 1, 13888150},
++	}
++	for _, c := range cases {
++		if got := VxlanID(LinkKeyNamespace(c.ns, ""), c.uid); got != c.vni {
++			t.Errorf("VxlanID(%q, %d) = %d, production image uses %d", c.ns, c.uid, got, c.vni)
++		}
++	}
++}
++
++func TestVxlanIDInRangeAndSymmetric(t *testing.T) {
++	a := VxlanID(LinkKeyNamespace("lab", "sandbox"), 7)
++	b := VxlanID(LinkKeyNamespace("sandbox", "lab"), 7)
++	if a != b {
++		t.Fatalf("cross-namespace ends disagree: %d vs %d", a, b)
++	}
++	for uid := int64(1); uid < 500; uid++ {
++		v := VxlanID("lab", uid)
++		if v < VxlanBaseMin || v >= VxlanBaseMax {
++			t.Fatalf("uid %d VNI %d out of range", uid, v)
++		}
++	}
++}

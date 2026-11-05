@@ -1,0 +1,28 @@
+defaults:
+  device: iol
+  # netlab 26.08 tightening: the legacy `link_attr` list is gone — custom link
+  # attributes are declared with a type under defaults.attributes.
+  attributes.link.cost: int
+
+nodes:
+# netlab 26.08 tightening: the legacy `as:` node attribute is gone — BGP AS is
+# `bgp.as` and the node must enable the bgp module itself.
+- name: pe1
+  module: [ bgp ]
+  bgp.as: 65000
+  device: eos
+- p1
+- p2
+- name: pe2
+  module: [ bgp ]
+  bgp.as: 65000
+
+links:
+- pe1-p1
+- pe1:
+  p2:
+  cost: 1000
+- pe2-p1
+- pe2:
+  p2:
+  cost: 1000

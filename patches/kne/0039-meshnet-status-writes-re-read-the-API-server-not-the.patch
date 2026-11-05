@@ -1,0 +1,140 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 20:50:33 -0500
+Subject: [PATCH 39/41] meshnet: status writes re-read the API server, not the
+ stale topology cache
+
+---
+diff --git a/third_party/meshnet/daemon/meshnet/handler.go b/third_party/meshnet/daemon/meshnet/handler.go
+index 04a81f9..3960bd9 100644
+--- a/third_party/meshnet/daemon/meshnet/handler.go
++++ b/third_party/meshnet/daemon/meshnet/handler.go
+@@ -137,7 +137,7 @@ func (m *Meshnet) SetAlive(ctx context.Context, pod *mpb.Pod) (*mpb.BoolResponse
+ 	mnetdLogger.Infof("Setting %s's SrcIp=%s and NetNs=%s", pod.Name, pod.SrcIp, pod.NetNs)
+ 
+ 	retryErr := retryStatusWrite(func() error {
+-		result, err := m.getPod(ctx, pod.Name, pod.KubeNs)
++		result, err := m.getPodLive(ctx, pod.Name, pod.KubeNs)
+ 		if err != nil {
+ 			mnetdLogger.Errorf("Failed to read pod %s from K8s", pod.Name)
+ 			return err
+@@ -183,7 +183,7 @@ func (m *Meshnet) Skip(ctx context.Context, skip *mpb.SkipQuery) (*mpb.BoolRespo
+ 	mnetdLogger.Infof("Pod %s, skipping peer pod %s for link UID %d ", skip.Pod, skip.Peer, skip.LinkId)
+ 
+ 	retryErr := retryStatusWrite(func() error {
+-		result, err := m.getPod(ctx, skip.Pod, skip.KubeNs)
++		result, err := m.getPodLive(ctx, skip.Pod, skip.KubeNs)
+ 		if err != nil {
+ 			mnetdLogger.Errorf("Failed to read pod %s from K8s", skip.Pod)
+ 			return err
+@@ -230,7 +230,7 @@ func (m *Meshnet) SkipReverse(ctx context.Context, skip *mpb.SkipQuery) (*mpb.Bo
+ 	var podName string
+ 	retryErr := retryStatusWrite(func() error {
+ 		// get the peer pod if it is alive
+-		peerPod, err := m.getPod(ctx, skip.Peer, skip.KubeNs)
++		peerPod, err := m.getPodLive(ctx, skip.Peer, skip.KubeNs)
+ 		if err != nil {
+ 			mnetdLogger.Errorf("Failed to read pod %s from K8s", skip.Pod)
+ 			return err
+@@ -305,7 +305,7 @@ func (m *Meshnet) SkipReverse(ctx context.Context, skip *mpb.SkipQuery) (*mpb.Bo
+ 
+ 	retryErr = retryStatusWrite(func() error {
+ 		// setting the value for this pod
+-		thisPod, err := m.getPod(ctx, skip.Pod, skip.KubeNs)
++		thisPod, err := m.getPodLive(ctx, skip.Pod, skip.KubeNs)
+ 		if err != nil {
+ 			mnetdLogger.Errorf("skipReverse: Failed to read pod %s from K8s", skip.Pod)
+ 			return err
+diff --git a/third_party/meshnet/daemon/meshnet/status_retry.go b/third_party/meshnet/daemon/meshnet/status_retry.go
+index 97abeeb..f0a06bd 100644
+--- a/third_party/meshnet/daemon/meshnet/status_retry.go
++++ b/third_party/meshnet/daemon/meshnet/status_retry.go
+@@ -1,8 +1,13 @@
+ package meshnet
+ 
+ import (
++	"context"
++	"fmt"
+ 	"time"
+ 
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+ 	"k8s.io/apimachinery/pkg/util/wait"
+ 	"k8s.io/client-go/util/retry"
+ )
+@@ -31,3 +36,24 @@ var statusWriteBackoff = wait.Backoff{
+ func retryStatusWrite(fn func() error) error {
+ 	return retry.RetryOnConflict(statusWriteBackoff, fn)
+ }
++
++// getPodLive reads the Topology from the API server, not from topoCache, for a
++// status write. The cache holds the version this writer may just have lost a
++// race on. A retry that re-read the cache would resubmit that same stale
++// resourceVersion on every attempt, and the write would fail until the informer
++// caught up. A successful live read refreshes the cache.
++func (m *Meshnet) getPodLive(ctx context.Context, name, ns string) (*unstructured.Unstructured, error) {
++	if m.tClient == nil {
++		return nil, fmt.Errorf("topology client not initialized")
++	}
++	topo, err := m.tClient.Topology(ns).Unstructured(ctx, name, metav1.GetOptions{})
++	if err != nil && apierrors.IsNotFound(err) && m.kClient != nil {
++		if aliased, ok, aliasErr := m.topologyForLauncher(ctx, name, ns); ok {
++			topo, err = aliased, aliasErr
++		}
++	}
++	if err == nil && topo != nil && m.topoCache != nil {
++		m.topoCache.Put(topo)
++	}
++	return topo, err
++}
+diff --git a/third_party/meshnet/daemon/meshnet/status_retry_test.go b/third_party/meshnet/daemon/meshnet/status_retry_test.go
+index 86217aa..bcbfdd3 100644
+--- a/third_party/meshnet/daemon/meshnet/status_retry_test.go
++++ b/third_party/meshnet/daemon/meshnet/status_retry_test.go
+@@ -11,6 +11,7 @@ import (
+ 	mpb "github.com/openconfig/kne/third_party/meshnet/daemon/proto/meshnet/v1beta1"
+ 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+ 	"k8s.io/apimachinery/pkg/runtime"
+ 	"k8s.io/apimachinery/pkg/runtime/schema"
+ 	dfake "k8s.io/client-go/dynamic/fake"
+@@ -66,3 +67,37 @@ func TestSetAliveGivesUpAfterBoundedConflicts(t *testing.T) {
+ 		t.Fatalf("update attempts = %d, want %d (the policy's steps)", got, statusWriteBackoff.Steps)
+ 	}
+ }
++
++// A status write must not resubmit a stale cached Topology. The API server holds
++// resourceVersion "2"; this daemon's cache holds "1" (what it last saw). The
++// server rejects any update that carries "1". A SetAlive that re-reads the cache
++// fails on every attempt. A live read lands on the first.
++func TestSetAliveDoesNotRewriteFromStaleCache(t *testing.T) {
++	InitLogger()
++	cs, err := toplogyv1client.NewForConfig(&rest.Config{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	stored := &topologyv1.Topology{ObjectMeta: metav1.ObjectMeta{Name: "p1", Namespace: "default", ResourceVersion: "2"}}
++	dc := dfake.NewSimpleDynamicClient(topologyv1.Scheme, stored)
++	dc.PrependReactor("update", "topologies", func(a clienttesting.Action) (bool, runtime.Object, error) {
++		obj := a.(clienttesting.UpdateAction).GetObject().(*unstructured.Unstructured)
++		if obj.GetResourceVersion() != "2" {
++			return true, nil, apierrors.NewConflict(schema.GroupResource{Group: "networkop.co.uk", Resource: "topologies"}, "p1", errors.New("stale resourceVersion"))
++		}
++		return false, nil, nil
++	})
++	cs.SetDynamicClient(dc.Resource(toplogyv1client.GVR()))
++
++	staleObj, err := toUnstructured(&topologyv1.Topology{ObjectMeta: metav1.ObjectMeta{Name: "p1", Namespace: "default", ResourceVersion: "1"}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	m := &Meshnet{tClient: cs, reconcileQueue: NewReconcileQueue(0), topoCache: NewTopologyCache()}
++	m.topoCache.Put(staleObj)
++
++	resp, err := m.SetAlive(context.Background(), &mpb.Pod{Name: "p1", KubeNs: "default", SrcIp: "10.0.0.1", NetNs: "/var/run/netns/x", ContainerId: "c"})
++	if err != nil || resp == nil || !resp.Response {
++		t.Fatalf("SetAlive from a stale cache: resp=%v err=%v; want the live read to land", resp, err)
++	}
++}

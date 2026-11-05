@@ -1,0 +1,37 @@
+message:
+  This lab illustrates the distance vector behavior of inter-area OSPF.
+
+module: [ ospf ]
+defaults.device: eos
+
+nodes:
+  # netlab 26.08 tightening: a node using module attributes must enable the
+  # module itself (topology-level `module:` no longer reaches nodes here).
+  a1:
+    module: [ ospf ]
+    ospf.area: 0
+  a2:
+    module: [ ospf ]
+    ospf.area: 0
+  s1:
+    module: [ ospf ]
+    ospf.area: 1
+  s2:
+    module: [ ospf ]
+    ospf.area: 1
+
+links:
+- a1-a2
+- a1:
+  s1:
+  ospf.area: 1
+- a1:
+  s2:
+  ospf.area: 1
+- a2:
+  s1:
+  ospf.area: 1
+- a2:
+  s2:
+  ospf.area: 1
+- s1-s2

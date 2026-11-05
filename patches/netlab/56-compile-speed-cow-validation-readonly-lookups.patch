@@ -1,0 +1,794 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 00:00:00 +0000
+Subject: [PATCH] SKYFORGE-SPECIFIC: netlab compile about 30% faster again on
+ top of patch 54, byte-identical output (copy-on-write validation, read-only
+ device lookups, exact one-pass copies)
+
+---
+diff --git a/netsim/augment/devices.py b/netsim/augment/devices.py
+index 2ad9278..08eeff1 100644
+--- a/netsim/augment/devices.py
++++ b/netsim/augment/devices.py
+@@ -35,13 +35,17 @@ Get generic device attribute:
+   * If the provider data is a dictionary, but the device data is not, return provider data (override)
+   * Return a merge of both dictionaries
+ """
+-def get_device_attribute(node: Box, attr: str, defaults: Box) -> typing.Optional[typing.Any]:
++def _device_attribute(node: Box, attr: str, defaults: Box) -> typing.Tuple[typing.Any,bool]:
++  """
++  SKYFORGE-SPECIFIC: get_device_attribute, returning (value, shared). shared=True means the value is the CACHED merged
++  table (see netsim.data.memo): nobody may modify it, and get_device_attribute hands out a copy of it instead.
++  """
+   devtype  = node.device
+   provider = get_provider(node,defaults)
+ 
+   if not devtype in defaults.devices:    # pragma: no cover
+     log.fatal(f'Internal error: call to get_device_attribute with unknown device {devtype}')
+-    return None
++    return (None,False)
+ 
+   pvalue = None
+   devdata = defaults.devices[devtype]
+@@ -50,24 +54,37 @@ def get_device_attribute(node: Box, attr: str, defaults: Box) -> typing.Optional
+     if attr in devdata[provider]:        # Including the attribute we're looking for?
+       pvalue = devdata[provider][attr]   # Get the provider value
+       if not isinstance(pvalue,dict):    # Provider-specific value is not a dictionary
+-        return pvalue                    # No chance of merging, return it
++        return (pvalue,False)            # No chance of merging, return it
+   elif provider == 'kne' and 'clab' in devdata and attr in devdata.clab:
+     pvalue = devdata.clab[attr]
+     if not isinstance(pvalue,dict):
+-      return pvalue
++      return (pvalue,False)
+ 
+   value = devdata.get(attr,None)         # Non-specific device data
+   if isinstance(value,Box) and isinstance(pvalue,Box):
+-    # SKYFORGE-SPECIFIC: the merged table is the same for every node of this device type and provider; every caller still
+-    # gets a copy of its own, as it always did (python-box creates keys when a missing one is read)
+-    return fastbox.copy_box(memo.memo('device_attr',(id(defaults),devtype,provider,attr),(defaults,value,pvalue),lambda: value+pvalue,watch=(value,pvalue)))
++    # SKYFORGE-SPECIFIC: the merged table is the same for every node of this device type and provider
++    return (memo.memo('device_attr',(id(defaults),devtype,provider,attr),(defaults,value,pvalue),lambda: value+pvalue,watch=(value,pvalue)),True)
+ 
+   if provider in devdata and attr in devdata[provider]:          # Do we have a provider-specific value?
+-    return pvalue                        # Provider-specific dictionary overriding non-dictionary device value
++    return (pvalue,False)                # Provider-specific dictionary overriding non-dictionary device value
+   if provider == 'kne' and 'clab' in devdata and attr in devdata.clab and pvalue is not None:
+-    return pvalue
++    return (pvalue,False)
++
++  return (value,False)                   # Return whatever the device value is
+ 
+-  return value                           # Return whatever the device value is
++def get_device_attribute(node: Box, attr: str, defaults: Box) -> typing.Optional[typing.Any]:
++  value,shared = _device_attribute(node,attr,defaults)
++  # SKYFORGE-SPECIFIC: every caller still gets a merged table of its own, as it always did (python-box creates keys
++  # when a missing one is read, and callers may modify what they get)
++  return fastbox.copy_box(value) if shared else value
++
++def get_device_attribute_readonly(node: Box, attr: str, defaults: Box) -> typing.Optional[typing.Any]:
++  """
++  SKYFORGE-SPECIFIC: get_device_attribute for callers that only READ the result with .get() and `in`. The value may
++  be shared with every other node of the device type: never modify it, and never read a missing key with attribute
++  or [] access (python-box would create it). Saves a copy of the table per call.
++  """
++  return _device_attribute(node,attr,defaults)[0]
+ 
+ """
+ Get device feature flags -- uses get_device_attribute but returns a Box to keep mypy happy
+@@ -77,7 +94,7 @@ def get_device_features(node: Box, defaults: Box) -> Box:
+   if not isinstance(n_features,Box):
+     n_features = data.get_empty_box()
+ 
+-  features = get_device_attribute(node,'features',defaults)
++  features,_shared = _device_attribute(node,'features',defaults)
+   if not features:
+     return n_features
+ 
+@@ -85,10 +102,22 @@ def get_device_features(node: Box, defaults: Box) -> Box:
+     log.fatal(f'Device features for device type {node.device} should be a dictionary')
+     return data.get_empty_box()
+ 
+-  if not n_features:                     # SKYFORGE-SPECIFIC: nothing to merge, so this is just features.copy() (python-box
+-    return fastbox.copy_box(features)    # ... builds that through its slow generic conversion; the result is the same)
++  if not n_features:                     # SKYFORGE-SPECIFIC: nothing to merge, so this is just features.copy() (one copy
++    return fastbox.copy_box(features)    # ... where the uncached code made two: the merge, then the copy; same result)
++
++  return fastbox.add(features,n_features)
+ 
+-  return features + n_features
++def get_device_features_readonly(node: Box, defaults: Box) -> Box:
++  """
++  SKYFORGE-SPECIFIC: get_device_features for callers that only READ the result with .get() and `in` (see
++  get_device_attribute_readonly). Falls back to get_device_features whenever the node has its own features.
++  """
++  if node.get('_features',None):
++    return get_device_features(node,defaults)
++  features,_shared = _device_attribute(node,'features',defaults)
++  if not features or not isinstance(features,Box):
++    return get_device_features(node,defaults)
++  return features
+ 
+ """
+ Get all device data for current provider
+@@ -132,9 +161,12 @@ def get_node_group_var(node: Box, g_var: str, defaults: Box) -> typing.Any:
+   if g_var in node:                               # Is group variable set in node?
+     return node.get(g_var)
+   else:                                           # Not set, get default device value for the node provider
+-    group_vars = get_device_attribute(node,'group_vars',defaults)
++    group_vars,shared = _device_attribute(node,'group_vars',defaults)    # SKYFORGE-SPECIFIC: no copy of the whole table
+     if isinstance(group_vars,Box):
+-      return group_vars.get(g_var,None)
++      value = group_vars.get(g_var,None)
++      if shared and type(value) is Box:     # ... but a nested table is still the caller's own, as before
++        return fastbox.copy_subtree(value,(g_var,))
++      return value
+     return None
+ 
+ """
+diff --git a/netsim/augment/links.py b/netsim/augment/links.py
+index 0e068de..f3fe8ee 100644
+--- a/netsim/augment/links.py
++++ b/netsim/augment/links.py
+@@ -351,7 +351,7 @@ def create_regular_interface(node: Box, ifdata: Box, defaults: Box) -> None:
+   # Assign MAC addresses to physical (but not VLAN member) interfaces if
+   # the device features include initial.generate_mac
+   #
+-  features = devices.get_device_features(node,defaults)
++  features = devices.get_device_features_readonly(node,defaults)        # SKYFORGE-SPECIFIC: read only
+   if 'ethernet' in features.get('initial.generate_mac',[]) and ifdata.get('type','') != 'vlan_member':
+     ifdata.mac_address = generate_interface_mac(node,ifdata,defaults)
+ 
+diff --git a/netsim/data/__init__.py b/netsim/data/__init__.py
+index 6c09794..f33aa13 100644
+--- a/netsim/data/__init__.py
++++ b/netsim/data/__init__.py
+@@ -22,7 +22,7 @@ def get_empty_box() -> Box:
+   return get_box({})
+ 
+ def get_new_box(b: Box) -> Box:
+-  return get_box(b.to_dict())
++  return fastbox.deep_copy(b) if type(b) is Box else get_box(b.to_dict())   # SKYFORGE-SPECIFIC: same result, one pass
+ 
+ #
+ # Another thingy we need all the time: make something a list
+diff --git a/netsim/data/fastbox.py b/netsim/data/fastbox.py
+index 61ab409..2550f96 100644
+--- a/netsim/data/fastbox.py
++++ b/netsim/data/fastbox.py
+@@ -144,12 +144,8 @@ def _make_list(src: list, cfg0: dict, opts0: dict, ns: tuple, proto: Box) -> Box
+       child = _new_box(cfg0,ns)
+       _fill(child,x,cfg0,opts0,ns,proto)
+       list.append(bl,child)
+-    elif isinstance(x,list):
+-      if isinstance(x,BoxList):
+-        x.box_options.update(bl.box_options)
+-        list.append(bl,x)
+-      else:
+-        list.append(bl,_make_list(x,cfg0,opts0,ns,proto))
++    elif isinstance(x,list):                            # python-box re-creates every list item, BoxList or not
++      list.append(bl,_make_list(x,cfg0,opts0,ns,proto))
+     else:
+       list.append(bl,x)
+   return bl
+@@ -253,6 +249,189 @@ def add(a: Box, b: dict) -> Box:
+       log.fatal('netlab fastbox: add differs from Box.__add__')
+   return result
+ 
++def _fill_deep(b: Box, src: dict, cfg0: dict, opts0: dict, ns: tuple, proto: Box) -> None:
++  """Like _fill, but a source BoxList is re-created as well: the result equals Box(src.to_dict()) for a Box source"""
++  safe = b._box_config['__safe_keys']
++  for k,v in dict.items(src):
++    if v is src:
++      raise _Slow('self reference')
++    if k.__class__ is str and ('.' in k or '[' in k):
++      raise _Slow(f'dotted key {k!r}')
++    if k.__class__ is str:
++      sk = _safe_str.get(k)
++      if sk is None:
++        sk = _safe_str[k] = proto._safe_attr(k)
++    else:
++      ck = (k.__class__,k)
++      sk = _safe_cache.get(ck)
++      if sk is None:
++        sk = _safe_cache[ck] = proto._safe_attr(k)
++    safe[sk] = k
++    if isinstance(v,_SCALARS):
++      dict.__setitem__(b,k,v)
++    elif isinstance(v,dict):
++      child = _new_box(cfg0,ns + (k,))
++      _fill_deep(child,v,cfg0,opts0,ns + (k,),proto)
++      dict.__setitem__(b,k,child)
++    elif isinstance(v,list):
++      dict.__setitem__(b,k,_make_list_deep(v,cfg0,opts0,ns + (k,),proto))
++    else:
++      dict.__setitem__(b,k,v)
++
++def _make_list_deep(src: list, cfg0: dict, opts0: dict, ns: tuple, proto: Box) -> BoxList:
++  bl = BoxList(**_child_options(opts0,ns))
++  for x in src:
++    if x is src:
++      raise _Slow('self reference')
++    if isinstance(x,dict):
++      child = _new_box(cfg0,ns)
++      _fill_deep(child,x,cfg0,opts0,ns,proto)
++      list.append(bl,child)
++    elif isinstance(x,list):
++      list.append(bl,_make_list_deep(x,cfg0,opts0,ns,proto))
++    else:
++      list.append(bl,x)
++  return bl
++
++def _deep_copy_fast(src: Box) -> Box:
++  _ensure_proto()
++  result = _new_box(_cfg0,())
++  _fill_deep(result,src,_cfg0,_opts0,(),_proto)
++  return result
++
++def deep_copy(src: Box) -> Box:
++  """
++  SKYFORGE-SPECIFIC: same result as get_box(src.to_dict()) -- a completely independent copy -- in one pass,
++  without building the intermediate plain dictionary.
++  """
++  if not enabled() or type(src) is not Box:
++    return Box(src.to_dict(),**_OPTS)
++  try:
++    result = _deep_copy_fast(src)
++  except _Slow:
++    return from_plain(to_dict(src))
++  if VERIFY:
++    expected = Box(src.to_dict(),**_OPTS)
++    if not same_structure(result,expected,check_config=True):
++      from ..utils import log
++      log.fatal('netlab fastbox: deep_copy differs from get_box(to_dict())')
++  return result
++
++
++def _set_item_fast(b: Box, key: typing.Any, value: typing.Any) -> None:
++  """Raw: what Box.__setitem__ / __convert_and_store do for a standard Box and a plain key; raises _Slow"""
++  _ensure_proto()
++  ns = b._box_config['box_namespace'] + (key,)
++  if isinstance(value,_SCALARS) or value is None:
++    stored = value
++  elif isinstance(value,dict):
++    if value is b:
++      raise _Slow('self reference')
++    stored = _new_box(_cfg0,ns)
++    _fill(stored,value,_cfg0,_opts0,ns,_proto)
++  elif isinstance(value,BoxList):
++    value.box_options.update(_child_options(_opts0,ns))
++    stored = value
++  elif isinstance(value,list):
++    stored = _make_list(value,_cfg0,_opts0,ns,_proto)
++  else:
++    stored = value
++  if key.__class__ is str:
++    sk = _safe_str.get(key)
++    if sk is None:
++      sk = _safe_str[key] = _proto._safe_attr(key)
++  else:
++    ck = (key.__class__,key)
++    sk = _safe_cache.get(ck)
++    if sk is None:
++      sk = _safe_cache[ck] = _proto._safe_attr(key)
++  b._box_config['__safe_keys'][sk] = key
++  dict.__setitem__(b,key,stored)
++
++def set_item(b: Box, key: typing.Any, value: typing.Any) -> None:
++  """
++  SKYFORGE-SPECIFIC: same result as b[key] = value (python-box re-creates a dictionary value as a Box, keeps a BoxList
++  and updates its options, makes a plain list a BoxList), without python-box's per-key conversion.
++  """
++  if not enabled() or type(b) is not Box or (isinstance(key,str) and ('.' in key or '[' in key)) or not _is_standard(b):
++    b[key] = value
++    return
++  try:
++    _set_item_fast(b,key,value)
++  except _Slow:
++    b[key] = value
++
++def set_reference(b: Box, key: str, value: typing.Any) -> None:
++  """
++  SKYFORGE-SPECIFIC: store `value` under `key` WITHOUT python-box's conversion (b[key] = value would copy a dictionary).
++  Only for a Box that is about to be copied as a whole (append_box, set_item, copy_box): the copy re-creates the value
++  exactly as an assignment would have, so the end result is the same and one copy is saved.
++  """
++  if not enabled() or type(b) is not Box or not isinstance(key,str) or '.' in key or '[' in key or not _is_standard(b):
++    b[key] = value
++    return
++  sk = _safe_str.get(key)
++  if sk is None:
++    sk = _safe_str[key] = _proto._safe_attr(key)
++  b._box_config['__safe_keys'][sk] = key
++  dict.__setitem__(b,key,value)
++
++def set_list(b: Box, key: typing.Any, value: list) -> None:
++  """
++  SKYFORGE-SPECIFIC: same result as b[key] = value for a plain list (python-box makes it a BoxList and re-creates every
++  dictionary in it), without python-box's per-item conversion. Anything unusual goes through python-box.
++  """
++  if not enabled() or type(b) is not Box or type(value) is not list or not isinstance(key,str) or '.' in key or '[' in key \
++     or not _is_standard(b):
++    b[key] = value
++    return
++  try:
++    bl = _make_list(value,_cfg0,_opts0,b._box_config['box_namespace'] + (key,),_proto)
++  except _Slow:
++    b[key] = value
++    return
++  sk = _safe_str.get(key)
++  if sk is None:
++    sk = _safe_str[key] = _proto._safe_attr(key)
++  b._box_config['__safe_keys'][sk] = key
++  dict.__setitem__(b,key,bl)
++  if VERIFY:
++    check = Box(**_OPTS)
++    object.__setattr__(check,'_box_config',dict(b._box_config,__safe_keys=dict(b._box_config['__safe_keys'])))
++    check[key] = value
++    if not same_structure(dict.__getitem__(b,key),dict.__getitem__(check,key),check_config=True):
++      from ..utils import log
++      log.fatal('netlab fastbox: set_list differs from python-box')
++
++def append_box(bl: BoxList, item: typing.Any) -> None:
++  """
++  SKYFORGE-SPECIFIC: same result as bl.append(item) (python-box re-creates a dictionary item as a Box configured by
++  the list's options), without python-box's per-key conversion. Anything unusual goes through python-box.
++  """
++  if not enabled() or type(bl) is not BoxList or type(item) not in (dict,Box):
++    bl.append(item)
++    return
++  _ensure_proto()
++  opts = bl.box_options
++  ns = opts.get('box_namespace',())
++  if opts.get('box_class',None) is not Box or not isinstance(ns,tuple) or \
++     {k:v for k,v in opts.items() if k != 'box_namespace'} != {k:v for k,v in _opts0.items() if k != 'box_namespace'}:
++    bl.append(item)
++    return
++  try:
++    child = _new_box(_cfg0,ns)
++    _fill(child,item,_cfg0,_opts0,ns,_proto)
++  except _Slow:
++    bl.append(item)
++    return
++  list.append(bl,child)
++  if VERIFY:
++    check = BoxList(**opts)
++    check.append(item)
++    if not same_structure(child,check[0],check_config=True):
++      from ..utils import log
++      log.fatal('netlab fastbox: append_box differs from python-box')
++
+ def shallow(src: Box) -> Box:
+   """
+   A new top-level Box with the configuration and keys of `src` whose VALUES ARE THE SAME OBJECTS (no conversion).
+@@ -322,6 +501,33 @@ def _run_self_test() -> bool:
+     fast_add.merge_update(Box(other,**_OPTS))
+     if not same_structure(fast_add,b2 + Box(other,**_OPTS),check_config=True):
+       return False
++    b1, b2 = Box(_sample(),**_OPTS), Box(_sample(),**_OPTS)
++    if not same_structure(_deep_copy_fast(b1),Box(b2.to_dict(),**_OPTS),check_config=True):
++      return False
++    b1, b2 = Box(_sample(),**_OPTS), Box(_sample(),**_OPTS)
++    items = [{'node': 'x', 'ifname': 'e1', 'l': [1, {'z': 2}]}, Box({'node': 'y', 'n': {'m': [3]}},**_OPTS), 'str', [4]]
++    target1, target2 = b1.h, b2.h
++    bl = _make_list(list(items),_cfg0,_opts0,target1._box_config['box_namespace'] + ('nb',),_proto)
++    target2['nb'] = list(items)
++    if not same_structure(bl,dict.__getitem__(target2,'nb'),check_config=True):
++      return False
++    target1, target2 = Box(_sample(),**_OPTS), Box(_sample(),**_OPTS)
++    target1.nl = []
++    target2.nl = []
++    for it in ({'name': 'n1', 'x': {'y': [1]}}, Box({'name': 'n2', 'l': [{'a': 1}]},**_OPTS)):
++      child = _new_box(_cfg0,target1.nl.box_options['box_namespace'])
++      _fill(child,it,_cfg0,_opts0,target1.nl.box_options['box_namespace'],_proto)
++      list.append(target1.nl,child)
++      target2.nl.append(it)
++    if not same_structure(target1.nl,target2.nl,check_config=True) or not same_structure(target1,target2,check_config=True):
++      return False
++    t1, t2 = Box(_sample(),**_OPTS), Box(_sample(),**_OPTS)
++    src = Box(_sample(),**_OPTS)
++    for k, v in (('v1', src.h), ('v2', [src.d, {'q': src.h}]), ('v3', 7), ('v4', src.d), (5, {'w': [src.d]}), ('v5', None)):
++      _set_item_fast(t1,k,v)
++      t2[k] = v
++    if not same_structure(t1,t2,check_config=True) or t1._box_config['__safe_keys'] != t2._box_config['__safe_keys']:
++      return False
+     sh = shallow(Box(_sample(),**_OPTS))
+     if not same_structure(sh,Box(_sample(),**_OPTS)):
+       return False
+diff --git a/netsim/data/validate.py b/netsim/data/validate.py
+index 18ba756..1a216d9 100644
+--- a/netsim/data/validate.py
++++ b/netsim/data/validate.py
+@@ -105,11 +105,10 @@ def get_valid_attributes(
+     no_propagate = f'{atlist}_no_propagate'                 # No-propagate list excluded only for non-first attribute category
+     if idx:                                                 # Special handling for secondary namespaces
+       if no_propagate in attributes:                        # Build a reduced dictionary if the secondary namespace has no_propagate list
+-        add_attr = { k:v for k,v in add_attr.items() if not k in attributes[no_propagate] }
++        add_attr = strip_secondary_namespace(attributes,atlist)
+       else:                                                 # Other create a copy of the secondary attributes
+         add_attr = fastbox.add(add_attr,{})
+-
+-      remove_required_flag(add_attr)                        # Remove required flags from the secondary namespace attributes
++        remove_required_flag(add_attr)                      # Remove required flags from the secondary namespace attributes
+ 
+     valid = fastbox.add(add_attr,valid)                     # ... nope, merge with existing list and move on
+ 
+@@ -711,7 +710,61 @@ def validate_item(
+ 
+   return OK
+ 
+-_private_tables: typing.Dict[int,typing.Any] = {}         # id -> weakref of the merged tables handed to validations
++_private_tables: typing.Dict[int,typing.Any] = {}         # id -> (weakref, copied namespaces) of the tables handed out
++
++def cow_namespace(attributes: Box, atlist: str) -> typing.Any:
++  """
++  SKYFORGE-SPECIFIC copy-on-write. A validation gets its own top-level attribute table whose namespaces are shared
++  with the cached merged table (see resolve_attributes). The only change validation ever makes to that table is
++  stripping the _required flags of a secondary namespace (strip_secondary_namespace); copy that namespace into the
++  table first, so the validation sees exactly what a full private copy would show and the shared namespaces stay
++  untouched.
++  """
++  entry = _private_tables.get(id(attributes))
++  if entry is None or entry[0]() is not attributes or atlist in entry[1]:
++    return attributes[atlist]
++  entry[1].add(atlist)
++  shared = dict.__getitem__(attributes,atlist)
++  if isinstance(shared,Box):
++    dict.__setitem__(attributes,atlist,fastbox.copy_subtree(shared,(atlist,)))
++  return attributes[atlist]
++
++def strip_secondary_namespace(attributes: Box, atlist: str) -> dict:
++  """
++  What get_valid_attributes does with a secondary namespace that has a no_propagate list: take the attributes not in
++  that list and strip their _required flags -- in place, so the table it was given keeps the stripped flags
++  (the uncached code behaves that way, and later validations with the same table depend on it)
++  """
++  add_attr = cow_namespace(attributes,atlist)               # SKYFORGE-SPECIFIC: about to be modified, see cow_namespace
++  add_attr = { k:v for k,v in add_attr.items() if not k in attributes[f'{atlist}_no_propagate'] }
++  remove_required_flag(add_attr)
++  return add_attr
++
++def resolve_private(attributes: Box, entry: tuple, attr_list: typing.List[str]) -> tuple:
++  """
++  SKYFORGE-SPECIFIC: resolve_attributes for a table handed out by resolve_attributes (a recursive validation reuses
++  the merged table of its caller). The table is fully determined by the cached table it was made from and the set of
++  namespaces it has copied and stripped so far, so the namespaces and the valid-attribute table computed for it can
++  be remembered on exactly that key. A computation strips more namespaces in the table as a side effect; on a hit
++  the same namespaces are stripped again here, so the table ends up exactly as the computation would leave it.
++  """
++  _ref,stripped,base = entry
++
++  def compute() -> tuple:
++    before = set(stripped)
++    ns = get_attribute_namespaces(attributes,attr_list)
++    valid = get_valid_attributes(attributes,ns)
++    return (ns,valid,frozenset(stripped - before))
++
++  ns,valid,side_effects = memo.memo(
++    'validate_private',
++    (id(base),frozenset(stripped),tuple(attr_list)),
++    (base,),
++    compute)
++  for atlist in side_effects:                               # replay (a no-op when compute just ran)
++    if atlist not in stripped:
++      strip_secondary_namespace(attributes,atlist)
++  return (attributes,ns,valid)
+ 
+ def resolve_attributes(
+       attributes: Box,
+@@ -738,9 +791,9 @@ def resolve_attributes(
+     # No copy is made: the caller's own table is used (and modified) in place, exactly as before. A table that this
+     # function handed out is private to one validation and different every time, so it is computed in place. A shared
+     # table (the module attribute definitions) is stripped only the first time, so the answer can be remembered.
+-    ref = _private_tables.get(id(attributes))
+-    if ref is not None and ref() is attributes:
+-      return compute()
++    entry = _private_tables.get(id(attributes))
++    if entry is not None and entry[0]() is attributes:
++      return resolve_private(attributes,entry,attr_list)
+     return memo.memo(
+       'validate_attributes_shared',
+       (id(attributes),tuple(attr_list)),
+@@ -756,8 +809,8 @@ def resolve_attributes(
+     watch=(attributes,extra_attributes))
+   if not isinstance(a,Box):
+     return (a,ns,valid)
+-  private = fastbox.copy_box(a)
+-  _private_tables[id(private)] = weakref.ref(private,lambda r,i=id(private): _private_tables.pop(i,None))
++  private = fastbox.shallow(a)                              # copy-on-write: see cow_namespace
++  _private_tables[id(private)] = (weakref.ref(private,lambda r,i=id(private): _private_tables.pop(i,None)),set(),a)
+   return (private,ns,valid)
+ 
+ """
+diff --git a/netsim/modules/bgp.py b/netsim/modules/bgp.py
+index 5ccb6e3..b740b4a 100644
+--- a/netsim/modules/bgp.py
++++ b/netsim/modules/bgp.py
+@@ -8,7 +8,7 @@ from box import Box
+ 
+ from .. import data
+ from ..augment import devices, groups
+-from ..data import global_vars
++from ..data import fastbox, global_vars
+ from ..data.types import must_be_asn, must_be_list
+ from ..data.validate import validate_item
+ from ..utils import log
+@@ -151,6 +151,13 @@ build_ibgp_sessions: create IBGP session data structure
+ * BGP route reflectors need IBGP session with all other nodes in the same AS
+ * Other nodes need IBGP sessions with all RRs in the same AS
+ """
++def _bgp_as(n: Box) -> typing.Any:
++  """SKYFORGE-SPECIFIC: n.get('bgp.as',None) without python-box's dotted-key machinery for the usual shape"""
++  bgp = dict.get(n,'bgp',None)
++  if isinstance(bgp,dict):
++    return dict.get(bgp,'as',None)
++  return n.get('bgp.as',None)
++
+ def build_ibgp_sessions(node: Box, sessions: Box, topology: Box) -> None:
+   node_as  = node.bgp['as']                       # Set up variables that will come handy, starting with node AS
+   is_rr    = node.bgp.get("rr",None)              # Is this node an RR?
+@@ -162,7 +169,7 @@ def build_ibgp_sessions(node: Box, sessions: Box, topology: Box) -> None:
+     ibgp_ngb_list = [                             # ... we need IBGP sessions to all nodes in the AS
+       ngb for ngb in topology.nodes.values()      # ... but while building the node list
+         if ngb.name != node.name and              # ... skip current node
+-           ngb.get('bgp.as',None) == node_as]     # ... and everyone not in the current AS (or not running BGP)
++           _bgp_as(ngb) == node_as]               # ... and everyone not in the current AS (or not running BGP)
+     if is_rr and not rr_mesh:                     # Are we a RR and the user hates inter-RR sessions?
+       ibgp_ngb_list = [                           # ... Let's exclude other RRs from neighbor list
+         ngb for ngb in ibgp_ngb_list              # Iterate over IBGP neighbors we found so far
+@@ -176,12 +183,14 @@ def build_ibgp_sessions(node: Box, sessions: Box, topology: Box) -> None:
+     neighbor_data = bgp_neighbor(n,n_intf,'ibgp',sessions,get_neighbor_rr(n))
+     if not neighbor_data is None:
+       if 'loopback' in node:
+-        neighbor_data._source_intf = node.loopback
++        # SKYFORGE-SPECIFIC: store the loopback as it is; append_box below re-creates it in the appended neighbor (the
++        # assignment copied it once more, and that copy was thrown away by the append that copied it again)
++        fastbox.set_reference(neighbor_data,'_source_intf',node.loopback)
+       if bgp_nhs:
+         neighbor_data.next_hop_self = 'ebgp'
+       if is_rr and not 'rr' in neighbor_data:
+         neighbor_data.rr_client = True
+-      node.bgp.neighbors.append(neighbor_data)
++      fastbox.append_box(node.bgp.neighbors,neighbor_data)   # SKYFORGE-SPECIFIC: same as .append(), faster
+       has_ibgp = True
+ 
+   if not has_ibgp:
+diff --git a/netsim/modules/vlan.py b/netsim/modules/vlan.py
+index 350ccf8..dc978c2 100644
+--- a/netsim/modules/vlan.py
++++ b/netsim/modules/vlan.py
+@@ -7,7 +7,7 @@ from box import Box
+ 
+ from .. import data
+ from ..augment import addressing, devices, groups, links
+-from ..data import get_box, get_empty_box, get_global_parameter
++from ..data import fastbox, get_box, get_empty_box, get_global_parameter
+ from ..utils import log, strings
+ from . import _dataplane, _Module, get_effective_module_attribute
+ 
+@@ -971,7 +971,7 @@ def set_svi_neighbor_list(node: Box, topology: Box) -> None:
+         if len(vlan_data.neighbors) == vlan_data.host_count +1:             # ... and there's exactly one non-host attached to the VLAN
+           ifdata.role = 'stub'                                              # ... then we have a stub link, mark it for IGP modules
+ 
+-      ifdata.neighbors = [ n for n in vlan_data.neighbors if n.node != node.name ]
++      fastbox.set_list(ifdata,'neighbors',[ n for n in vlan_data.neighbors if n.node != node.name ])   # SKYFORGE-SPECIFIC: same as =, faster
+       if ifdata.neighbors:
+         if ' -> ' in ifdata.name:
+           ifdata.name = ifdata.name.split(' -> ')[0]
+diff --git a/netsim/outputs/common.py b/netsim/outputs/common.py
+index c441f62..d086b90 100644
+--- a/netsim/outputs/common.py
++++ b/netsim/outputs/common.py
+@@ -39,12 +39,12 @@ def add_group_vars(
+   if provider_only:
+     group_vars = devices.get_provider_data(node,defaults).get('group_vars',{})
+   else:
+-    group_vars = devices.get_device_attribute(node,'group_vars',defaults)
++    group_vars = devices.get_device_attribute_readonly(node,'group_vars',defaults)    # SKYFORGE-SPECIFIC: read only
+ 
+   if isinstance(group_vars,dict):
+     for k,v in group_vars.items():
+       if k not in host:
+-        host[k] = v
++        fastbox.set_item(host,k,v)              # SKYFORGE-SPECIFIC: same as host[k] = v, faster
+ 
+   return group_vars
+ 
+@@ -68,7 +68,7 @@ def adjust_inventory_host(
+     # for provider group_vars on nodes with non-default provider, as they might have (for example)
+     # different ansible_connection
+     #
+-    g_vars = devices.get_device_attribute(node,'group_vars',defaults)
++    g_vars = devices.get_device_attribute_readonly(node,'group_vars',defaults)       # SKYFORGE-SPECIFIC: read only
+     if n_provider != defaults.provider:
+       add_group_vars(host,node,defaults,provider_only=True)
+ 
+@@ -80,8 +80,8 @@ def adjust_inventory_host(
+     node.inventory_hostname = node.name
+     node.netlab_device_type = host.get('netlab_device_type',host.get('ansible_network_os','none'))
+     node.node_provider = n_provider
+-    node.netlab_interfaces = ([ node.get('loopback')] if 'loopback' in node else []) + \
+-                             node.get('interfaces',[])
++    fastbox.set_item(node,'netlab_interfaces',                  # SKYFORGE-SPECIFIC: same as node.netlab_interfaces = ...
++                     ([ node.get('loopback')] if 'loopback' in node else []) + node.get('interfaces',[]))
+ 
+   # For Docker nodes, do not use mgmt.X attributes (to set ansible_host)
+   # Everywhere else, 'mgmt.ipv4' will overwrite 'hostname' (set by clab)
+@@ -96,11 +96,11 @@ def adjust_inventory_host(
+   for (node_key,inv_key) in translate.items():
+     value = node.get(node_key,None)
+     if value is not None:
+-      host[inv_key] = value
++      fastbox.set_item(host,inv_key,value)        # SKYFORGE-SPECIFIC: same as host[inv_key] = value, faster
+ 
+   for (k,v) in node.items():
+     if not k in ignore:
+-      host[k] = v
++      fastbox.set_item(host,k,v)                  # SKYFORGE-SPECIFIC: same as host[k] = v, faster
+ 
+   # KNE uses the compile-time provider contract for apply, not any source
+   # provider label that may still be present on imported clab topologies.
+@@ -116,14 +116,14 @@ def create_adjusted_topology(
+       topology: Box,
+       ignore: typing.Optional[list] = ['name'],
+       template_vars: bool = False) -> Box:
+-  topo_copy = fastbox.from_plain(fastbox.to_dict(topology))      # SKYFORGE-SPECIFIC: same result as get_box(topology.to_dict()), faster
++  topo_copy = fastbox.deep_copy(topology)                         # SKYFORGE-SPECIFIC: same result as get_box(topology.to_dict()), one pass
+   for node in list(topo_copy.nodes.keys()):
+-    topo_copy.nodes[node] = adjust_inventory_host(
++    fastbox.set_item(topo_copy.nodes,node,adjust_inventory_host(     # SKYFORGE-SPECIFIC: same as topo_copy.nodes[node] = ...
+                               node=topo_copy.nodes[node],
+                               defaults=topology.defaults,
+                               ignore=ignore,
+                               group_vars=True,
+-                              template_vars=template_vars)
++                              template_vars=template_vars))
+   return topo_copy
+ 
+ """
+diff --git a/netsim/providers/kne.py b/netsim/providers/kne.py
+index 8a167f4..b1a5cf0 100644
+--- a/netsim/providers/kne.py
++++ b/netsim/providers/kne.py
+@@ -615,7 +615,7 @@ def get_node_config_mode(node: Box, topology: Box) -> str:
+       return 'none'
+     return cfg_mode
+ 
+-  features = devices.get_device_features(node,topology.defaults)
++  features = devices.get_device_features_readonly(node,topology.defaults)   # SKYFORGE-SPECIFIC: read only
+   supported = features.get('initial.config_mode',[])
+   if len(supported) == 1 and supported[0] in ('sh','cp_sh'):
+     return supported[0]
+@@ -2410,7 +2410,7 @@ def kne_device_initial_features(node: Box, topology: Box) -> Box:
+   and raises on an absent one, so ask only when there is a name to ask about.'''
+   if not node.get('device',None):
+     return Box({},default_box=True)
+-  return devices.get_device_features(node,topology.defaults).get('initial',Box({},default_box=True))
++  return devices.get_device_features_readonly(node,topology.defaults).get('initial',Box({},default_box=True))   # SKYFORGE-SPECIFIC: read only
+ 
+ def kne_device_mtu_ceiling(node: Box, topology: Box, device_caps: dict) -> int | None:
+   '''The largest interface MTU this node's NOS will actually accept.
+@@ -2856,7 +2856,7 @@ def build_kne_render_node_data(node: Box, topology: Box, node_interfaces: list)
+   if isinstance(node.get('kne',None),Box) and 'config_templates' in node.kne:
+     return build_kne_node_data(node,topology,node_interfaces)
+ 
+-  render_node = fastbox.from_plain(fastbox.to_dict(node))           # SKYFORGE-SPECIFIC: same result as get_box(node.to_dict())
++  render_node = fastbox.deep_copy(node)                             # SKYFORGE-SPECIFIC: same result as get_box(node.to_dict()), one pass
+   render_node.kne = Box(default_box=True,box_dots=True)
+   render_node.kne.config_templates = Box(default_box=True,box_dots=True)
+   add_default_config_mode(render_node,topology)
+@@ -2881,7 +2881,7 @@ def normalize_interface_mtu(value: object) -> int | None:
+ 
+ def render_kne_topology_textproto(topology: Box) -> str:
+   search_path = _files.get_search_path('kne',pkg_path_component='templates/provider/kne')
+-  topo_data = fastbox.from_plain(fastbox.to_dict(topology))         # SKYFORGE-SPECIFIC: same result as get_box(topology.to_dict())
++  topo_data = fastbox.deep_copy(topology)                           # SKYFORGE-SPECIFIC: same result as get_box(topology.to_dict()), one pass
+   topo_data.kne_name = str(topo_data.get('kne_name',get_kne_topology_name(topology)) or get_kne_topology_name(topology))
+   topo_data.kne_links = [
+     get_box(link) if not isinstance(link,Box) else link
+diff --git a/netsim/utils/routing.py b/netsim/utils/routing.py
+index 952b149..c96e6d7 100644
+--- a/netsim/utils/routing.py
++++ b/netsim/utils/routing.py
+@@ -17,8 +17,21 @@ from . import log
+ def get_ipv4_address(addr: typing.Union[str,int]) -> str:
+   return str(ipaddress.IPv4Interface(addr).ip)
+ 
++_intf_address_cache: typing.Dict[typing.Any,str] = {}
++
+ def get_intf_address(addr: typing.Union[str,int]) -> str:
+-  return str(ipaddress.ip_interface(addr).ip)
++  # SKYFORGE-SPECIFIC: a pure function of its argument, asked for the same loopback once per BGP session (tens of
++  # thousands of times in a large lab); remember the answers. Errors are not cached: they are raised every time.
++  key = (addr.__class__,addr)
++  try:
++    return _intf_address_cache[key]
++  except KeyError:
++    pass
++  except TypeError:                     # unhashable argument: compute it every time, as before
++    return str(ipaddress.ip_interface(addr).ip)
++  result = str(ipaddress.ip_interface(addr).ip)
++  _intf_address_cache[key] = result
++  return result
+ 
+ def get_address(addr: str) -> str:
+   return str(ipaddress.ip_address(addr))
+diff --git a/tests/test_compile_speed.py b/tests/test_compile_speed.py
+index e3c433e..8dbde9c 100644
+--- a/tests/test_compile_speed.py
++++ b/tests/test_compile_speed.py
+@@ -422,3 +422,71 @@ def test_add_equals_python_box_add_for_nested_merges() -> None:
+   a = get_box({'x': {'y': {'z': 1}, 'l': [1]}, 'k': 'v'})
+   b = {'x': {'y': {'w': 2}, 'l': [2]}, 'n': {'m': [3]}}
+   _same(fastbox.add(a, b), a + b)
++
++
++def test_stripping_a_secondary_namespace_never_reaches_the_next_validation(monkeypatch: pytest.MonkeyPatch) -> None:
++  """
++  get_valid_attributes strips the _required flags of a secondary namespace that has a no_propagate list IN the table
++  it is given. With the speed-ups that table shares namespaces with the cache, so the strip must land on a copy.
++  Compared against the same sequence with the speed-ups off.
++  """
++  from netsim.data import validate
++  _init_log()
++  attrs = get_box({
++    'node': {'name': 'str', 'mode': {'type': 'str', '_required': True}},
++    'link': {'mtu': 'int', 'tunnel': {'type': 'dict', '_keys': {'mode': {'type': 'str', '_required': True}}},
++             'bw': {'type': 'int', '_required': True}},
++    'link_no_propagate': ['bw'],
++    'interface': {'ifindex': 'int'},
++  })
++  extra = get_box({'node': {'clab': None}, 'link': {'clab': None}})
++
++  def sequence() -> tuple:
++    memo.invalidate()
++    first = validate.resolve_attributes(attrs, extra, ['node'])         # resolving 'node' leaves 'link' untouched
++    validate.get_valid_attributes(first[0], ['interface', 'link'])      # strips link.* _required in first[0]
++    second = validate.resolve_attributes(attrs, extra, ['node'])
++    return fastbox.to_dict(first[0]), fastbox.to_dict(second[0])
++
++  fast_first, fast_second = sequence()
++  monkeypatch.setattr(memo, 'DISABLED', True)
++  monkeypatch.setattr(fastbox, 'ENABLED', False)
++  slow_first, slow_second = sequence()
++  assert slow_first != slow_second                     # the test is only meaningful if something was stripped
++  assert fast_first == slow_first                      # the strip happened in the validation's own table ...
++  assert fast_second == slow_second                    # ... and not in the next one
++  assert attrs.link.tunnel._keys.mode._required is True
++
++
++def test_recursive_validation_on_a_private_table_matches_the_uncached_code(monkeypatch: pytest.MonkeyPatch) -> None:
++  """
++  A recursive validation reuses its caller's merged table; with the speed-ups its namespaces and valid-attribute
++  table come from a cache keyed by the table's origin and stripped namespaces, and the strip is replayed on a hit.
++  Every result and the table itself must equal the uncached sequence, on the first call and on cache hits.
++  """
++  from netsim.data import validate
++  _init_log()
++  attrs = get_box({
++    'node': {'name': 'str', 'mode': {'type': 'str', '_required': True}},
++    'interface': {'ifindex': 'int', '_namespace': ['link']},
++    'link': {'mtu': {'type': 'int', '_required': True}, 'bw': {'type': 'int', '_required': True}},
++    'link_no_propagate': ['bw'],
++  })
++  extra = get_box({'node': {'clab': None}})
++
++  def sequence() -> list:
++    memo.invalidate()
++    out = []
++    for _ in range(3):                                 # first call fills the cache, the others hit it
++      table = validate.resolve_attributes(attrs, extra, ['node'])[0]
++      for attr_list in (['interface'], ['node'], ['interface']):
++        _t, ns, valid = validate.resolve_attributes(table, None, attr_list)
++        out.append((list(ns), fastbox.to_dict(valid) if isinstance(valid, Box) else valid, fastbox.to_dict(table)))
++    return out
++
++  fast = sequence()
++  monkeypatch.setattr(memo, 'DISABLED', True)
++  monkeypatch.setattr(fastbox, 'ENABLED', False)
++  slow = sequence()
++  assert fast == slow
++  assert slow[0][2] != fastbox.to_dict(attrs + extra)  # the strip happened (the test exercises the side effect)
+-- 
+2.56.0
+

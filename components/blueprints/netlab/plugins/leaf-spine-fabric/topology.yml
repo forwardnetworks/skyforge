@@ -1,0 +1,27 @@
+defaults.device: eos
+provider: kne
+plugin: [ fabric ]
+fabric.spines: 2
+fabric.leafs: 4
+
+fabric.leaf.name: leaf-{count}
+fabric.spine.name: spine-{count}
+
+groups:
+  leafs:
+    module: [ ospf, bgp ]
+    bgp.as: 65000
+  spines:
+    module: [ ospf ]
+
+nodes:
+  host-1:
+    device: linux
+  host-2:
+    device: linux
+
+links:
+- host-1:
+  leaf-1:
+- host-2:
+  leaf-2:

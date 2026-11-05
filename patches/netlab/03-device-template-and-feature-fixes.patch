@@ -1,0 +1,1139 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 12:00:00 +0000
+Subject: [PATCH] devices: template and feature fixes across
+ IOS/NX-OS/EOS/Junos/IOS-XR/SR OS
+
+---
+diff --git a/docs/caveats.md b/docs/caveats.md
+index 9a844d2..fb58315 100644
+--- a/docs/caveats.md
++++ b/docs/caveats.md
+@@ -290,6 +290,8 @@ See also [common Cisco IOS](caveats-ios) caveats.
+ * _netlab_ translates **match.community** routing policy entry into IOS XR `community matches-any` test, and the **community-set** object cannot match two (or more) communities in a single entry. You cannot use the current _netlab_ IOS XR implementation of BGP community lists to match two (or more) communities being attached to the route *at the same time*.
+ * The **remove-private-as** option **all** or **replace** is not accepted when the local BGP AS number is private.
+ 
++* IOS XRv/XRd support **routed VLANs only**: a routed access VLAN stays on the physical interface, a routed VLAN on a trunk becomes a dot1q subinterface. XRd Control Plane forwards through an L3-only Linux dataplane with no L2VPN bridge-domains, so bridged and IRB VLANs (VLAN interfaces, native VLANs) are rejected on this device. Use **cisco8000v** for bridged VLANs on IOS XR.
++
+ ### Cisco IOS XRv
+ 
+ * netlab was tested with IOS XR release 7.4. Earlier releases might use a different management interface name. In that case, you must set the **defaults.devices.iosxr.mgmt_if** parameter to the name of the management interface
+diff --git a/docs/module/vlan.md b/docs/module/vlan.md
+index 307103e..2bf79db 100644
+--- a/docs/module/vlan.md
++++ b/docs/module/vlan.md
+@@ -29,6 +29,7 @@ VLANs are supported on these platforms:
+ | Arista EOS            | ✅  | ✅  | ✅  | ✅ | ✅ |
+ | Aruba AOS-CX          | ✅  | ✅  |  ❌  | ✅ | ✅ |
+ | Cisco 8000v (IOS XR)  | ✅  | ✅  | ✅  | ✅ | ✅ |
++| Cisco IOS XRv/XRd [❗](caveats-iosxr) | ✅  | ❌  | ✅  | ✅ | ❌ |
+ | Cisco IOSv            | ✅  | ✅  | ✅  | ✅ | ✅ |
+ | Cisco IOSvL2 [❗](caveats-iosv) | ✅ | ✅ | ✅ | ✅ | ✅ |
+ | Cisco IOL             | ✅  | ✅  | ✅ | ✅ | ✅ |
+diff --git a/docs/netlab/defaults.md b/docs/netlab/defaults.md
+index d09b8cf..65a9f20 100644
+--- a/docs/netlab/defaults.md
++++ b/docs/netlab/defaults.md
+@@ -59,7 +59,7 @@ For example, to display all defaults changed in the user default file (`~/.netla
+ $ netlab defaults --user
+ devices.arubacx.clab.image = vrnetlab/vr-aoscx:20240129204649 (user)
+ devices.csr.clab.image = vrnetlab/cisco_csr1000v:17.03.08 (user)
+-devices.nxos.clab.image = vrnetlab/vr-n9kv:9.3.10 (user)
++devices.nxos.clab.image = vrnetlab/vr-n9kv:9.3.8 (user)
+ devices.vptx.clab.image = vrnetlab/juniper_vjunosevolved:23.2R2.21-EVO (user)
+ devices.vsrx.clab.image = vrnetlab/juniper_vsrx:junos-vsrx-21.4R1.12 (user)
+ ```
+diff --git a/netsim/ansible/tasks/readiness-check/junos.yml b/netsim/ansible/tasks/readiness-check/junos.yml
+index c1d0311..8458674 100644
+--- a/netsim/ansible/tasks/readiness-check/junos.yml
++++ b/netsim/ansible/tasks/readiness-check/junos.yml
+@@ -3,6 +3,26 @@
+     junos_phy_iflist: >-
+       {{ interfaces|rejectattr('virtual_interface','defined') }}
+ 
++# Junos devices declare netlab_ready: [ ansible ] with ansible_connection: netconf,
++# so the FIRST thing the readiness check does is open a NETCONF session. On a cold
++# VM (vsrx measured 2026-09-15: pod RUNNING at 17:28:34, check at 17:29:51) the SSH
++# daemon answers before the startup config has committed `system services netconf
++# ssh`, and junos_command fails the connect outright -- "Could not open socket to
++# <host>:830" -- 31s in, on the FIRST attempt. The wait_for/retries below never
++# applies: it retries the COMMAND RESULT, not the transport. Wait for the NETCONF
++# port itself first, from the controller, within the device's own declared budget
++# (netlab_check_retries * netlab_check_delay; junos base = 60 * 10 = 600s).
++- name: Wait for NETCONF ({{ ansible_host }}:{{ ansible_port|default(830) }}) to accept connections
++  ansible.builtin.wait_for:
++    host: "{{ ansible_host }}"
++    port: "{{ ansible_port|default(830) }}"
++    timeout: "{{ (netlab_check_retries|default(60)|int) * (netlab_check_delay|default(10)|int) }}"
++    delay: 0
++  delegate_to: localhost
++  vars:
++    ansible_connection: local
++  when: junos_phy_iflist is ansible.builtin.truthy
++
+ - name: Wait for first interface ({{ junos_phy_iflist[0].junos_interface }})
+   junos_command:
+     commands:
+diff --git a/netsim/ansible/templates/bgp/eos.j2 b/netsim/ansible/templates/bgp/eos.j2
+index ef87955..f44f5bd 100644
+--- a/netsim/ansible/templates/bgp/eos.j2
++++ b/netsim/ansible/templates/bgp/eos.j2
+@@ -64,7 +64,7 @@ router bgp {{ bgp.as }}
+ {%   if bgp[af] is defined %}
+ !
+  address-family {{ af }}
+-{{     redistribute.config(bgp,af=af) }}
++{{     redistribute.config(bgp,af=af,ospf_match=['internal','external']) }}
+ !
+ {%     for pfx in bgp.advertise|default([]) if af in pfx %}
+   network {{ pfx[af] }}
+diff --git a/netsim/ansible/templates/bgp/nxos.j2 b/netsim/ansible/templates/bgp/nxos.j2
+index 7710260..31ba41e 100644
+--- a/netsim/ansible/templates/bgp/nxos.j2
++++ b/netsim/ansible/templates/bgp/nxos.j2
+@@ -1,3 +1,4 @@
++{% import "templates/routing/_redistribute.nxos.j2" as redistribute with context %}
+ {% macro community(list) -%}
+ {{ "both" if list|length >= 2 else list[0] }}
+ {%- endmacro %}
+@@ -14,6 +15,9 @@ router bgp {{ bgp.as }}
+ {% for af in ['ipv4','ipv6'] if bgp [af] is defined %}
+ !
+  address-family {{ af }} unicast
++{%   if bgp.import is defined %}
++{{     redistribute.config(bgp,af=af)|indent(1,first=True) }}
++{%   endif %}
+ !
+ {%   for pfx in bgp.advertise|default([]) if af in pfx %}
+   network {{ pfx[af] }}
+diff --git a/netsim/ansible/templates/evpn/ios-common.j2 b/netsim/ansible/templates/evpn/ios-common.j2
+index fbfc458..f14412c 100644
+--- a/netsim/ansible/templates/evpn/ios-common.j2
++++ b/netsim/ansible/templates/evpn/ios-common.j2
+@@ -63,8 +63,8 @@ router bgp {{ bgp.as }}
+  address-family l2vpn evpn
+   bgp scan-time 5
+ {% for n in bgp.neighbors if n.evpn|default(False) %}
+-  neighbor {{ n[n.evpn] }} activate
+   neighbor {{ n[n.evpn] }} encap {{ evpn.transport }}
++  neighbor {{ n[n.evpn] }} activate
+   neighbor {{ n[n.evpn] }} send-community both
+ {%   if n.rr_client|default(False) %}
+   neighbor {{ n[n.evpn] }} route-reflector-client
+diff --git a/netsim/ansible/templates/gateway/junos.j2 b/netsim/ansible/templates/gateway/junos.j2
+index 132c71a..08bde4a 100644
+--- a/netsim/ansible/templates/gateway/junos.j2
++++ b/netsim/ansible/templates/gateway/junos.j2
+@@ -15,6 +15,7 @@ interfaces {
+       address {{ intf[af] }} {
+         {{ 'vrrp-group' if af == 'ipv4' else 'vrrp-inet6-group' }} {{ intf.gateway.vrrp.group }} {
+           {{ 'virtual-address' if af == 'ipv4' else 'virtual-inet6-address' }} {{ intf.gateway[af]|ansible.utils.ipaddr('address') }};
++          accept-data;
+ {%     if 'priority' in intf.gateway.vrrp %}
+           priority {{ intf.gateway.vrrp.priority }};
+ {%     endif %}
+diff --git a/netsim/ansible/templates/initial/csrx.j2 b/netsim/ansible/templates/initial/csrx.j2
+index 616e21b..9200d7b 100644
+--- a/netsim/ansible/templates/initial/csrx.j2
++++ b/netsim/ansible/templates/initial/csrx.j2
+@@ -1,15 +1,80 @@
+-{% include 'junos/hosts.j2' %}
++system {
++  host-name {{ inventory_hostname }};
++  root-authentication {
++    encrypted-password "$6$lB5c6$Zeud8c6IhCTE6hnZxXBl3ZMZTC2hOx9pxxYUWTHKW1oC32SATWLMH2EXarxWS5k685qMggUfFur1lq.o4p4cg1"; ## SECRET-DATA
++  }
++  services {
++    ssh {
++      root-login allow;
++    }
++    netconf {
++      ssh;
++    }
++  }
++  static-host-mapping {
++{% for k,v in hostvars.items() if k != inventory_hostname %}
++{%   if v.loopback.ipv4 is defined %}
++    {{ k|replace('_','') }} inet {{ v.loopback.ipv4|ansible.utils.ipaddr('address') }};
++{%   elif v.interfaces|default([]) and v.interfaces[0].ipv4|default(False) is string %}
++    {{ k|replace('_','') }} inet {{ v.interfaces[0].ipv4|ansible.utils.ipaddr('address') }};
++{%   endif %}
++{% endfor %}
++  }
++}
+ 
+-{% include 'junos/container_interfaces.j2' %}
++interfaces {
++{% for l in netlab_interfaces|default([]) %}
++  {{ l.ifname }} {
++{% if l.name is defined %}
++    description "{{ l.name }}{{ " ["+l.role+"]" if l.role is defined else "" }}";
++{% elif l.type|default("") == "stub" %}
++    description "Stub interface";
++{% endif %}
++{% if l.shutdown|default(False) %}
++    disable;
++{% endif %}
++    unit 0 {
++{% if 'ipv4' in l %}
++      family inet {
++{%   if l.ipv4|ansible.utils.ipv4 %}
++        address {{ l.ipv4 }};
++{%   endif %}
++{%   if l.mtu is defined %}
++        mtu {{ l.mtu }};
++{%   endif %}
++      }
++{% endif %}
++{% if 'ipv6' in l %}
++      family inet6 {
++{%   if l.ipv6 is string %}
++        address {{ l.ipv6 }};
++{%   endif %}
++{%   if l.mtu is defined %}
++        mtu {{ l.mtu }};
++{%   endif %}
++      }
++{% endif %}
++    }
++  }
++{% endfor %}
++}
+ 
+ security {
+-    zones {
+-        security-zone default {
+-            interfaces {
+-                {% for l in netlab_interfaces|default([]) %}
+-                {{ l.ifname }}.0;
+-                {% endfor %}
+-            }
++  zones {
++    security-zone default {
++      host-inbound-traffic {
++        system-services {
++          all;
++        }
++        protocols {
++          all;
+         }
++      }
++      interfaces {
++{% for l in netlab_interfaces|default([]) %}
++        {{ l.ifname }}.0;
++{% endfor %}
++      }
+     }
++  }
+ }
+diff --git a/netsim/ansible/templates/initial/ios.j2 b/netsim/ansible/templates/initial/ios.j2
+index 3a040e8..8714211 100644
+--- a/netsim/ansible/templates/initial/ios.j2
++++ b/netsim/ansible/templates/initial/ios.j2
+@@ -2,7 +2,16 @@
+ hostname {{ inventory_hostname }}
+ !
+ no ip domain lookup
++ip domain name netlab.local
+ logging buffered 256000
++no logging console
++no logging monitor
++username admin privilege 15 secret admin
++enable secret admin
++crypto key generate rsa modulus 2048
++ip ssh version 2
++ip ssh time-out 60
++ip ssh authentication-retries 3
+ {% from '_debug_commands.j2' import enable_debugging %}
+ {{ enable_debugging(ios.debug,prefix='do debug') }}
+ !
+@@ -12,7 +21,15 @@ no cdp run
+ {% if services.dns._no_hosts is not defined %}
+ {%   for hname,hdata in hosts.items() if hname != inventory_hostname %}
+ {%     set ipv6_addr = hdata.ipv6|default([]) if netlab_device_type not in ['iosvl2','ioll2'] else [] %}
+-{%     set addr_list = hdata.ipv4|default([]) + ipv6_addr %}
++{#     IOS/IOLL2: one address per family only. A multi-address 'ip host' line is
++       rejected on these platforms and fails the whole initial config. #}
++{%     set addr_list = [] %}
++{%     if hdata.ipv4 is defined and hdata.ipv4 %}
++{%       set addr_list = addr_list + [ hdata.ipv4[0] ] %}
++{%     endif %}
++{%     if ipv6_addr %}
++{%       set addr_list = addr_list + [ ipv6_addr[0] ] %}
++{%     endif %}
+ {%     if addr_list %}
+ ip host {{ hname }} {{ addr_list|join (' ') }}
+ {%     endif %}
+@@ -35,6 +52,17 @@ no ipv6 unicast-routing
+ {% include 'ios.vrf.j2' +%}
+ !
+ {% endif %}
++{% if netlab_device_type in ['ios','iosvl2','csr','iol','ioll2','cat8000v'] %}
++{# The name is a device group var (netlab_mgmt_vrf) so the services templates can put the
++   syslog host and flow exporter in the same VRF; the literal stays as the fallback for
++   platforms that never declared it. #}
++vrf definition {{ netlab_mgmt_vrf|default('MGMT') }}
++ description Management interface
++ !
++ address-family ipv4
++ exit-address-family
++!
++{% endif %}
+ {% if vlans is defined %}
+ {% include [ netlab_device_type ~ '.vlan.j2', 'ios.vlan.j2' ] +%}
+ !
+@@ -50,9 +78,50 @@ interface {{ loopback.ifname }}
+ {%   endif %}
+ {% endif %}
+ !
+-interface {{ mgmt.ifname|default('GigabitEthernet0/0') }}
++{# No `|default()`: mgmt.ifname is resolved by netlab per device AND provider (eos: Management1
++   at device level, Management0 in the clab block), and a plausible-but-wrong literal is only
++   discovered when the device refuses it at line 1 of `configure replace`. The name is NOT
++   filtered with `mandatory` either: that is an ANSIBLE filter and this file is also rendered
++   by netlab's own Jinja env, which has no such filter. Both envs use a strict Undefined, so a
++   bare {{ mgmt.ifname }} already fails at render when it is unset. #}
++interface {{ mgmt.ifname }}
+  no lldp transmit
+  no lldp receive
++{# ORDER MATTERS ON THE L2 IMAGE. A switchport rejects `vrf forwarding`; on ioll2 (and
++   iosvl2) the port must be routed FIRST. With the VRF line ahead of `no switchport` the
++   binding was silently dropped and Ethernet0/0 stayed in the global table -- which nobody
++   noticed while only inbound SSH/SNMP used it, and which surfaced the moment the exporter
++   said `destination ... vrf MGMT` (demo-lab lhr-acc-sw01, 2026-09-12: config carried
++   the route and the VRF, `show run int e0/0` had no vrf forwarding, exporter "No FIB"). #}
++{% if netlab_device_type in ['ioll2','iosvl2'] %}
++ no switchport
++{% endif %}
++{# cat8000v IS in this list (since 2026-09-14). With Gi1 in the GLOBAL table the DHCP default
++   (AD 254) loses to any default the LAB hands the router -- an ISP's default-originate, an
++   iBGP default from the RR (AD 200), an OSPF default -- and the reply to every management SSH
++   SYN leaves through the data plane instead of back to the masquerade gateway. Measured
++   2026-09-14 on a 9-node c8000v lab: exactly the five nodes that learned a BGP default timed
++   out on :22 (guest healthy, Gi1 up with 10.0.2.2, sshd LISTENing). Same fault the collector saw as
++   CONNECTION_TIMEOUT on a hackweek lab. iol/csr were always in the VRF; the controller-mode
++   edge boothook uses Mgmt-intf; autonomous c8000v was the one IOS shape left in the global
++   table. #}
++{% if netlab_device_type in ['ios','iosvl2','csr','iol','ioll2','cat8000v'] %}
++ vrf forwarding {{ netlab_mgmt_vrf|default('MGMT') }}
++{% endif %}
++{% if netlab_device_type in ['iol','ioll2'] %}
++ ip address 169.254.100.2 255.255.255.252
++ no shutdown
++{% endif %}
++{% if netlab_device_type == 'cat8000v' %}
++{# On the native KubeVirt lane nobody else configures management. vrnetlab's
++   launch.py used to DHCP GigabitEthernet1 before the NOS ever saw traffic;
++   without this stanza the CVAC-applied day-0 leaves Gi1 unassigned and
++   administratively down, the masquerade DNAT has no backend, and every
++   c8000v is unreachable on :22 -- the collector reports CONNECTION_TIMEOUT on a
++   fully configured router. KubeVirt masquerade serves 10.0.2.2 via DHCP. #}
++ ip address dhcp
++ no shutdown
++{% endif %}
+ !
+ {% for l in interfaces|default([]) %}
+ interface {{ l.ifname }}
+@@ -148,8 +217,16 @@ interface {{ l.ifname }}
+ !
+ {{ extra_module_initial(['dhcp']) }}
+ !
++line con 0
++ exec-timeout 0 0
++ privilege level 15
++!
+ line vty 0 4
+  exec-timeout 0 0 
++ length 0
++ privilege level 15
++ login local
++ transport input ssh
+ !
+ no banner exec
+ no banner login
+diff --git a/netsim/ansible/templates/initial/linux/vanilla-ifconfig.j2 b/netsim/ansible/templates/initial/linux/vanilla-ifconfig.j2
+index 5dfdaa8..0c2c95e 100644
+--- a/netsim/ansible/templates/initial/linux/vanilla-ifconfig.j2
++++ b/netsim/ansible/templates/initial/linux/vanilla-ifconfig.j2
+@@ -17,7 +17,12 @@ set -e
+ ip -6 addr add {{ intf.ipv6 }} dev {{ intf.ifname }}
+ {% endif %}
+ {% if intf.mtu is defined %}
+-ip link set dev {{ intf.ifname }} mtu {{ intf.mtu }}
++target_mtu="{{ intf.mtu }}"
++current_mtu="$(ip -o link show dev {{ intf.ifname }} 2>/dev/null | sed -n 's/.* mtu \([0-9][0-9]*\).*/\1/p' | head -n 1)"
++if [ -n "$current_mtu" ] && [ "$current_mtu" -lt "$target_mtu" ] 2>/dev/null; then
++  target_mtu="$current_mtu"
++fi
++ip link set dev {{ intf.ifname }} mtu "$target_mtu"
+ {% endif %}
+ {% if intf.shutdown|default(False) %}
+ ip link set dev {{ intf.ifname }} down
+diff --git a/netsim/ansible/templates/initial/nxos.j2 b/netsim/ansible/templates/initial/nxos.j2
+index f50b582..1420124 100644
+--- a/netsim/ansible/templates/initial/nxos.j2
++++ b/netsim/ansible/templates/initial/nxos.j2
+@@ -3,12 +3,39 @@
+ #}
+ hostname {{ 'nxos-' if inventory_hostname|length == 1 else '' }}{{ inventory_hostname }}
+ !
++feature bash-shell
++!
+ no ip domain-lookup
+ !
+ feature lldp
++{# n9kv first boot (KubeVirt/CVAC) does NOT ship with an SSH host key and does
++   not auto-generate one on "feature ssh". The prior "no feature ssh" tore down
++   the default SSH state and the subsequent key-gen raced the re-enable, so
++   "feature ssh" failed with "no ssh key configured, cannot enable ssh" and the
++   management plane never opened. Enable ssh (default key present) then force a
++   fresh 2048-bit RSA key -- proven to bring SSHv2 up unattended on n9kv. #}
++feature ssh
++ssh key rsa 2048 force
++feature nxapi
++feature telnet
++feature netconf
++feature grpc
++feature scp-server
++!
++{# n9kv (KubeVirt/CVAC) enforces the secure password standard on first boot: a
++   startup-config "username ... password <pw>" with a password shorter than 8
++   chars is REJECTED, so the account is never created. With no valid admin
++   password in the bootstrap file, n9kv falls back to the interactive "System
++   Admin Account Setup" dialog on the serial console -> SSH/mgmt never come up
++   and netlab cannot connect. Disabling the strength check lets netlab's
++   (short, image-default) admin/vagrant credentials apply so the switch
++   auto-provisions unattended. role network-admin grants the privileges the
++   accounts need (a role-less user cannot drive config). #}
++no password strength-check
+ no cdp enable
+ !
+-username vagrant password vagrant
++username admin password admin role network-admin
++username vagrant password vagrant role network-admin
+ !
+ {% if services.dns._no_hosts is not defined %}
+ {%   for hname,hdata in hosts.items() if 'ipv4' in hdata and hname != inventory_hostname %}
+@@ -27,16 +54,21 @@ feature interface-vlan
+ interface {{ mgmt.ifname|default('GigabitEthernet0/0') }}
+  no lldp transmit
+  no lldp receive
++ ip address dhcp
++ no shutdown
++!
++line vty
++ exec-timeout 0
+ !
+ {% for l in netlab_interfaces %}
+ interface {{ l.ifname }}
+ {% if l.shutdown|default(False) %}
+  shutdown
+ {% endif %}
+-{% if l.virtual_interface is not defined %}
++{% if l.virtual_interface is not defined and l.lag is not defined %}
+  no switchport
+ {% endif %}
+-{% if l.mac_address is defined %}
++{% if l.mac_address is defined and l.lag is not defined %}
+  mac-address {{ l.mac_address }}
+ {% endif %}
+ {% if l.vrf is defined %}
+@@ -50,7 +82,7 @@ interface {{ l.ifname }}
+ {% if l.bandwidth is defined %}
+  bandwidth {{ l.bandwidth  }}
+ {% endif %}
+-{% if l.mtu is defined %}
++{% if l.mtu is defined and l.lag is not defined %}
+  mtu {{ l.mtu }}
+ {% endif %}
+ {#
+diff --git a/netsim/ansible/templates/initial/sros.j2 b/netsim/ansible/templates/initial/sros.j2
+index cc6bdd9..f754be5 100644
+--- a/netsim/ansible/templates/initial/sros.j2
++++ b/netsim/ansible/templates/initial/sros.j2
+@@ -1,5 +1,10 @@
+ {% macro if_name(i,name=None) -%}
+-{{ name or i.ifname }}
++{%- set raw = (name or i.ifname) -%}
++{%- if 'ixr' in clab.type and clab.type != 'ixr-x' -%}
++{{ raw|replace('/c', '/') }}
++{%- else -%}
++{{ raw }}
++{%- endif -%}
+ {%- endmacro %}
+ 
+ {% macro declare_router(i,sub_path="",intf_cfg=False,vrf_config=True) -%}
+@@ -146,12 +151,17 @@
+ 
+ {%  set portname = l.parent_ifname if l.type=='vlan_member' else l.ifname %}
+ {%  set portname = portname.replace('eth-','') %}
++{%  set use_breakout = '/c' in portname %}
+ {%  if 'ixr' in clab.type and clab.type != 'ixr-x' %}
+-{#  Remove connector from port name for IXR platform #}
+-{%  set portname = portname.replace("c","") %}
++{#  Remove connector and breakout from IXR-compact port names (non-connector style). #}
++{%  set portname = portname.replace("/c","/") %}
++{%  set use_breakout = False %}
+ {%  endif %}
++{#  SR chassis vSIM (vrnetlab/vr-sros) exposes connector ports (1/1/c1).
++    These require breakout (c1-100g) before the ethernet sub-port (1/1/c1/1) can be used.
++    use_breakout remains True for sr- types; the original sr- strip was incorrect. #}
+ {%  if l.type in ['p2p','lan','vlan_member','stub'] %}
+-{%   if 'c' in portname %}
++{%   if use_breakout %}
+ - path: configure/port[port-id={{portname}}]
+   val:
+    admin-state: enable
+@@ -170,6 +180,12 @@
+ {%   if l._port_mode is defined %}
+     mode: {{ l._port_mode }}
+ {%   endif %}
++    lldp:
++      dest-mac:
++      - mac-type: nearest-bridge
++        port-id-subtype: tx-if-alias
++        receive: true
++        transmit: true
+ {%   if tagged %}
+ {%    set portname = portname + ':' + vlan|string %}
+     encap-type: dot1q
+@@ -186,6 +202,30 @@
+ {%- endmacro -%}
+ 
+ updates:
++{% for card in clab.hardware|default([]) %}
++{%  if card['slot-number'] | string != 'A' %}
++{%    set ns = namespace(val={}) %}
++{%    for k, v in card.items() %}
++{%      if k != 'slot-number' and k != 'mda' %}
++{%        set ns.val = ns.val | combine({k: v}) %}
++{%      endif %}
++{%    endfor %}
++- path: configure/card[slot-number={{ card['slot-number'] }}]
++  val:
++{{ ns.val|to_nice_yaml(indent=2)|indent(4,first=True) }}
++{%    for mda in card['mda']|default([]) %}
++{%      set mda_ns = namespace(val={}) %}
++{%      for mk, mv in mda.items() %}
++{%        if mk != 'mda-slot' %}
++{%          set mda_ns.val = mda_ns.val | combine({mk: mv}) %}
++{%        endif %}
++{%      endfor %}
++- path: configure/card[slot-number={{ card['slot-number'] }}]/mda[mda-slot={{ mda['mda-slot'] }}]
++  val:
++{{ mda_ns.val|to_nice_yaml(indent=2)|indent(4,first=True) }}
++{%    endfor %}
++{%  endif %}
++{% endfor %}
+ {% if 'ixr' in clab.type %}
+ - path: configure/system/resource
+   val:
+diff --git a/netsim/ansible/templates/normalize/iosvl2.j2 b/netsim/ansible/templates/normalize/iosvl2.j2
+index 07ac88e..7e5f76a 100644
+--- a/netsim/ansible/templates/normalize/iosvl2.j2
++++ b/netsim/ansible/templates/normalize/iosvl2.j2
+@@ -3,4 +3,7 @@
+ interface {{ intf.ifname }}
+ {# 'no switchport' allocates an internal VLAN in range 1006-, causing issues when overlapping with topology vlans #}
+  shutdown
++ exit
+ {% endfor %}
++!
++end
+diff --git a/netsim/ansible/templates/routing/_redistribute.ios.j2 b/netsim/ansible/templates/routing/_redistribute.ios.j2
+index 2d86745..2d0ead4 100644
+--- a/netsim/ansible/templates/routing/_redistribute.ios.j2
++++ b/netsim/ansible/templates/routing/_redistribute.ios.j2
+@@ -1,6 +1,11 @@
+ {% macro policy(sp_data,af) -%}
+   {% if 'policy' in sp_data %} route-map {{ sp_data.policy }}-{{ af }}{% endif +%}
+ {%- endmacro %}
++{% macro eigrp_metric(sp_data,t_proto) -%}
++  {% if t_proto == 'eigrp' and sp_data.metric is defined %} metric {{
++    sp_data.metric.bandwidth }} {{ sp_data.metric.delay }} {{
++    sp_data.metric.reliability }} {{ sp_data.metric.load }} {{ sp_data.metric.mtu }}{% endif +%}
++{%- endmacro %}
+ {% macro config(pdata,af='ipv4',t_proto='',ospf_pid=1,vrf='default') -%}
+ {%   set r_append = ' subnets' if t_proto == 'ospf' else '' %}
+ {%   for s_proto,s_data in pdata.import.items() %}
+@@ -11,9 +16,11 @@
+ {%       set sp_config = sp_config + ' ' + isis.instance + ' level-1-2' %}
+ {%     elif s_proto == 'ospf' %}
+ {%       set sp_config = sp_config + ' ' + ospf_pid|string + ' match internal external' %}
++{%     elif s_proto == 'eigrp' %}
++{%       set sp_config = sp_config + ' ' + eigrp.as|string %}
+ {%     elif s_proto == 'rip' and af == 'ipv6' %}
+ {%       set sp_config = sp_config + ' default' %}
+ {%     endif %}
+- redistribute {{ sp_config }}{{ policy(s_data,af) }}
++ redistribute {{ sp_config }}{{ eigrp_metric(s_data,t_proto) }}{{ r_append }}{{ policy(s_data,af) }}
+ {%   endfor %}
+ {%- endmacro %}
+diff --git a/netsim/ansible/templates/routing/nxos.j2 b/netsim/ansible/templates/routing/nxos.j2
+index fe005d0..333cec0 100644
+--- a/netsim/ansible/templates/routing/nxos.j2
++++ b/netsim/ansible/templates/routing/nxos.j2
+@@ -1,3 +1,12 @@
++{% import '_route_map_ios.j2' as routemap with context %}
++{% if routing.policy|default({}) %}
++{%   call(p_entry,af_list) routemap.create_route_maps(routing.policy) -%}
++{{     routemap.common_route_map_entry(p_entry,af_list) }}
++{%-  endcall %}
++{% endif %}
++{% if routing.prefix|default({}) %}
++{%   include '_prefix_list_ios.j2' %}
++{% endif %}
+ {% if routing.static is defined %}
+ {%   include 'nxos/static.j2' %}
+ {% endif %}
+diff --git a/netsim/ansible/templates/sr/sros.j2 b/netsim/ansible/templates/sr/sros.j2
+index 6aa1d2a..f0f7405 100644
+--- a/netsim/ansible/templates/sr/sros.j2
++++ b/netsim/ansible/templates/sr/sros.j2
+@@ -18,10 +18,7 @@ updates:
+         global: [null]
+     # srlb: reference mpls-labels reserved-label-block
+       tunnel-table-pref: 8 # default 11
+-{%   if isis.af.ipv6 is defined %}
+-      multi-topology:
+-        mt2: True
+-{%   endif %}
++    # segment-routing/multi-topology is not present in SR OS 22.10 model-driven YANG
+     interface:
+     - interface-name: system
+ {% for af in ['ipv4','ipv6'] if af in loopback and sr.node_sid[af]|default(False) %}
+diff --git a/netsim/ansible/templates/vlan/iosvl2.j2 b/netsim/ansible/templates/vlan/iosvl2.j2
+index 919b4e9..f811347 100644
+--- a/netsim/ansible/templates/vlan/iosvl2.j2
++++ b/netsim/ansible/templates/vlan/iosvl2.j2
+@@ -1,4 +1,13 @@
+ {% if vlans is defined %}
++!
++! VTP server mode (the IOS default) keeps the VLAN database in vlan.dat and
++! ignores `vlan N` lines rendered here at boot; a device that boots its whole
++! rendered config (IOL-L2, IOSvL2 -- netlab defaults.yml features.initial.
++! startup_only) then has every SVI down/down and every trunk forwarding
++! nothing. Transparent mode makes the VLANs part of the running config,
++! created by the same startup config that references them.
++vtp mode transparent
++!
+ {%   for vname,vdata in vlans.items() %}
+ vlan {{ vdata.id }}
+  name {{ vname }}
+diff --git a/netsim/ansible/templates/vlan/iosxr.j2 b/netsim/ansible/templates/vlan/iosxr.j2
+new file mode 100644
+index 0000000..9ee7b26
+--- /dev/null
++++ b/netsim/ansible/templates/vlan/iosxr.j2
+@@ -0,0 +1,21 @@
++{#
++   Routed VLANs on IOS XRv / XRd.
++
++   The device declares no svi_interface_name, so the vlan module has already
++   rejected every bridged or IRB VLAN before this template renders: XRd
++   Control Plane forwards through an L3-only Linux dataplane with no L2VPN
++   bridge-domains. What is left is:
++
++   * a routed access VLAN on a physical interface -- the interface keeps the
++     VLAN's IP address (rendered by the initial template) and needs nothing
++     from here;
++   * a routed VLAN on a trunk -- a dot1q subinterface whose addresses the
++     initial template renders; this template supplies the encapsulation.
++
++   Mirrors the routed half of vlan/cisco8000v.j2.
++#}
++{% for ifdata in interfaces if ifdata.vlan.access_id is defined and ifdata.type == 'vlan_member' %}
++interface {{ ifdata.ifname }}{{ ifdata._xr_native_subif|default('') }}
++ encapsulation dot1Q {{ ifdata.vlan.access_id }}
++!
++{% endfor %}
+diff --git a/netsim/ansible/templates/vrf/eos.bgp.j2 b/netsim/ansible/templates/vrf/eos.bgp.j2
+index 028e60f..f8a3e7a 100644
+--- a/netsim/ansible/templates/vrf/eos.bgp.j2
++++ b/netsim/ansible/templates/vrf/eos.bgp.j2
+@@ -28,7 +28,7 @@ router bgp {{ bgp.as }}
+ !
+   address-family {{ af }}
+ {%     if vdata.bgp.import is defined %}
+-{{       redistribute.config(vdata.bgp,af=af)|indent(2,first=True) }}
++{{       redistribute.config(vdata.bgp,af=af,ospf_match=['internal','external'])|indent(2,first=True) }}
+ {%     endif %}
+ {%     for n in vdata.bgp.advertise|default([]) if af in n %}
+     network {{ n[af] }}
+diff --git a/netsim/devices/arubacx.yml b/netsim/devices/arubacx.yml
+index e475add..bab62aa 100644
+--- a/netsim/devices/arubacx.yml
++++ b/netsim/devices/arubacx.yml
+@@ -122,6 +122,7 @@ features:
+       ipv6: True
+       transport_vrf: False
+     syslog: True
++    # snmp_config custom config module.
+   stp:
+     supported_protocols: [ mstp, pvrst, stp ]
+     enable_per_port: True
+diff --git a/netsim/devices/asav.yml b/netsim/devices/asav.yml
+index 0659a86..98fe629 100644
+--- a/netsim/devices/asav.yml
++++ b/netsim/devices/asav.yml
+@@ -23,6 +23,8 @@ group_vars:
+ external:
+   image: none
+ features:
++  services:
++    # snmp_config custom config module.
+   initial:
+     collect: true
+     reload: true
+@@ -32,6 +34,10 @@ features:
+     caveats:
+       import: true
+     import: [ ospf, connected, static, no_policy ]
++  ipsec:
++    route_based: true
++    tunnel: true
++    ike: [ ikev2 ]
+   isis:
+     caveats: true
+     circuit_type: true
+diff --git a/netsim/devices/cat8000v.yml b/netsim/devices/cat8000v.yml
+index 1560bba..2410040 100644
+--- a/netsim/devices/cat8000v.yml
++++ b/netsim/devices/cat8000v.yml
+@@ -27,6 +27,10 @@ group_vars:
+ node:
+   min_mtu: 1500
+ features:
++  services:
++    # snmp_config custom config module.
++  sdwan:
++    types: [ controller ]
+   srv6:
+     bgp: false
+     isis: true
+diff --git a/netsim/devices/cisco8000v.py b/netsim/devices/cisco8000v.py
+index bce3a65..02d2aa7 100644
+--- a/netsim/devices/cisco8000v.py
++++ b/netsim/devices/cisco8000v.py
+@@ -5,31 +5,8 @@ from box import Box
+ 
+ from .iosxr import IOSXR as _IOSXR
+ 
+-"""
+-IOS XR needs native L2 subinterfaces to make native bridged VLANs work.
+-
+-This function identifies interfaces that are really native VLANs in disguise
+-and sets the _xr_native_subif string to create a complete interface name in
+-the configuration templates
+-"""
+-def vlan_native_subif(node: Box) -> None:
+-  if 'vlan' not in node.get('module',[]):
+-    return
+-  for intf in node.interfaces:
+-    access_vlan = intf.get('vlan.access_id',None)     # No access_id on LAN interface, no native VLAN
+-    if not access_vlan:
+-      continue
+-    intf._xr_native_subif = ''                        # Assume we don't need an extra subinterface
+-    if intf.type != 'lan':                            # Not a LAN interface, not interesting
+-      continue
+-    trunk_vlans = intf.get('vlan.trunk_id',[])        # if the access VLAN is not in the trunk VLAN list
+-    if access_vlan not in trunk_vlans:                # ... this is not a trunk interface with native VLAN
+-      continue
+-    intf._xr_native_subif = f'.{access_vlan}'         # oops, there goes the native subif
+-
+ class Cisco8000v(_IOSXR):
+ 
+   @classmethod
+   def device_quirks(self, node: Box, topology: Box) -> None:
+-    vlan_native_subif(node)
+-    super().device_quirks(node,topology)
++    super().device_quirks(node,topology)                # vlan_native_subif now runs for every IOS XR device
+diff --git a/netsim/devices/csrx.yml b/netsim/devices/csrx.yml
+index 7ab4955..38fa9ea 100644
+--- a/netsim/devices/csrx.yml
++++ b/netsim/devices/csrx.yml
+@@ -14,6 +14,8 @@ interface_name: ge-0/0/{ifindex}
+ mtu: 1500
+ 
+ features:
++  services:
++    # snmp_config custom config module.
+   initial:
+     ipv4:
+       unnumbered: false               # The 'unnumbered-address' family inet command does not work on cSRX
+diff --git a/netsim/devices/cumulus.yml b/netsim/devices/cumulus.yml
+index 825d70d..60d1ed5 100644
+--- a/netsim/devices/cumulus.yml
++++ b/netsim/devices/cumulus.yml
+@@ -47,6 +47,8 @@ group_vars:
+     mpls: [ ldpd ]
+ evpn._start_transit_vlan: 3900
+ features:
++  services:
++    # snmp_config custom config module.
+   initial:
+     system_mtu: True
+     ipv4:
+diff --git a/netsim/devices/cumulus_nvue.yml b/netsim/devices/cumulus_nvue.yml
+index 8a71879..6073498 100644
+--- a/netsim/devices/cumulus_nvue.yml
++++ b/netsim/devices/cumulus_nvue.yml
+@@ -30,6 +30,8 @@ group_vars:
+   ansible_python_interpreter: auto_silent
+   netlab_ready: [ ansible ]
+ features:
++  services:
++    # snmp_config custom config module.
+   initial:
+     system_mtu: True
+     ipv4:
+diff --git a/netsim/devices/dellos10.yml b/netsim/devices/dellos10.yml
+index 9efb7d8..3eb6e64 100644
+--- a/netsim/devices/dellos10.yml
++++ b/netsim/devices/dellos10.yml
+@@ -5,6 +5,8 @@ mgmt_if: mgmt1/1/1
+ loopback_interface_name: loopback{ifindex}
+ lag_interface_name: "port-channel{lag.ifindex}"
+ features:
++  services:
++    # snmp_config custom config module.
+   initial:
+     system_mtu: true
+     ipv4:
+diff --git a/netsim/devices/fortios.yml b/netsim/devices/fortios.yml
+index 7b1d567..debc23a 100644
+--- a/netsim/devices/fortios.yml
++++ b/netsim/devices/fortios.yml
+@@ -45,6 +45,8 @@ group_vars:
+ external:
+   image: none
+ features:
++  services:
++    # snmp_config custom config module.
+   bgp:
+     activate_af: true          # Per-neighbor activate / activate6
+     advertise: true            # "config network" / "config network6"
+@@ -60,6 +62,9 @@ features:
+     gr:                        # No helper-only mode: FortiOS either advertises the full
+       valid: [ enable, disable ]   # restart capability or stays silent
+       caveats: true
++  nat: true
++  security:
++    policy: true
+   ospf:
+     default: true
+     gr: [ ipv4, ipv6 ]
+diff --git a/netsim/devices/iol.py b/netsim/devices/iol.py
+index 50a46c9..ac0f0a5 100644
+--- a/netsim/devices/iol.py
++++ b/netsim/devices/iol.py
+@@ -3,6 +3,7 @@
+ #
+ from box import Box
+ 
++from ..modules import _routing
+ from ..utils import log
+ from . import _Quirks, report_quirk
+ from .iosv import check_ripng_passive
+@@ -49,6 +50,14 @@ def evpn_transit_vlan(node: Box, topology: Box) -> None:
+ class IOSXE(_Quirks):
+   @classmethod
+   def device_quirks(self, node: Box, topology: Box) -> None:
++    # Every VRF OSPF process copies the node's router ID (ospf vrf_copy), and
++    # IOS-XE runs one process per VRF. Two processes with one router ID that
++    # meet in the same area (e.g. a firewall peering into both VRFs) overwrite
++    # each other's router LSAs forever: sequence numbers climb, SPF runs every
++    # few seconds, routes come and go. IOSv already gets unique IDs here
++    # (iosv.common_ios_quirks); IOL/IOL-L2 did not.
++    if 'ospf' in node.get('module',[]):
++      _routing.get_unique_router_ids(node,'ospf',topology)
+     check_ripng_passive(node,topology)
+     check_srv6_sid(node,topology)
+     check_vni(node,topology)
+diff --git a/netsim/devices/iol.yml b/netsim/devices/iol.yml
+index a2354a3..03fb86e 100644
+--- a/netsim/devices/iol.yml
++++ b/netsim/devices/iol.yml
+@@ -16,6 +16,8 @@ clab:
+       ifstate: /iol/ifstate.cfg
+ 
+ features:
++  services:
++    # snmp_config custom config module.
+   initial:
+     min_mtu: 68
+     min_phy_mtu: 1501
+diff --git a/netsim/devices/ioll2.yml b/netsim/devices/ioll2.yml
+index 10797bf..d95ff0e 100644
+--- a/netsim/devices/ioll2.yml
++++ b/netsim/devices/ioll2.yml
+@@ -4,6 +4,8 @@ parent: iol
+ lag_interface_name: "Port-channel{lag.ifindex}"
+ 
+ features:
++  services:
++    # snmp_config custom config module.
+   initial:
+     generate_mac: [ ethernet, svi ]
+     normalize: true
+diff --git a/netsim/devices/ios.yml b/netsim/devices/ios.yml
+index 2361770..d91e87e 100644
+--- a/netsim/devices/ios.yml
++++ b/netsim/devices/ios.yml
+@@ -44,7 +44,6 @@ features:
+     local_as: true
+     vrf_local_as: true
+     local_as_ibgp: true
+-    import: [ ospf, isis, ripv2, connected, static, vrf ]
+     community:
+       standard: [ standard ]
+       extended: [ extended ]
+diff --git a/netsim/devices/iosv.yml b/netsim/devices/iosv.yml
+index c1dc280..74f17ea 100644
+--- a/netsim/devices/iosv.yml
++++ b/netsim/devices/iosv.yml
+@@ -16,6 +16,8 @@ libvirt:
+   build: https://netlab.tools/labs/iosv/
+   create_template: iosv.xml.j2
+ features:
++  services:
++    # snmp_config custom config module.
+   initial:
+     min_mtu: 64
+     max_mtu: 9600
+diff --git a/netsim/devices/iosxr.py b/netsim/devices/iosxr.py
+index 2a3a591..bb5c059 100644
+--- a/netsim/devices/iosxr.py
++++ b/netsim/devices/iosxr.py
+@@ -115,10 +115,34 @@ def clist_check(node: Box) -> None:
+           category=log.IncorrectValue,
+           node=node)
+ 
++"""
++IOS XR needs native L2 subinterfaces to make native bridged VLANs work.
++
++This function identifies interfaces that are really native VLANs in disguise
++and sets the _xr_native_subif string to create a complete interface name in
++the configuration templates. Shared by every IOS XR device (XRv/XRd and
++Cisco 8000v); it used to live in cisco8000v.py alone.
++"""
++def vlan_native_subif(node: Box) -> None:
++  if 'vlan' not in node.get('module',[]):
++    return
++  for intf in node.interfaces:
++    access_vlan = intf.get('vlan.access_id',None)     # No access_id on LAN interface, no native VLAN
++    if not access_vlan:
++      continue
++    intf._xr_native_subif = ''                        # Assume we don't need an extra subinterface
++    if intf.type != 'lan':                            # Not a LAN interface, not interesting
++      continue
++    trunk_vlans = intf.get('vlan.trunk_id',[])        # if the access VLAN is not in the trunk VLAN list
++    if access_vlan not in trunk_vlans:                # ... this is not a trunk interface with native VLAN
++      continue
++    intf._xr_native_subif = f'.{access_vlan}'         # oops, there goes the native subif
++
+ class IOSXR(_Quirks):
+ 
+   @classmethod
+   def device_quirks(self, node: Box, topology: Box) -> None:
++    vlan_native_subif(node)
+     if 'routing' in node:
+       rp_set(node,'prefix',None)
+       rp_set(node,'aspath',None)
+diff --git a/netsim/devices/iosxr.yml b/netsim/devices/iosxr.yml
+index 55dc2fb..07c0a82 100644
+--- a/netsim/devices/iosxr.yml
++++ b/netsim/devices/iosxr.yml
+@@ -40,6 +40,22 @@ clab:
+     netlab_default_shebang: '#!/config/netlab/netlab-config.sh'
+ 
+ features:
++  # Routed VLANs only. XRd Control Plane forwards through an L3-only Linux
++  # dataplane and has no L2VPN bridge-domains, so there is deliberately no
++  # svi_interface_name here: a bridged or IRB VLAN on this device is
++  # rejected by the vlan module ("does not support VLAN interfaces") instead
++  # of rendering an l2vpn bridge-domain that cannot forward. Routed access
++  # VLANs stay on the physical interface; routed VLANs on a trunk become
++  # dot1q subinterfaces (see templates/vlan/iosxr.j2). Mirrors cisco8000v.
++  vlan:
++    model: router
++    subif_name: "{ifname}.{vlan.access_id}"
++    mixed_trunk: true
++    native_routed: false
++  services:
++    # Telemetry endpoints the device SERVES: SNMP answers an NMS, gNMI
++    # answers a collector. Ported from the snmp_config/gnmi_config custom
++    # config modules.
+   srv6:
+     isis: true
+     ebgp: true
+diff --git a/netsim/devices/nxos.yml b/netsim/devices/nxos.yml
+index 36fcd53..5f8eff4 100644
+--- a/netsim/devices/nxos.yml
++++ b/netsim/devices/nxos.yml
+@@ -6,6 +6,8 @@ support:
+ interface_name: Ethernet1/{ifindex}
+ mgmt_if: mgmt0
+ loopback_interface_name: loopback{ifindex}
++routing:
++  _rm_per_af: True
+ clab:
+   group_vars:
+     ansible_ssh_pass: admin
+@@ -85,12 +87,19 @@ features:
+     password: true
+     priority: true
+   routing:
++    policy:
++      set: [ locpref, med, weight, prepend, community ]
++      match: [ prefix, nexthop ]
++    prefix: true
+     static:
+       vrf: True
+       discard: True
+   services:
+     dns: True
+     syslog: True
++    # Telemetry endpoints the device SERVES: SNMP answers an NMS, gNMI
++    # answers a collector. Ported from the snmp_config/gnmi_config custom
++    # config modules.
+   vlan:
+     model: l3-switch
+     native_routed: true
+diff --git a/netsim/devices/sros.yml b/netsim/devices/sros.yml
+index d54a0c8..5d3ae98 100644
+--- a/netsim/devices/sros.yml
++++ b/netsim/devices/sros.yml
+@@ -98,6 +98,7 @@ features:
+   services:
+     syslog:
+       transport_vrf: False
++    # snmp_config custom config module.
+   sr:
+     af: [ ipv4, ipv6 ]
+     protocol: [ isis ]
+@@ -175,6 +176,14 @@ clab:
+     license: /Projects/SR_OS_VSR-SIM_license.txt
+     env:
+       CLAB_MGMT_PASSTHROUGH: "true"
++    hardware:
++    - slot-number: A
++      card-type: cpm-1
++    - slot-number: 1
++      card-type: iom-1
++      mda:
++      - mda-slot: 1
++        mda-type: me12-100gb-qsfp28
+   interface:
+     name: eth{ifindex}
+   group_vars:
+diff --git a/netsim/devices/vjunos-router.yml b/netsim/devices/vjunos-router.yml
+index 1b60a5f..8ee4026 100644
+--- a/netsim/devices/vjunos-router.yml
++++ b/netsim/devices/vjunos-router.yml
+@@ -9,6 +9,8 @@ group_vars:
+   netlab_device_type: vjunos-router
+ 
+ features:
++  services:
++    # snmp_config custom config module.
+   evpn:
+     asymmetrical_irb: true
+     irb: true
+diff --git a/netsim/devices/vjunos-switch.yml b/netsim/devices/vjunos-switch.yml
+index b09273d..55f1966 100644
+--- a/netsim/devices/vjunos-switch.yml
++++ b/netsim/devices/vjunos-switch.yml
+@@ -6,6 +6,8 @@ group_vars:
+   netlab_device_type: vjunos-switch
+ 
+ features:
++  services:
++    # snmp_config custom config module.
+   evpn:
+     asymmetrical_irb: true
+     irb: true
+diff --git a/netsim/devices/vmx.yml b/netsim/devices/vmx.yml
+index c0739c8..88c2c3a 100644
+--- a/netsim/devices/vmx.yml
++++ b/netsim/devices/vmx.yml
+@@ -12,6 +12,8 @@ group_vars:
+   netlab_license_url: https://www.juniper.net/content/dam/www/assets/dm/us/en/E421992502.txt
+ 
+ features:
++  services:
++    # snmp_config custom config module.
+   vlan:
+     model: router
+     svi_interface_name: irb.{vlan}
+diff --git a/netsim/devices/vptx.yml b/netsim/devices/vptx.yml
+index a0a6bae..e4fea78 100644
+--- a/netsim/devices/vptx.yml
++++ b/netsim/devices/vptx.yml
+@@ -7,6 +7,8 @@ group_vars:
+   netlab_device_type: vptx
+ 
+ features:
++  services:
++    # snmp_config custom config module.
+   evpn:
+     asymmetrical_irb: true
+     irb: true
+diff --git a/netsim/devices/vsrx.yml b/netsim/devices/vsrx.yml
+index 96ae8de..052aa12 100644
+--- a/netsim/devices/vsrx.yml
++++ b/netsim/devices/vsrx.yml
+@@ -10,6 +10,8 @@ group_vars:
+   netlab_device_type: vsrx
+ 
+ features:
++  services:
++    # snmp_config custom config module.
+   gateway:
+     protocol: [ vrrp ]
+   lag:
+diff --git a/netsim/extra/bgp/session/eos.j2 b/netsim/extra/bgp/session/eos.j2
+index 00dea0f..ae9be31 100644
+--- a/netsim/extra/bgp/session/eos.j2
++++ b/netsim/extra/bgp/session/eos.j2
+@@ -123,7 +123,3 @@ router bgp {{ bgp.as }}
+ {%   endfor %}
+ {% endif %}
+ !
+-{% if netlab_config_mode|default('') in ['sh','netmiko'] %}
+-do bash sleep 2
+-{% endif %}
+-do clear bgp vrf all
+diff --git a/netsim/install/libvirt/nxos.txt b/netsim/install/libvirt/nxos.txt
+index 7e5e4f3..98b08c1 100644
+--- a/netsim/install/libvirt/nxos.txt
++++ b/netsim/install/libvirt/nxos.txt
+@@ -11,6 +11,7 @@ feature bash-shell
+ !
+ username admin password admin!
+ no ip domain-lookup
++feature ssh
+ username vagrant password vagrant role network-admin
+ !
+ username vagrant sshkey ssh-rsa AAAAB3NzaC1yc2EAAAABIwAAAQEA6NF8iallvQVp22WDkTkyrtvp9eWW6A8YVr+kz4TjGYe7gHzIw+niNltGEFHzD8+v1I2YJ6oXevct1YeS0o9HZyN1Q9qgCgzUFtdOKLv6IedplqoPkcmF0aYet2PkEDo3MlTBckFXPITAMzF8dJSIFo9D8HfdOV0IAdx4O7PtixWKn5y2hMNG0zQPyUecp4pzC6kivAIhyfHilFR61RGL+GPXQ2MWZWFYbAGjyiYJnAmCP3NOTd0jMZEnDkbUvxhMmBYSdETk1rRgm+R4LOzFUGaHqHDLKLX+FIPKcF96hrucXzcWyLbIbEgE98OHlnVYCzRdK8jlqm8tehUc9c9WhQ==
+diff --git a/netsim/providers/clab.yml b/netsim/providers/clab.yml
+index 8ef907d..0185970 100644
+--- a/netsim/providers/clab.yml
++++ b/netsim/providers/clab.yml
+@@ -65,6 +65,13 @@ attributes:
+       restart-policy: str
+       network-mode: str
+       exec: { type: list, _subtype: str }
++      # SR OS emulates a chassis, so its card/MDA layout is data, not an image
++      # property: devices/sros.yml sets clab.node.hardware and the vr-sros
++      # startup template renders it. _keys is an EXPLICIT allowlist -- an
++      # attribute the device defaults set but this list omits is rejected as
++      # "Incorrect node attribute 'hardware' in nodes.<n>.clab", so declaring
++      # it here is what makes the device default legal at all.
++      hardware: list
+   interface:
+     name: str
+   link:
+-- 
+2.56.0
+

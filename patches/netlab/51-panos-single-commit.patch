@@ -1,0 +1,555 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 00:00:00 +0000
+Subject: [PATCH] SKYFORGE-SPECIFIC: SKYFORGE_PANOS_SINGLE_COMMIT stages every
+ PAN-OS lane and commits once (default: a commit per lane)
+
+---
+diff --git a/netsim/ansible/initial-config.ansible b/netsim/ansible/initial-config.ansible
+index a8725c9..53b4ced 100755
+--- a/netsim/ansible/initial-config.ansible
++++ b/netsim/ansible/initial-config.ansible
+@@ -14,6 +14,15 @@
+       node_files: "{{ lookup('env','PWD') }}/node_files"
+     tags: [ always ]
+ 
++  # SKYFORGE-SPECIFIC: single PAN-OS commit. When SKYFORGE_PANOS_SINGLE_COMMIT is on, the PAN-OS lanes only stage
++  # their lines and the last play below commits once (tasks/panos/commit-pending.yml). The flag is set HERE, in the
++  # playbook that owns that last play, so no other playbook that reaches the PAN-OS lanes (netlab config, reload)
++  # can leave staged-but-uncommitted configuration behind: they never see panos_commit_deferred and commit per lane.
++  - name: Decide whether PAN-OS commits once at the end of this playbook
++    set_fact:
++      panos_commit_deferred: "{{ (lookup('env','SKYFORGE_PANOS_SINGLE_COMMIT') | default('',true) | trim | lower) in ['1','true','yes','on'] }}"
++    tags: [ always ]
++
+   - name: Deploy initial configuration
+     include_tasks: "tasks/deploy-module.yml"
+     args:
+@@ -90,3 +99,21 @@
+     loop: "{{ netlab_custom_config }}"
+     loop_control:
+       loop_var: custom_config
++
++#
++# SKYFORGE-SPECIFIC: the one PAN-OS commit (only when a lane staged something; see tasks/panos/commit-pending.yml)
++#
++- name: Commit staged PAN-OS configuration
++  hosts: all:!unprovisioned
++  strategy: "{{ netlab_strategy|default('linear') }}"
++  gather_facts: false
++  tags: [ always ]
++  tasks:
++  - name: Commit the configuration the PAN-OS lanes staged
++    include_tasks: "tasks/panos/commit-pending.yml"
++    when: >-
++      (panos_commit_pending | default(false) | bool)
++      and (netlab_device_type | default(ansible_network_os | default(''))) == 'panos'
++    args:
++      apply:
++        tags: [ always ]
+diff --git a/netsim/ansible/library/panos_cli_config_kne.py b/netsim/ansible/library/panos_cli_config_kne.py
+index 444f528..df573ed 100644
+--- a/netsim/ansible/library/panos_cli_config_kne.py
++++ b/netsim/ansible/library/panos_cli_config_kne.py
+@@ -41,9 +41,19 @@ options:
+     type: str
+   lines:
+     description: Configuration-mode commands, one per entry. Blank lines and comments are ignored.
+-    required: true
++      May be empty only together with C(commit_only).
++    required: false
++    default: []
+     type: list
+     elements: str
++  commit_only:
++    description:
++      - Open configuration mode, send no C(set) lines and just C(commit) what the candidate configuration already
++        holds. SKYFORGE-SPECIFIC: this is the one commit of the single-commit mode (SKYFORGE_PANOS_SINGLE_COMMIT),
++        after every lane has pushed its lines with C(commit=false). Needs C(commit=true) and configure mode.
++    required: false
++    default: false
++    type: bool
+   commit:
+     description: Commit after the lines are applied. Ignored in op mode.
+     required: false
+@@ -84,6 +94,22 @@ def send(master: int, value: str) -> None:
+   os.write(master, (value + '\n').encode())
+ 
+ 
++def build_queue(lines: list, op_mode: bool, do_commit: bool) -> list:
++  """The CLI session, one entry per prompt. Pure, so the sequence is testable without a device."""
++  # scripting-mode keeps the CLI from echoing interactive furniture; pager off keeps long output from wedging the
++  # prompt detector.
++  queue = ['set cli scripting-mode on', 'set cli pager off']
++  if not op_mode:
++    queue.append('configure')
++  queue += lines
++  if do_commit:
++    queue.append('commit')
++  if not op_mode:
++    queue.append('exit')
++  queue.append('exit')
++  return queue
++
++
+ def apply_config(module: AnsibleModule) -> tuple[bool, str]:
+   host = module.params['host']
+   port = int(module.params['port'])
+@@ -99,21 +125,12 @@ def apply_config(module: AnsibleModule) -> tuple[bool, str]:
+     line = str(raw or '').strip()
+     if line and not line.startswith('#'):
+       lines.append(line)
+-  if not lines:
++  commit_only = bool(module.params.get('commit_only')) and do_commit
++  if not lines and not commit_only:
+     return False, ''
+ 
+-  # The full session, sent one entry per prompt. scripting-mode keeps the CLI
+-  # from echoing interactive furniture; pager off keeps long output from
+-  # wedging the prompt detector.
+-  queue = ['set cli scripting-mode on', 'set cli pager off']
+-  if not op_mode:
+-    queue.append('configure')
+-  queue += lines
+-  if do_commit:
+-    queue.append('commit')
+-  if not op_mode:
+-    queue.append('exit')
+-  queue.append('exit')
++  # The full session, sent one entry per prompt.
++  queue = build_queue(lines, op_mode, do_commit)
+ 
+   cmd = [
+     'ssh',
+@@ -197,7 +214,8 @@ def main() -> None:
+       port=dict(type='int', required=True),
+       username=dict(type='str', default='admin'),
+       password=dict(type='str', required=True, no_log=True),
+-      lines=dict(type='list', elements='str', required=True),
++      lines=dict(type='list', elements='str', required=False, default=[]),
++      commit_only=dict(type='bool', default=False),
+       mode=dict(type='str', default='configure', choices=['configure', 'op']),
+       commit=dict(type='bool', default=True),
+       timeout=dict(type='int', default=300),
+@@ -206,7 +224,12 @@ def main() -> None:
+   )
+ 
+   wanted = [str(l or '').strip() for l in (module.params['lines'] or [])]
+-  if not [l for l in wanted if l and not l.startswith('#')]:
++  commit_only = bool(module.params.get('commit_only'))
++  if commit_only and (not module.params['commit'] or module.params['mode'] != 'configure'):
++    module.fail_json(msg='commit_only needs commit=true and mode=configure')
++  if commit_only and [l for l in wanted if l and not l.startswith('#')]:
++    module.fail_json(msg='commit_only sends no configuration lines; pass lines OR commit_only, not both')
++  if not commit_only and not [l for l in wanted if l and not l.startswith('#')]:
+     module.exit_json(changed=False, msg='no configuration lines to apply')
+ 
+   ok, transcript = apply_config(module)
+diff --git a/netsim/ansible/tasks/deploy-config/panos.yml b/netsim/ansible/tasks/deploy-config/panos.yml
+index 775da00..147b326 100644
+--- a/netsim/ansible/tasks/deploy-config/panos.yml
++++ b/netsim/ansible/tasks/deploy-config/panos.yml
+@@ -30,7 +30,17 @@
+     username: "{{ ansible_user }}"
+     password: "{{ ansible_password }}"
+     lines: "{{ panos_deployed_config.splitlines() }}"
+-    commit: true
++    # SKYFORGE-SPECIFIC single-commit mode: see tasks/panos/initial.yml.
++    commit: "{{ not (panos_commit_deferred | default(false) | bool) }}"
+     timeout: 300
+   when: not ansible_check_mode and ((panos_deployed_config | trim | length) > 0)
+   tags: [ print_action, always ]
++
++- name: "panos: remember that {{ netsim_action }} is staged but not committed"
++  ansible.builtin.set_fact:
++    panos_commit_pending: true
++    panos_pending_lanes: "{{ (panos_pending_lanes | default([])) + [netsim_action] }}"
++  when: >-
++    not ansible_check_mode and ((panos_deployed_config | trim | length) > 0)
++    and (panos_commit_deferred | default(false) | bool)
++  tags: [ print_action, always ]
+diff --git a/netsim/ansible/tasks/panos/commit-pending.yml b/netsim/ansible/tasks/panos/commit-pending.yml
+new file mode 100644
+index 0000000..2549604
+--- /dev/null
++++ b/netsim/ansible/tasks/panos/commit-pending.yml
+@@ -0,0 +1,43 @@
++---
++# SKYFORGE-SPECIFIC: the ONE PAN-OS commit of the single-commit mode (SKYFORGE_PANOS_SINGLE_COMMIT).
++#
++# WHY. Every PAN-OS lane (initial, static routes, services, firewall.policy, firewall.zonebased) used to push its
++# set-commands AND commit: four commits of 48 to 67 s each on fleet40 (2026-10-10), ~250 s of the lab's apply
++# phase, while the set-commands themselves take ~3 s. Nothing in the lanes depends on an earlier lane being
++# COMMITTED: they are all `set` statements into the candidate configuration (a rule that names a zone, a route
++# that names an interface, an lldp line on an interface the initial lane created are references the commit
++# validates, and the candidate already holds the target). With the switch on, each lane stages its lines
++# (commit=false) and this file commits once, at the very end of initial-config.ansible.
++#
++# WHAT THIS KEEPS. The autocommit gate and the password promotion still run BEFORE any lane (initial.yml). A
++# line the device rejects ("Invalid syntax", "Unknown command") still fails the lane that sent it. What changes
++# is that a commit-time validation error is now reported by this task for the whole staged set; the failure
++# message names every staged lane. Nothing is rolled back: the candidate configuration keeps all the lanes, as it
++# did after a failed per-lane commit.
++- name: Commit the staged PAN-OS configuration (one commit for every lane)
++  block:
++  - name: "Commit staged PAN-OS lanes: {{ panos_pending_lanes | default([]) | join(', ') }}"
++    panos_cli_config_kne:
++      host: "{{ ansible_host }}"
++      port: "{{ panos_kne_ssh_port }}"
++      username: "{{ ansible_user }}"
++      password: "{{ ansible_password }}"
++      commit_only: true
++      commit: true
++      timeout: 600
++    register: panos_single_commit
++
++  - name: The staged PAN-OS lanes are committed
++    ansible.builtin.set_fact:
++      panos_commit_pending: false
++
++  rescue:
++  - name: The single PAN-OS commit failed
++    ansible.builtin.fail:
++      msg: >-
++        The single PAN-OS commit on {{ inventory_hostname }} failed
++        ({{ ansible_failed_result.msg | default('no message') }}). It covered the lanes
++        {{ panos_pending_lanes | default([]) | join(', ') }}; none of them is committed and the device's candidate
++        configuration still holds all of them. Per-lane commits are the default: unset
++        SKYFORGE_PANOS_SINGLE_COMMIT to get a commit (and a failure) per lane. Device transcript tail:
++        {{ (ansible_failed_result.transcript | default(''))[-1500:] }}
+diff --git a/netsim/ansible/tasks/panos/initial.yml b/netsim/ansible/tasks/panos/initial.yml
+index 9d1582d..109d2fd 100644
+--- a/netsim/ansible/tasks/panos/initial.yml
++++ b/netsim/ansible/tasks/panos/initial.yml
+@@ -245,5 +245,15 @@
+     username: "{{ ansible_user }}"
+     password: "{{ ansible_password }}"
+     lines: "{{ panos_initial_config.splitlines() }}"
+-    commit: true
++    # SKYFORGE-SPECIFIC single-commit mode: with SKYFORGE_PANOS_SINGLE_COMMIT on, initial-config.ansible sets
++    # panos_commit_deferred, every lane only STAGES its lines in the candidate configuration, and ONE commit at
++    # the end of the playbook (tasks/panos/commit-pending.yml) commits them all. Off (the default) this is the
++    # historical commit-per-lane.
++    commit: "{{ not (panos_commit_deferred | default(false) | bool) }}"
+     timeout: 300
++
++- name: Remember that the PAN-OS initial configuration is staged but not committed
++  ansible.builtin.set_fact:
++    panos_commit_pending: true
++    panos_pending_lanes: "{{ (panos_pending_lanes | default([])) + [netsim_action | default('initial')] }}"
++  when: panos_commit_deferred | default(false) | bool
+diff --git a/netsim/ansible/tasks/panos/routing.yml b/netsim/ansible/tasks/panos/routing.yml
+index f98b314..b6615eb 100644
+--- a/netsim/ansible/tasks/panos/routing.yml
++++ b/netsim/ansible/tasks/panos/routing.yml
+@@ -17,7 +17,15 @@
+          'next-vr' if route.nexthop.vrf is defined and route.nexthop.vrf is not none else
+          'ip-address' }}
+ 
++# SKYFORGE-SPECIFIC single-commit mode: the routes above are set in the CANDIDATE configuration through the XML API,
++# the same candidate the CLI lanes stage into, so the one final commit (tasks/panos/commit-pending.yml) covers them.
+ - name: Commit static routing configuration
+-  when: routing.static|default([])|length > 0
++  when: routing.static|default([])|length > 0 and not (panos_commit_deferred | default(false) | bool)
+   paloaltonetworks.panos.panos_commit_firewall:
+     provider: "{{ panos_provider }}"
++
++- name: Remember that the PAN-OS static routes are staged but not committed
++  when: routing.static|default([])|length > 0 and (panos_commit_deferred | default(false) | bool)
++  ansible.builtin.set_fact:
++    panos_commit_pending: true
++    panos_pending_lanes: "{{ (panos_pending_lanes | default([])) + [netsim_action | default('routing')] }}"
+diff --git a/tests/test_panos_initial_gates.py b/tests/test_panos_initial_gates.py
+index 56d3486..75f2b9e 100644
+--- a/tests/test_panos_initial_gates.py
++++ b/tests/test_panos_initial_gates.py
+@@ -185,7 +185,9 @@ def test_an_aged_out_autocommit_row_does_not_cost_the_whole_budget(tasks):
+ def test_initial_push_uses_the_rendered_template_and_commits(tasks):
+   push = tasks[index_of(tasks, "Apply and commit the PAN-OS initial configuration")]
+   mod = push["panos_cli_config_kne"]
+-  assert mod["commit"] is True
++  # SKYFORGE-SPECIFIC single-commit mode: committing is the DEFAULT (flag undefined or false) and is switched off
++  # only by panos_commit_deferred (tests/test_panos_single_commit.py runs both ways through ansible-playbook).
++  assert "panos_commit_deferred | default(false)" in str(mod["commit"]) and "not" in str(mod["commit"])
+   assert "panos_initial_config" in str(mod["lines"])
+   render = tasks[index_of(tasks, "Render the PAN-OS initial configuration")]
+   assert "config_template" in str(render["ansible.builtin.set_fact"]), \
+@@ -203,7 +205,7 @@ def test_the_module_deploy_lane_exists_and_guards_empty_renders():
+     if "panos_cli_config_kne" in task:
+       deploy = task
+   assert deploy is not None, "the lane must push through the same module as initial"
+-  assert deploy["panos_cli_config_kne"]["commit"] is True
++  assert "panos_commit_deferred | default(false)" in str(deploy["panos_cli_config_kne"]["commit"])
+   when = str(deploy.get("when"))
+   assert "trim" in when and "length" in when, "empty renders must deploy nothing"
+ 
+diff --git a/tests/test_panos_single_commit.py b/tests/test_panos_single_commit.py
+new file mode 100644
+index 0000000..3405c1a
+--- /dev/null
++++ b/tests/test_panos_single_commit.py
+@@ -0,0 +1,261 @@
++"""PAN-OS single-commit mode (SKYFORGE-SPECIFIC): SKYFORGE_PANOS_SINGLE_COMMIT.
++
++The requirement. The PAN-OS lanes (initial, static routes, services, firewall.policy) used to commit four times.
++With the switch on there must be EXACTLY ONE commit, it must come after every lane's lines, and it must cover
++the lanes that really staged something; with the switch off (the default) the sequence must be today's, commit for
++commit. The subject is the REAL task files run by the real ansible-playbook; only the three modules that would
++talk to a device are replaced by recorders (the CLI module, and the two XML-API modules of the static-route lane).
++"""
++
++import json
++import os
++import subprocess
++import sys
++import textwrap
++from pathlib import Path
++
++import pytest
++import yaml
++
++ANSIBLE = Path(__file__).parent.parent / "netsim" / "ansible"
++TASKS = ANSIBLE / "tasks"
++
++CLI_STUB = textwrap.dedent(
++    '''
++    import json, os
++    from ansible.module_utils.basic import AnsibleModule
++
++    def main():
++        m = AnsibleModule(argument_spec=dict(
++            host=dict(type="str"), port=dict(type="int"), username=dict(type="str"),
++            password=dict(type="str", no_log=True), lines=dict(type="list", elements="str", default=[]),
++            commit=dict(type="bool", default=True), commit_only=dict(type="bool", default=False),
++            mode=dict(type="str", default="configure"), timeout=dict(type="int", default=300)))
++        p = m.params
++        with open(os.environ["RECORD"], "a") as fh:
++            fh.write(json.dumps({"kind": "cli", "first": (p["lines"] or [""])[0], "n": len(p["lines"] or []),
++                                 "commit": p["commit"], "commit_only": p["commit_only"]}) + "\\n")
++        if p["commit_only"] and p["commit"] and os.environ.get("STUB_FAIL_COMMIT"):
++            m.fail_json(msg="PAN-OS commit failed on the device", transcript="Validation Error: zone inside has no interface")
++        m.exit_json(changed=True)
++
++    main()
++    '''
++)
++
++API_STUB = textwrap.dedent(
++    '''
++    import json, os
++    from ansible.module_utils.basic import AnsibleModule
++
++    def main():
++        m = AnsibleModule(argument_spec=dict(
++            provider=dict(type="raw", no_log=True), virtual_router=dict(type="raw"), name=dict(type="raw"),
++            destination=dict(type="raw"), interface=dict(type="raw"), nexthop=dict(type="raw"),
++            nexthop_type=dict(type="raw")))
++        with open(os.environ["RECORD"], "a") as fh:
++            fh.write(json.dumps({"kind": "KIND", "name": m.params.get("name")}) + "\\n")
++        m.exit_json(changed=True)
++
++    main()
++    '''
++)
++
++
++def named(tasks, needle):
++    for task in tasks:
++        if needle in str(task.get("name", "")):
++            return task
++    raise AssertionError(f"no task named like {needle!r}")
++
++
++def build_workdir(tmp_path):
++    (tmp_path / "library").write_text("") if False else (tmp_path / "library").mkdir()
++    (tmp_path / "library" / "panos_cli_config_kne.py").write_text(CLI_STUB)
++    coll = tmp_path / "collections" / "ansible_collections" / "paloaltonetworks" / "panos" / "plugins" / "modules"
++    coll.mkdir(parents=True)
++    (coll.parent.parent / "meta").mkdir()
++    (coll.parent.parent / "meta" / "runtime.yml").write_text("requires_ansible: '>=2.9'\n")
++    (coll / "panos_static_route.py").write_text(API_STUB.replace("KIND", "api-route"))
++    (coll / "panos_commit_firewall.py").write_text(API_STUB.replace("KIND", "api-commit"))
++    (tmp_path / "tasks").symlink_to(TASKS)
++    tpl = tmp_path / "templates"
++    tpl.mkdir()
++    (tpl / "initial.j2").write_text("set deviceconfig system hostname pa-fw\nset zone \"inside\" network layer3 ethernet1/1\n")
++    (tpl / "services.j2").write_text("set deviceconfig system service disable-snmp no\n")
++    (tpl / "policy.j2").write_text('set rulebase security rules "ALLOW" action allow\n')
++    (tpl / "empty.j2").write_text("\n")
++
++    initial_tasks = yaml.safe_load((TASKS / "panos" / "initial.yml").read_text())
++    initial_play = yaml.safe_load((ANSIBLE / "initial-config.ansible").read_text())
++    decide = named(initial_play[0]["tasks"], "Decide whether PAN-OS commits once")
++    final_play = named(initial_play, "Commit staged PAN-OS configuration")
++
++    def lane(template, action):
++        return {
++            "name": f"deploy {action}",
++            "include_tasks": "tasks/deploy-config/panos.yml",
++            "args": {"apply": {"vars": {"config_template": str(tpl / template), "netsim_action": action}}},
++        }
++
++    play1 = {
++        "name": "pa-fw lanes in the order netlab runs them",
++        "hosts": "pa_fw",
++        "gather_facts": False,
++        "vars": {"config_template": str(tpl / "initial.j2")},
++        "tasks": [
++            decide,
++            named(initial_tasks, "Render the PAN-OS initial configuration"),
++            named(initial_tasks, "Apply and commit the PAN-OS initial configuration"),
++            named(initial_tasks, "initial configuration is staged"),
++            {"name": "routing lane", "include_tasks": "tasks/panos/routing.yml"},
++            lane("services.j2", "services"),
++            lane("policy.j2", "firewall.policy"),
++            lane("empty.j2", "firewall.zonebased"),
++        ],
++    }
++    final = dict(final_play)
++    final["hosts"] = "pa_fw"
++    (tmp_path / "play.yml").write_text(yaml.safe_dump([play1, final]))
++    (tmp_path / "hosts").write_text("[pa_fw]\npa-fw ansible_connection=local\n")
++    (tmp_path / "group_vars").mkdir()
++    # inventory variables, as netlab's group_vars/host_vars provide them: visible to EVERY play of the playbook
++    (tmp_path / "group_vars" / "pa_fw.yml").write_text(yaml.safe_dump({
++        "ansible_host": "127.0.0.1", "panos_kne_ssh_port": 22, "ansible_user": "admin", "ansible_password": "x",
++        "netlab_device_type": "panos", "panos_provider": {"ip_address": "127.0.0.1"},
++        "panos_virtual_router": "default",
++        "routing": {"static": [{"ipv4": "10.10.101.0/24", "nexthop": {"ipv4": "10.252.2.1", "intf": "ethernet1/1"}}]},
++    }))
++    return tmp_path
++
++
++def run(tmp_path, single_commit, fail_commit=False):
++    import shutil
++    if shutil.which("ansible-playbook") is None:
++        pytest.skip("ansible-playbook is not installed: the single-commit command sequence was NOT exercised here")
++    work = build_workdir(tmp_path)
++    record = work / "record.jsonl"
++    env = dict(os.environ)
++    env.update(
++        RECORD=str(record),
++        ANSIBLE_LIBRARY=str(work / "library"),
++        ANSIBLE_COLLECTIONS_PATH=str(work / "collections"),
++        ANSIBLE_HOME=str(work / "ansible_home"),
++        ANSIBLE_LOCAL_TEMP=str(work / "tmp"),
++        ANSIBLE_NOCOLOR="1",
++    )
++    env.pop("SKYFORGE_PANOS_SINGLE_COMMIT", None)
++    env.pop("STUB_FAIL_COMMIT", None)
++    if single_commit is not None:
++        env["SKYFORGE_PANOS_SINGLE_COMMIT"] = single_commit
++    if fail_commit:
++        env["STUB_FAIL_COMMIT"] = "1"
++    proc = subprocess.run(
++        [sys.executable, "-m", "ansible", "playbook", "-i", str(work / "hosts"), str(work / "play.yml")]
++        if False else ["ansible-playbook", "-i", str(work / "hosts"), str(work / "play.yml")],
++        cwd=work, env=env, capture_output=True, text=True, timeout=300, stdin=subprocess.DEVNULL,
++    )
++    records = [json.loads(l) for l in record.read_text().splitlines()] if record.exists() else []
++    return proc, records
++
++
++def commits(records):
++    """Every commit the device would see: a CLI call with commit=true, or the API commit."""
++    return [r for r in records if (r["kind"] == "cli" and r["commit"]) or r["kind"] == "api-commit"]
++
++
++def test_default_is_four_commits_in_todays_order(tmp_path):
++    proc, rec = run(tmp_path, None)
++    assert proc.returncode == 0, proc.stdout + proc.stderr
++    assert [r["kind"] for r in rec] == ["cli", "api-route", "api-commit", "cli", "cli"], rec
++    assert [r["commit"] for r in rec if r["kind"] == "cli"] == [True, True, True]
++    assert len(commits(rec)) == 4, "initial, routes, services, policy: the empty zonebased render sends nothing"
++    assert not any(r.get("commit_only") for r in rec)
++
++
++@pytest.mark.parametrize("value", ["false", "0", "", "off", "garbage"])
++def test_anything_but_an_explicit_on_keeps_per_lane_commits(tmp_path, value):
++    proc, rec = run(tmp_path, value)
++    assert proc.returncode == 0, proc.stdout + proc.stderr
++    assert len(commits(rec)) == 4 and not any(r.get("commit_only") for r in rec)
++
++
++@pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on"])
++def test_switch_on_means_exactly_one_commit_and_it_is_last(tmp_path, value):
++    proc, rec = run(tmp_path, value)
++    assert proc.returncode == 0, proc.stdout + proc.stderr
++    assert [r["kind"] for r in rec] == ["cli", "api-route", "cli", "cli", "cli"], rec
++    assert len(commits(rec)) == 1, rec
++    assert rec[-1]["commit_only"] is True and rec[-1]["commit"] is True and rec[-1]["n"] == 0
++    # every lane staged its lines first, none committed
++    assert all(r["commit"] is False for r in rec[:-1] if r["kind"] == "cli")
++    assert [r["first"] for r in rec if r["kind"] == "cli"][:3] == [
++        "set deviceconfig system hostname pa-fw",
++        "set deviceconfig system service disable-snmp no",
++        'set rulebase security rules "ALLOW" action allow',
++    ]
++
++
++def test_the_single_commit_names_every_staged_lane_and_a_failure_names_them_too(tmp_path):
++    proc, rec = run(tmp_path, "true", fail_commit=True)
++    assert proc.returncode != 0
++    out = proc.stdout + proc.stderr
++    assert "The single PAN-OS commit on pa-fw failed" in out
++    for lane in ("initial", "routing", "services", "firewall.policy"):
++        assert lane in out.split("It covered the lanes")[1].split(";")[0], lane
++    assert "firewall.zonebased" not in out.split("It covered the lanes")[1].split(";")[0], "an empty render stages nothing"
++    assert "SKYFORGE_PANOS_SINGLE_COMMIT" in out, "the failure says how to get per-lane commits back"
++    assert len(commits(rec)) == 1
++
++
++def test_a_run_that_staged_nothing_commits_nothing(tmp_path):
++    import shutil
++    if shutil.which("ansible-playbook") is None:
++        pytest.skip("ansible-playbook is not installed: the single-commit command sequence was NOT exercised here")
++    work = build_workdir(tmp_path)
++    play = yaml.safe_load((work / "play.yml").read_text())
++    play[0]["tasks"] = [t for t in play[0]["tasks"] if t["name"].startswith("Decide")]
++    (work / "play.yml").write_text(yaml.safe_dump(play))
++    env = dict(os.environ, RECORD=str(work / "r.jsonl"), ANSIBLE_LIBRARY=str(work / "library"),
++               ANSIBLE_HOME=str(work / "h"), ANSIBLE_LOCAL_TEMP=str(work / "t"), SKYFORGE_PANOS_SINGLE_COMMIT="true")
++    proc = subprocess.run(["ansible-playbook", "-i", str(work / "hosts"), str(work / "play.yml")], cwd=work, env=env,
++                          capture_output=True, text=True, timeout=300, stdin=subprocess.DEVNULL)
++    assert proc.returncode == 0, proc.stdout + proc.stderr
++    assert not (work / "r.jsonl").exists(), "no staged lane, no commit"
++
++
++def test_the_flag_is_decided_only_in_the_playbook_that_owns_the_final_commit():
++    """netlab config / reload playbooks reach the same PAN-OS lanes. They must never see the flag, or they would
++    stage configuration nothing commits."""
++    for playbook in sorted(ANSIBLE.glob("*.ansible")):
++        text = playbook.read_text()
++        if playbook.name == "initial-config.ansible":
++            assert "panos_commit_deferred" in text and "tasks/panos/commit-pending.yml" in text
++        else:
++            assert "panos_commit_deferred" not in text, playbook.name
++    for lane in (TASKS / "panos" / "initial.yml", TASKS / "panos" / "routing.yml", TASKS / "deploy-config" / "panos.yml"):
++        assert "panos_commit_deferred | default(false)" in lane.read_text(), f"{lane.name}: undefined must mean per-lane commit"
++
++
++def _module():
++    import importlib.util
++    spec = importlib.util.spec_from_file_location("panos_cli_config_kne_under_test", ANSIBLE / "library" / "panos_cli_config_kne.py")
++    mod = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(mod)
++    return mod
++
++
++def test_session_queue_for_a_lane_is_unchanged_and_commit_only_sends_just_the_commit():
++    cli = _module()
++    # today's lane session: lines, commit, leave configure mode, leave
++    assert cli.build_queue(["set a b", "set c d"], op_mode=False, do_commit=True) == [
++        "set cli scripting-mode on", "set cli pager off", "configure", "set a b", "set c d", "commit", "exit", "exit"]
++    # a staged lane: the same session without the commit
++    assert cli.build_queue(["set a b"], op_mode=False, do_commit=False) == [
++        "set cli scripting-mode on", "set cli pager off", "configure", "set a b", "exit", "exit"]
++    # the single commit: no set lines, just the commit
++    assert cli.build_queue([], op_mode=False, do_commit=True) == [
++        "set cli scripting-mode on", "set cli pager off", "configure", "commit", "exit", "exit"]
++    # op mode (the autocommit gate) is untouched
++    assert cli.build_queue(["show jobs all"], op_mode=True, do_commit=False) == [
++        "set cli scripting-mode on", "set cli pager off", "show jobs all", "exit"]
+-- 
+2.56.0
+

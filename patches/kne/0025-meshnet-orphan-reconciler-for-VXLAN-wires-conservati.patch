@@ -1,0 +1,497 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 14:13:34 -0500
+Subject: [PATCH 25/35] meshnet: orphan reconciler for VXLAN wires,
+ conservative, two passes (M0015, ported)
+
+---
+diff --git a/third_party/meshnet/daemon/main.go b/third_party/meshnet/daemon/main.go
+index d60cb58..28b7f1f 100644
+--- a/third_party/meshnet/daemon/main.go
++++ b/third_party/meshnet/daemon/main.go
+@@ -6,7 +6,9 @@ import (
+ 	"os"
+ 	"os/signal"
+ 	"strconv"
++	"strings"
+ 	"syscall"
++	"time"
+ 
+ 	"github.com/openconfig/kne/third_party/meshnet/daemon/cni"
+ 	"github.com/openconfig/kne/third_party/meshnet/daemon/grpcwire"
+@@ -66,8 +68,35 @@ func main() {
+ 	// cni.WatchMultusWrap): meshnetd can start before multus does at node boot.
+ 	go cni.WatchMultusWrap(ctx)
+ 
++	// Orphan reconciler (M0015): remove VXLAN wires no live topology declares.
++	orphanInterval, orphanNeed := orphanKnobs()
++	go m.RunOrphanReconciler(ctx, orphanInterval, orphanNeed)
++
+ 	if err := m.Serve(); err != nil {
+ 		log.Errorf("daemon exited badly: %v", err)
+ 		os.Exit(1)
+ 	}
+ }
++
++// orphanKnobs reads the orphan reconciler's interval and confirmation count.
++// Defaults: 5 minutes and 2 passes. Invalid values are logged and the default
++// is used, so a typo cannot disable the reconciler silently.
++func orphanKnobs() (time.Duration, int) {
++	interval := 5 * time.Minute
++	if raw := strings.TrimSpace(os.Getenv("MESHNET_RECONCILE_INTERVAL")); raw != "" {
++		if d, err := time.ParseDuration(raw); err == nil && d >= time.Second {
++			interval = d
++		} else {
++			log.Warnf("ignoring MESHNET_RECONCILE_INTERVAL=%q (want a duration >= 1s): using 5m", raw)
++		}
++	}
++	need := 2
++	if raw := strings.TrimSpace(os.Getenv("MESHNET_RECONCILE_CONFIRMATIONS")); raw != "" {
++		if n, err := strconv.Atoi(raw); err == nil && n >= 1 {
++			need = n
++		} else {
++			log.Warnf("ignoring MESHNET_RECONCILE_CONFIRMATIONS=%q (want an integer >= 1): using 2", raw)
++		}
++	}
++	return interval, need
++}
+diff --git a/third_party/meshnet/daemon/meshnet/orphan.go b/third_party/meshnet/daemon/meshnet/orphan.go
+new file mode 100644
+index 0000000..4eec676
+--- /dev/null
++++ b/third_party/meshnet/daemon/meshnet/orphan.go
+@@ -0,0 +1,247 @@
++package meshnet
++
++import (
++	"context"
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++	"time"
++
++	"github.com/containernetworking/plugins/pkg/ns"
++	log "github.com/sirupsen/logrus"
++	"github.com/vishvananda/netlink"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++
++	topologyv1 "github.com/openconfig/kne/third_party/meshnet/api/types/v1beta1"
++	"github.com/openconfig/kne/third_party/meshnet/daemon/vxlan"
++)
++
++// Orphan reconciler (KNE rebase R-M0015, ported to VXLAN wires).
++//
++// Every cross-node wire is created by a CNI ADD and removed by a CNI DEL. A
++// pod that survives while its topology is deleted (or re-declared without the
++// link) gets no event, so its wire stays. Production found this on demo-lab
++// (2026-09-05): a surviving pod kept stale wire state and nothing looked at it
++// again. This pass looks at the wires.
++//
++// The rule that shapes it: doing nothing is the default. A wire is removed only
++// when all of the following hold:
++//  1. It carries our owner alias (wires built before the alias existed never
++//     qualify, so the reconciler cannot touch them).
++//  2. Its netns can be entered. A dead sandbox's netns cannot, and that case
++//     belongs to CNI DEL, not to this pass.
++//  3. The judgement is orphan: no topology in the wire's namespace owns that
++//     netns, or the topology that owns it no longer declares the interface.
++//     A wire that a live topology declares is never an orphan, even when it is
++//     broken. Repair is a different job.
++//  4. The same orphan verdict holds on N consecutive passes with the same wire
++//     identity (link name, index, netns, alias). A pod recreated in between
++//     changes its identity and starts the count over.
++//
++// Deletion touches only the one VXLAN link. Non-meshnet links are never listed.
++
++const (
++	defaultOrphanInterval      = 5 * time.Minute
++	defaultOrphanConfirmations = 2
++	netnsRoot                  = "/var/run/netns"
++)
++
++type orphanVerdict int
++
++const (
++	verdictKeep orphanVerdict = iota
++	verdictOrphan
++	verdictUnknown
++)
++
++func (v orphanVerdict) String() string {
++	switch v {
++	case verdictKeep:
++		return "keep"
++	case verdictOrphan:
++		return "orphan"
++	default:
++		return "unknown"
++	}
++}
++
++// ownedWire is one meshnet VXLAN found in a pod netns.
++type ownedWire struct {
++	kubeNs, netNs, intf string
++	linkName            string
++	index               int
++	alias               string
++}
++
++// judgeOwnedWire is the read-only decision. It is pure so the rule can be
++// tested without a cluster. enterable is whether the netns could be opened.
++// topos are the topologies in the wire's namespace; listErr is a failed list.
++func judgeOwnedWire(w ownedWire, enterable bool, topos []topologyv1.Topology, listErr error) (orphanVerdict, string) {
++	if !enterable {
++		return verdictUnknown, "netns cannot be entered; a dead sandbox is CNI DEL's job"
++	}
++	if listErr != nil {
++		return verdictUnknown, fmt.Sprintf("topology list failed: %v", listErr)
++	}
++	var owner *topologyv1.Topology
++	for i := range topos {
++		if topos[i].Status.NetNS == w.netNs {
++			owner = &topos[i]
++			break
++		}
++	}
++	if owner == nil {
++		return verdictOrphan, fmt.Sprintf("no topology in %s owns netns %s", w.kubeNs, w.netNs)
++	}
++	for _, l := range owner.Spec.Links {
++		if l.LocalIntf == w.intf {
++			return verdictKeep, ""
++		}
++	}
++	return verdictOrphan, fmt.Sprintf("topology %s/%s no longer declares %s", w.kubeNs, owner.Name, w.intf)
++}
++
++// orphanTracker counts consecutive orphan verdicts per wire identity.
++type orphanTracker struct {
++	need int
++	seen map[string]int
++}
++
++func newOrphanTracker(need int) *orphanTracker {
++	if need < 1 {
++		need = 1
++	}
++	return &orphanTracker{need: need, seen: map[string]int{}}
++}
++
++// observe records one pass's verdict for key. It returns true only when the
++// orphan verdict has held for need passes in a row. Any other verdict resets.
++func (o *orphanTracker) observe(key string, v orphanVerdict) bool {
++	if v != verdictOrphan {
++		delete(o.seen, key)
++		return false
++	}
++	o.seen[key]++
++	if o.seen[key] >= o.need {
++		delete(o.seen, key)
++		return true
++	}
++	return false
++}
++
++// listOwnedWires returns every meshnet VXLAN found in the named netns.
++func listOwnedWires(netnsPath string) ([]ownedWire, error) {
++	netNS, err := ns.GetNS(netnsPath)
++	if err != nil {
++		return nil, err
++	}
++	defer netNS.Close()
++	var out []ownedWire
++	err = netNS.Do(func(_ ns.NetNS) error {
++		links, err := netlink.LinkList()
++		if err != nil {
++			return err
++		}
++		for _, l := range links {
++			vx, ok := l.(*netlink.Vxlan)
++			if !ok || !strings.HasPrefix(vx.Attrs().Alias, vxlan.OwnerAliasPrefix) {
++				continue
++			}
++			kubeNs, aliasNetNs, intf, ok := vxlan.ParseOwnerAlias(vx.Attrs().Alias)
++			if !ok {
++				continue
++			}
++			out = append(out, ownedWire{kubeNs: kubeNs, netNs: aliasNetNs, intf: intf,
++				linkName: vx.Attrs().Name, index: vx.Attrs().Index, alias: vx.Attrs().Alias})
++		}
++		return nil
++	})
++	return out, err
++}
++
++// orphanPass runs one reconcile pass over every netns on the node. It returns
++// the wires it removed, as "netns:link" strings.
++func (m *Meshnet) orphanPass(ctx context.Context, tr *orphanTracker, root string) []string {
++	entries, err := os.ReadDir(root)
++	if err != nil {
++		mnetdLogger.Warnf("orphan pass: cannot read %s: %v", root, err)
++		return nil
++	}
++	topoCache := map[string][]topologyv1.Topology{}
++	topoErr := map[string]error{}
++	var removed []string
++	for _, e := range entries {
++		path := filepath.Join(root, e.Name())
++		wires, err := listOwnedWires(path)
++		if err != nil || len(wires) == 0 {
++			continue
++		}
++		for _, w := range wires {
++			if _, ok := topoCache[w.kubeNs]; !ok {
++				if m.tClient == nil {
++					topoErr[w.kubeNs] = fmt.Errorf("topology client not initialized")
++				} else if list, err := m.tClient.Topology(w.kubeNs).List(ctx, metav1.ListOptions{}); err != nil {
++					topoErr[w.kubeNs] = err
++				} else {
++					topoCache[w.kubeNs] = list.Items
++				}
++			}
++			// w.netNs (the alias) is what the owning topology's status must match;
++			// path is where the wire lives and is the netns we enter to delete.
++			v, reason := judgeOwnedWire(w, true, topoCache[w.kubeNs], topoErr[w.kubeNs])
++			key := fmt.Sprintf("%s|%s|%d|%s", path, w.linkName, w.index, w.alias)
++			if !tr.observe(key, v) {
++				if v != verdictKeep {
++					mnetdLogger.Debugf("orphan pass: %s %s: %s (%s), not yet confirmed", path, w.linkName, v, reason)
++				}
++				continue
++			}
++			if err := deleteOwnedWire(path, w.linkName); err != nil {
++				mnetdLogger.Warnf("orphan pass: remove %s in %s: %v", w.linkName, path, err)
++				continue
++			}
++			mnetdLogger.Warnf("orphan pass: removed orphan wire %s in %s (%s)", w.linkName, path, reason)
++			removed = append(removed, path+":"+w.linkName)
++		}
++	}
++	return removed
++}
++
++// deleteOwnedWire removes one link, by name, inside netnsPath.
++func deleteOwnedWire(netnsPath, linkName string) error {
++	netNS, err := ns.GetNS(netnsPath)
++	if err != nil {
++		return err
++	}
++	defer netNS.Close()
++	return netNS.Do(func(_ ns.NetNS) error {
++		link, err := netlink.LinkByName(linkName)
++		if err != nil {
++			return err
++		}
++		return netlink.LinkDel(link)
++	})
++}
++
++// RunOrphanReconciler runs orphanPass every interval until ctx is done. The
++// first pass runs after one interval, so a node that has just started does
++// not judge wires that its own CNI ADDs are still building.
++func (m *Meshnet) RunOrphanReconciler(ctx context.Context, interval time.Duration, need int) {
++	if interval <= 0 {
++		interval = defaultOrphanInterval
++	}
++	tr := newOrphanTracker(need)
++	ticker := time.NewTicker(interval)
++	defer ticker.Stop()
++	for {
++		select {
++		case <-ctx.Done():
++			return
++		case <-ticker.C:
++			if removed := m.orphanPass(ctx, tr, netnsRoot); len(removed) > 0 {
++				log.Infof("orphan reconciler removed %d wire(s): %v", len(removed), removed)
++			}
++		}
++	}
++}
+diff --git a/third_party/meshnet/daemon/meshnet/orphan_test.go b/third_party/meshnet/daemon/meshnet/orphan_test.go
+new file mode 100644
+index 0000000..80ce05a
+--- /dev/null
++++ b/third_party/meshnet/daemon/meshnet/orphan_test.go
+@@ -0,0 +1,71 @@
++package meshnet
++
++import (
++	"errors"
++	"testing"
++
++	topologyv1 "github.com/openconfig/kne/third_party/meshnet/api/types/v1beta1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++)
++
++// The rule (orphan.go): a wire is an orphan only when a live topology in its
++// namespace is the owner of the netns and no longer declares the interface, or
++// when no topology owns the netns at all. A declared wire is never an orphan.
++func TestJudgeOwnedWire(t *testing.T) {
++	const netns = "/var/run/netns/cni-A"
++	w := ownedWire{kubeNs: "lab", netNs: netns, intf: "eth1", linkName: "eth1", alias: "meshnet|lab|" + netns + "|eth1"}
++	owner := topologyv1.Topology{
++		ObjectMeta: metav1.ObjectMeta{Name: "p1", Namespace: "lab"},
++		Spec:       topologyv1.TopologySpec{Links: []topologyv1.Link{{LocalIntf: "eth1", UID: 1, PeerPod: "p2"}}},
++		Status:     topologyv1.TopologyStatus{NetNS: netns},
++	}
++	ownerNoLink := owner
++	ownerNoLink.Spec = topologyv1.TopologySpec{}
++	otherNetns := topologyv1.Topology{ObjectMeta: metav1.ObjectMeta{Name: "p9"}, Spec: owner.Spec, Status: topologyv1.TopologyStatus{NetNS: "/var/run/netns/cni-B"}}
++
++	cases := []struct {
++		name      string
++		enterable bool
++		topos     []topologyv1.Topology
++		listErr   error
++		want      orphanVerdict
++	}{
++		{name: "declared by the owning topology is kept", enterable: true, topos: []topologyv1.Topology{owner}, want: verdictKeep},
++		{name: "owner no longer declares the interface is an orphan", enterable: true, topos: []topologyv1.Topology{ownerNoLink}, want: verdictOrphan},
++		{name: "no topology owns the netns is an orphan", enterable: true, topos: []topologyv1.Topology{otherNetns}, want: verdictOrphan},
++		{name: "topology deleted (empty list) is an orphan", enterable: true, want: verdictOrphan},
++		{name: "netns cannot be entered is unknown, never removed", enterable: false, topos: nil, want: verdictUnknown},
++		{name: "list failure is unknown, never removed", enterable: true, listErr: errors.New("apiserver down"), want: verdictUnknown},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			got, reason := judgeOwnedWire(w, tc.enterable, tc.topos, tc.listErr)
++			if got != tc.want {
++				t.Fatalf("verdict = %v (%s), want %v", got, reason, tc.want)
++			}
++		})
++	}
++}
++
++// Corroboration: an orphan is removed only after N passes in a row. Any other
++// verdict in between resets the count.
++func TestOrphanTrackerNeedsConsecutivePasses(t *testing.T) {
++	tr := newOrphanTracker(2)
++	if tr.observe("w", verdictOrphan) {
++		t.Fatal("removed on the first orphan pass")
++	}
++	if !tr.observe("w", verdictOrphan) {
++		t.Fatal("not removed after two consecutive orphan passes")
++	}
++	tr = newOrphanTracker(2)
++	tr.observe("w", verdictOrphan)
++	tr.observe("w", verdictKeep)
++	if tr.observe("w", verdictOrphan) {
++		t.Fatal("a keep in between did not reset the count")
++	}
++	tr = newOrphanTracker(2)
++	tr.observe("w", verdictOrphan)
++	if tr.observe("w", verdictUnknown) {
++		t.Fatal("an unknown verdict counted toward removal")
++	}
++}
+diff --git a/third_party/meshnet/daemon/vxlan/owner.go b/third_party/meshnet/daemon/vxlan/owner.go
+new file mode 100644
+index 0000000..c4c0e49
+--- /dev/null
++++ b/third_party/meshnet/daemon/vxlan/owner.go
+@@ -0,0 +1,43 @@
++package vxlan
++
++import "fmt"
++
++// OwnerAliasPrefix marks a link meshnet created. The alias is the only owner
++// record a wire has, so the orphan reconciler never judges a link without it.
++const OwnerAliasPrefix = "meshnet|"
++
++// wireOwnerAlias is "meshnet|<kubeNs>|<netNs>|<intf>". It fits IFALIAS (256).
++func wireOwnerAlias(kubeNs, netNs, intf string) string {
++	return fmt.Sprintf("%s%s|%s|%s", OwnerAliasPrefix, kubeNs, netNs, intf)
++}
++
++// ParseOwnerAlias reverses wireOwnerAlias. ok is false for any other alias.
++func ParseOwnerAlias(alias string) (kubeNs, netNs, intf string, ok bool) {
++	if len(alias) <= len(OwnerAliasPrefix) || alias[:len(OwnerAliasPrefix)] != OwnerAliasPrefix {
++		return "", "", "", false
++	}
++	var parts [3]string
++	rest := alias[len(OwnerAliasPrefix):]
++	for i := 0; i < 2; i++ {
++		j := indexByte(rest, '|')
++		if j < 0 {
++			return "", "", "", false
++		}
++		parts[i] = rest[:j]
++		rest = rest[j+1:]
++	}
++	parts[2] = rest
++	if parts[0] == "" || parts[1] == "" || parts[2] == "" {
++		return "", "", "", false
++	}
++	return parts[0], parts[1], parts[2], true
++}
++
++func indexByte(s string, c byte) int {
++	for i := 0; i < len(s); i++ {
++		if s[i] == c {
++			return i
++		}
++	}
++	return -1
++}
+diff --git a/third_party/meshnet/daemon/vxlan/owner_test.go b/third_party/meshnet/daemon/vxlan/owner_test.go
+new file mode 100644
+index 0000000..3d38eca
+--- /dev/null
++++ b/third_party/meshnet/daemon/vxlan/owner_test.go
+@@ -0,0 +1,21 @@
++package vxlan
++
++import "testing"
++
++func TestOwnerAliasRoundTrip(t *testing.T) {
++	a := wireOwnerAlias("lab-a", "/var/run/netns/cni-1", "eth1")
++	ns, netns, intf, ok := ParseOwnerAlias(a)
++	if !ok || ns != "lab-a" || netns != "/var/run/netns/cni-1" || intf != "eth1" {
++		t.Fatalf("round trip of %q = %q %q %q %v", a, ns, netns, intf, ok)
++	}
++}
++
++// Only a meshnet alias with all three parts parses. Anything else (an unrelated
++// alias, a truncated one) is not ours and is never judged.
++func TestParseOwnerAliasRejectsForeignAliases(t *testing.T) {
++	for _, bad := range []string{"", "koko|x|y|z", "meshnet|", "meshnet|lab|netns", "meshnet||/ns|eth1", "meshnet|lab|/ns|"} {
++		if _, _, _, ok := ParseOwnerAlias(bad); ok {
++			t.Fatalf("ParseOwnerAlias(%q) ok, want rejected", bad)
++		}
++	}
++}
+diff --git a/third_party/meshnet/daemon/vxlan/vxlan.go b/third_party/meshnet/daemon/vxlan/vxlan.go
+index 4d51b5e..399f1d8 100644
+--- a/third_party/meshnet/daemon/vxlan/vxlan.go
++++ b/third_party/meshnet/daemon/vxlan/vxlan.go
+@@ -24,6 +24,10 @@ type VxLan struct {
+ 	MTU      int // the fabric MTU this wire must carry (wireutil.FabricMTUEnv)
+ 	// Underlay is bound or unbound (underlay.go). The zero value is bound.
+ 	Underlay vxlanUnderlay
++	// Owner is the link's alias: "meshnet|<kubeNs>|<netNs>|<intf>". The orphan
++	// reconciler (daemon/meshnet/orphan.go) reads it. Wires built before this
++	// existed have no alias and are never judged an orphan.
++	Owner string
+ }
+ 
+ // InitLogger initializes the logrus logger for the VXLAN overlay daemon.
+@@ -67,6 +71,7 @@ func CreateOrUpdate(v *mpb.RemotePod) error {
+ 		MTU:      mtu,
+ 	}
+ 	vxlan.Underlay = resolveUnderlay(srcIntf, vxlan.IPAddr)
++	vxlan.Owner = wireOwnerAlias(v.KubeNs, v.NetNs, v.IntfName)
+ 	vxLanOvrlyLogger.Infof("Created vxlan struct %+v (underlay: unbound=%v %s)", vxlan, vxlan.Underlay.unbound, vxlan.Underlay.reason)
+ 
+ 	// KubeVirt may have renamed the wire (see kubevirt_slot.go). Find it where it is.
+@@ -147,6 +152,7 @@ func makeVxLan(nsName, linkName string, ipNet *net.IPNet, vxlan VxLan) error {
+ 			Name:   tempLinkName,
+ 			TxQLen: 1000,
+ 			MTU:    vxlan.MTU,
++			Alias:  vxlan.Owner,
+ 		},
+ 		VxlanId:  vxlan.ID,
+ 		Group:    vxlan.IPAddr,
+-- 
+2.56.0
+

@@ -1,0 +1,34 @@
+message: |
+  The devices under test are VLAN-to-VXLAN bridges between two access VLANs
+  and two VXLAN VNIs.
+
+  * h1 and h2 should be able to ping each other
+  * h3 and h4 should be able to ping each other
+  * h1 should not be able to reach h3
+
+  Please note it might take a while for the lab to work due to
+  STP learning phase
+
+# netlab 26.08: the platform no longer supplies an implicit default device —
+# every catalog blueprint must name one.
+defaults.device: eos
+
+groups:
+  hosts:
+    members: [ h1, h2, h3, h4 ]
+    device: linux
+  switches:
+    members: [ s1,s2 ]
+    module: [ vlan,vxlan,ospf ]
+
+vlans:
+  red:
+    mode: bridge
+    links: [ h1-s1, h2-s2 ]
+  blue:
+    mode: bridge
+    links: [ h3-s1, h4-s2 ]
+
+nodes: [ h1, h2, h3, h4, s1, s2 ]
+
+links: [ s1-s2 ]

@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 15:00:00 +0000
+Subject: [PATCH] linux initial script: start the image services (a KNE pod
+ never runs the image entrypoint)
+
+SKYFORGE-SPECIFIC: platform behaviour; not for upstream.
+
+---
+diff --git a/netsim/ansible/templates/initial/linux-kne.j2 b/netsim/ansible/templates/initial/linux-kne.j2
+index 3cf9856..7fdb9c8 100644
+--- a/netsim/ansible/templates/initial/linux-kne.j2
++++ b/netsim/ansible/templates/initial/linux-kne.j2
+@@ -240,3 +240,14 @@ chmod +x /tmp/netlab-host-activity.sh
+ pkill -f '/tmp/netlab-host-activity.sh' >/dev/null 2>&1 || true
+ nohup /tmp/netlab-host-activity.sh >/var/log/netlab-host-activity.log 2>&1 &
+ fi
++
++{#
++  SKYFORGE-SPECIFIC (patch 40): a KNE pod never runs the image entrypoint (KNE replaces the command with `sleep`), so the
++  services the skyforge-linux-host image offers (Caldera agent launcher, opt-in listeners, iperf3, LLDP) are started from here,
++  the only script that runs in a KNE lab. The helper is idempotent (a warm reconfigure re-runs this script) and fails open; an
++  image without it (any non-Skyforge linux image) is skipped. It reads its switches from the pod environment that patches 36
++  and 38 render, which `kubectl exec` inherits.
++#}
++if [ -x /usr/local/bin/skyforge-host-services.sh ]; then
++  nohup /usr/local/bin/skyforge-host-services.sh >/var/log/skyforge-host-services.log 2>&1 &
++fi
+diff --git a/tests/test_kne_provider.py b/tests/test_kne_provider.py
+index da3462c..e1bb281 100644
+--- a/tests/test_kne_provider.py
++++ b/tests/test_kne_provider.py
+@@ -1915,6 +1915,26 @@ def test_kne_linux_snmp_can_be_disabled_per_node(tmp_path: Path, monkeypatch: py
+   assert 'snmpd' not in text and 'rocommunity' not in text
+ 
+ 
++
++def test_kne_linux_initial_script_starts_the_image_services_idempotently(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  # a KNE pod never runs the image entrypoint, so the initial script is the only place the image services can start from
++  monkeypatch.chdir(tmp_path)
++  topo_file = write_topology(tmp_path,"""
++provider: kne
++
++nodes:
++  h1:
++    device: linux
++""")
++  init_log()
++  create.run(['-o','config','-o','provider',str(topo_file)])
++  text = Path('node_files/h1/initial').read_text()
++  assert 'if [ -x /usr/local/bin/skyforge-host-services.sh ]; then' in text
++  assert 'nohup /usr/local/bin/skyforge-host-services.sh' in text
++  # after sshd and the activity loop, and guarded so a foreign image is skipped
++  assert text.index('skyforge-host-services.sh') > text.index('netlab-host-activity.sh')
++
++
+ def test_kne_ioll2_uses_distinct_image_contract(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+   monkeypatch.chdir(tmp_path)
+   topo_file = write_topology(tmp_path,"""
+-- 
+2.56.0
+

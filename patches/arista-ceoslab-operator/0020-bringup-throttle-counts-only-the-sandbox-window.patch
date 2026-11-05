@@ -1,0 +1,365 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 07:32:58 -0500
+Subject: [PATCH] bringup throttle: count only pods in the sandbox window, so
+ labs larger than the ceiling converge
+
+SKYFORGE-SPECIFIC: platform behaviour; not for upstream.
+
+---
+diff --git a/controllers/ceoslabdevice_bringup_topology_test.go b/controllers/ceoslabdevice_bringup_topology_test.go
+new file mode 100644
+index 0000000..d5c9f8f
+--- /dev/null
++++ b/controllers/ceoslabdevice_bringup_topology_test.go
+@@ -0,0 +1,286 @@
++package controllers
++
++// SKYFORGE-SPECIFIC (scale ladder 2026-10-12): the bringup throttle must let a lab of ANY
++// size converge when cEOS pods wait in Init for their meshnet link peers.
++//
++// Live failure this guards: a 96-cEOS EVPN Clos (4 pods x [4 spines + 20 leaves]) with
++// SKYFORGE_MAX_CONCURRENT_BRINGUP=48 hung forever. A cEOS pod stays Pending in Init until
++// meshnet has wired every link, and a link is wired only once BOTH ends exist; spines wait
++// for all their leaves and leaves for all their spines. The throttle counted those
++// Init-waiting pods, so 48 admitted pods spread across Clos pods held every slot while
++// waiting on peers that were never admitted.
++//
++// The simulation drives the PRODUCTION admission path (reserveBringup -> pod create) tick by
++// tick against a fake API server, and models the pod lifecycle the throttle observes:
++//
++//	created            Pending, no container started   (CNI-ADD / sandbox window)
++//	next tick          Pending, init container Running (interface wait on link peers)
++//	all peers wired    Running                          (boot)
++//
++// A run converges when every device is Running; it deadlocks when a tick makes no progress.
++
++import (
++	"context"
++	"fmt"
++	"math/rand"
++	"testing"
++	"time"
++
++	ceoslabv1alpha1 "github.com/aristanetworks/arista-ceoslab-operator/v2/api/v1alpha1"
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/types"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++	"sigs.k8s.io/controller-runtime/pkg/client/fake"
++)
++
++type simTopology struct {
++	devices []string
++	peers   map[string][]string
++}
++
++// clos builds the scale-ladder fabric: pods of `spines` spines and `leaves` leaves, every
++// leaf linked to every spine of its pod, and spine i of every pod linked to spine i of the
++// next pod (the inter-pod tier), so the whole fabric is one dependency component.
++func clos(pods, spines, leaves int) simTopology {
++	t := simTopology{peers: map[string][]string{}}
++	link := func(a, b string) {
++		t.peers[a] = append(t.peers[a], b)
++		t.peers[b] = append(t.peers[b], a)
++	}
++	for p := 0; p < pods; p++ {
++		for s := 0; s < spines; s++ {
++			t.devices = append(t.devices, fmt.Sprintf("p%ds%d", p, s))
++		}
++		for l := 0; l < leaves; l++ {
++			leaf := fmt.Sprintf("p%dl%d", p, l)
++			t.devices = append(t.devices, leaf)
++			for s := 0; s < spines; s++ {
++				link(leaf, fmt.Sprintf("p%ds%d", p, s))
++			}
++		}
++		if p > 0 {
++			for s := 0; s < spines; s++ {
++				link(fmt.Sprintf("p%ds%d", p-1, s), fmt.Sprintf("p%ds%d", p, s))
++			}
++		}
++	}
++	return t
++}
++
++type simPhase int
++
++const (
++	simAbsent simPhase = iota
++	simSandbox
++	simInitWait
++	simRunning
++)
++
++// simulateBringup returns (ticks to converge, converged).
++func simulateBringup(t *testing.T, topo simTopology, order []string, maxTicks int) (int, bool) {
++	t.Helper()
++	scheme := runtime.NewScheme()
++	if err := corev1.AddToScheme(scheme); err != nil {
++		t.Fatal(err)
++	}
++	if err := ceoslabv1alpha1.AddToScheme(scheme); err != nil {
++		t.Fatal(err)
++	}
++	c := fake.NewClientBuilder().WithScheme(scheme).Build()
++	r := &CEosLabDeviceReconciler{Client: c, APIReader: c, Scheme: scheme}
++	bringupAdmissions = bringupAdmissionReservations{pods: map[types.NamespacedName]struct{}{}}
++	ctx := context.Background()
++	const ns = "scale"
++
++	phase := map[string]simPhase{}
++	setPod := func(name string, ph simPhase) {
++		pod := &corev1.Pod{}
++		key := types.NamespacedName{Namespace: ns, Name: name}
++		if err := c.Get(ctx, key, pod); err != nil {
++			t.Fatalf("get %s: %v", name, err)
++		}
++		switch ph {
++		case simInitWait:
++			pod.Status.Phase = corev1.PodPending
++			pod.Status.InitContainerStatuses = []corev1.ContainerStatus{{Name: "init-wait",
++				State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}}}
++		case simRunning:
++			pod.Status.Phase = corev1.PodRunning
++			pod.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: "ceos",
++				State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}}}
++		}
++		if err := c.Status().Update(ctx, pod); err != nil {
++			if err := c.Update(ctx, pod); err != nil {
++				t.Fatalf("update %s: %v", name, err)
++			}
++		}
++		phase[name] = ph
++	}
++
++	for tick := 1; tick <= maxTicks; tick++ {
++		progress := false
++		// 1. Lifecycle: last tick's creates have their sandbox; Init-waiting pods whose
++		//    every peer has a sandbox (so meshnet could wire every link) start booting.
++		for _, d := range topo.devices {
++			if phase[d] == simSandbox {
++				setPod(d, simInitWait)
++				progress = true
++			}
++		}
++		for _, d := range topo.devices {
++			if phase[d] != simInitWait {
++				continue
++			}
++			wired := true
++			for _, peer := range topo.peers[d] {
++				if phase[peer] < simInitWait {
++					wired = false
++					break
++				}
++			}
++			if wired {
++				setPod(d, simRunning)
++				progress = true
++			}
++		}
++		// 2. Admission: one reconcile per not-yet-created device, in the given order.
++		for _, d := range order {
++			if phase[d] != simAbsent {
++				continue
++			}
++			device := &ceoslabv1alpha1.CEosLabDevice{ObjectMeta: metav1.ObjectMeta{Name: d, Namespace: ns}}
++			reserved, throttled, _, err := r.reserveBringup(ctx, device)
++			if err != nil {
++				t.Fatalf("reserveBringup(%s): %v", d, err)
++			}
++			if throttled || !reserved {
++				continue
++			}
++			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: d, Namespace: ns,
++				CreationTimestamp: metav1.NewTime(time.Now()),
++				OwnerReferences:   []metav1.OwnerReference{{Kind: ceosLabDeviceKind, Name: d}}},
++				Status: corev1.PodStatus{Phase: corev1.PodPending}}
++			if err := c.Create(ctx, pod); err != nil {
++				t.Fatalf("create %s: %v", d, err)
++			}
++			phase[d] = simSandbox
++			progress = true
++		}
++		running := 0
++		for _, d := range topo.devices {
++			if phase[d] == simRunning {
++				running++
++			}
++		}
++		if running == len(topo.devices) {
++			return tick, true
++		}
++		if !progress {
++			counts := map[simPhase]int{}
++			for _, d := range topo.devices {
++				counts[phase[d]]++
++			}
++			t.Logf("deadlock at tick %d: absent=%d sandbox=%d init-wait=%d running=%d",
++				tick, counts[simAbsent], counts[simSandbox], counts[simInitWait], counts[simRunning])
++			return tick, false
++		}
++	}
++	return maxTicks, false
++}
++
++// adversarialOrder admits leaves round-robin across Clos pods before any spine: the order
++// that filled every slot with peer-blocked pods on the live 96-cEOS rung.
++func adversarialOrder(topo simTopology) []string {
++	var spines []string
++	byPod := map[int][]string{}
++	pods := 0
++	for _, d := range topo.devices {
++		var p, i int
++		if _, err := fmt.Sscanf(d, "p%ds%d", &p, &i); err == nil {
++			spines = append(spines, d)
++			continue
++		}
++		if _, err := fmt.Sscanf(d, "p%dl%d", &p, &i); err == nil {
++			byPod[p] = append(byPod[p], d)
++			if p+1 > pods {
++				pods = p + 1
++			}
++		}
++	}
++	var leaves []string
++	for i := 0; ; i++ {
++		added := false
++		for p := 0; p < pods; p++ {
++			if i < len(byPod[p]) {
++				leaves = append(leaves, byPod[p][i])
++				added = true
++			}
++		}
++		if !added {
++			break
++		}
++	}
++	if len(leaves)+len(spines) != len(topo.devices) {
++		panic("adversarialOrder lost devices")
++	}
++	return append(leaves, spines...)
++}
++
++func TestBringupConvergesForLabsLargerThanTheCeiling(t *testing.T) {
++	t.Setenv("SKYFORGE_MAX_CONCURRENT_BRINGUP", "48")
++	cases := []struct {
++		name string
++		topo simTopology
++	}{
++		{"96 cEOS (the live 2026-10-12 rung)", clos(4, 4, 20)},
++		{"504 cEOS (the 500 rung)", clos(21, 4, 20)},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name+"/adversarial order", func(t *testing.T) {
++			ticks, ok := simulateBringup(t, tc.topo, adversarialOrder(tc.topo), 200)
++			if !ok {
++				t.Fatalf("%d devices did not converge (deadlock) with ceiling 48", len(tc.topo.devices))
++			}
++			t.Logf("%d devices converged in %d ticks", len(tc.topo.devices), ticks)
++		})
++		seeds := int64(3)
++		if len(tc.topo.devices) > 200 {
++			seeds = 1 // the fake API server lists every pod per reconcile; one random order is enough here
++		}
++		for seed := int64(1); seed <= seeds; seed++ {
++			t.Run(fmt.Sprintf("%s/random order seed %d", tc.name, seed), func(t *testing.T) {
++				order := append([]string(nil), tc.topo.devices...)
++				rand.New(rand.NewSource(seed)).Shuffle(len(order), func(i, j int) { order[i], order[j] = order[j], order[i] })
++				if _, ok := simulateBringup(t, tc.topo, order, 200); !ok {
++					t.Fatalf("%d devices did not converge (deadlock) with ceiling 48", len(tc.topo.devices))
++				}
++			})
++		}
++	}
++}
++
++// The sandbox-window ceiling still paces CNI work: no tick ever has more than the ceiling
++// of pods freshly created (in the sandbox window) at once.
++func TestBringupStillPacesTheSandboxWindow(t *testing.T) {
++	t.Setenv("SKYFORGE_MAX_CONCURRENT_BRINGUP", "48")
++	scheme := runtime.NewScheme()
++	_ = corev1.AddToScheme(scheme)
++	_ = ceoslabv1alpha1.AddToScheme(scheme)
++	var objs []client.Object
++	for i := 0; i < 48; i++ {
++		objs = append(objs, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("c%d", i), Namespace: "scale",
++			CreationTimestamp: metav1.NewTime(time.Now()),
++			OwnerReferences:   []metav1.OwnerReference{{Kind: ceosLabDeviceKind, Name: fmt.Sprintf("c%d", i)}}},
++			Status: corev1.PodStatus{Phase: corev1.PodPending}})
++	}
++	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
++	r := &CEosLabDeviceReconciler{Client: c, APIReader: c, Scheme: scheme}
++	bringupAdmissions = bringupAdmissionReservations{pods: map[types.NamespacedName]struct{}{}}
++	th, reason, err := r.bringupThrottled(context.Background(),
++		&ceoslabv1alpha1.CEosLabDevice{ObjectMeta: metav1.ObjectMeta{Name: "next", Namespace: "scale"}})
++	if err != nil || !th {
++		t.Fatalf("48 pods in the sandbox window must throttle the 49th (throttled=%v reason=%q err=%v)", th, reason, err)
++	}
++}
+diff --git a/controllers/ceoslabdevice_controller.go b/controllers/ceoslabdevice_controller.go
+index 432e306..8ab12e5 100644
+--- a/controllers/ceoslabdevice_controller.go
++++ b/controllers/ceoslabdevice_controller.go
+@@ -146,7 +146,7 @@ const (
+ 	// when the node is visibly backing up on sandbox creation — so a deploy of any size
+ 	// succeeds AND small/medium deploys aren't throttled.
+ 	defaultMaxConcurrentBringup = 16               // high ceiling / catastrophe backstop; tunable via SKYFORGE_MAX_CONCURRENT_BRINGUP
+-	maxSafeConcurrentBringup    = 48               // burst-validated safety boundary; configuration may lower but never exceed it
++	maxSafeConcurrentBringup    = 48               // burst-validated safety boundary on pods IN THE SANDBOX WINDOW (not on lab size); configuration may lower but never exceed it
+ 	bringupSandboxDeadline      = 45 * time.Second // a cEOS pod Pending this long with no sandbox/init started => CNI is backing up
+ 	bringupRequeueAfter         = 10 * time.Second // how soon to retry a deferred device
+ 
+@@ -892,6 +892,23 @@ func podSandboxStarted(p *corev1.Pod) bool {
+ 	return false
+ }
+ 
++// inBringupSandboxWindow reports whether a pod the operator owns still occupies a bringup
++// slot: it is Pending AND no container has started, i.e. it is still in the CNI-ADD /
++// sandbox-creation window this throttle exists to pace (task#40/#47).
++//
++// SKYFORGE-SPECIFIC (scale ladder 2026-10-12): a Pending pod whose sandbox HAS started is
++// NOT in that window. A cEOS pod sits Pending in Init (the interface wait) until meshnet has
++// wired every link, and a link is only wired once BOTH ends exist. Counting those pods made
++// the throttle a deadlock for any lab larger than the ceiling: in a Clos, a spine waits for
++// all its leaves and a leaf for all its spines, so 48 admitted pods spread across pods held
++// all 48 slots while waiting on peers the throttle would never admit (96-cEOS rung: 48 stuck
++// in Init:0/3, 38 never created, 3,326 deferrals in 16 min). Init-waiting is cheap (no CNI
++// work, no boot); it must not hold a slot. The CPU-heavy boot phase starts only when a
++// pod's last peer exists, so admission pacing cannot bound it anyway.
++func inBringupSandboxWindow(p *corev1.Pod) bool {
++	return p.Status.Phase == corev1.PodPending && !podSandboxStarted(p)
++}
++
+ // ownedByCEosLabDevice reports whether a pod was created by this operator — it carries a
+ // controller OwnerReference to a CEosLabDevice. The bringup throttle counts ONLY these
+ // pods: they are the cEOS devices the operator paces. The linux host pods KNE/meshnet
+@@ -946,11 +963,11 @@ func (r *CEosLabDeviceReconciler) observeBringup(ctx context.Context, device *ce
+ 			continue // only pace the cEOS pods we own; never count the host pods gated on us
+ 		}
+ 		observation.visiblePods[p.Name] = struct{}{}
+-		if p.Status.Phase != corev1.PodPending {
+-			continue // a cEOS pod that has left Pending has cleared the sandbox/init window
++		if !inBringupSandboxWindow(p) {
++			continue
+ 		}
+ 		observation.inflight++
+-		if time.Since(p.CreationTimestamp.Time) > bringupSandboxDeadline && !podSandboxStarted(p) {
++		if time.Since(p.CreationTimestamp.Time) > bringupSandboxDeadline {
+ 			observation.stuck++ // still in the CNI/sandbox window past the deadline => backpressure
+ 		}
+ 	}
+@@ -965,7 +982,7 @@ func bringupThrottleReason(observation bringupObservation, effectiveInflight int
+ 		return true, fmt.Sprintf("node is backing up on sandbox creation (%d cEOS pod(s) stuck in ContainerCreating in namespace %s); deferring pod creation", observation.stuck, namespace)
+ 	}
+ 	if effectiveInflight >= maxConcurrentBringup() {
+-		return true, fmt.Sprintf("bringup ceiling reached (%d cEOS pods still initializing or admission-reserved in namespace %s); deferring pod creation", effectiveInflight, namespace)
++		return true, fmt.Sprintf("bringup ceiling reached (%d cEOS pods still in sandbox creation or admission-reserved in namespace %s); deferring pod creation", effectiveInflight, namespace)
+ 	}
+ 	return false, ""
+ }
+-- 
+2.56.0
+

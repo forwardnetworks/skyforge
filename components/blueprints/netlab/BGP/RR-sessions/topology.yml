@@ -1,0 +1,28 @@
+#
+# Using FRR on containerlab to make it fast
+#
+defaults.device: eos
+provider: kne
+module: [ isis, bgp ]
+
+bgp.as_list:
+  65000:
+    members: [ rr1, rr2, pe1, pe2 ]
+    rr: [ rr1, rr2 ]
+  65001:
+    members: [ x1 ]
+
+groups:
+  # netlab 26.08 tightening: nodes must enable the modules their attributes
+  # use; topology-level `module:` no longer reaches nodes here (and the
+  # auto-created asNNNN groups have no members yet when group modules are
+  # checked, so an explicit group carries them).
+  routers:
+    members: [ rr1, rr2, pe1, pe2, x1 ]
+    module: [ isis, bgp ]
+  as65000:
+    bgp.advertise_loopback: false
+
+nodes: [ rr1, rr2, pe1, pe2, x1 ]
+
+links: [ rr1-pe1, rr1-pe2, rr2-pe1, rr2-pe2, rr1-x1 ]

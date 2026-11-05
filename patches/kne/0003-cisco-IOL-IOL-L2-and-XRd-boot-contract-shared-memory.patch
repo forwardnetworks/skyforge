@@ -1,0 +1,2034 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 13:47:13 -0500
+Subject: [PATCH 03/35] cisco: IOL/IOL-L2 and XRd boot contract, shared memory,
+ VRF permit, XRd default route, kubevirt status
+
+---
+diff --git a/topo/node/cisco/cisco.go b/topo/node/cisco/cisco.go
+index 6ad8820..f446f03 100644
+--- a/topo/node/cisco/cisco.go
++++ b/topo/node/cisco/cisco.go
+@@ -41,11 +41,243 @@ import (
+ )
+ 
+ const (
+-	ModelXRD = "xrd"
++	ModelXRD         = "xrd"
++	ModelIOL         = "iol"
++	ModelIOLL2       = "ioll2"
++	ModelCISCOC8000V = "cat8000v"
++	ModelNXOS        = "nxos"
++	ModelASAV        = "asav"
++	ModelVEdge       = "vedge"
++	ModelVSmart      = "vsmart"
++	ModelVBond       = "vbond"
++	ModelVManage     = "vmanage"
+ 
+ 	scrapliPlatformName = "cisco_iosxr"
+ 	reset8000eCMD       = "copy disk0:/startup-config running-config replace"
+ 	xrdInterfaceConfig  = "/var/opt/cisco/iosxr/xrd/interface_ip_config.txt"
++	xrdFirstBootConfig  = "/etc/xrd/first-boot.cfg"
++	xrdEveryBootScript  = "/etc/xrd/mgmt_intf_v6_addr.sh"
++	xrdProxyScriptFile  = "mgmt_intf_v6_addr.sh"
++	xrdProxyVolumeName  = "xrd-every-boot-script"
++	// XR's shared memory lives here. It must be a large filesystem; see
++	// attachXRdSharedMemory for why we mount one rather than let Cisco's
++	// startup script try to symlink its way to /dev/shm.
++	xrdSharedMemoryPath = "/dev/shmem"
++	xrdProxyPIDFile     = "/run/kne-xrd-port-proxy.pid"
++	xrdProxyLogFile     = "/run/kne-xrd-port-proxy.log"
++	xrdPostStartLogFile = "/run/kne-xrd-poststart.log"
++	xrdProxyBootstrap   = `#!/bin/bash
++set -eu
++# --- skyforge: XRd VRF-netns L3VPN control-plane permit (the XRd analog of the
++# arista-ceoslab-operator 0010 fix). XRd's control-plane image realizes every routing
++# VRF as a Linux network namespace: the global table is "global-vrf", management is
++# "vrf-management", and each configured L3VPN VRF becomes its OWN netns holding that
++# VRF's data interfaces. XR keeps a control-plane firewall in each netns whose INPUT
++# policy DROPs traffic arriving on the VRF data interfaces, so CE<->PE VRF eBGP / VRF
++# OSPF / VRF ICMP is dropped before XR ever sees it (the netns IpInReceives counter
++# climbs while IpInDelivers stays 0 — a netfilter drop, not a checksum/offload problem;
++# the on-wire L4 checksums are correct). The KNE-injected port-proxy below only reaches
++# loopback ports INSIDE vrf-management/global-vrf and never clears this data-plane wall.
++# Mirror the trusted-fabric permit into EVERY netns: global-vrf clears plain (non-VRF)
++# fabric eBGP too, and each vrf-* clears its L3VPN CE<->PE sessions. Enumerate the data
++# interfaces from WITHIN each netns (ip -o link show is netns-correct) and re-assert in a
++# retry loop, because the VRF netns appear only after XR finishes processing the VRF
++# config — slightly after the fabric interfaces are wired. Delete-then-insert keeps
++# exactly one ACCEPT per interface ahead of the DROP.
++apply_vrf_dataplane_permits() {
++  for _ns in $(ip netns list 2>/dev/null | sed 's/ .*//'); do
++    [ -n "${_ns}" ] || continue
++    for _ifc in $(ip netns exec "${_ns}" ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | sed 's/@.*//'); do
++      case "${_ifc}" in ""|lo) continue ;; esac
++      ip netns exec "${_ns}" iptables -D INPUT -i "${_ifc}" -j ACCEPT 2>/dev/null || true
++      ip netns exec "${_ns}" iptables -I INPUT 1 -i "${_ifc}" -j ACCEPT 2>/dev/null || true
++    done
++  done
++}
++vrfpidfile=/run/kne-xrd-vrf-permit.pid
++if ! { [ -s "$vrfpidfile" ] && kill -0 "$(cat "$vrfpidfile")" 2>/dev/null; }; then
++  printf 'vrf-permit launch: pid=%s netns=%s\n' "$$" "$(readlink /proc/$$/ns/net 2>/dev/null || true)" >> /run/kne-xrd-vrf-permit.log
++  (
++    i=0
++    max=${SKYFORGE_XRD_VRF_PERMIT_RETRIES:-180}
++    interval=${SKYFORGE_XRD_VRF_PERMIT_INTERVAL:-5}
++    while [ "$i" -lt "$max" ]; do
++      apply_vrf_dataplane_permits
++      i=$((i + 1))
++      sleep "$interval"
++    done
++  ) >> /run/kne-xrd-vrf-permit.log 2>&1 &
++  echo $! > "$vrfpidfile"
++fi
++pidfile=` + xrdProxyPIDFile + `
++if [ -s "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
++  printf 'proxy already running: pid=%s netns=%s\n' "$(cat "$pidfile")" "$(readlink /proc/$$/ns/net 2>/dev/null || true)" >> ` + xrdProxyLogFile + `
++  exit 0
++fi
++printf 'proxy launch: pid=%s netns=%s\n' "$$" "$(readlink /proc/$$/ns/net 2>/dev/null || true)" >> ` + xrdProxyLogFile + `
++nohup python3 - <<'PY' >>` + xrdProxyLogFile + ` 2>&1 &
++import os
++import socket
++import subprocess
++import threading
++import time
++import traceback
++
++TARGET_NAMESPACES = ("vrf-management", "global-vrf")
++TCP_TARGET_PORTS = (22, 57400)
++UDP_TARGET_PORTS = (161,)
++
++
++def log(message):
++    print(message, flush=True)
++
++
++def wait_namespace(port, protocol):
++    while True:
++        for ns in TARGET_NAMESPACES:
++            if protocol == "tcp":
++                rc = subprocess.run(
++                    ["ip", "netns", "exec", ns, "nc", "-z", "-w", "1", "127.0.0.1", str(port)],
++                    stdout=subprocess.DEVNULL,
++                    stderr=subprocess.DEVNULL,
++                    check=False,
++                ).returncode
++                if rc == 0:
++                    log(f"proxy target ready: namespace={ns} port={port} protocol={protocol}")
++                    return ns
++            else:
++                probe = subprocess.run(
++                    ["ip", "netns", "exec", ns, "ss", "-lun"],
++                    stdout=subprocess.PIPE,
++                    stderr=subprocess.DEVNULL,
++                    check=False,
++                    text=True,
++                )
++                if probe.returncode == 0 and f":{port}" in probe.stdout:
++                    log(f"proxy target ready: namespace={ns} port={port} protocol={protocol}")
++                    return ns
++        time.sleep(1)
++
++
++def pipe_sock_to_proc(sock, proc):
++    try:
++        while True:
++            data = sock.recv(65536)
++            if not data:
++                break
++            if proc.stdin is None:
++                break
++            os.write(proc.stdin.fileno(), data)
++    except Exception:
++        pass
++    finally:
++        if proc.stdin is not None:
++            try:
++                proc.stdin.close()
++            except Exception:
++                pass
++
++
++def pipe_proc_to_sock(proc, sock):
++    try:
++        if proc.stdout is None:
++            return
++        while True:
++            data = os.read(proc.stdout.fileno(), 65536)
++            if not data:
++                break
++            sock.sendall(data)
++    except Exception:
++        pass
++    finally:
++        try:
++            sock.close()
++        except Exception:
++            pass
++
++
++def serve(port):
++    ns = wait_namespace(port, "tcp")
++    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
++    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
++    try:
++        listener.bind(("0.0.0.0", port))
++    except OSError as exc:
++        log(f"bind failed: port={port} error={exc}")
++        return
++    listener.listen(32)
++    log(f"proxy listener ready: port={port} namespace={ns} protocol=tcp")
++    while True:
++        conn, _ = listener.accept()
++        proc = subprocess.Popen(
++            ["ip", "netns", "exec", ns, "nc", "127.0.0.1", str(port)],
++            stdin=subprocess.PIPE,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.DEVNULL,
++            bufsize=0,
++        )
++        threading.Thread(target=pipe_sock_to_proc, args=(conn, proc), daemon=True).start()
++        threading.Thread(target=pipe_proc_to_sock, args=(proc, conn), daemon=True).start()
++
++
++UDP_PROXY = r"""
++import socket
++import sys
++
++port = int(sys.argv[1])
++payload = sys.stdin.buffer.read()
++s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
++s.settimeout(3)
++s.sendto(payload, ("127.0.0.1", port))
++try:
++    data, _ = s.recvfrom(65535)
++    sys.stdout.buffer.write(data)
++except Exception:
++    pass
++"""
++
++
++def serve_udp(port):
++    ns = wait_namespace(port, "udp")
++    listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
++    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
++    try:
++        listener.bind(("0.0.0.0", port))
++    except OSError as exc:
++        log(f"bind failed: port={port} protocol=udp error={exc}")
++        return
++    log(f"proxy listener ready: port={port} namespace={ns} protocol=udp")
++    while True:
++        payload, addr = listener.recvfrom(65535)
++        proc = subprocess.Popen(
++            ["ip", "netns", "exec", ns, "python3", "-c", UDP_PROXY, str(port)],
++            stdin=subprocess.PIPE,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.DEVNULL,
++            bufsize=0,
++        )
++        try:
++            response, _ = proc.communicate(payload, timeout=4)
++        except subprocess.TimeoutExpired:
++            proc.kill()
++            continue
++        if response:
++            listener.sendto(response, addr)
++
++
++for target_port in TCP_TARGET_PORTS:
++    threading.Thread(target=serve, args=(target_port,), daemon=True).start()
++for target_port in UDP_TARGET_PORTS:
++    threading.Thread(target=serve_udp, args=(target_port,), daemon=True).start()
++
++try:
++    while True:
++        time.sleep(3600)
++except Exception:
++    traceback.print_exc()
++    raise
++PY
++echo $! > "$pidfile"`
+ 	// Add the empty echo to work around the copy command not outputting a newline at the end if there is no
+ 	// change in config.
+ 	resetXRdCMD             = "/pkg/bin/xr_cli \"copy disk0:/startup-config running-config replace\" ; echo \"\""
+@@ -64,6 +296,27 @@ var (
+ 		CPU:    "4000m", // 4000 milliCPUs
+ 		Memory: "20Gi",  // 20 GB RAM
+ 	}
++
++	defaultNXOSConstraints = node.Constraints{
++		CPU:    "1000m", // 1000 milliCPUs
++		Memory: "6Gi",   // 6 GB RAM
++	}
++
++	defaultCISCOC8000VConstraints = node.Constraints{
++		CPU:    "2000m", // 2000 milliCPUs
++		Memory: "4Gi",   // 4 GB RAM
++	}
++
++	defaultCiscoSDWANConstraints = node.Constraints{
++		CPU:    "2000m", // 2000 milliCPUs
++		Memory: "4Gi",   // 4 GB RAM
++	}
++
++	defaultASAVConstraints = node.Constraints{
++		CPU:    "2000m", // 2000 milliCPUs
++		Memory: "2Gi",   // 2 GB RAM
++	}
++
+ 	defaultCiscoNode = tpb.Node{
+ 		Name: "default_cisco_node",
+ 		Services: map[uint32]*tpb.Service{
+@@ -156,6 +409,12 @@ var skipValidation = false
+ 
+ func (n *Node) Create(ctx context.Context) error {
+ 	log.Infof("Creating Cisco %s node resource %s", n.Proto.Model, n.Name())
++	if n.UsesKubeVirtVM() {
++		return n.Impl.Create(ctx)
++	}
++	if err := n.Impl.EnsureImagePullSecret(ctx); err != nil {
++		return err
++	}
+ 
+ 	pb := n.Proto
+ 	if err := validateHostConstraints(n, skipValidation); err != nil {
+@@ -184,6 +443,8 @@ func (n *Node) Create(ctx context.Context) error {
+ 		stdin = true
+ 	}
+ 	readinessProbe := node.ServiceReadinessProbe(pb)
++	containerCommand := pb.Config.Command
++	containerArgs := pb.Config.Args
+ 	pod := &corev1.Pod{
+ 		ObjectMeta: metav1.ObjectMeta{
+ 			Name: n.Name(),
+@@ -193,11 +454,21 @@ func (n *Node) Create(ctx context.Context) error {
+ 			},
+ 		},
+ 		Spec: corev1.PodSpec{
++			ImagePullSecrets: node.KNEImagePullSecrets(),
++			InitContainers: []corev1.Container{{
++				Name:  fmt.Sprintf("init-%s", n.Name()),
++				Image: initContainerImage,
++				Args: []string{
++					fmt.Sprintf("%d", len(pb.GetInterfaces())+1),
++					fmt.Sprintf("%d", pb.GetConfig().Sleep),
++				},
++				ImagePullPolicy: "IfNotPresent",
++			}},
+ 			Containers: []corev1.Container{{
+ 				Name:            n.Name(),
+ 				Image:           pb.Config.Image,
+-				Command:         pb.Config.Command,
+-				Args:            pb.Config.Args,
++				Command:         containerCommand,
++				Args:            containerArgs,
+ 				TTY:             tty,
+ 				Stdin:           stdin,
+ 				Env:             node.ToEnvVar(pb.Config.Env),
+@@ -221,8 +492,11 @@ func (n *Node) Create(ctx context.Context) error {
+ 			}},
+ 			TerminationGracePeriodSeconds: pointer.Int64(0),
+ 			EnableServiceLinks:            pointer.Bool(false),
+-			NodeSelector:                  map[string]string{},
++			PriorityClassName:             node.KNEPriorityClassName(),
++			NodeSelector:                  node.KNENodeSelector(),
++			Tolerations:                   node.KNETolerations(),
+ 			Affinity: &corev1.Affinity{
++				NodeAffinity: node.KNEContainerNodeAffinity(),
+ 				PodAntiAffinity: &corev1.PodAntiAffinity{
+ 					PreferredDuringSchedulingIgnoredDuringExecution: []corev1.WeightedPodAffinityTerm{{
+ 						Weight: 100,
+@@ -241,19 +515,104 @@ func (n *Node) Create(ctx context.Context) error {
+ 			},
+ 		},
+ 	}
++	if isCiscoIOLModel(pb.Model) {
++		attachIOLReadinessProbes(&pod.Spec.Containers[0])
++	}
++	if pb.Model == ModelXRD {
++		attachXRdSharedMemory(&pod.Spec, pb.Name)
++	}
+ 	for label, v := range n.GetProto().GetLabels() {
+ 		pod.ObjectMeta.Labels[label] = v
+ 	}
+-
++	mountPath := pb.Config.ConfigPath + "/" + pb.Config.ConfigFile
++	if pb.Model == ModelXRD {
++		mountPath = xrdFirstBootConfig
++	}
++	if err := n.AttachStartupConfig(ctx, pod, mountPath); err != nil {
++		return err
++	}
++	if pb.Model == ModelXRD {
++		if err := attachXRdDefaultRoute(pod, initContainerImage, pb.Config.ConfigFile); err != nil {
++			return err
++		}
++	}
+ 	if pb.Model == ModelXRD {
+-		configFile := pb.Config.ConfigFile
+-		if configFile == "" {
+-			configFile = "startup.cfg"
+-		}
+-		configDstPath := "/config-dst"
+-		configSrcPath := "/config-src"
+-		initScript := fmt.Sprintf(`
+-/entrypoint.sh "$1" "$2"
++		vol, vm, err := n.createXRDRelayScript(ctx)
++		if err != nil {
++			return err
++		}
++		pod.Spec.Volumes = append(pod.Spec.Volumes, *vol)
++		pod.Spec.Containers[0].VolumeMounts = append(pod.Spec.Containers[0].VolumeMounts, *vm)
++		pod.Spec.Containers[0].Lifecycle = &corev1.Lifecycle{
++			PostStart: &corev1.LifecycleHandler{
++				Exec: &corev1.ExecAction{
++					Command: []string{
++						"/bin/sh",
++						"-lc",
++						fmt.Sprintf("nohup /bin/sh -lc 'sleep 45; %s' >%s 2>&1 &", xrdEveryBootScript, xrdPostStartLogFile),
++					},
++				},
++			},
++		}
++	}
++	sPod, err := n.KubeClient.CoreV1().Pods(n.Namespace).Create(ctx, pod, metav1.CreateOptions{})
++	if err != nil {
++		return fmt.Errorf("failed to create pod for %q: %w", pb.Name, err)
++	}
++	log.V(1).Infof("Pod created:\n%+v\n", sPod)
++	log.Infof("Created Cisco %s node resource %s pod", n.Proto.Model, n.Name())
++	if err := n.CreateService(ctx); err != nil {
++		return err
++	}
++	log.Infof("Created Cisco %s node resource %s services", n.Proto.Model, n.Name())
++	return nil
++}
++
++func (n *Node) createXRDRelayScript(ctx context.Context) (*corev1.Volume, *corev1.VolumeMount, error) {
++	cm := &corev1.ConfigMap{
++		ObjectMeta: metav1.ObjectMeta{
++			Name: fmt.Sprintf("%s-xrd-script", n.Proto.Name),
++		},
++		Data: map[string]string{
++			xrdProxyScriptFile: xrdProxyBootstrap,
++		},
++	}
++	if _, err := n.KubeClient.CoreV1().ConfigMaps(n.Namespace).Create(ctx, cm, metav1.CreateOptions{}); err != nil {
++		return nil, nil, err
++	}
++	vol := &corev1.Volume{
++		Name: xrdProxyVolumeName,
++		VolumeSource: corev1.VolumeSource{
++			ConfigMap: &corev1.ConfigMapVolumeSource{
++				LocalObjectReference: corev1.LocalObjectReference{
++					Name: cm.Name,
++				},
++				DefaultMode: pointer.Int32(0o755),
++			},
++		},
++	}
++	vm := &corev1.VolumeMount{
++		Name:      xrdProxyVolumeName,
++		MountPath: xrdEveryBootScript,
++		SubPath:   xrdProxyScriptFile,
++		ReadOnly:  true,
++	}
++	return vol, vm, nil
++}
++
++// XRd default-route injection, carried over from upstream aecdf13 (the XRd init script in CreatePod).
++// netlab's IOS-XR config and the fork's seed mount install no management default route, so the
++// first-boot config is copied from the seed volume to an emptyDir and the pod's default IPv4/IPv6
++// gateways are appended as `router static` entries before XR starts. Only upstream's entrypoint
++// call is dropped: the interface wait is the separate init-<name> container.
++const (
++	xrdDefaultRouteVolumeName = "xrd-first-boot-config"
++	xrdDefaultRouteSrcDir     = "/config-src"
++	xrdDefaultRouteDstDir     = "/config-dst"
++)
++
++func xrdDefaultRouteScript(srcDir, dstDir, configFile string) string {
++	return fmt.Sprintf(`
+ mkdir -p %[1]s
+ if [ -f %[2]s/%[3]s ]; then
+   cp %[2]s/%[3]s %[1]s/%[3]s
+@@ -268,93 +627,65 @@ GW6=$(ip -6 route show default 2>/dev/null | awk '{print $3}' | head -n1)
+ if [ -n "$GW6" ]; then
+   printf '\nrouter static\n address-family ipv6 unicast\n  ::/0 %%s\n !\n!\n' "$GW6" >> %[1]s/%[3]s
+ fi
+-`, configDstPath, configSrcPath, configFile)
++`, dstDir, srcDir, configFile)
++}
+ 
+-		var initVolumeMounts []corev1.VolumeMount
+-		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
+-			Name: node.ConfigVolumeName,
+-			VolumeSource: corev1.VolumeSource{
+-				EmptyDir: &corev1.EmptyDirVolumeSource{},
+-			},
+-		})
+-		initVolumeMounts = append(initVolumeMounts, corev1.VolumeMount{
+-			Name:      node.ConfigVolumeName,
+-			MountPath: configDstPath,
+-		})
+-		vm := corev1.VolumeMount{
+-			Name:      node.ConfigVolumeName,
+-			MountPath: pb.Config.ConfigPath + "/" + configFile,
+-			SubPath:   configFile,
+-			ReadOnly:  true,
++// attachXRdDefaultRoute adds the upstream XRd gateway-route step. The first-boot file is copied from the
++// seed mount (when AttachStartupConfig left one at xrdFirstBootConfig) into an emptyDir, the default
++// IPv4/IPv6 gateways are appended, and the XR container reads that emptyDir file. Without a seed mount
++// (no config data) the init container still writes a routes-only file, as upstream did.
++func attachXRdDefaultRoute(pod *corev1.Pod, initImage, configFile string) error {
++	if pod == nil || len(pod.Spec.Containers) == 0 {
++		return nil
++	}
++	c := &pod.Spec.Containers[0]
++	idx := -1
++	for i, vm := range c.VolumeMounts {
++		if vm.MountPath == xrdFirstBootConfig {
++			idx = i
++			break
+ 		}
+-		for i := range pod.Spec.Containers {
+-			pod.Spec.Containers[i].VolumeMounts = append(pod.Spec.Containers[i].VolumeMounts, vm)
++	}
++	var srcMount *corev1.VolumeMount
++	if idx >= 0 {
++		seed := c.VolumeMounts[idx]
++		if seed.SubPath == "" {
++			return fmt.Errorf("xrd first-boot config %s is not a configmap subPath mount", xrdFirstBootConfig)
+ 		}
+-
+-		if vol, err := n.CreateConfig(ctx); err != nil {
+-			return err
+-		} else if vol != nil {
+-			vol.Name = "startup-config-src-volume"
+-			pod.Spec.Volumes = append(pod.Spec.Volumes, *vol)
+-			initVolumeMounts = append(initVolumeMounts, corev1.VolumeMount{
+-				Name:      "startup-config-src-volume",
+-				MountPath: configSrcPath,
+-				ReadOnly:  true,
+-			})
+-		}
+-
+-		pod.Spec.InitContainers = []corev1.Container{{
+-			Name:    fmt.Sprintf("init-%s", n.Name()),
+-			Image:   initContainerImage,
+-			Command: []string{"/bin/sh", "-c"},
+-			Args: []string{
+-				initScript,
+-				"init",
+-				fmt.Sprintf("%d", len(pb.GetInterfaces())+1),
+-				fmt.Sprintf("%d", pb.GetConfig().Sleep),
+-			},
+-			ImagePullPolicy: "IfNotPresent",
+-			VolumeMounts:    initVolumeMounts,
+-		}}
++		configFile = seed.SubPath
++		srcMount = &corev1.VolumeMount{Name: seed.Name, MountPath: xrdDefaultRouteSrcDir, ReadOnly: true}
++	}
++	if configFile == "" {
++		configFile = "startup.cfg"
++	}
++	pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
++		Name:         xrdDefaultRouteVolumeName,
++		VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
++	})
++	dstMount := corev1.VolumeMount{Name: xrdDefaultRouteVolumeName, MountPath: xrdDefaultRouteDstDir}
++	initMounts := []corev1.VolumeMount{dstMount}
++	if srcMount != nil {
++		initMounts = []corev1.VolumeMount{*srcMount, dstMount}
++	}
++	pod.Spec.InitContainers = append(pod.Spec.InitContainers, corev1.Container{
++		Name:            "xrd-default-route",
++		Image:           initImage,
++		ImagePullPolicy: corev1.PullIfNotPresent,
++		Command:         []string{"/bin/sh", "-c"},
++		Args:            []string{xrdDefaultRouteScript(xrdDefaultRouteSrcDir, xrdDefaultRouteDstDir, configFile)},
++		VolumeMounts:    initMounts,
++	})
++	xrMount := corev1.VolumeMount{
++		Name:      xrdDefaultRouteVolumeName,
++		MountPath: xrdFirstBootConfig,
++		SubPath:   configFile,
++		ReadOnly:  true,
++	}
++	if idx >= 0 {
++		c.VolumeMounts[idx] = xrMount
+ 	} else {
+-		pod.Spec.InitContainers = []corev1.Container{{
+-			Name:  fmt.Sprintf("init-%s", n.Name()),
+-			Image: initContainerImage,
+-			Args: []string{
+-				fmt.Sprintf("%d", len(pb.GetInterfaces())+1),
+-				fmt.Sprintf("%d", pb.GetConfig().Sleep),
+-			},
+-			ImagePullPolicy: "IfNotPresent",
+-		}}
+-		if pb.Config.ConfigData != nil {
+-			vol, err := n.CreateConfig(ctx)
+-			if err != nil {
+-				return err
+-			}
+-			pod.Spec.Volumes = append(pod.Spec.Volumes, *vol)
+-			vm := corev1.VolumeMount{
+-				Name:      node.ConfigVolumeName,
+-				MountPath: pb.Config.ConfigPath + "/" + pb.Config.ConfigFile,
+-				ReadOnly:  true,
+-			}
+-			if vol.ConfigMap != nil {
+-				vm.SubPath = pb.Config.ConfigFile
+-			}
+-			for i, c := range pod.Spec.Containers {
+-				pod.Spec.Containers[i].VolumeMounts = append(c.VolumeMounts, vm)
+-			}
+-		}
+-	}
+-	sPod, err := n.KubeClient.CoreV1().Pods(n.Namespace).Create(ctx, pod, metav1.CreateOptions{})
+-	if err != nil {
+-		return fmt.Errorf("failed to create pod for %q: %w", pb.Name, err)
++		c.VolumeMounts = append(c.VolumeMounts, xrMount)
+ 	}
+-	log.V(1).Infof("Pod created:\n%+v\n", sPod)
+-	log.Infof("Created Cisco %s node resource %s pod", n.Proto.Model, n.Name())
+-	if err := n.CreateService(ctx); err != nil {
+-		return err
+-	}
+-	log.Infof("Created Cisco %s node resource %s services", n.Proto.Model, n.Name())
+ 	return nil
+ }
+ 
+@@ -368,6 +699,12 @@ func (n *Node) DefaultNodeConstraints() node.Constraints {
+ 	switch n.GetProto().Model {
+ 	case "8201", "8201-32FH", "8202", "8101-32H", "8102-64H":
+ 		return default8000eConstraints
++	case ModelCISCOC8000V:
++		return defaultCISCOC8000VConstraints
++	case ModelNXOS:
++		return defaultNXOSConstraints
++	case ModelASAV:
++		return defaultASAVConstraints
+ 	default:
+ 	}
+ 
+@@ -400,6 +737,53 @@ func constraints(pb *tpb.Node) *tpb.Node {
+ 			pb.Constraints["memory"] = default8000eConstraints.Memory
+ 		}
+ 	default:
++		// IOL and IOL-L2 can run with smaller defaults than XRd.
++		if pb.Model == ModelIOL || pb.Model == ModelIOLL2 {
++			if pb.Constraints["cpu"] == "" {
++				pb.Constraints["cpu"] = "100m"
++			}
++			if pb.Constraints["memory"] == "" {
++				pb.Constraints["memory"] = "512Mi"
++			}
++			return pb
++		}
++		if pb.Model == ModelCISCOC8000V {
++			if pb.Constraints["cpu"] == "" {
++				pb.Constraints["cpu"] = defaultCISCOC8000VConstraints.CPU
++			}
++			if pb.Constraints["memory"] == "" {
++				pb.Constraints["memory"] = defaultCISCOC8000VConstraints.Memory
++			}
++			return pb
++		}
++		// NX-OS needs the larger KubeVirt profile to reliably reach SSH.
++		if pb.Model == ModelNXOS {
++			if pb.Constraints["cpu"] == "" {
++				pb.Constraints["cpu"] = defaultNXOSConstraints.CPU
++			}
++			if pb.Constraints["memory"] == "" {
++				pb.Constraints["memory"] = defaultNXOSConstraints.Memory
++			}
++			return pb
++		}
++		if pb.Model == ModelASAV {
++			if pb.Constraints["cpu"] == "" {
++				pb.Constraints["cpu"] = defaultASAVConstraints.CPU
++			}
++			if pb.Constraints["memory"] == "" {
++				pb.Constraints["memory"] = defaultASAVConstraints.Memory
++			}
++			return pb
++		}
++		if pb.Model == ModelVEdge || pb.Model == ModelVSmart || pb.Model == ModelVBond || pb.Model == ModelVManage {
++			if pb.Constraints["cpu"] == "" {
++				pb.Constraints["cpu"] = defaultCiscoSDWANConstraints.CPU
++			}
++			if pb.Constraints["memory"] == "" {
++				pb.Constraints["memory"] = defaultCiscoSDWANConstraints.Memory
++			}
++			return pb
++		}
+ 		if pb.Constraints["cpu"] == "" {
+ 			pb.Constraints["cpu"] = defaultXRDConstraints.CPU
+ 		}
+@@ -474,10 +858,34 @@ func setXRDEnv(pb *tpb.Node) error {
+ 	if pb.Config.Env["XR_INTERFACES"] == "" {
+ 		pb.Config.Env["XR_INTERFACES"] = interfaceMap
+ 	}
+-	if pb.Config.Env["XR_EVERY_BOOT_CONFIG"] == "" {
+-		pb.Config.Env["XR_EVERY_BOOT_CONFIG"] = filepath.Join(pb.Config.ConfigPath, pb.Config.ConfigFile)
++	// XRd boot-time config handling follows the containerlab contract: a first-boot config
++	// file is mounted into the container and both the first-boot and every-boot env vars
++	// point at it.
++	//
++	// WHY the target is DERIVED and not just the xrdFirstBootConfig constant: the file's
++	// real in-container location is chosen by the writable startup-config persistence path
++	// (KNE patch 0005). When Config.ConfigPath is on that allow-list -- netlab now maps the
++	// iosxr node to /config -- KNE seeds the config into a per-node PVC and mounts THAT PVC
++	// at ConfigPath, so the file lands at ConfigPath/ConfigFile and nothing is mounted at
++	// /etc/xrd at all. Hardcoding a different path makes XRd abort platform init with
++	// "Invalid env vars: XR_FIRST_BOOT_CONFIG=/etc/xrd/first-boot.cfg - File not found".
++	//
++	// The ':' guard keeps IOS-XR CLI filesystem syntax (e.g. "/disk0:") from being treated
++	// as a container path; those nodes keep the xrdFirstBootConfig fallback exactly as before.
++	target := xrdFirstBootConfig
++	if p := strings.TrimSpace(pb.Config.ConfigPath); strings.HasPrefix(p, "/") && !strings.Contains(p, ":") {
++		if f := strings.TrimSpace(pb.Config.ConfigFile); f != "" {
++			target = filepath.Join(p, f)
++		}
++	}
++	if pb.Config.ConfigData != nil {
++		if pb.Config.Env["XR_FIRST_BOOT_CONFIG"] == "" {
++			pb.Config.Env["XR_FIRST_BOOT_CONFIG"] = target
++		}
++		if pb.Config.Env["XR_EVERY_BOOT_CONFIG"] == "" {
++			pb.Config.Env["XR_EVERY_BOOT_CONFIG"] = target
++		}
+ 	}
+-	pb.Config.Env["XR_MGMT_INTERFACES"] = "linux:eth0,xr_name=MgmtEth0/RP0/CPU0/0,chksum,snoop_v4,snoop_v6"
+ 	return nil
+ }
+ 
+@@ -548,7 +956,7 @@ func defaults(pb *tpb.Node) (*tpb.Node, error) {
+ 	if pb.Config.ConfigPath == "" {
+ 		pb.Config.ConfigPath = defaultNodeClone.Config.ConfigPath
+ 	}
+-	if pb.Config.Cert == nil {
++	if pb.Config.Cert == nil && !isCiscoOnboardedModel(pb.Model) {
+ 		pb.Config.Cert = defaultCiscoNode.Config.Cert
+ 	}
+ 	if pb.Model == "" {
+@@ -596,6 +1004,25 @@ func defaults(pb *tpb.Node) (*tpb.Node, error) {
+ 						ConstraintType: &tpb.KernelParam_BoundedInteger{BoundedInteger: &tpb.BoundedInteger{
+ 							MinValue: 64000}}}}})
+ 		}
++	case ModelIOL, ModelIOLL2:
++		if pb.Config.Image == "" {
++			pb.Config.Image = fmt.Sprintf("%s:latest", pb.Model)
++		}
++		if isCiscoIOLModel(pb.Model) {
++			setIOLSNMPEnv(pb)
++		}
++	case ModelNXOS, ModelASAV:
++		if pb.Config.Image == "" {
++			pb.Config.Image = fmt.Sprintf("%s:latest", pb.Model)
++		}
++	case ModelCISCOC8000V:
++		if pb.Config.Image == "" {
++			pb.Config.Image = fmt.Sprintf("%s:latest", pb.Model)
++		}
++	case ModelVEdge, ModelVSmart, ModelVBond, ModelVManage:
++		if pb.Config.Image == "" {
++			pb.Config.Image = fmt.Sprintf("vrnetlab/vr-%s", pb.Model)
++		}
+ 	//nolint:goconst
+ 	case "8201", "8202", "8201-32FH", "8102-64H", "8101-32H":
+ 		if err := setE8000Env(pb); err != nil {
+@@ -615,6 +1042,18 @@ func defaults(pb *tpb.Node) (*tpb.Node, error) {
+ 	return pb, nil
+ }
+ 
++func setIOLSNMPEnv(pb *tpb.Node) {
++	if pb.Config.Env == nil {
++		pb.Config.Env = map[string]string{}
++	}
++	if pb.Config.Env["IOL_SNMP_COMMUNITY"] == "" {
++		pb.Config.Env["IOL_SNMP_COMMUNITY"] = "skyforge"
++	}
++	if pb.Config.Env["IOL_SNMP_HOSTNAME"] == "" && strings.TrimSpace(pb.Name) != "" {
++		pb.Config.Env["IOL_SNMP_HOSTNAME"] = strings.TrimSpace(pb.Name)
++	}
++}
++
+ // Status returns the current node state.
+ // For 8000e nodes it checks the logs and return running if log contains "Router up" and pod is ready.
+ // For XRD nodes it returns running if pod is ready.
+@@ -623,6 +1062,9 @@ func (n *Node) Status(ctx context.Context) (node.Status, error) {
+ 	if err != nil {
+ 		return node.StatusUnknown, err
+ 	}
++	if len(p) == 0 {
++		return node.StatusPending, nil
++	}
+ 	if len(p) != 1 {
+ 		return node.StatusUnknown, fmt.Errorf("expected exactly one pod for node %s", n.Name())
+ 	}
+@@ -635,7 +1077,7 @@ func (n *Node) Status(ctx context.Context) (node.Status, error) {
+ 		return node.StatusFailed, nil
+ 	case corev1.PodSucceeded, corev1.PodRunning:
+ 		pb := n.Proto
+-		if pb.GetModel() != ModelXRD {
++		if isCisco8000eModel(pb.GetModel()) {
+ 			req := n.KubeClient.CoreV1().Pods(p[0].Namespace).GetLogs(p[0].Name, &corev1.PodLogOptions{})
+ 			logBytes, err := getPodLogs(ctx, req)
+ 			if err != nil {
+@@ -664,6 +1106,164 @@ func (n *Node) Status(ctx context.Context) (node.Status, error) {
+ 	}
+ }
+ 
++func isCisco8000eModel(model string) bool {
++	switch model {
++	case "8201", "8201-32FH", "8202", "8101-32H", "8102-64H":
++		return true
++	default:
++		return false
++	}
++}
++
++func isCiscoIOLModel(model string) bool {
++	switch model {
++	case ModelIOL, ModelIOLL2:
++		return true
++	default:
++		return false
++	}
++}
++
++func iolProbe(command []string, initialDelaySeconds, periodSeconds, timeoutSeconds, failureThreshold int32) *corev1.Probe {
++	return &corev1.Probe{
++		ProbeHandler: corev1.ProbeHandler{
++			Exec: &corev1.ExecAction{
++				Command: command,
++			},
++		},
++		InitialDelaySeconds: initialDelaySeconds,
++		PeriodSeconds:       periodSeconds,
++		TimeoutSeconds:      timeoutSeconds,
++		FailureThreshold:    failureThreshold,
++	}
++}
++
++// xrdSharedMemoryVolumeName is the pod-unique name of the memory-backed volume
++// mounted at /dev/shmem for XRd nodes.
++func xrdSharedMemoryVolumeName(topologyName string) string {
++	return fmt.Sprintf("%s-shmem-mount", topologyName)
++}
++
++// attachXRdSharedMemory mounts a memory-backed emptyDir at /dev/shmem.
++//
++// WHY. XR keeps its shared memory under /dev/shmem, and Cisco's
++// /pkg/etc/ds_startup.sh is what is supposed to put that somewhere with room:
++//
++//	# Create /dev/shmem if it doesn't exist yet.
++//	ln -nsf /dev/shm /dev/shmem
++//
++// That line only works if nothing has created /dev/shmem yet. XR's own
++// libraries reach for /dev/shmem while the node boots -- libbag_schema writes
++// bagschema.0, the ltrace infrastructure creates a subdirectory per process --
++// and when one of them gets there first, /dev/shmem already exists as a real
++// directory. `ln -nsf` cannot replace a directory with a symlink, so it drops
++// a nested /dev/shmem/shm -> /dev/shm INSIDE it and returns success. The real
++// shared memory stays where it landed: on /dev.
++//
++// /dev is the 64 MiB tmpfs the OCI runtime gives every container. bagschema.0
++// alone is 22 MiB and ltrace holds hundreds of subdirectories, so /dev reaches
++// 100% in about thirty seconds and every shared-memory fault after that is
++// SIGBUS. processmgr respawns and dies roughly twice a second, fills the disk
++// with core dumps, and the node never reaches runtime-ready -- while the pod
++// still reports Running, which is why this reads as a hang rather than a crash.
++//
++// MEASURED on node-a, 2026-08-14, a pod that lost the race:
++//
++//	/dev/shmem      drwxrwxrwx   <- real directory, not a symlink
++//	/dev/shmem/shm  -> /dev/shm  <- the nested link the `ln` left behind
++//	/dev            64M   64M  0  100%
++//	/dev/shm        756G  580M     1%   <- the space XR should have been using
++//	xr_cli "show version"  ->  Bus error (core dumped), exit 135
++//
++// and, on the same node and image digest, six pods that won it: /dev/shmem ->
++// /dev/shm, /dev at 1%, xr_cli exit 0.
++//
++// WHAT THIS DOES. Mounting the volume removes the race rather than trying to
++// win it. The kubelet establishes the mount before the container's first
++// instruction, so /dev/shmem is a large tmpfs no matter which XR library gets
++// there first, and no startup ordering can change that. Cisco's `ln` still runs
++// and still leaves the harmless nested /dev/shmem/shm behind; what changes is
++// that the bytes land on a tmpfs sized by the pod instead of on the 64 MiB /dev.
++//
++// WHY NOT ENLARGE /dev INSTEAD. /dev's size comes from the OCI runtime spec --
++// runc hardcodes size=65536k -- and neither Kubernetes nor containerd exposes a
++// per-pod knob for it. Raising it means a node-level containerd/Talos change
++// that widens the tmpfs for every container on every node, which is a
++// cluster-wide blast radius to fix one NOS. It also would not fix the defect:
++// XR's shared memory would still be on the wrong filesystem, still capped by a
++// number somebody guessed, and the same failure would return with a larger
++// topology. This keeps the change inside the pod that has the problem.
++func attachXRdSharedMemory(spec *corev1.PodSpec, topologyName string) {
++	if spec == nil {
++		return
++	}
++	name := xrdSharedMemoryVolumeName(topologyName)
++	for _, volume := range spec.Volumes {
++		if volume.Name == name {
++			return
++		}
++	}
++	spec.Volumes = append(spec.Volumes, corev1.Volume{
++		Name: name,
++		VolumeSource: corev1.VolumeSource{
++			EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory},
++		},
++	})
++	for i := range spec.Containers {
++		spec.Containers[i].VolumeMounts = append(spec.Containers[i].VolumeMounts, corev1.VolumeMount{
++			Name:      name,
++			ReadOnly:  false,
++			MountPath: xrdSharedMemoryPath,
++		})
++	}
++}
++
++func attachIOLReadinessProbes(container *corev1.Container) {
++	if container == nil {
++		return
++	}
++	healthCommand := []string{
++		"/bin/sh",
++		"-c",
++		"IOL_READY_MIN_SECONDS=5 IOL_READY_REQUIRE_RELAY=true IOL_READY_REQUIRE_MGMT_PING=false IOL_READY_REQUIRE_MGMT_SSH=false IOL_READY_REQUIRE_PROXY=false /usr/local/bin/iol-ready-check",
++	}
++	readinessCommand := []string{
++		"/bin/sh",
++		"-c",
++		"IOL_READY_MIN_SECONDS=30 IOL_READY_REQUIRE_RELAY=true IOL_READY_REQUIRE_MGMT_PING=true IOL_READY_REQUIRE_MGMT_SSH=false IOL_READY_REQUIRE_PROXY=false /usr/local/bin/iol-ready-check",
++	}
++	livenessCommand := []string{
++		"/bin/sh",
++		"-c",
++		"IOL_READY_MIN_SECONDS=0 IOL_READY_REQUIRE_RELAY=true IOL_READY_REQUIRE_MGMT_PING=false IOL_READY_REQUIRE_MGMT_SSH=false IOL_READY_REQUIRE_PROXY=false /usr/local/bin/iol-ready-check",
++	}
++	container.StartupProbe = iolProbe(healthCommand, 0, 10, 45, 60)
++	container.ReadinessProbe = iolProbe(readinessCommand, 0, 10, 45, 3)
++	// EXPERIMENTAL (2026-09-20): the ongoing SSH/proxy checks on readiness and
++	// liveness were dropped entirely to test whether the readiness/liveness
++	// probes' continuous SSH connects to IOS's own live control plane
++	// (169.254.100.2:22 + the local proxy's second forked connect, every 10s
++	// readiness / every 30s liveness, indefinitely for the pod's whole life)
++	// are causing the periodic self-inflicted BGP TCP resets on demo-lab's
++	// LHR site. The doc's own stated intent (components/docs/kne-iol-image.md)
++	// was to guard the BOOT-TIME iouyap/relay management-veth race, not to
++	// keep hammering a live control plane forever -- this is a targeted
++	// regression test of that theory, not the final design. If it fixes the
++	// flap, the SSH/proxy check needs to come back scoped to an actual
++	// startup window (a one-shot verification, or a much longer period after
++	// first success), not as a perpetual 10s/30s liveness/readiness gate.
++	container.LivenessProbe = iolProbe(livenessCommand, 0, 30, 45, 6)
++}
++
++func isCiscoOnboardedModel(model string) bool {
++	switch model {
++	case ModelIOL, ModelIOLL2, ModelNXOS, ModelASAV, ModelCISCOC8000V, ModelVEdge, ModelVSmart, ModelVBond, ModelVManage:
++		return true
++	default:
++		return false
++	}
++}
++
+ func getPodLogs(ctx context.Context, req *rest.Request) ([]byte, error) {
+ 	podLogs, err := req.Stream(ctx)
+ 	if err != nil {
+diff --git a/topo/node/cisco/cisco_test.go b/topo/node/cisco/cisco_test.go
+index 3c63f20..2b75145 100644
+--- a/topo/node/cisco/cisco_test.go
++++ b/topo/node/cisco/cisco_test.go
+@@ -145,8 +145,8 @@ func TestNew(t *testing.T) {
+ 				Image: "xrd:latest",
+ 				Env: map[string]string{
+ 					"XR_INTERFACES":        "test/interface",
++					"XR_FIRST_BOOT_CONFIG": "/foo",
+ 					"XR_EVERY_BOOT_CONFIG": "/foo",
+-					"XR_MGMT_INTERFACES":   "linux:eth0,xr_name=MgmtEth0/RP0/CPU0/0,chksum,snoop_v4,snoop_v6",
+ 				},
+ 				EntryCommand: "kubectl exec -it pod1 -- bash",
+ 				ConfigPath:   "/",
+@@ -242,8 +242,8 @@ func TestNew(t *testing.T) {
+ 				Image: "xrd:latest",
+ 				Env: map[string]string{
+ 					"XR_INTERFACES":        "linux:eth1,xr_name=GigabitEthernet0/0/0/0;linux:eth2,xr_name=GIG1;linux:eth3,xr_name=GigabitEthernet0/0/0/2",
++					"XR_FIRST_BOOT_CONFIG": "/foo",
+ 					"XR_EVERY_BOOT_CONFIG": "/foo",
+-					"XR_MGMT_INTERFACES":   "linux:eth0,xr_name=MgmtEth0/RP0/CPU0/0,chksum,snoop_v4,snoop_v6",
+ 				},
+ 				EntryCommand: "kubectl exec -it pod1 -- bash",
+ 				ConfigPath:   "/",
+@@ -903,7 +903,7 @@ var (
+ 		Proto: &tpb.Node{
+ 			Name:   "xrd",
+ 			Vendor: tpb.Vendor_CISCO,
+-			Config: &tpb.Config{},
++			Config: &tpb.Config{Env: map[string]string{"XR_EVERY_BOOT_CONFIG": "/startup.cfg"}},
+ 			Model:  ModelXRD,
+ 		},
+ 	}
+@@ -1309,6 +1309,7 @@ func TestCreate(t *testing.T) {
+ 		desc              string
+ 		model             string
+ 		configData        []byte
++		wantInitNames     []string // explicit init container names, in order
+ 		wantInitCommand   []string
+ 		wantInitArgsLen   int
+ 		wantInitMountsLen int
+@@ -1320,26 +1321,29 @@ func TestCreate(t *testing.T) {
+ 			desc:              "XRD with config data",
+ 			model:             ModelXRD,
+ 			configData:        []byte("hostname xrd"),
++			wantInitNames:     []string{"init-node1", "xrd-default-route"},
+ 			wantInitCommand:   []string{"/bin/sh", "-c"},
+-			wantInitArgsLen:   4, // script, "init", num_intfs, sleep
+-			wantInitMountsLen: 2, // /config-dst and /config-src
+-			wantMainMountsLen: 2, // /run and /startup.cfg
+-			wantInitScriptSub: []string{"/entrypoint.sh", "router static", "address-family ipv4 unicast", "address-family ipv6 unicast", "/config-dst"},
++			wantInitArgsLen:   1, // xrd-default-route: script only (interface wait is init-node1)
++			wantInitMountsLen: 2, // xrd-default-route: /config-src (seed) and /config-dst
++			wantMainMountsLen: 4, // XR: /run, /dev/shmem, first-boot emptyDir subPath (routes), every-boot proxy script
++			wantInitScriptSub: []string{"router static", "address-family ipv4 unicast", "address-family ipv6 unicast", "/config-dst"},
+ 		},
+ 		{
+ 			desc:              "XRD without config data",
+ 			model:             ModelXRD,
+ 			configData:        nil,
++			wantInitNames:     []string{"init-node1", "xrd-default-route"},
+ 			wantInitCommand:   []string{"/bin/sh", "-c"},
+-			wantInitArgsLen:   4,
+-			wantInitMountsLen: 1, // only /config-dst
+-			wantMainMountsLen: 2, // /run and /startup.cfg
+-			wantInitScriptSub: []string{"/entrypoint.sh", "router static", "address-family ipv4 unicast"},
++			wantInitArgsLen:   1,
++			wantInitMountsLen: 1, // only /config-dst (no seed to copy; routes-only file)
++			wantMainMountsLen: 4, // XR: /run, /dev/shmem, first-boot emptyDir subPath (routes), every-boot proxy script
++			wantInitScriptSub: []string{"router static", "address-family ipv4 unicast"},
+ 		},
+ 		{
+ 			desc:              "8201 non-XRD with config data",
+ 			model:             "8201",
+ 			configData:        []byte("hostname 8201"),
++			wantInitNames:     []string{"init-node1"},
+ 			wantInitCommand:   nil, // default entrypoint
+ 			wantInitArgsLen:   2,   // num_intfs, sleep
+ 			wantInitMountsLen: 0,
+@@ -1349,6 +1353,7 @@ func TestCreate(t *testing.T) {
+ 			desc:              "8201 non-XRD without config data",
+ 			model:             "8201",
+ 			configData:        nil,
++			wantInitNames:     []string{"init-node1"},
+ 			wantInitCommand:   nil,
+ 			wantInitArgsLen:   2,
+ 			wantInitMountsLen: 0,
+@@ -1370,9 +1375,9 @@ func TestCreate(t *testing.T) {
+ 				Namespace:  "test",
+ 				KubeClient: ki,
+ 				Proto: &tpb.Node{
+-					Name:       "node1",
+-					Model:      tt.model,
+-					Config:     cfg,
++					Name:   "node1",
++					Model:  tt.model,
++					Config: cfg,
+ 					Interfaces: map[string]*tpb.Interface{
+ 						"eth1": {Name: "GigabitEthernet0/0/0/0"},
+ 					},
+@@ -1391,10 +1396,15 @@ func TestCreate(t *testing.T) {
+ 			if got := pod.Spec.EnableServiceLinks; got == nil || *got {
+ 				t.Errorf("pod.Spec.EnableServiceLinks = %v, want false", got)
+ 			}
+-			if len(pod.Spec.InitContainers) != 1 {
+-				t.Fatalf("expected 1 init container, got %d", len(pod.Spec.InitContainers))
++			var initNames []string
++			for _, ic := range pod.Spec.InitContainers {
++				initNames = append(initNames, ic.Name)
+ 			}
+-			initC := pod.Spec.InitContainers[0]
++			if diff := cmp.Diff(tt.wantInitNames, initNames); diff != "" {
++				t.Fatalf("init container names diff (-want +got):\n%s", diff)
++			}
++			// The last init container is the one these expectations describe (xrd-default-route for XRd).
++			initC := pod.Spec.InitContainers[len(pod.Spec.InitContainers)-1]
+ 			if diff := cmp.Diff(tt.wantInitCommand, initC.Command); diff != "" {
+ 				t.Errorf("init container command diff (-want +got):\n%s", diff)
+ 			}
+@@ -1587,3 +1597,323 @@ func TestValidPathRegexp(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestOnboardedModelDefaults(t *testing.T) {
++	tests := []struct {
++		name      string
++		model     string
++		wantCPU   string
++		wantMem   string
++		wantImage string
++	}{
++		{
++			name:      "IOL defaults",
++			model:     ModelIOL,
++			wantCPU:   "100m",
++			wantMem:   "512Mi",
++			wantImage: "iol:latest",
++		},
++		{
++			name:      "IOLL2 defaults",
++			model:     ModelIOLL2,
++			wantCPU:   "100m",
++			wantMem:   "512Mi",
++			wantImage: "ioll2:latest",
++		},
++		{
++			name:      "NXOS defaults",
++			model:     ModelNXOS,
++			wantCPU:   "1000m",
++			wantMem:   "6Gi",
++			wantImage: "nxos:latest",
++		},
++		{
++			name:      "ASAV defaults",
++			model:     ModelASAV,
++			wantCPU:   "2000m",
++			wantMem:   "2Gi",
++			wantImage: "asav:latest",
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			pb := &tpb.Node{
++				Name:  "pod1",
++				Model: tt.model,
++				Config: &tpb.Config{
++					ConfigPath: "/",
++					ConfigFile: "startup.cfg",
++				},
++			}
++			got, err := defaults(pb)
++			if err != nil {
++				t.Fatalf("defaults() unexpected error: %v", err)
++			}
++			if got.Constraints["cpu"] != tt.wantCPU {
++				t.Fatalf("defaults() cpu = %q, want %q", got.Constraints["cpu"], tt.wantCPU)
++			}
++			if got.Constraints["memory"] != tt.wantMem {
++				t.Fatalf("defaults() memory = %q, want %q", got.Constraints["memory"], tt.wantMem)
++			}
++			if got.Config.Image != tt.wantImage {
++				t.Fatalf("defaults() image = %q, want %q", got.Config.Image, tt.wantImage)
++			}
++			if got.Config.Cert != nil {
++				t.Fatalf("defaults() cert = %v, want nil for model %q", got.Config.Cert, tt.model)
++			}
++		})
++	}
++}
++
++func TestXRDNoBootConfigEnvWithoutConfigData(t *testing.T) {
++	pb := &tpb.Node{
++		Name:  "xrd-test",
++		Model: ModelXRD,
++		Config: &tpb.Config{
++			ConfigPath: "/",
++			ConfigFile: "startup.cfg",
++		},
++	}
++	got, err := defaults(pb)
++	if err != nil {
++		t.Fatalf("defaults() unexpected error: %v", err)
++	}
++	if _, ok := got.Config.Env["XR_EVERY_BOOT_CONFIG"]; ok {
++		t.Fatalf("defaults() should not set XR_EVERY_BOOT_CONFIG without ConfigData")
++	}
++}
++
++func TestCreateIOLUsesImageEntrypoint(t *testing.T) {
++	ki := fake.NewSimpleClientset()
++	ni := &node.Impl{
++		KubeClient: ki,
++		Namespace:  "test",
++		Proto: &tpb.Node{
++			Name:  "iol1",
++			Model: ModelIOL,
++			Config: &tpb.Config{
++				Image:      "registry.example.com/skyforge/cisco_iol:17.16.01a-kne-r23",
++				ConfigPath: "/",
++				ConfigFile: "startup.cfg",
++				ConfigData: &tpb.Config_Data{
++					Data: []byte("hostname iol1\n"),
++				},
++			},
++		},
++	}
++	n, err := New(ni)
++	if err != nil {
++		t.Fatalf("New() unexpected error: %v", err)
++	}
++	if err := n.Create(context.Background()); err != nil {
++		t.Fatalf("Create() unexpected error: %v", err)
++	}
++	pod, err := ki.CoreV1().Pods("test").Get(context.Background(), "iol1", metav1.GetOptions{})
++	if err != nil {
++		t.Fatalf("Get(Pod) unexpected error: %v", err)
++	}
++	if len(pod.Spec.Containers[0].Command) != 0 {
++		t.Fatalf("expected rebuilt IOL image to use its native entrypoint, got command: %#v", pod.Spec.Containers[0].Command)
++	}
++	if len(pod.Spec.Containers[0].Args) != 0 {
++		t.Fatalf("expected rebuilt IOL image to use its native args, got args: %#v", pod.Spec.Containers[0].Args)
++	}
++	env := map[string]string{}
++	for _, item := range pod.Spec.Containers[0].Env {
++		env[item.Name] = item.Value
++	}
++	if got := env["IOL_SNMP_COMMUNITY"]; got != "skyforge" {
++		t.Fatalf("expected IOL SNMP community to match Skyforge the collector credential, got %q", got)
++	}
++	if got := env["IOL_SNMP_HOSTNAME"]; got != "iol1" {
++		t.Fatalf("expected IOL SNMP hostname to be set from node name, got %q", got)
++	}
++	if _, err := ki.CoreV1().ConfigMaps("test").Get(context.Background(), "iol1-iol-snmp-bridge", metav1.GetOptions{}); err == nil {
++		t.Fatalf("did not expect a KNE-managed IOL SNMP bridge ConfigMap for rebuilt images")
++	}
++	if pod.Spec.Containers[0].StartupProbe == nil {
++		t.Fatalf("expected IOL startup probe to be set")
++	}
++	if pod.Spec.Containers[0].ReadinessProbe == nil {
++		t.Fatalf("expected IOL readiness probe to be set")
++	}
++	if pod.Spec.Containers[0].LivenessProbe == nil {
++		t.Fatalf("expected IOL liveness probe to be set")
++	}
++	// Current contract (cisco.go attachIOLReadinessProbes, EXPERIMENTAL 2026-09-20):
++	// readiness and liveness check relay and mgmt ping only; the SSH/proxy gates
++	// were dropped to test the control-plane flap. Pinned here so a change in
++	// either direction is a deliberate edit, not drift.
++	probes := map[string]struct {
++		probe *corev1.Probe
++		want  []string
++	}{
++		"startup": {
++			probe: pod.Spec.Containers[0].StartupProbe,
++			want: []string{
++				"/bin/sh",
++				"-c",
++				"IOL_READY_MIN_SECONDS=5 IOL_READY_REQUIRE_RELAY=true IOL_READY_REQUIRE_MGMT_PING=false IOL_READY_REQUIRE_MGMT_SSH=false IOL_READY_REQUIRE_PROXY=false /usr/local/bin/iol-ready-check",
++			},
++		},
++		"readiness": {
++			probe: pod.Spec.Containers[0].ReadinessProbe,
++			want: []string{
++				"/bin/sh",
++				"-c",
++				"IOL_READY_MIN_SECONDS=30 IOL_READY_REQUIRE_RELAY=true IOL_READY_REQUIRE_MGMT_PING=true IOL_READY_REQUIRE_MGMT_SSH=false IOL_READY_REQUIRE_PROXY=false /usr/local/bin/iol-ready-check",
++			},
++		},
++		"liveness": {
++			probe: pod.Spec.Containers[0].LivenessProbe,
++			want: []string{
++				"/bin/sh",
++				"-c",
++				"IOL_READY_MIN_SECONDS=0 IOL_READY_REQUIRE_RELAY=true IOL_READY_REQUIRE_MGMT_PING=false IOL_READY_REQUIRE_MGMT_SSH=false IOL_READY_REQUIRE_PROXY=false /usr/local/bin/iol-ready-check",
++			},
++		},
++	}
++	for probeName, tc := range probes {
++		probe := tc.probe
++		if probe.Exec == nil {
++			t.Fatalf("%s probe exec = nil", probeName)
++		}
++		if diff := cmp.Diff(tc.want, probe.Exec.Command); diff != "" {
++			t.Fatalf("%s probe command mismatch (-want +got):\n%s", probeName, diff)
++		}
++	}
++}
++
++// TestXRDBootstrapAppliesVRFPermits asserts that the XRd every-boot relay script the
++// cisco node injects also clears the VRF-netns L3VPN control-plane wall. XRd realizes
++// each routing VRF as a Linux network namespace (global-vrf, vrf-management, and one
++// per configured L3VPN VRF), each with an INPUT-policy DROP in front of its data
++// interfaces that silently drops CE<->PE VRF eBGP/OSPF/ICMP. The port-proxy only reaches
++// loopback ports inside the netns; the trusted-fabric permit must be mirrored into every
++// netns (the XRd analog of arista-ceoslab-operator patch 0010).
++func TestXRDBootstrapAppliesVRFPermits(t *testing.T) {
++	for _, want := range []string{
++		"apply_vrf_dataplane_permits",
++		"ip netns list",
++		`ip netns exec "${_ns}" ip -o link show`,
++		`ip netns exec "${_ns}" iptables -I INPUT 1 -i "${_ifc}" -j ACCEPT`,
++		"/run/kne-xrd-vrf-permit.pid",
++	} {
++		if !strings.Contains(xrdProxyBootstrap, want) {
++			t.Fatalf("xrd every-boot bootstrap missing %q; VRF-netns L3VPN permit not applied:\n%s", want, xrdProxyBootstrap)
++		}
++	}
++}
++
++// TestXRDMountsSharedMemory asserts that an XRd pod gets a memory-backed volume at
++// /dev/shmem, and that a non-XRd Cisco model does not.
++//
++// Without the mount, /dev/shmem is whatever wins a race inside the container: Cisco's
++// /pkg/etc/ds_startup.sh runs `ln -nsf /dev/shm /dev/shmem`, but XR's own libraries
++// reach for /dev/shmem while the node boots, and when they get there first the `ln`
++// cannot replace a directory -- it nests /dev/shmem/shm -> /dev/shm inside it and the
++// shared memory stays on the 64 MiB /dev tmpfs, which fills in about thirty seconds and
++// turns every later shared-memory fault into SIGBUS. Measured on node-a 2026-08-14:
++// /dev at 100%, /dev/shm at 1%, xr_cli exit 135 (Bus error).
++//
++// The IOL case is the negative control. If this test asserted only the XRd mount it
++// would still pass with the mount attached unconditionally to every Cisco model, which
++// would put a tmpfs over /dev/shmem in NOSes that neither want nor use one.
++func TestXRDMountsSharedMemory(t *testing.T) {
++	for _, tt := range []struct {
++		desc  string
++		name  string
++		model string
++		image string
++		want  bool
++	}{{
++		desc:  "xrd gets the shared-memory mount",
++		name:  "xrd1",
++		model: ModelXRD,
++		image: "registry.example.com/skyforge/kne/cisco_xrd:25.2.1",
++		want:  true,
++	}, {
++		desc:  "iol does not get the shared-memory mount",
++		name:  "iol1",
++		model: ModelIOL,
++		image: "registry.example.com/skyforge/kne/cisco_iol:17.16.01a",
++		want:  false,
++	}} {
++		t.Run(tt.desc, func(t *testing.T) {
++			ki := fake.NewSimpleClientset()
++			ni := &node.Impl{
++				KubeClient: ki,
++				Namespace:  "test",
++				Proto: &tpb.Node{
++					Name:  tt.name,
++					Model: tt.model,
++					Config: &tpb.Config{
++						Image:      tt.image,
++						ConfigPath: "/",
++						ConfigFile: "startup.cfg",
++						ConfigData: &tpb.Config_Data{Data: []byte("hostname " + tt.name + "\n")},
++					},
++				},
++			}
++			n, err := New(ni)
++			if err != nil {
++				t.Fatalf("New() unexpected error: %v", err)
++			}
++			if err := n.Create(context.Background()); err != nil {
++				t.Fatalf("Create() unexpected error: %v", err)
++			}
++			pod, err := ki.CoreV1().Pods("test").Get(context.Background(), tt.name, metav1.GetOptions{})
++			if err != nil {
++				t.Fatalf("Get(Pod) unexpected error: %v", err)
++			}
++
++			wantVolume := xrdSharedMemoryVolumeName(tt.name)
++			var volume *corev1.Volume
++			for i := range pod.Spec.Volumes {
++				if pod.Spec.Volumes[i].Name == wantVolume {
++					volume = &pod.Spec.Volumes[i]
++					break
++				}
++			}
++			var mount *corev1.VolumeMount
++			for i := range pod.Spec.Containers[0].VolumeMounts {
++				if pod.Spec.Containers[0].VolumeMounts[i].MountPath == xrdSharedMemoryPath {
++					mount = &pod.Spec.Containers[0].VolumeMounts[i]
++					break
++				}
++			}
++
++			if !tt.want {
++				if volume != nil {
++					t.Fatalf("model %q must not declare the XRd shared-memory volume, got %#v", tt.model, *volume)
++				}
++				if mount != nil {
++					t.Fatalf("model %q must not mount %s, got %#v", tt.model, xrdSharedMemoryPath, *mount)
++				}
++				return
++			}
++
++			if volume == nil {
++				t.Fatalf("expected volume %q on the XRd pod, got volumes %#v", wantVolume, pod.Spec.Volumes)
++			}
++			if volume.EmptyDir == nil {
++				t.Fatalf("expected %q to be an emptyDir, got %#v", wantVolume, volume.VolumeSource)
++			}
++			if volume.EmptyDir.Medium != corev1.StorageMediumMemory {
++				t.Fatalf("expected %q to be memory-backed so it is not the 64 MiB /dev tmpfs, got medium %q",
++					wantVolume, volume.EmptyDir.Medium)
++			}
++			if mount == nil {
++				t.Fatalf("expected a mount at %s on the XRd container, got %#v",
++					xrdSharedMemoryPath, pod.Spec.Containers[0].VolumeMounts)
++			}
++			if mount.Name != wantVolume {
++				t.Fatalf("expected %s to be backed by %q, got %q", xrdSharedMemoryPath, wantVolume, mount.Name)
++			}
++			if mount.ReadOnly {
++				t.Fatalf("%s must be writable: XR creates its shared-memory windows there", xrdSharedMemoryPath)
++			}
++		})
++	}
++}
+diff --git a/topo/node/cisco/iol-snmp-bridge.pl b/topo/node/cisco/iol-snmp-bridge.pl
+new file mode 100644
+index 0000000..9cac596
+--- /dev/null
++++ b/topo/node/cisco/iol-snmp-bridge.pl
+@@ -0,0 +1,467 @@
++#!/usr/bin/perl
++use strict;
++use warnings;
++use Socket qw(AF_INET SOCK_DGRAM SOL_SOCKET SO_REUSEADDR sockaddr_in inet_aton);
++
++my $listen_port   = $ENV{IOL_SNMP_PORT} // 161;
++my $community     = $ENV{IOL_SNMP_COMMUNITY} // 'public';
++my $refresh_sec   = $ENV{IOL_SNMP_REFRESH_SEC} // 5;
++my $config_path   = $ENV{IOL_CONFIG_PATH} // '/iol/config.txt';
++my $console_exec  = $ENV{IOL_SNMP_CONSOLE_EXEC} // '/usr/local/bin/iol-console-exec';
++my $use_console   = ($ENV{IOL_SNMP_ENABLE_CONSOLE} // '') eq '1';
++my $start_time    = time();
++my $last_refresh  = 0;
++my @default_ifaces = map { "Ethernet0/$_" } (0 .. 3);
++my @initial_ifaces = grep { length $_ } map { s/^\s+|\s+$//gr } split /,/, ($ENV{IOL_SNMP_INTERFACES} // '');
++@initial_ifaces = @default_ifaces if !@initial_ifaces;
++my %state         = (
++  hostname => $ENV{IOL_SNMP_HOSTNAME} || 'iol',
++  sysdescr => $ENV{IOL_SNMP_SYS_DESCR} || 'Cisco IOS Software [IOSXE], Linux Software (X86_64BI_LINUX-ADVENTERPRISEK9-M)',
++  cpu      => defined $ENV{IOL_SNMP_CPU} ? $ENV{IOL_SNMP_CPU} + 0 : 0,
++  mem_used => defined $ENV{IOL_SNMP_MEM_USED} ? $ENV{IOL_SNMP_MEM_USED} + 0 : 0,
++  mem_free => defined $ENV{IOL_SNMP_MEM_FREE} ? $ENV{IOL_SNMP_MEM_FREE} + 0 : 1,
++  ifaces   => \@initial_ifaces,
++);
++
++sub read_file {
++  my ($path) = @_;
++  return '' if !$path || !-f $path;
++  open my $fh, '<', $path or return '';
++  local $/;
++  my $data = <$fh>;
++  close $fh;
++  return defined $data ? $data : '';
++}
++
++sub run_console_cmd {
++  my ($cmd) = @_;
++  return '' if !$cmd;
++  return '' if !-x $console_exec;
++  local $ENV{SSH_ORIGINAL_COMMAND} = $cmd;
++  my $output = qx{$console_exec 2>/dev/null};
++  return $output // '';
++}
++
++sub parse_interfaces {
++  my ($text) = @_;
++  my @ifaces;
++  for my $line (split /\n/, $text // '') {
++    $line =~ s/\r//g;
++    next if $line =~ /^\s*$/;
++    next if $line =~ /^Interface\s+IP-Address/i;
++    next if $line =~ /^[^[:space:]\r\n]+[>#]\s*$/;
++    next if $line =~ /^[^[:space:]\r\n]+[>#]\S+/;
++    if ($line =~ /^\s*([A-Za-z][A-Za-z0-9\/\.\-\:]+)\s+/) {
++      push @ifaces, $1;
++    }
++  }
++  return \@ifaces;
++}
++
++sub parse_interfaces_from_config {
++  my ($text) = @_;
++  my %seen;
++  my @ifaces;
++  for my $line (split /\n/, $text // '') {
++    $line =~ s/\r//g;
++    if ($line =~ /^\s*interface\s+(\S+)/i) {
++      my $iface = $1;
++      next if $seen{$iface}++;
++      push @ifaces, $iface;
++    }
++  }
++  return \@ifaces;
++}
++
++sub iface_type {
++  my ($name) = @_;
++  return 24  if $name =~ /^Loopback/i;
++  return 53  if $name =~ /^Vlan/i;
++  return 6;
++}
++
++sub iface_speed {
++  my ($name) = @_;
++  return 1000 if $name =~ /^Ethernet/i;
++  return 0;
++}
++
++sub refresh_state {
++  my $now = time();
++  return if $now - $last_refresh < $refresh_sec;
++  $last_refresh = $now;
++
++  if (!$ENV{IOL_SNMP_HOSTNAME}) {
++    my $cfg = read_file($config_path);
++    if ($cfg =~ /^\s*hostname\s+(\S+)/m) {
++      $state{hostname} = $1;
++    }
++    if (!$ENV{IOL_SNMP_INTERFACES}) {
++      my $ifaces = parse_interfaces_from_config($cfg);
++      if (@{$ifaces}) {
++        $state{ifaces} = $ifaces;
++      }
++    }
++  }
++
++  return if !$use_console;
++
++  if (!$ENV{IOL_SNMP_SYS_DESCR}) {
++    my $descr = run_console_cmd('show version | include Cisco IOS Software');
++    if ($descr =~ /(Cisco IOS Software[^\r\n]*)/) {
++      $state{sysdescr} = $1;
++    }
++  }
++
++  if (!$ENV{IOL_SNMP_INTERFACES}) {
++    my $brief = run_console_cmd('show ip interface brief');
++    my $ifaces = parse_interfaces($brief);
++    if (@{$ifaces}) {
++      $state{ifaces} = $ifaces;
++    }
++  }
++
++  if (!$ENV{IOL_SNMP_CPU}) {
++    my $cpu = run_console_cmd('show processes cpu | include CPU utilization');
++    if ($cpu =~ /five minutes:\s*(\d+)%/i) {
++      $state{cpu} = $1;
++    }
++  }
++}
++
++sub oid_tuple {
++  my ($oid_str) = @_;
++  return [ map { 0 + $_ } split /\./, $oid_str ];
++}
++
++sub oid_compare {
++  my ($a, $b) = @_;
++  my $len = @$a > @$b ? @$a : @$b;
++  for (my $i = 0; $i < $len; $i++) {
++    my $av = $i < @$a ? $a->[$i] : -1;
++    my $bv = $i < @$b ? $b->[$i] : -1;
++    return $av <=> $bv if $av != $bv;
++  }
++  return 0;
++}
++
++sub oid_to_string {
++  my ($oid) = @_;
++  return join '.', @$oid;
++}
++
++sub encode_length {
++  my ($len) = @_;
++  return pack('C', $len) if $len < 0x80;
++  my $bytes = '';
++  while ($len > 0) {
++    $bytes = pack('C', $len & 0xff) . $bytes;
++    $len >>= 8;
++  }
++  return pack('C', 0x80 | length($bytes)) . $bytes;
++}
++
++sub encode_tlv {
++  my ($tag, $value) = @_;
++  return pack('C', $tag) . encode_length(length($value)) . $value;
++}
++
++sub encode_integer {
++  my ($value, $tag) = @_;
++  $tag //= 0x02;
++  my $bytes = '';
++  if ($value == 0) {
++    $bytes = "\x00";
++  } else {
++    my $v = $value;
++    while ($v > 0) {
++      $bytes = pack('C', $v & 0xff) . $bytes;
++      $v >>= 8;
++    }
++    if ((ord(substr($bytes, 0, 1)) & 0x80) != 0) {
++      $bytes = "\x00" . $bytes;
++    }
++  }
++  return encode_tlv($tag, $bytes);
++}
++
++sub encode_octet_string {
++  my ($value) = @_;
++  $value = '' if !defined $value;
++  return encode_tlv(0x04, $value);
++}
++
++sub encode_null {
++  return "\x05\x00";
++}
++
++sub encode_exception {
++  my ($tag) = @_;
++  return pack('CC', $tag, 0);
++}
++
++sub encode_oid {
++  my ($oid) = @_;
++  my @parts = @{$oid};
++  my $first = shift @parts // 0;
++  my $second = shift @parts // 0;
++  my @bytes = (($first * 40) + $second);
++  for my $part (@parts) {
++    my @stack = ($part & 0x7f);
++    $part >>= 7;
++    while ($part > 0) {
++      unshift @stack, 0x80 | ($part & 0x7f);
++      $part >>= 7;
++    }
++    push @bytes, @stack;
++  }
++  return encode_tlv(0x06, pack('C*', @bytes));
++}
++
++sub decode_length {
++  my ($data, $offset) = @_;
++  my $first = ord(substr($data, $offset, 1));
++  $offset++;
++  return ($first, $offset) if ($first & 0x80) == 0;
++  my $count = $first & 0x7f;
++  my $len = 0;
++  for (1 .. $count) {
++    $len = ($len << 8) | ord(substr($data, $offset, 1));
++    $offset++;
++  }
++  return ($len, $offset);
++}
++
++sub decode_tlv {
++  my ($data, $offset) = @_;
++  my $tag = ord(substr($data, $offset, 1));
++  $offset++;
++  my ($len, $value_offset) = decode_length($data, $offset);
++  my $value = substr($data, $value_offset, $len);
++  return ($tag, $len, $value, $value_offset + $len);
++}
++
++sub decode_integer {
++  my ($bytes) = @_;
++  my $value = 0;
++  for my $byte (unpack('C*', $bytes)) {
++    $value = ($value << 8) | $byte;
++  }
++  return $value;
++}
++
++sub decode_oid {
++  my ($bytes) = @_;
++  my @octets = unpack('C*', $bytes);
++  return [1,3] if !@octets;
++  my $first = shift @octets;
++  my @parts = (int($first / 40), $first % 40);
++  my $value = 0;
++  for my $octet (@octets) {
++    $value = ($value << 7) | ($octet & 0x7f);
++    if (($octet & 0x80) == 0) {
++      push @parts, $value;
++      $value = 0;
++    }
++  }
++  return \@parts;
++}
++
++sub build_mib {
++  refresh_state();
++  my %mib = (
++    '1.3.6.1.2.1.1.1.0'              => { type => 'octet',     value => $state{sysdescr} },
++    '1.3.6.1.2.1.1.2.0'              => { type => 'oid',       value => [1,3,6,1,4,1,9,1,1] },
++    '1.3.6.1.2.1.1.3.0'              => { type => 'timeticks', value => int((time() - $start_time) * 100) },
++    '1.3.6.1.2.1.1.5.0'              => { type => 'octet',     value => $state{hostname} },
++    '1.3.6.1.4.1.9.9.109.1.1.1.1.8'  => { type => 'integer',   value => $state{cpu} },
++    '1.3.6.1.4.1.9.9.48.1.1.1.5.1'   => { type => 'integer',   value => $state{mem_used} },
++    '1.3.6.1.4.1.9.9.48.1.1.1.6.1'   => { type => 'integer',   value => $state{mem_free} },
++  );
++
++  my $idx = 1;
++  for my $iface (@{$state{ifaces}}) {
++    $mib{"1.3.6.1.2.1.31.1.1.1.1.$idx"}  = { type => 'octet',     value => $iface };
++    $mib{"1.3.6.1.2.1.31.1.1.1.6.$idx"}  = { type => 'counter64', value => 0 };
++    $mib{"1.3.6.1.2.1.31.1.1.1.10.$idx"} = { type => 'counter64', value => 0 };
++    $mib{"1.3.6.1.2.1.31.1.1.1.15.$idx"} = { type => 'gauge32',   value => iface_speed($iface) };
++    $mib{"1.3.6.1.2.1.2.2.1.13.$idx"}    = { type => 'counter32', value => 0 };
++    $mib{"1.3.6.1.2.1.2.2.1.19.$idx"}    = { type => 'counter32', value => 0 };
++    $mib{"1.3.6.1.2.1.2.2.1.14.$idx"}    = { type => 'counter32', value => 0 };
++    $mib{"1.3.6.1.2.1.2.2.1.20.$idx"}    = { type => 'counter32', value => 0 };
++    $mib{"1.3.6.1.2.1.2.2.1.3.$idx"}     = { type => 'integer',   value => iface_type($iface) };
++    $idx++;
++  }
++
++  my @oids = sort { oid_compare(oid_tuple($a), oid_tuple($b)) } keys %mib;
++  return (\%mib, \@oids);
++}
++
++sub encode_value {
++  my ($entry) = @_;
++  return encode_exception(0x80) if !$entry;
++  return encode_octet_string($entry->{value}) if $entry->{type} eq 'octet';
++  return encode_oid($entry->{value})          if $entry->{type} eq 'oid';
++  return encode_integer($entry->{value}, 0x43) if $entry->{type} eq 'timeticks';
++  return encode_integer($entry->{value}, 0x41) if $entry->{type} eq 'counter32';
++  return encode_integer($entry->{value}, 0x42) if $entry->{type} eq 'gauge32';
++  return encode_integer($entry->{value}, 0x46) if $entry->{type} eq 'counter64';
++  return encode_integer($entry->{value}, 0x02);
++}
++
++sub exact_lookup {
++  my ($mib, $oid) = @_;
++  return $mib->{ oid_to_string($oid) };
++}
++
++sub next_lookup {
++  my ($mib, $sorted, $oid) = @_;
++  for my $candidate (@{$sorted}) {
++    return ($candidate, $mib->{$candidate}) if oid_compare(oid_tuple($candidate), $oid) > 0;
++  }
++  return (undef, undef);
++}
++
++sub build_varbind {
++  my ($oid, $entry) = @_;
++  return encode_tlv(0x30, encode_oid($oid) . encode_value($entry));
++}
++
++sub handle_get {
++  my ($mib, $sorted, $requests) = @_;
++  my @out;
++  for my $oid (@{$requests}) {
++    push @out, build_varbind($oid, exact_lookup($mib, $oid));
++  }
++  return @out;
++}
++
++sub handle_getnext {
++  my ($mib, $sorted, $requests) = @_;
++  my @out;
++  for my $oid (@{$requests}) {
++    my ($next_oid_str, $entry) = next_lookup($mib, $sorted, $oid);
++    if (defined $next_oid_str) {
++      push @out, build_varbind(oid_tuple($next_oid_str), $entry);
++    } else {
++      push @out, encode_tlv(0x30, encode_oid($oid) . encode_exception(0x82));
++    }
++  }
++  return @out;
++}
++
++sub handle_getbulk {
++  my ($mib, $sorted, $requests, $non_repeaters, $max_repetitions) = @_;
++  my @out;
++  $non_repeaters = 0 if $non_repeaters < 0;
++  $max_repetitions = 1 if $max_repetitions < 1;
++  my $count = scalar @{$requests};
++  my $nr = $non_repeaters > $count ? $count : $non_repeaters;
++
++  for my $i (0 .. $nr - 1) {
++    my ($next_oid_str, $entry) = next_lookup($mib, $sorted, $requests->[$i]);
++    if (defined $next_oid_str) {
++      push @out, build_varbind(oid_tuple($next_oid_str), $entry);
++    } else {
++      push @out, encode_tlv(0x30, encode_oid($requests->[$i]) . encode_exception(0x82));
++    }
++  }
++
++  for my $i ($nr .. $count - 1) {
++    my $cursor = $requests->[$i];
++    for (1 .. $max_repetitions) {
++      my ($next_oid_str, $entry) = next_lookup($mib, $sorted, $cursor);
++      if (defined $next_oid_str) {
++        my $next_oid = oid_tuple($next_oid_str);
++        push @out, build_varbind($next_oid, $entry);
++        $cursor = $next_oid;
++      } else {
++        push @out, encode_tlv(0x30, encode_oid($cursor) . encode_exception(0x82));
++        last;
++      }
++    }
++  }
++  return @out;
++}
++
++sub parse_message {
++  my ($payload) = @_;
++  my ($tag, undef, $msg_value, undef) = decode_tlv($payload, 0);
++  die "invalid message" if $tag != 0x30;
++  my $offset = 0;
++  my ($v_tag, undef, $v_val, $off1) = decode_tlv($msg_value, $offset);
++  die "invalid version" if $v_tag != 0x02;
++  my $version = decode_integer($v_val);
++  $offset = $off1;
++  my ($c_tag, undef, $c_val, $off2) = decode_tlv($msg_value, $offset);
++  die "invalid community" if $c_tag != 0x04;
++  my $msg_community = $c_val;
++  $offset = $off2;
++  my ($pdu_tag, undef, $pdu_val, undef) = decode_tlv($msg_value, $offset);
++  my $pdu_off = 0;
++  my (undef, undef, $req_id_val, $p1) = decode_tlv($pdu_val, $pdu_off);
++  my $req_id = decode_integer($req_id_val);
++  $pdu_off = $p1;
++  my (undef, undef, $field2_val, $p2) = decode_tlv($pdu_val, $pdu_off);
++  my $field2 = decode_integer($field2_val);
++  $pdu_off = $p2;
++  my (undef, undef, $field3_val, $p3) = decode_tlv($pdu_val, $pdu_off);
++  my $field3 = decode_integer($field3_val);
++  $pdu_off = $p3;
++  my ($vb_tag, undef, $vb_val, undef) = decode_tlv($pdu_val, $pdu_off);
++  die "invalid varbind list" if $vb_tag != 0x30;
++  my @oids;
++  my $vb_off = 0;
++  while ($vb_off < length($vb_val)) {
++    my ($row_tag, undef, $row_val, $row_next) = decode_tlv($vb_val, $vb_off);
++    last if $row_tag != 0x30;
++    my ($oid_tag, undef, $oid_val, undef) = decode_tlv($row_val, 0);
++    last if $oid_tag != 0x06;
++    push @oids, decode_oid($oid_val);
++    $vb_off = $row_next;
++  }
++  return ($version, $msg_community, $pdu_tag, $req_id, $field2, $field3, \@oids);
++}
++
++sub build_response {
++  my ($req_id, $varbinds) = @_;
++  my $varbind_list = encode_tlv(0x30, join('', @{$varbinds}));
++  my $pdu = encode_integer($req_id) . encode_integer(0) . encode_integer(0) . $varbind_list;
++  return encode_tlv(0x30, encode_integer(1) . encode_octet_string($community) . encode_tlv(0xA2, $pdu));
++}
++
++sub serve_once {
++  my ($sock) = @_;
++  my $peer = recv($sock, my $payload, 65535, 0);
++  return if !defined $peer;
++  my ($mib, $sorted) = build_mib();
++  my ($version, $msg_community, $pdu_tag, $req_id, $field2, $field3, $oids);
++  eval {
++    ($version, $msg_community, $pdu_tag, $req_id, $field2, $field3, $oids) = parse_message($payload);
++  };
++  return if $@;
++  return if $version > 1;
++  return if $msg_community ne $community;
++
++  my @varbinds;
++  if ($pdu_tag == 0xA0) {
++    @varbinds = handle_get($mib, $sorted, $oids);
++  } elsif ($pdu_tag == 0xA1) {
++    @varbinds = handle_getnext($mib, $sorted, $oids);
++  } elsif ($pdu_tag == 0xA5) {
++    @varbinds = handle_getbulk($mib, $sorted, $oids, $field2, $field3);
++  } else {
++    return;
++  }
++
++  my $response = build_response($req_id, \@varbinds);
++  send($sock, $response, 0, $peer);
++}
++
++socket(my $sock, AF_INET, SOCK_DGRAM, 0) or die "socket: $!";
++setsockopt($sock, SOL_SOCKET, SO_REUSEADDR, 1) or die "setsockopt: $!";
++bind($sock, sockaddr_in($listen_port, inet_aton('0.0.0.0'))) or die "bind: $!";
++
++while (1) {
++  serve_once($sock);
++}
+diff --git a/topo/node/cisco/kubevirt_status_test.go b/topo/node/cisco/kubevirt_status_test.go
+new file mode 100644
+index 0000000..a530fe7
+--- /dev/null
++++ b/topo/node/cisco/kubevirt_status_test.go
+@@ -0,0 +1,35 @@
++package cisco
++
++import (
++	"context"
++	"testing"
++
++	tpb "github.com/openconfig/kne/proto/topo"
++	"github.com/openconfig/kne/topo/node"
++	"k8s.io/client-go/kubernetes/fake"
++	"k8s.io/client-go/rest"
++)
++
++func TestStatusPendingWithoutKubeVirtLauncherPod(t *testing.T) {
++	n := &Node{
++		Impl: &node.Impl{
++			Namespace:  "test",
++			KubeClient: fake.NewSimpleClientset(),
++			RestConfig: &rest.Config{},
++			Proto: &tpb.Node{
++				Name:   "n1",
++				Vendor: tpb.Vendor_CISCO,
++				Model:  ModelNXOS,
++				Config: &tpb.Config{Image: "registry.example.com/skyforge/kubevirt/nxos:9.3.8"},
++			},
++		},
++	}
++
++	got, err := n.Status(context.Background())
++	if err != nil {
++		t.Fatalf("Status() failed: %v", err)
++	}
++	if got != node.StatusPending {
++		t.Fatalf("Status() got %v, want %v", got, node.StatusPending)
++	}
++}
+diff --git a/topo/node/cisco/xrd_default_route_test.go b/topo/node/cisco/xrd_default_route_test.go
+new file mode 100644
+index 0000000..0099ac0
+--- /dev/null
++++ b/topo/node/cisco/xrd_default_route_test.go
+@@ -0,0 +1,120 @@
++package cisco
++
++import (
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	corev1 "k8s.io/api/core/v1"
++)
++
++// TestXRDDefaultRouteScriptExecution runs the real init script with a fake `ip` that reports a
++// default gateway, the same contract upstream's TestXRDInitScriptExecution used. The routes must be
++// appended to the copied first-boot config.
++func TestXRDDefaultRouteScriptExecution(t *testing.T) {
++	tmpDir := t.TempDir()
++	srcDir := filepath.Join(tmpDir, "config-src")
++	dstDir := filepath.Join(tmpDir, "config-dst")
++	binDir := filepath.Join(tmpDir, "bin")
++	for _, d := range []string{srcDir, binDir} {
++		if err := os.MkdirAll(d, 0755); err != nil {
++			t.Fatal(err)
++		}
++	}
++	const configFile = "startup.cfg"
++	if err := os.WriteFile(filepath.Join(srcDir, configFile), []byte("hostname xrd\n"), 0644); err != nil {
++		t.Fatal(err)
++	}
++	ipScript := `#!/bin/sh
++if [ "$1" = "-4" ] && [ "$2" = "route" ]; then
++  echo "default via 10.244.0.1 dev eth0"
++elif [ "$1" = "-6" ] && [ "$2" = "route" ]; then
++  echo "default via 2001:db8::1 dev eth0"
++fi
++`
++	if err := os.WriteFile(filepath.Join(binDir, "ip"), []byte(ipScript), 0755); err != nil {
++		t.Fatal(err)
++	}
++
++	cmd := exec.Command("/bin/sh", "-c", xrdDefaultRouteScript(srcDir, dstDir, configFile))
++	cmd.Env = append(os.Environ(), "PATH="+binDir+":"+os.Getenv("PATH"))
++	if out, err := cmd.CombinedOutput(); err != nil {
++		t.Fatalf("script execution failed: %v, output: %s", err, out)
++	}
++	content, err := os.ReadFile(filepath.Join(dstDir, configFile))
++	if err != nil {
++		t.Fatalf("failed to read generated config: %v", err)
++	}
++	got := string(content)
++	for _, want := range []string{
++		"hostname xrd",
++		"router static\n address-family ipv4 unicast\n  0.0.0.0/0 10.244.0.1\n !\n!\n",
++		"router static\n address-family ipv6 unicast\n  ::/0 2001:db8::1\n !\n!\n",
++	} {
++		if !strings.Contains(got, want) {
++			t.Errorf("generated config missing %q; got:\n%s", want, got)
++		}
++	}
++}
++
++// TestAttachXRdDefaultRouteWiresSeedThroughInit checks the pod wiring: the XR container must read the
++// first-boot file from the emptyDir the init container fills, and the init container must read the
++// seed volume.
++func TestAttachXRdDefaultRouteWiresSeedThroughInit(t *testing.T) {
++	pod := &corev1.Pod{Spec: corev1.PodSpec{
++		Volumes: []corev1.Volume{{Name: "startup-config-volume"}},
++		Containers: []corev1.Container{{
++			Name: "xrd",
++			VolumeMounts: []corev1.VolumeMount{{
++				Name: "startup-config-volume", MountPath: xrdFirstBootConfig, SubPath: "startup.cfg", ReadOnly: true,
++			}},
++		}},
++	}}
++	if err := attachXRdDefaultRoute(pod, "init:test", "startup.cfg"); err != nil {
++		t.Fatalf("attachXRdDefaultRoute() failed: %v", err)
++	}
++	if len(pod.Spec.InitContainers) != 1 || pod.Spec.InitContainers[0].Name != "xrd-default-route" {
++		t.Fatalf("init containers = %#v, want xrd-default-route", pod.Spec.InitContainers)
++	}
++	init := pod.Spec.InitContainers[0]
++	if init.Image != "init:test" || len(init.VolumeMounts) != 2 ||
++		init.VolumeMounts[0].Name != "startup-config-volume" || init.VolumeMounts[0].MountPath != xrdDefaultRouteSrcDir ||
++		init.VolumeMounts[1].Name != xrdDefaultRouteVolumeName || init.VolumeMounts[1].MountPath != xrdDefaultRouteDstDir {
++		t.Fatalf("init container wiring = %#v", init)
++	}
++	if !strings.Contains(init.Args[0], "/config-dst/startup.cfg") || !strings.Contains(init.Args[0], "0.0.0.0/0") {
++		t.Fatalf("init script does not write the routed config: %s", init.Args[0])
++	}
++	xr := pod.Spec.Containers[0].VolumeMounts[0]
++	if xr.Name != xrdDefaultRouteVolumeName || xr.MountPath != xrdFirstBootConfig || xr.SubPath != "startup.cfg" {
++		t.Fatalf("XR first-boot mount = %#v, want the emptyDir subPath", xr)
++	}
++	foundVol := false
++	for _, v := range pod.Spec.Volumes {
++		if v.Name == xrdDefaultRouteVolumeName && v.EmptyDir != nil {
++			foundVol = true
++		}
++	}
++	if !foundVol {
++		t.Fatalf("pod volumes = %#v, want emptyDir %s", pod.Spec.Volumes, xrdDefaultRouteVolumeName)
++	}
++}
++
++// TestAttachXRdDefaultRouteNoSeedWritesRoutesOnly covers the no-config path: upstream still wrote a
++// routes-only first-boot file, so the init container gets only the /config-dst mount and XR mounts it.
++func TestAttachXRdDefaultRouteNoSeedWritesRoutesOnly(t *testing.T) {
++	pod := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "xrd"}}}}
++	if err := attachXRdDefaultRoute(pod, "init:test", "startup.cfg"); err != nil {
++		t.Fatalf("attachXRdDefaultRoute() failed: %v", err)
++	}
++	if len(pod.Spec.InitContainers) != 1 || len(pod.Spec.InitContainers[0].VolumeMounts) != 1 ||
++		pod.Spec.InitContainers[0].VolumeMounts[0].MountPath != xrdDefaultRouteDstDir {
++		t.Fatalf("init container = %#v, want one /config-dst mount", pod.Spec.InitContainers)
++	}
++	if len(pod.Spec.Containers[0].VolumeMounts) != 1 || pod.Spec.Containers[0].VolumeMounts[0].MountPath != xrdFirstBootConfig ||
++		pod.Spec.Containers[0].VolumeMounts[0].SubPath != "startup.cfg" {
++		t.Fatalf("XR mounts = %#v, want the routes-only file at %s", pod.Spec.Containers[0].VolumeMounts, xrdFirstBootConfig)
++	}
++}
+-- 
+2.56.0
+

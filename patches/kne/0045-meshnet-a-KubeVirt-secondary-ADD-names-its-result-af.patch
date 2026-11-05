@@ -1,0 +1,230 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 08:03:39 -0500
+Subject: [PATCH 45/46] meshnet: a KubeVirt secondary ADD names its result
+ after the requested interface
+
+---
+diff --git a/third_party/meshnet/plugin/kubevirt_secondary_test.go b/third_party/meshnet/plugin/kubevirt_secondary_test.go
+new file mode 100644
+index 0000000..d719003
+--- /dev/null
++++ b/third_party/meshnet/plugin/kubevirt_secondary_test.go
+@@ -0,0 +1,125 @@
++package main
++
++import (
++	"encoding/json"
++	"io"
++	"os"
++	"testing"
++
++	"github.com/containernetworking/cni/pkg/skel"
++	types100 "github.com/containernetworking/cni/pkg/types/100"
++)
++
++// The NAD the kne generator writes for a KubeVirt VM's meshnet wires (the
++// live object on the cat8000v lab, 2026-10-24). Multus runs one meshnet ADD per
++// requested interface against this config.
++const liveKubeVirtNADConfig = `{"cniVersion":"0.3.0","dns":{},"fabricMTU":8950,"ipam":{},"kubevirtSecondary":true,"name":"meshnet","secondaryWaitSeconds":180,"type":"meshnet"}`
++
++// A chained (container) meshnet conflist carries no kubevirtSecondary key.
++const chainedMeshnetConfig = `{"cniVersion":"0.3.0","name":"meshnet","type":"meshnet","delegate":{}}`
++
++func TestNADConfigMarksKubeVirtSecondary(t *testing.T) {
++	n, _, err := loadConf([]byte(liveKubeVirtNADConfig))
++	if err != nil {
++		t.Fatalf("loadConf(NAD): %v", err)
++	}
++	if !n.KubeVirtSecondary {
++		t.Fatalf("NAD with kubevirtSecondary:true must set KubeVirtSecondary")
++	}
++	n, _, err = loadConf([]byte(chainedMeshnetConfig))
++	if err != nil {
++		t.Fatalf("loadConf(chained): %v", err)
++	}
++	if n.KubeVirtSecondary {
++		t.Fatalf("a chained conflist without the key must not be treated as a KubeVirt secondary")
++	}
++}
++
++func TestRequestedIfNameComesFromMultusArgs(t *testing.T) {
++	t.Setenv("CNI_IFNAME", "from-env")
++	if got := requestedIfName(&skel.CmdArgs{IfName: "pod24bf8ab8fca"}); got != "pod24bf8ab8fca" {
++		t.Fatalf("IfName must win over CNI_IFNAME, got %q", got)
++	}
++	if got := requestedIfName(&skel.CmdArgs{}); got != "from-env" {
++		t.Fatalf("empty IfName must fall back to CNI_IFNAME, got %q", got)
++	}
++}
++
++// An empty secondary result (no prevResult) must name the requested slot, so
++// Multus has nothing to rename into a slot the daemon already holds.
++func TestAlignEmptyResultNamesRequestedInterface(t *testing.T) {
++	r := &types100.Result{}
++	alignResultInterfaceName(r, "pod24bf8ab8fca")
++	if len(r.Interfaces) != 1 || r.Interfaces[0].Name != "pod24bf8ab8fca" {
++		t.Fatalf("want one interface named pod24bf8ab8fca, got %+v", r.Interfaces)
++	}
++}
++
++func TestAlignExistingResultRenamesLastInterface(t *testing.T) {
++	r := &types100.Result{Interfaces: []*types100.Interface{{Name: "meshnet"}}}
++	alignResultInterfaceName(r, "pod151b6d47576")
++	if r.Interfaces[0].Name != "pod151b6d47576" {
++		t.Fatalf("want last interface renamed to requested name, got %q", r.Interfaces[0].Name)
++	}
++}
++
++// printAddResult is what Multus parses. For the NAD the printed interface name
++// must be the requested one; for a chained config the output is unchanged.
++func TestPrintedSecondaryResultNamesRequestedInterface(t *testing.T) {
++	out := captureStdout(t, func() {
++		n := &netConf{KubeVirtSecondary: true}
++		n.CNIVersion = "0.3.0"
++		args := &skel.CmdArgs{IfName: "pod24bf8ab8fca"}
++		if err := printAddResult(n, &types100.Result{}, args); err != nil {
++			t.Fatalf("printAddResult: %v", err)
++		}
++	})
++	var got struct {
++		Interfaces []struct {
++			Name string `json:"name"`
++		} `json:"interfaces"`
++	}
++	if err := json.Unmarshal(out, &got); err != nil {
++		t.Fatalf("printed result is not JSON: %v (%s)", err, out)
++	}
++	if len(got.Interfaces) != 1 || got.Interfaces[0].Name != "pod24bf8ab8fca" {
++		t.Fatalf("printed interface must be the requested pod24bf8ab8fca, got %s", out)
++	}
++}
++
++func TestPrintedChainedResultIsUnchanged(t *testing.T) {
++	out := captureStdout(t, func() {
++		n := &netConf{}
++		n.CNIVersion = "0.3.0"
++		args := &skel.CmdArgs{IfName: "pod24bf8ab8fca"}
++		if err := printAddResult(n, &types100.Result{}, args); err != nil {
++			t.Fatalf("printAddResult: %v", err)
++		}
++	})
++	var got map[string]any
++	if err := json.Unmarshal(out, &got); err != nil {
++		t.Fatalf("printed result is not JSON: %v", err)
++	}
++	if _, ok := got["interfaces"]; ok {
++		t.Fatalf("chained path must not gain an interface, got %s", out)
++	}
++}
++
++func captureStdout(t *testing.T, fn func()) []byte {
++	t.Helper()
++	r, w, err := os.Pipe()
++	if err != nil {
++		t.Fatal(err)
++	}
++	orig := os.Stdout
++	os.Stdout = w
++	done := make(chan []byte)
++	go func() {
++		b, _ := io.ReadAll(r)
++		done <- b
++	}()
++	fn()
++	os.Stdout = orig
++	w.Close()
++	return <-done
++}
+diff --git a/third_party/meshnet/plugin/meshnet.go b/third_party/meshnet/plugin/meshnet.go
+index 11c6611..d47df24 100644
+--- a/third_party/meshnet/plugin/meshnet.go
++++ b/third_party/meshnet/plugin/meshnet.go
+@@ -7,6 +7,7 @@ import (
+ 	"net"
+ 	"os"
+ 	"runtime"
++	"strings"
+ 	"time"
+ 
+ 	"github.com/containernetworking/cni/pkg/skel"
+@@ -41,6 +42,52 @@ var interNodeLinkType = wireutil.INTER_NODE_LINK_VXLAN
+ type netConf struct {
+ 	types.NetConf
+ 	Delegate map[string]interface{} `json:"delegate"`
++	// KubeVirtSecondary marks a NetworkAttachmentDefinition that a KubeVirt
++	// VM takes its meshnet wires through (Multus, one ADD per requested
++	// interface). Set by the kne NAD generator (kubeVirtMeshnetNADConfig).
++	KubeVirtSecondary bool `json:"kubevirtSecondary,omitempty"`
++}
++
++// requestedIfName is the interface name Multus asked this ADD to produce.
++func requestedIfName(args *skel.CmdArgs) string {
++	if args == nil {
++		return ""
++	}
++	if ifName := strings.TrimSpace(args.IfName); ifName != "" {
++		return ifName
++	}
++	return strings.TrimSpace(os.Getenv("CNI_IFNAME"))
++}
++
++// alignResultInterfaceName names the result interface after the requested
++// ifName. A NAD ADD returns an empty result (no prevResult); with no interface
++// in it Multus falls back to the NAD name ("meshnet") and renames the link
++// into the requested slot. When the daemon has already created the wire under
++// that slot (a KubeVirt pod's topology links are realized as one set), that
++// rename fails with "validateIfName: interface name X already exists". Naming
++// the result after the requested slot means Multus has nothing to rename.
++func alignResultInterfaceName(result *types100.Result, ifName string) {
++	if result == nil {
++		return
++	}
++	ifName = strings.TrimSpace(ifName)
++	if ifName == "" {
++		return
++	}
++	if len(result.Interfaces) == 0 {
++		result.Interfaces = []*types100.Interface{{Name: ifName}}
++		return
++	}
++	result.Interfaces[len(result.Interfaces)-1].Name = ifName
++}
++
++// printAddResult prints the ADD result. For a KubeVirt secondary NAD the
++// interface is aligned to the requested name first.
++func printAddResult(n *netConf, result *types100.Result, args *skel.CmdArgs) error {
++	if n.KubeVirtSecondary {
++		alignResultInterfaceName(result, requestedIfName(args))
++	}
++	return types.PrintResult(result, n.CNIVersion)
+ }
+ 
+ type k8sArgs struct {
+@@ -217,12 +264,12 @@ func cmdAdd(args *skel.CmdArgs) error {
+ 		}
+ 
+ 		log.Infof("Add: Pod %s:%s was not a topology pod returning", string(cniArgs.K8S_POD_NAMESPACE), string(cniArgs.K8S_POD_NAME))
+-		return types.PrintResult(result, n.CNIVersion)
++		return printAddResult(n, result, args)
+ 	}
+ 
+ 	if localPod == nil {
+ 		log.Infof("Add: Pod %s:%s was not a topology pod returning", string(cniArgs.K8S_POD_NAMESPACE), string(cniArgs.K8S_POD_NAME))
+-		return types.PrintResult(result, n.CNIVersion)
++		return printAddResult(n, result, args)
+ 	}
+ 
+ 	if err := checkCrossNamespaceLinks(string(cniArgs.K8S_POD_NAMESPACE), localPod.Links, interNodeLinkType); err != nil {
+@@ -328,7 +375,7 @@ func cmdAdd(args *skel.CmdArgs) error {
+ 	}
+ WaitDone:
+ 
+-	return types.PrintResult(result, n.CNIVersion)
++	return printAddResult(n, result, args)
+ }
+ 
+ // -------------------------------------------------------------------------------------------------
+-- 
+2.56.0
+

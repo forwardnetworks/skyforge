@@ -1,0 +1,110 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 12:00:00 +0000
+Subject: [PATCH] kne provider: the Caldera agent env for linux nodes is
+ opt-in, from one per-run fact
+
+SKYFORGE-SPECIFIC: platform behaviour; not for upstream.
+
+---
+diff --git a/netsim/providers/kne.py b/netsim/providers/kne.py
+index 414b360..482e1de 100644
+--- a/netsim/providers/kne.py
++++ b/netsim/providers/kne.py
+@@ -385,6 +385,10 @@ KNE_STARTUP_CONFIG_GENERATORS: dict = {
+ }
+ 
+ KNE_NODE_DATA_ADJUSTERS: dict = {
++  'linux': (
++    lambda kne_data, node, topology, cfg_mode, disable_startup_for_node:
++      adjust_linux_node_data(kne_data,node),
++  ),
+   'iol': (
+     lambda kne_data, node, topology, cfg_mode, disable_startup_for_node:
+       adjust_iol_node_data(kne_data,node),
+@@ -2518,6 +2522,31 @@ def adjust_iol_node_data(kne_data: Box, node: Box) -> None:
+     return
+   kne_data.env.IOL_RUNNER_LOCAL_APP = str(node_id)
+ 
++CALDERA_AGENT_ENV_KEYS = ('SKYFORGE_CALDERA_AGENT_ENABLED','SKYFORGE_CALDERA_SERVER')
++
++def adjust_linux_node_data(kne_data: Box, node: Box) -> None:
++  '''
++  SKYFORGE-SPECIFIC: the Caldera (Sandcat) agent is OPT-IN PER LAB, and this is the only door.
++
++  The skyforge-linux-host image starts its Sandcat launcher only when the pod carries
++  SKYFORGE_CALDERA_AGENT_ENABLED=1 and SKYFORGE_CALDERA_SERVER. Both come from ONE per-run fact,
++  NETLAB_KNE_CALDERA_AGENT_SERVER, which the Skyforge server puts on the runtime Job only when the
++  deployment's owner switched Caldera on for that deployment (default off, audited). Unset -> the pod
++  gets neither variable and the image runs no agent.
++
++  A topology author's own `kne.env.SKYFORGE_CALDERA_*` is DISCARDED either way: the lab file is user
++  input and must not be able to enrol a node by itself (the Caldera NetworkPolicy is the second lock;
++  this keeps the pod spec honest about it).
++  '''
++  kne_data.env = kne_data.get('env',Box(default_box=True,box_dots=True))
++  for key in CALDERA_AGENT_ENV_KEYS:
++    kne_data.env.pop(key,None)
++  server = str(os.environ.get('NETLAB_KNE_CALDERA_AGENT_SERVER','') or '').strip()
++  if not server:
++    return
++  kne_data.env.SKYFORGE_CALDERA_AGENT_ENABLED = '1'
++  kne_data.env.SKYFORGE_CALDERA_SERVER = server
++
+ def adjust_eos_node_data(kne_data: Box, node: Box, topology: Box, cfg_mode: str) -> None:
+   kne_data.env = kne_data.get('env',Box(default_box=True,box_dots=True))
+   kne_data.env.pop('CLAB_MGMT_VRF',None)
+diff --git a/tests/test_kne_provider.py b/tests/test_kne_provider.py
+index f64ac7e..fa8ad68 100644
+--- a/tests/test_kne_provider.py
++++ b/tests/test_kne_provider.py
+@@ -1604,6 +1604,46 @@ nodes:
+   assert topology.nodes.h1.kne.get('startup_config',None) is None
+ 
+ 
++def _linux_pod_env(tmp_path: Path) -> str:
++  topo_file = write_topology(tmp_path,"""
++provider: kne
++
++nodes:
++  h1:
++    device: linux
++    kne:
++      env:
++        SKYFORGE_CALDERA_AGENT_ENABLED: "1"
++        SKYFORGE_CALDERA_SERVER: http://attacker.example:8888
++        KEEP_ME: "yes"
++  h2:
++    device: linux
++""")
++  init_log()
++  create.run(['-o','config','-o','provider',str(topo_file)])
++  return Path('topology.pb.txt').read_text()
++
++
++def test_kne_linux_caldera_agent_is_off_by_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.chdir(tmp_path)
++  monkeypatch.delenv('NETLAB_KNE_CALDERA_AGENT_SERVER',raising=False)
++  provider_text = _linux_pod_env(tmp_path)
++  # nothing from the platform, and the topology author's own attempt is discarded
++  assert 'SKYFORGE_CALDERA' not in provider_text
++  assert 'attacker.example' not in provider_text
++  assert 'KEEP_ME' in provider_text
++
++
++def test_kne_linux_caldera_agent_env_follows_the_per_run_fact(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.chdir(tmp_path)
++  monkeypatch.setenv('NETLAB_KNE_CALDERA_AGENT_SERVER','http://caldera.example.invalid:8888')
++  provider_text = _linux_pod_env(tmp_path)
++  # both linux nodes get the platform's values (h1's own are overwritten, not honoured)
++  assert provider_text.count('key: "SKYFORGE_CALDERA_AGENT_ENABLED"') == 2
++  assert provider_text.count('value: "http://caldera.example.invalid:8888"') == 2
++  assert 'attacker.example' not in provider_text
++
++
+ def test_kne_ioll2_uses_distinct_image_contract(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+   monkeypatch.chdir(tmp_path)
+   topo_file = write_topology(tmp_path,"""
+-- 
+2.56.0
+

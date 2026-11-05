@@ -1,0 +1,177 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 19:46:07 -0500
+Subject: [PATCH 37/41] meshnet: a labelled node's VXLAN binds its declared
+ underlay (M0012 fix, 2)
+
+---
+diff --git a/third_party/meshnet/daemon/meshnet/controller.go b/third_party/meshnet/daemon/meshnet/controller.go
+index f03054f..471cabb 100644
+--- a/third_party/meshnet/daemon/meshnet/controller.go
++++ b/third_party/meshnet/daemon/meshnet/controller.go
+@@ -383,6 +383,9 @@ func (m *Meshnet) reconcilePodLinksInternal(ctx context.Context, topo *unstructu
+ 					IntfName: link.LocalIntf,
+ 					IntfIp:   link.LocalIP,
+ 					PeerVtep: peerSrcIP,
++					// A labelled node's VXLAN is bound to its declared underlay (M0012);
++					// empty keeps the default-route lookup on unlabelled nodes.
++					NodeIntf: m.nodeIntf,
+ 					// Both ends of a cross-namespace link must derive the same VNI, so the key is the ordered pair.
+ 					Vni:    link.LinkUID + wireutil.NamespaceVNIOffset(wireutil.LinkKeyNamespace(link.KubeNs, link.PeerKubeNs)),
+ 					KubeNs: link.KubeNs,
+diff --git a/third_party/meshnet/daemon/meshnet/meshnet.go b/third_party/meshnet/daemon/meshnet/meshnet.go
+index a57378b..edfa30a 100644
+--- a/third_party/meshnet/daemon/meshnet/meshnet.go
++++ b/third_party/meshnet/daemon/meshnet/meshnet.go
+@@ -39,14 +39,17 @@ type Meshnet struct {
+ 	mpb.UnimplementedLocalServer
+ 	mpb.UnimplementedRemoteServer
+ 	mpb.UnimplementedWireProtocolServer
+-	config            Config
+-	kClient           kubernetes.Interface
+-	tClient           topologyclientv1.Interface
+-	GWireDynClient    *dynamic.DynamicClient
+-	rCfg              *rest.Config
+-	s                 *grpc.Server
+-	lis               net.Listener
+-	nodeIP            string
++	config         Config
++	kClient        kubernetes.Interface
++	tClient        topologyclientv1.Interface
++	GWireDynClient *dynamic.DynamicClient
++	rCfg           *rest.Config
++	s              *grpc.Server
++	lis            net.Listener
++	nodeIP         string
++	// nodeIntf is the declared underlay interface of a labelled node (M0012).
++	// Empty on an unlabelled node, which keeps the default-route lookup.
++	nodeIntf          string
+ 	interNodeLinkType string
+ 	topoCache         *TopologyCache
+ 	reconcileQueue    *ReconcileQueue
+@@ -151,10 +154,11 @@ func New(cfg Config) (*Meshnet, error) {
+ 	// the labelled interface, so the daemon's identity must be that source too.
+ 	// Resolving it here (not only HOST_IP) keeps the local checks consistent.
+ 	// Fail closed: if the node cannot be read, the daemon does not start.
+-	if id, err := m.resolveNodeIdentity(context.Background()); err != nil {
++	if id, intf, err := m.resolveNodeIdentity(context.Background()); err != nil {
+ 		return nil, fmt.Errorf("resolve node VTEP identity: %w", err)
+ 	} else {
+ 		m.nodeIP = id
++		m.nodeIntf = intf
+ 	}
+ 
+ 	// After server is registered, reduce logging if link type is GRPC
+diff --git a/third_party/meshnet/daemon/meshnet/underlay_contract.go b/third_party/meshnet/daemon/meshnet/underlay_contract.go
+index 972baba..9d67417 100644
+--- a/third_party/meshnet/daemon/meshnet/underlay_contract.go
++++ b/third_party/meshnet/daemon/meshnet/underlay_contract.go
+@@ -49,53 +49,64 @@ func declaredUnderlayContract(labels map[string]string, configuredMTU int) (intf
+ }
+ 
+ // resolveNodeIdentity returns the address this daemon's node is known by in
+-// status.src_ip: the declared VTEP source on a labelled node, HOST_IP otherwise.
+-func (m *Meshnet) resolveNodeIdentity(ctx context.Context) (string, error) {
+-	ip, _, err := m.nodeSourceForCurrentNode(ctx)
++// status.src_ip, and the declared underlay interface (empty when unlabelled):
++// the declared VTEP source on a labelled node, HOST_IP otherwise.
++func (m *Meshnet) resolveNodeIdentity(ctx context.Context) (string, string, error) {
++	ip, intf, declared, err := m.nodeSourceDeclared(ctx)
+ 	if err != nil {
+-		return "", err
++		return "", "", err
++	}
++	if !declared {
++		return ip, "", nil
+ 	}
+-	return ip, nil
++	return ip, intf, nil
+ }
+ 
+ // nodeSourceForCurrentNode returns the VTEP source IP and interface for this
+ // node. Labels win when present; otherwise HOST_IP and HOST_INTF are used as
+ // before.
+ func (m *Meshnet) nodeSourceForCurrentNode(ctx context.Context) (string, string, error) {
++	ip, intf, _, err := m.nodeSourceDeclared(ctx)
++	return ip, intf, err
++}
++
++// nodeSourceDeclared is nodeSourceForCurrentNode plus whether the node declared
++// its underlay (labelled). An unlabelled node reports declared=false.
++func (m *Meshnet) nodeSourceDeclared(ctx context.Context) (string, string, bool, error) {
+ 	legacyIP := os.Getenv("HOST_IP")
+ 	legacyIntf := os.Getenv("HOST_INTF")
+ 	nodeName := strings.TrimSpace(os.Getenv("NODE_NAME"))
+ 	if nodeName == "" || m == nil || m.kClient == nil {
+-		return legacyIP, legacyIntf, nil
++		return legacyIP, legacyIntf, false, nil
+ 	}
+ 	node, err := m.kClient.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+ 	if err != nil {
+-		return "", "", fmt.Errorf("read meshnet underlay declaration for node %q: %w", nodeName, err)
++		return "", "", false, fmt.Errorf("read meshnet underlay declaration for node %q: %w", nodeName, err)
+ 	}
+ 	fabricMTU, err := wireutil.FabricMTUFromEnv()
+ 	if err != nil {
+-		return "", "", err
++		return "", "", false, err
+ 	}
+ 	nodeIntf, requiredMTU, advertised, err := declaredUnderlayContract(node.Labels, fabricMTU)
+ 	if err != nil {
+-		return "", "", fmt.Errorf("node %q meshnet underlay contract: %w", nodeName, err)
++		return "", "", false, fmt.Errorf("node %q meshnet underlay contract: %w", nodeName, err)
+ 	}
+ 	if !advertised {
+-		return legacyIP, legacyIntf, nil
++		return legacyIP, legacyIntf, false, nil
+ 	}
+ 	iface, err := net.InterfaceByName(nodeIntf)
+ 	if err != nil {
+-		return "", "", fmt.Errorf("node %q advertised meshnet underlay interface %q: %w", nodeName, nodeIntf, err)
++		return "", "", false, fmt.Errorf("node %q advertised meshnet underlay interface %q: %w", nodeName, nodeIntf, err)
+ 	}
+ 	if iface.MTU < requiredMTU {
+-		return "", "", fmt.Errorf("node %q advertised meshnet underlay interface %q has MTU %d, need at least %d", nodeName, nodeIntf, iface.MTU, requiredMTU)
++		return "", "", false, fmt.Errorf("node %q advertised meshnet underlay interface %q has MTU %d, need at least %d", nodeName, nodeIntf, iface.MTU, requiredMTU)
+ 	}
+ 	sourceIP, err := nodeSourceFromInterface(iface)
+ 	if err != nil {
+-		return "", "", fmt.Errorf("node %q advertised meshnet underlay interface %q: %w", nodeName, nodeIntf, err)
++		return "", "", false, fmt.Errorf("node %q advertised meshnet underlay interface %q: %w", nodeName, nodeIntf, err)
+ 	}
+ 	mnetdLogger.Infof("Using declared meshnet underlay for node %s: interface=%s source_ip=%s", nodeName, nodeIntf, sourceIP)
+-	return sourceIP, nodeIntf, nil
++	return sourceIP, nodeIntf, true, nil
+ }
+ 
+ // nodeSourceFromInterface returns the first IPv4 address of the interface.
+diff --git a/third_party/meshnet/daemon/meshnet/underlay_contract_test.go b/third_party/meshnet/daemon/meshnet/underlay_contract_test.go
+index e0dcafe..0d27842 100644
+--- a/third_party/meshnet/daemon/meshnet/underlay_contract_test.go
++++ b/third_party/meshnet/daemon/meshnet/underlay_contract_test.go
+@@ -95,10 +95,13 @@ func TestNodeIdentityIsDeclaredVTEPOnLabelledNode(t *testing.T) {
+ 		t.Skipf("loopback has no IPv4 in this environment: %v", err)
+ 	}
+ 	m := &Meshnet{kClient: fakekube.NewSimpleClientset(node)}
+-	id, err := m.resolveNodeIdentity(context.Background())
++	id, intf, err := m.resolveNodeIdentity(context.Background())
+ 	if err != nil {
+ 		t.Fatalf("resolveNodeIdentity: %v", err)
+ 	}
++	if intf != "lo" {
++		t.Fatalf("labelled node declared interface = %q, want \"lo\" (the VXLAN must bind to it)", intf)
++	}
+ 	if id == "172.18.0.7" {
+ 		t.Fatalf("labelled node identity = HOST_IP %q; want the declared source %q", id, want)
+ 	}
+@@ -114,8 +117,8 @@ func TestNodeIdentityUnlabelledIsHostIP(t *testing.T) {
+ 	t.Setenv("HOST_INTF", "eth0")
+ 	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n4"}}
+ 	m := &Meshnet{kClient: fakekube.NewSimpleClientset(node)}
+-	id, err := m.resolveNodeIdentity(context.Background())
+-	if err != nil || id != "172.18.0.8" {
++	id, intf, err := m.resolveNodeIdentity(context.Background())
++	if err != nil || id != "172.18.0.8" || intf != "" {
+ 		t.Fatalf("unlabelled identity = %q, %v; want HOST_IP", id, err)
+ 	}
+ }

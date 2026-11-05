@@ -1,0 +1,40 @@
+module: [ bgp, ospf ]
+
+# JvB added
+provider: kne
+defaults.device: sros # iosv
+bgp.as: 65000
+
+groups:
+  # netlab 26.08 tightening: a topology-level `module:` no longer reaches the
+  # nodes, so `rr` carried bgp.rr and `y` carried bgp.as/bgp.originate with the
+  # bgp module not enabled on either -- "nodes.rr uses an attribute from module
+  # bgp which is not enabled in nodes.rr".
+  net:
+    members: [ a,b,c,d,m,rr ]
+    module: [ bgp, ospf ]
+  add_path:
+    members: [ m, rr ]
+    config: [ bgp-addpath ]
+  ext:
+    members: [ y ]
+    # bgp only: y is the external AS 65100 peer and runs no IGP with the fabric.
+    module: [ bgp ]
+    # config: [ test-loopback.j2 ] # using 'generate-icmp true' in SRL
+
+nodes:
+  a:
+  b:
+  c:
+  d:
+  m: # Starting with R23.3.1 SRL now supports ADD_PATH capability
+    device: sros
+  rr:
+    device: sros
+    bgp.rr: True
+    id: 1
+  y:
+    bgp.as: 65100
+    bgp.originate: [ 10.42.42.0/24 ]
+
+links: [ a-b, a-c, b-d, c-d, b-rr, d-rr, c-y, d-y, m-c, m-d ]

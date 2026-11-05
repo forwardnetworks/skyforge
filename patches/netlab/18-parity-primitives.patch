@@ -1,0 +1,742 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 12:00:00 +0000
+Subject: [PATCH] primitives: bgp multipath, ospf distance, NHRP timeout, MPLS
+ TTL propagation, ASA inspect
+
+---
+diff --git a/docs/module/bgp.md b/docs/module/bgp.md
+index e4f642f..83e9583 100644
+--- a/docs/module/bgp.md
++++ b/docs/module/bgp.md
+@@ -185,6 +185,8 @@ Instead of using a global list of autonomous systems, you could specify a BGP au
+ 
+ * **bgp.as**: AS number -- specified on a node, or as default global value (propagated to all nodes without a specified AS number)
+ * **bgp.rr** -- The node is a BGP route reflector within its autonomous system.
++* **bgp.multipath** -- number of equal-cost BGP paths installed in the routing table (`maximum-paths N`, `maximum-paths ibgp N` on Cisco IOS; `maximum-paths N ecmp N` on Arista EOS). Supported on devices with the **bgp.multipath** feature (IOS/IOL, EOS); a device without it refuses the attribute.
++* **bgp.multipath_relax** -- allow multipath across EBGP paths with different AS paths of equal length (`bgp bestpath as-path multipath-relax`). Requires **bgp.multipath**.
+ 
+ ```{note}
+ * The **bgp.as** parameter *must* be specified for every node using the BGP configuration module.
+diff --git a/docs/module/mpls.md b/docs/module/mpls.md
+index 54c5d2c..8550410 100644
+--- a/docs/module/mpls.md
++++ b/docs/module/mpls.md
+@@ -104,6 +104,7 @@ The following table describes the per-platform support of individual MPLS label
+ * **mpls.bgp** -- enable BGP Labeled Unicast address families. BGP-LU is disabled by default.
+ * **mpls.vpn** -- enable VPNv4 and VPNv6 address families. BGP/MPLS L3VPN is disabled by default.
+ * **mpls.6pe** -- enable 6PE on IBGP and/or EBGP sessions (default: IBGP only). 6PE is disabled by default.
++* **mpls.propagate_ttl** -- set to `False` to stop copying the IP TTL into the MPLS label stack (`no mpls ip propagate-ttl` on Cisco IOS): a customer traceroute then sees the provider core as one hop. Supported on IOS/IOL only.
+ 
+ LDP is enabled by default on all nodes using the **mpls** configuration module, and can be disabled by setting **mpls.ldp** node parameter to *False*.
+ 
+diff --git a/docs/module/ospf.md b/docs/module/ospf.md
+index 3aa5045..57f2176 100644
+--- a/docs/module/ospf.md
++++ b/docs/module/ospf.md
+@@ -125,6 +125,7 @@ VRF OSPF instances are implemented on these devices:
+ * **ospf.password** -- default OSPFv2 cleartext authentication password. Applies to all interfaces without an explicit **ospf.password** setting.
+ * **ospf.priority** -- node-wide OSPF router priority. Applies to all interfaces without an explicit **ospf.priority** setting.
+ * **ospf.reference_bandwidth** – per-node OSPF auto-cost reference bandwidth (in Mbps).
++* **ospf.distance** -- administrative distance of OSPF routes (1-255). Rendered as `distance N` on Cisco IOS and as intra-area/inter-area/external distance on Arista EOS. Use it to rank OSPF below or above another protocol (for example `201` to prefer IBGP-reflected copies of the same prefixes). Supported on IOS/IOL and EOS; other devices refuse the attribute.
+ * **ospf.router_id** -- set [static router ID](routing_router_id).
+ * **ospf.passive** -- node-level default for passive interfaces (default: False)
+ * **ospf.timers** -- default OSPF interface timers. You can override the node values on individual interfaces.
+diff --git a/docs/plugins.md b/docs/plugins.md
+index c171ac9..f7ccb47 100644
+--- a/docs/plugins.md
++++ b/docs/plugins.md
+@@ -76,6 +76,7 @@ These plugins are included with _netlab_ and can be used in all lab topologies:
+    plugins/nat.md
+    plugins/mlag.vtep.md
+    plugins/evpn.multihoming.md
++   plugins/tunnel.dmvpn.md
+    plugins/tunnel.gre.md
+    plugins/tunnel.wireguard.md
+ ```
+diff --git a/docs/plugins/firewall.policy.md b/docs/plugins/firewall.policy.md
+index 1d88afa..824b66e 100644
+--- a/docs/plugins/firewall.policy.md
++++ b/docs/plugins/firewall.policy.md
+@@ -40,6 +40,8 @@ Node-level:
+ * `firewall.policy.rules` — a list of rules.
+ * `firewall.policy.service_objects` — named protocol/port services (`name`, `protocol` tcp|udp, `port`, optional `description`).
+ * `firewall.policy.service_groups` — named service GROUPS (`name`, `members`). Members are service objects, inline `tcp/PORT` forms, other groups, or predefined platform services. A rule that names a group keeps the group: FortiOS and PAN-OS emit the group object and reference it, the ASA expands the members into one ACE each.
++* `firewall.policy.same_security_traffic` — ASA only: `same-security-traffic permit inter-interface`, without which two interfaces at the same security level never exchange traffic.
++* `firewall.policy.inspect` — ASA only: protocol inspection engines added to the factory `global_policy` / `inspection_default` class (`icmp`, `icmp-error`). `icmp` makes the return half of ping/traceroute stateful through a lower-security interface; without it time-exceeded and unreachable replies from `outside` are dropped.
+ * `firewall.policy.address_objects` — named addresses (`name`, `ipv4` as prefix, host or `a-b` range). FortiOS also generates an address object for any src/dst token that is written as a prefix, host or range, because a FortiGate policy cannot take one inline.
+ 
+ Rule attributes:
+diff --git a/docs/plugins/tunnel.dmvpn.md b/docs/plugins/tunnel.dmvpn.md
+new file mode 100644
+index 0000000..c144b2f
+--- /dev/null
++++ b/docs/plugins/tunnel.dmvpn.md
+@@ -0,0 +1,25 @@
++(plugin-tunnel-dmvpn)=
++# DMVPN (mGRE + NHRP) Tunnels
++
++The **tunnel.dmvpn** plugin builds a multipoint GRE overlay with NHRP: one or
++more hubs act as next-hop servers, spokes register with them, and a routing
++protocol (typically EIGRP) runs over the single tunnel interface. There is no
++`tunnel destination` -- NHRP resolves it. Cisco IOS/IOL/IOS-XE only.
++
++## Link attributes
++
++| Attribute | Type | Meaning |
++| --- | --- | --- |
++| `tunnel.mode` | `dmvpn` | Required. |
++| `tunnel.hub` | str or list | Node name(s) acting as NHRP next-hop server. Every other node is a spoke. |
++| `tunnel.nhrp_id` | int | NHRP network-id (default: the link index). |
++| `tunnel.password` | str | NHRP authentication string. |
++| `tunnel.registration_timeout` | int | Spoke `ip nhrp registration timeout N` (seconds): how soon a spoke re-registers after a hub flap. IOS defaults to holdtime/3 (up to 40 minutes); a lab that wants fast reconvergence sets it low. Hubs never carry it. |
++| `tunnel.source` | dict | Where the tunnel is sourced: `{ link: { role: <role> } }`, `{ link: { name: <name> } }`, `{ ifindex: N }` or `{ type: loopback }`. |
++| `tunnel.af` | `ipv4` / `ipv6` | Address family (default ipv4). |
++| `tunnel.vrf` | str | Transport VRF. |
++
++The hub renders `ip nhrp map multicast dynamic` (and `no ip split-horizon
++eigrp <as>` when EIGRP runs on the tunnel, so spokes see each other's routes);
++spokes render `ip nhrp map <hub-overlay> <hub-nbma>`, `ip nhrp map multicast
++<hub-nbma>` and `ip nhrp nhs <hub-overlay>` for every hub.
+diff --git a/netsim/ansible/templates/bgp/eos.j2 b/netsim/ansible/templates/bgp/eos.j2
+index f44f5bd..efb1d04 100644
+--- a/netsim/ansible/templates/bgp/eos.j2
++++ b/netsim/ansible/templates/bgp/eos.j2
+@@ -53,6 +53,12 @@ router bgp {{ bgp.as }}
+ {% if bgp.rr|default(False) and bgp.rr_cluster_id|default(False) %}
+   bgp cluster-id {{ bgp.rr_cluster_id }}
+ {% endif %}
++{% if bgp.multipath|default(0) %}
++  maximum-paths {{ bgp.multipath }} ecmp {{ bgp.multipath }}
++{% endif %}
++{% if bgp.multipath_relax|default(False) %}
++  bgp bestpath as-path multipath-relax
++{% endif %}
+ {% for n in bgp.neighbors %}
+ {%   for af in ['ipv4','ipv6'] if n[af] is defined %}
+ {{     bgpcfg.neighbor(n,af,bgp) }}
+diff --git a/netsim/ansible/templates/bgp/ios.j2 b/netsim/ansible/templates/bgp/ios.j2
+index 9fe8d83..dcdf504 100644
+--- a/netsim/ansible/templates/bgp/ios.j2
++++ b/netsim/ansible/templates/bgp/ios.j2
+@@ -19,6 +19,9 @@ router bgp {{ bgp.as }}
+ {% if bgp.rr|default(False) and bgp.rr_cluster_id|default(False) %}
+  bgp cluster-id {{ bgp.rr_cluster_id }}
+ {% endif %}
++{% if bgp.multipath_relax|default(False) %}
++ bgp bestpath as-path multipath-relax
++{% endif %}
+ {#
+     Configure IPv4 and IPv6 BGP neighbors
+ #}
+@@ -32,6 +35,10 @@ router bgp {{ bgp.as }}
+ {% for af in ['ipv4','ipv6'] if bgp[af] is defined %}
+  address-family {{ af }}
+   bgp scan-time 5
++{%   if bgp.multipath|default(0) %}
++  maximum-paths {{ bgp.multipath }}
++  maximum-paths ibgp {{ bgp.multipath }}
++{%   endif %}
+ {%   if bgp.import is defined %}
+ {{     redistribute.config(bgp,af=af,ospf_pid=ospf_pid)|indent(1,first=True) }}
+ {%   endif %}
+diff --git a/netsim/ansible/templates/mpls/ios.j2 b/netsim/ansible/templates/mpls/ios.j2
+index b72f69b..e48e034 100644
+--- a/netsim/ansible/templates/mpls/ios.j2
++++ b/netsim/ansible/templates/mpls/ios.j2
+@@ -1,3 +1,7 @@
++{% if mpls.propagate_ttl is defined and not mpls.propagate_ttl %}
++no mpls ip propagate-ttl
++!
++{% endif %}
+ {% if ldp is defined %}
+ {%   include 'ios.ldp.j2' +%}
+ {% endif %}
+diff --git a/netsim/ansible/templates/ospf/eos.ospfv2.j2 b/netsim/ansible/templates/ospf/eos.ospfv2.j2
+index db8cbd1..d2f7220 100644
+--- a/netsim/ansible/templates/ospf/eos.ospfv2.j2
++++ b/netsim/ansible/templates/ospf/eos.ospfv2.j2
+@@ -26,6 +26,11 @@ router ospf {{ ospf_pid }}
+ {% if ospf_data.reference_bandwidth is defined %}
+  auto-cost reference-bandwidth {{ ospf_data.reference_bandwidth }}
+ {% endif %}
++{% if ospf_data.distance is defined %}
++ distance ospf intra-area {{ ospf_data.distance }}
++ distance ospf inter-area {{ ospf_data.distance }}
++ distance ospf external {{ ospf_data.distance }}
++{% endif %}
+ {% for l in intf_data if l.ospf.passive|default(False) and 'ipv4' in l %}
+  passive-interface {{ l.ifname }}
+ {% endfor %}
+diff --git a/netsim/ansible/templates/ospf/ios.ospfv2.j2 b/netsim/ansible/templates/ospf/ios.ospfv2.j2
+index a958a3f..1877308 100644
+--- a/netsim/ansible/templates/ospf/ios.ospfv2.j2
++++ b/netsim/ansible/templates/ospf/ios.ospfv2.j2
+@@ -13,6 +13,9 @@ router ospf {{ ospf_pid }}
+ {% if ospf_data.reference_bandwidth is defined %}
+  auto-cost reference-bandwidth {{ ospf_data.reference_bandwidth }}
+ {% endif %}
++{% if ospf_data.distance is defined %}
++ distance {{ ospf_data.distance }}
++{% endif %}
+ {% if ospf_data.distribute_list is defined %}
+ {#  routing/acl.ios.j2 renders the ACL named by ospf.distribute_list as an
+     IPv4 standard ACL under its own unsuffixed name (not <name>_ipv4): IOS
+diff --git a/netsim/devices/eos.yml b/netsim/devices/eos.yml
+index ca53f20..5ad477c 100644
+--- a/netsim/devices/eos.yml
++++ b/netsim/devices/eos.yml
+@@ -38,6 +38,7 @@ features:
+   bgp:
+     activate_af: true
+     advertise: true
++    multipath: true
+     ipv6_lla: true
+     local_as: true
+     local_as_ibgp: true
+@@ -119,6 +120,7 @@ features:
+       command: 'configure replace flash:replace-config'
+   ospf:
+     unnumbered: true
++    distance: true
+     import: [ bgp, isis, ripv2, connected, static, vrf ]
+     default.policy: true
+     password: true
+diff --git a/netsim/devices/ios.yml b/netsim/devices/ios.yml
+index 0df9ad1..67c894e 100644
+--- a/netsim/devices/ios.yml
++++ b/netsim/devices/ios.yml
+@@ -41,6 +41,7 @@ features:
+   bgp:
+     activate_af: true
+     advertise: true
++    multipath: true
+     local_as: true
+     vrf_local_as: true
+     local_as_ibgp: true
+@@ -105,6 +106,7 @@ features:
+     bgp: true
+     vpn: true
+     6pe: true
++    propagate_ttl: true
+   netmiko:
+     device_type: cisco_ios
+     collect:
+@@ -120,6 +122,7 @@ features:
+       file_transfer: true
+   ospf:
+     unnumbered: true
++    distance: true
+     import: [ bgp, isis, ripv2, connected, static, vrf, eigrp ]
+     default.policy: true
+     distribute_list: true
+diff --git a/netsim/extra/firewall/policy/defaults.yml b/netsim/extra/firewall/policy/defaults.yml
+index fcf4cb0..0782777 100644
+--- a/netsim/extra/firewall/policy/defaults.yml
++++ b/netsim/extra/firewall/policy/defaults.yml
+@@ -56,6 +56,13 @@ attributes:
+       # ASA only: interfaces at EQUAL security levels cannot talk without this.
+       # It is a node-wide switch on the platform, not a per-rule one.
+       same_security_traffic: bool
++      # ASA only: protocol inspection engines enabled in the factory
++      # global_policy / inspection_default class (MPF). `icmp` is what lets
++      # echo-reply, time-exceeded and unreachable come back through a lower
++      # security-level interface statefully -- the source labs configure
++      # `inspect icmp` for exactly that; without it a traceroute from the LAN
++      # dies at the firewall. Rendered by the ASA initial template.
++      inspect: { type: list, _subtype: { type: str, valid_values: [ icmp, icmp-error ] } }
+   interface:
+     # The ASA has no zone construct: an interface's `nameif` IS its zone, and
+     # rules reference that name. Declaring the zone on the interface is what
+diff --git a/netsim/extra/tunnel/dmvpn/__init__.py b/netsim/extra/tunnel/dmvpn/__init__.py
+index 194fd5c..97611fe 100644
+--- a/netsim/extra/tunnel/dmvpn/__init__.py
++++ b/netsim/extra/tunnel/dmvpn/__init__.py
+@@ -86,6 +86,7 @@ def post_transform(topology: Box) -> None:
+     net_id = link.get('tunnel.nhrp_id',None) or lidx or 1
+     t_af   = link.get('tunnel.af','ipv4')
+     passwd = link.get('tunnel.password',None)
++    reg_to = link.get('tunnel.registration_timeout',None)
+ 
+     # MATCH ON THE LINK'S linkindex, NOT THE LINK-INTERFACE'S.
+     #
+@@ -141,5 +142,7 @@ def post_transform(topology: Box) -> None:
+       ni.tunnel._dmvpn_nhs   = [ h for h in hub_map if h['node'] != n_name ]
+       if passwd:
+         ni.tunnel._dmvpn_password = passwd
++      if reg_to and ni.tunnel._dmvpn_role == 'spoke':
++        ni.tunnel._dmvpn_registration_timeout = reg_to
+ 
+       api.node_config(ndata,_config_name)
+diff --git a/netsim/extra/tunnel/dmvpn/defaults.yml b/netsim/extra/tunnel/dmvpn/defaults.yml
+index ce78563..10400f6 100644
+--- a/netsim/extra/tunnel/dmvpn/defaults.yml
++++ b/netsim/extra/tunnel/dmvpn/defaults.yml
+@@ -26,6 +26,10 @@ attributes:
+         _alt_types: [ str ]
+       nhrp_id: int            # NHRP network-id; defaults to the link index
+       password: str           # NHRP authentication string
++      registration_timeout:   # Spoke NHRP re-registration interval (seconds).
++        { type: int, min_value: 1, max_value: 65535 }
++                              # Source labs set this low (10) so a spoke re-registers
++                              # seconds after a hub flap instead of holdtime/3.
+       source:
+         type: dict
+         _keys:
+diff --git a/netsim/extra/tunnel/dmvpn/ios.j2 b/netsim/extra/tunnel/dmvpn/ios.j2
+index 175a487..a1db57a 100644
+--- a/netsim/extra/tunnel/dmvpn/ios.j2
++++ b/netsim/extra/tunnel/dmvpn/ios.j2
+@@ -35,6 +35,9 @@ interface {{ intf.ifname }}
+  no ip split-horizon eigrp {{ eigrp.as }}
+ {%     endif %}
+ {%   endif %}
++{%   if intf.tunnel._dmvpn_registration_timeout is defined %}
++ ip nhrp registration timeout {{ intf.tunnel._dmvpn_registration_timeout }}
++{%   endif %}
+ {%   for nhs in intf.tunnel._dmvpn_nhs|default([]) %}
+ {%     if nhs.nbma %}
+  ip nhrp map {{ nhs.overlay }} {{ nhs.nbma }}
+diff --git a/netsim/modules/bgp.py b/netsim/modules/bgp.py
+index 2776853..741d866 100644
+--- a/netsim/modules/bgp.py
++++ b/netsim/modules/bgp.py
+@@ -742,6 +742,27 @@ def process_as_list(topology: Box) -> None:
+ 
+       node.bgp = node_data[name] + node.bgp
+ 
++"""
++check_bgp_multipath: bgp.multipath / bgp.multipath_relax are device features
++(IOS 'maximum-paths N' + 'bgp bestpath as-path multipath-relax', EOS
++'maximum-paths N ecmp N'). A device without the feature fails loudly instead of
++silently installing one path.
++"""
++def check_bgp_multipath(node: Box, topology: Box) -> None:
++  if 'multipath' not in node.bgp and 'multipath_relax' not in node.bgp:
++    return
++  features = devices.get_device_features(node,topology.defaults)
++  if not features.bgp.get('multipath',False):
++    log.error(
++      text=f'{node.name} (device {node.device}) does not support BGP multipath (bgp.multipath / bgp.multipath_relax)',
++      category=log.IncorrectValue,
++      module='bgp')
++  if node.bgp.get('multipath_relax',False) and not node.bgp.get('multipath',0):
++    log.error(
++      text=f'{node.name}: bgp.multipath_relax needs bgp.multipath (the number of paths) as well',
++      category=log.IncorrectValue,
++      module='bgp')
++
+ """
+ Check the confederation data (if it exists) against node AS numbers
+ """
+@@ -990,6 +1011,7 @@ class BGP(_Module):
+       log.fatal(f"Internal error: node {node.name} has BGP module enabled but no BGP parameters","bgp")
+       return
+     build_bgp_sessions(node,topology)
++    check_bgp_multipath(node,topology)
+     check_advertise_data(node,topology)
+     bgp_set_advertise(node,topology)
+     bgp_process_originate(node,topology)
+diff --git a/netsim/modules/bgp.yml b/netsim/modules/bgp.yml
+index 46d6511..775188f 100644
+--- a/netsim/modules/bgp.yml
++++ b/netsim/modules/bgp.yml
+@@ -63,6 +63,8 @@ attributes:
+       ipv6: { type: list, _subtype: bgp_session_type }
+     advertise_loopback: bool
+     advertise_roles: list
++    multipath: { type: int, min_value: 1, max_value: 128 }
++    multipath_relax: bool
+     community:
+       ibgp: { type: list, _subtype: bgp_community_type }
+       ebgp: { type: list, _subtype: bgp_community_type }
+@@ -100,6 +102,8 @@ attributes:
+     local_as: asn
+     replace_global_as: bool
+     import: _r_import
++    multipath: { copy: global }
++    multipath_relax: { copy: global }
+   vrf:
+     router_id: { type: ipv4, use: id }
+     advertise: bgp_prefix_list
+diff --git a/netsim/modules/gateway.py b/netsim/modules/gateway.py
+index 201fd8d..10f08ef 100644
+--- a/netsim/modules/gateway.py
++++ b/netsim/modules/gateway.py
+@@ -179,6 +179,36 @@ class FHRP(_Module):
+         #
+         process_gw_id(vdata.get('gateway.id',None),required=False,path=f'VLAN {vname}')
+ 
++  '''
++  VLAN access links behind a pure-L2 switch.
++
++  A VLAN definition may carry gateway parameters (protocol, VRRP group ...). The
++  vlan module copies them onto every access link of that VLAN, but the link
++  hook below runs only for links with a gateway-module node attached. A host
++  on an L2 access switch (the switch bridges, the dis pair two hops away owns
++  the VIP) sits on a link with no such node, so its link.gateway stays a bare
++  fragment without id/protocol, set_fhrp_gateway never derives the VIP, and the
++  host ends up with no default gateway -- while a host wired straight to an
++  IRB switch gets one. Same VLAN, different answer.
++
++  Finalize those links here (merge global defaults) so every host on the VLAN
++  learns the same VIP, whatever it is cabled to.
++  '''
++  def module_pre_link_transform(self, topology: Box) -> None:
++    global_gateway = data.get_global_settings(topology,'gateway')
++    if not global_gateway:                      # pragma: no cover
++      return
++    for link in topology.get('links',[]):
++      if not isinstance(link,Box) or not isinstance(link.get('gateway',None),Box):
++        continue
++      intfs = [ i for i in link.get('interfaces',[]) if isinstance(i,Box) and i.get('node') in topology.nodes ]
++      if any('gateway' in topology.nodes[i.node].get('module',[]) for i in intfs):
++        continue                                # A module node is attached: link_pre_link_transform owns it
++      if 'vlan_name' not in link and not any(i.get('vlan.access',None) for i in intfs):
++        continue                                # Not a VLAN access link: nothing to inherit from
++      check_gw_protocol(link.gateway,f'{link._linkname}',topology)
++      link.gateway = global_gateway + link.gateway
++
+   def link_pre_link_transform(self, link: Box, topology: Box) -> None:
+     #
+     # Step#1: deal with 'gateway' interface attributes
+diff --git a/netsim/modules/mpls.py b/netsim/modules/mpls.py
+index 0ec7a02..3283cd5 100644
+--- a/netsim/modules/mpls.py
++++ b/netsim/modules/mpls.py
+@@ -315,4 +315,10 @@ class MPLS(_Module):
+     if '6pe' in node.mpls:
+       node_adjust_6pe(node,topology,features)
+ 
++    if 'propagate_ttl' in node.mpls and not features.get('mpls.propagate_ttl',False):
++      log.error(
++        text=f'{node.name} (device {node.device}) does not support mpls.propagate_ttl',
++        category=log.IncorrectValue,
++        module='mpls')
++
+     check_node_features(node,topology,features)
+diff --git a/netsim/modules/mpls.yml b/netsim/modules/mpls.yml
+index 92e110d..0f760de 100644
+--- a/netsim/modules/mpls.yml
++++ b/netsim/modules/mpls.yml
+@@ -28,6 +28,7 @@ attributes:
+     bgp:
+     vpn:
+     6pe:
++    propagate_ttl: bool     # False => 'no mpls ip propagate-ttl' (hide the LSP from customer traceroutes)
+   link:
+     ldp: bool
+ features:
+@@ -35,3 +36,4 @@ features:
+   bgp: Supports BGP Labeled Unicast address family
+   vpn: Supports MPLS/VPN
+   6pe: Supports 6PE
++  propagate_ttl: Can disable IP TTL propagation into the MPLS label stack
+diff --git a/netsim/modules/ospf.py b/netsim/modules/ospf.py
+index da767cd..9d1c60a 100644
+--- a/netsim/modules/ospf.py
++++ b/netsim/modules/ospf.py
+@@ -252,6 +252,11 @@ class OSPF(_Module):
+     _routing.check_vrf_protocol_support(node,'ospf','ipv6','ospfv3',topology)
+     _routing.check_intf_support(node,'ospf',topology)
+     check_gr(node,features)
++    if 'distance' in node.get('ospf',{}) and not features.get('ospf.distance',False):
++      log.error(
++        text=f'{node.name} (device {node.device}) does not support ospf.distance (administrative distance)',
++        category=log.IncorrectValue,
++        module='ospf')
+     dlist = node.get('ospf.distribute_list',None)
+     if dlist is not None:
+       if not features.get('ospf.distribute_list',False):
+diff --git a/netsim/modules/ospf.yml b/netsim/modules/ospf.yml
+index 8fb2c61..6045a98 100644
+--- a/netsim/modules/ospf.yml
++++ b/netsim/modules/ospf.yml
+@@ -39,6 +39,7 @@ attributes:
+         cost: int
+         type: { type: str, valid_values: [ e1, e2 ] }
+     digest: { type: dict }
++    distance: { type: int, min_value: 1, max_value: 255 }
+     # Global (not per-interface) inbound route filter: `router ospf <pid> /
+     # distribute-list <acl> in`. References the name of a `routing.acl` entry
+     # already declared on this node -- same `id` type interface.acl.in.ipv4
+diff --git a/tests/test_parity_primitives.py b/tests/test_parity_primitives.py
+new file mode 100644
+index 0000000..0f06ae1
+--- /dev/null
++++ b/tests/test_parity_primitives.py
+@@ -0,0 +1,271 @@
++#!/usr/bin/env python3
++"""
++Primitives added for demo-lab intent parity (2026-09-19). Each one exists so a
++source facet can be DECLARED on the topology instead of injected as a config
++snippet:
++
++  bgp.multipath / bgp.multipath_relax   maximum-paths N (+ as-path multipath-relax)
++  ospf.distance                         administrative distance under router ospf
++  tunnel.registration_timeout           spoke `ip nhrp registration timeout N` (tunnel.dmvpn)
++  mpls.propagate_ttl: false             `no mpls ip propagate-ttl`
++  firewall.policy.inspect               ASA MPF `inspect icmp` in global_policy
++
++Every positive test greps the startup-config netlab writes for a KNE startup
++device; every negative test proves the attribute fails CLOSED on a device
++without the feature (a silent single-path/no-inspect render is the defect these
++primitives replace).
++"""
++
++import textwrap
++from pathlib import Path
++
++import pytest
++
++from netsim.cli import create
++from netsim.utils import log
++
++
++def init_log(raise_error: bool = False) -> None:
++  log.init_log_system(header=False)
++  log.set_flag(quiet=True,raise_error=raise_error,warning=False,logging=False,verbose=0)
++
++
++def write_topology(tmp_path: Path, topology: str) -> Path:
++  topo_file = tmp_path / 'topology.yml'
++  topo_file.write_text(textwrap.dedent(topology).strip() + '\n')
++  return topo_file
++
++
++def startup(node: str) -> str:
++  return Path(f'node_files/{node}/startup-config').read_text()
++
++
++def module_cfg(node: str, module: str) -> str:
++  """cEOS is not a startup-config device on KNE: its module configs are
++  delivered by Ansible and land in node_files/<node>/<module>."""
++  return Path(f'node_files/{node}/{module}').read_text()
++
++
++def test_bgp_multipath_renders_on_ios_and_eos(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.chdir(tmp_path)
++  topo_file = write_topology(tmp_path,"""
++provider: kne
++module: [ bgp ]
++nodes:
++  ce:    { device: iol, bgp.as: 65016, bgp.multipath: 2, bgp.multipath_relax: true }
++  leaf:  { device: eos, bgp.as: 213,   bgp.multipath: 2 }
++  pe1:   { device: iol, bgp.as: 65255 }
++  pe2:   { device: iol, bgp.as: 65355 }
++links: [ ce-pe1, ce-pe2, leaf-pe1, leaf-pe2 ]
++""")
++  init_log()
++  create.run(['-o','config','-o','provider',str(topo_file)])
++
++  ce = startup('ce')
++  assert ' bgp bestpath as-path multipath-relax' in ce
++  assert '  maximum-paths 2\n' in ce
++  assert '  maximum-paths ibgp 2' in ce
++
++  leaf = module_cfg('leaf','bgp')
++  assert '  maximum-paths 2 ecmp 2' in leaf
++  assert 'multipath-relax' not in leaf          # not declared on the leaf
++
++  pe1 = startup('pe1')                          # positive control: undeclared => absent
++  assert 'maximum-paths' not in pe1
++
++
++def test_bgp_multipath_relax_needs_a_path_count(tmp_path: Path) -> None:
++  topo_file = write_topology(tmp_path,"""
++provider: kne
++module: [ bgp ]
++nodes:
++  ce:  { device: iol, bgp.as: 65016, bgp.multipath_relax: true }
++  pe1: { device: iol, bgp.as: 65255 }
++links: [ ce-pe1 ]
++""")
++  init_log(raise_error=True)
++  with pytest.raises(log.ErrorAbort):
++    create.run(['-o','none',str(topo_file)])
++
++
++def test_bgp_multipath_fails_closed_on_a_device_without_the_feature(tmp_path: Path) -> None:
++  topo_file = write_topology(tmp_path,"""
++provider: kne
++module: [ bgp ]
++nodes:
++  r1: { device: vjunos-router, bgp.as: 65016, bgp.multipath: 2 }
++  r2: { device: iol, bgp.as: 65255 }
++links: [ r1-r2 ]
++""")
++  init_log(raise_error=True)
++  with pytest.raises(log.ErrorAbort):
++    create.run(['-o','none',str(topo_file)])
++
++
++def test_ospf_distance_renders_on_ios_and_eos(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.chdir(tmp_path)
++  topo_file = write_topology(tmp_path,"""
++provider: kne
++module: [ ospf ]
++nodes:
++  rr:   { device: iol, ospf.distance: 201 }
++  sw:   { device: eos, ospf.distance: 150 }
++  x:    { device: iol }
++links: [ rr-sw, rr-x, sw-x ]
++""")
++  init_log()
++  create.run(['-o','config','-o','provider',str(topo_file)])
++
++  assert ' distance 201\n' in startup('rr')
++  sw = module_cfg('sw','ospf')
++  assert ' distance ospf intra-area 150' in sw
++  assert ' distance ospf external 150' in sw
++  assert ' distance ' not in startup('x')       # positive control
++
++
++def test_ospf_distance_fails_closed_on_a_device_without_the_feature(tmp_path: Path) -> None:
++  topo_file = write_topology(tmp_path,"""
++provider: kne
++module: [ ospf ]
++nodes:
++  r1: { device: vjunos-router, ospf.distance: 201 }
++  r2: { device: iol }
++links: [ r1-r2 ]
++""")
++  init_log(raise_error=True)
++  with pytest.raises(log.ErrorAbort):
++    create.run(['-o','none',str(topo_file)])
++
++
++def test_dmvpn_registration_timeout_is_a_spoke_line_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.chdir(tmp_path)
++  topo_file = write_topology(tmp_path,"""
++provider: kne
++plugin: [ tunnel.dmvpn ]
++nodes:
++  hub:   { device: iol }
++  spoke: { device: iol }
++  inet:  { device: iol }
++links:
++- { hub: {}, inet: {}, role: tp }
++- { spoke: {}, inet: {}, role: tp }
++- hub:   { ipv4: 172.22.150.1/24 }
++  spoke: { ipv4: 172.22.150.2/24 }
++  prefix: { ipv4: 172.22.150.0/24 }
++  tunnel: { mode: dmvpn, hub: hub, nhrp_id: 22, registration_timeout: 10, source: { link: { role: tp } } }
++""")
++  init_log()
++  create.run(['-o','config','-o','provider',str(topo_file)])
++
++  spoke = startup('spoke')
++  assert ' ip nhrp registration timeout 10' in spoke
++  assert ' ip nhrp nhs 172.22.150.1' in spoke
++  hub = startup('hub')
++  assert 'registration timeout' not in hub     # hubs do not register
++  assert ' ip nhrp map multicast dynamic' in hub
++
++
++def test_mpls_propagate_ttl_false_renders_the_no_form(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.chdir(tmp_path)
++  topo_file = write_topology(tmp_path,"""
++provider: kne
++module: [ ospf, mpls ]
++mpls.ldp: true
++nodes:
++  pe: { device: iol, mpls.propagate_ttl: false }
++  p:  { device: iol }
++links: [ pe-p ]
++""")
++  init_log()
++  create.run(['-o','config','-o','provider',str(topo_file)])
++
++  assert 'no mpls ip propagate-ttl' in startup('pe')
++  assert 'propagate-ttl' not in startup('p')   # positive control
++
++
++def test_mpls_propagate_ttl_fails_closed_on_a_device_without_the_feature(tmp_path: Path) -> None:
++  topo_file = write_topology(tmp_path,"""
++provider: kne
++module: [ ospf, mpls ]
++mpls.ldp: true
++nodes:
++  pe: { device: eos, mpls.propagate_ttl: false }
++  p:  { device: iol }
++links: [ pe-p ]
++""")
++  init_log(raise_error=True)
++  with pytest.raises(log.ErrorAbort):
++    create.run(['-o','none',str(topo_file)])
++
++
++def test_asa_inspect_renders_in_global_policy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.chdir(tmp_path)
++  topo_file = write_topology(tmp_path,"""
++provider: kne
++plugin: [ firewall.policy ]
++nodes:
++  fw: { device: asav, firewall.policy: { same_security_traffic: true, inspect: [ icmp, icmp-error ] } }
++  fw2: { device: asav }
++  r:  { device: iol }
++links:
++- interfaces: [ { node: fw, firewall.zone: inside }, { node: r } ]
++- interfaces: [ { node: fw2, firewall.zone: inside }, { node: r } ]
++""")
++  init_log()
++  create.run(['-o','config','-o','provider',str(topo_file)])
++
++  fw = startup('fw')
++  assert 'policy-map global_policy\n class inspection_default\n  inspect icmp\n  inspect icmp error' in fw
++  assert 'inspect icmp' not in startup('fw2')  # positive control
++
++
++def test_asa_inspect_rejects_an_unknown_engine(tmp_path: Path) -> None:
++  topo_file = write_topology(tmp_path,"""
++provider: kne
++plugin: [ firewall.policy ]
++nodes:
++  fw: { device: asav, firewall.policy: { inspect: [ http ] } }
++  r:  { device: iol }
++links:
++- interfaces: [ { node: fw, firewall.zone: inside }, { node: r } ]
++""")
++  init_log(raise_error=True)
++  with pytest.raises(log.ErrorAbort):
++    create.run(['-o','none',str(topo_file)])
++
++
++def test_host_behind_l2_switch_learns_the_vlan_vip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  """A host on a pure-L2 access switch and a host wired straight to the IRB
++  switch are on the same VLAN and must get the same VRRP VIP as their default
++  gateway. Before the gateway module finalized VLAN access links, only the
++  second one did."""
++  monkeypatch.chdir(tmp_path)
++  topo_file = write_topology(tmp_path,"""
++provider: kne
++gateway.id: 1
++gateway.protocol: vrrp
++vlans:
++  v10: { id: 10, gateway: { vrrp: { group: 10 } } }
++nodes:
++  dis1: { device: ioll2, module: [ vlan, gateway ], gateway.vrrp.priority: 110 }
++  dis2: { device: ioll2, module: [ vlan, gateway ] }
++  acc:  { device: ioll2, module: [ vlan ], vlan.mode: bridge }
++  h1:   { device: linux }
++  h2:   { device: linux }
++links:
++- { acc: {}, dis1: {}, vlan.trunk: [ v10 ] }
++- { acc: {}, dis2: {}, vlan.trunk: [ v10 ] }
++- { acc: {}, h1: {}, vlan.access: v10 }
++- { dis1: {}, h2: {}, vlan.access: v10 }
++""")
++  init_log()
++  create.run(['-o','config','-o','provider',str(topo_file)])
++
++  h1 = module_cfg('h1','routing')
++  h2 = module_cfg('h2','routing')
++  assert 'ip route replace 0.0.0.0/0 via 172.16.0.1 dev eth1' in h2   # positive control (IRB switch on the wire)
++  assert 'ip route replace 0.0.0.0/0 via 172.16.0.1 dev eth1' in h1   # the host behind the L2 switch
++  dis1 = startup('dis1')
++  assert 'vrrp 10 address-family ipv4' in dis1
++  assert '    address 172.16.0.1' in dis1
++  assert 'priority 110' in dis1
+-- 
+2.56.0
+

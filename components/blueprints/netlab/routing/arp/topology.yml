@@ -1,0 +1,27 @@
+---
+defaults.device: eos
+# netlab 26.08 tightening: a host whose only adjacent router is unnumbered now
+# raises a fatal host_gw warning. h2's routerless default route is deliberate
+# here (that is the ARP behaviour under test), so silence just that flag.
+defaults.routing.warnings.host_gw: False
+
+groups:
+  # netlab 26.08 tightening: group role `target` is gone (valid roles are
+  # router/host/bridge/gateway) — linux ping targets are plain hosts.
+  hosts:
+    members: [ h1, h2 ]
+    device: linux
+    role: host
+
+nodes:
+  h1:
+  h2:
+  rtr:
+    id: 1
+
+links:
+- h1:
+  rtr:
+- h2:
+  rtr:
+    ipv4: True

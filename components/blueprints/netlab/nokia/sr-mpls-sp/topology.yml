@@ -1,0 +1,81 @@
+---
+name: nokia_sr_mpls_sp
+provider: kne
+
+# Native Nokia SR OS service-provider core:
+# - SR-MPLS over IS-IS in a BGP-free P core
+# - iBGP only between PE routers
+# - no full running-config injection; netlab owns generated config
+module: [ isis, sr ]
+
+addressing:
+  loopback:
+    ipv4: 10.255.0.0/24
+  p2p:
+    ipv4: 10.10.0.0/24
+
+sr:
+  protocol: isis
+  af:
+    ipv4: true
+    ipv6: false
+
+isis:
+  area: '49.0001'
+  type: level-2
+
+defaults:
+  device: sros
+  devices:
+    sros:
+      group_vars:
+        netlab_ready: [ ssh, ansible, sros ]
+
+groups:
+  pe:
+    device: sros
+    module: [ isis, bgp, sr ]
+    bgp:
+      as: 65000
+    members:
+      - pe1
+      - pe2
+  p:
+    device: sros
+    module: [ isis, sr ]
+    members:
+      - p1
+      - p2
+
+nodes:
+  pe1:
+    loopback:
+      ipv4: 10.255.0.1/32
+    sr:
+      node_sid:
+        ipv4: 101
+  p1:
+    loopback:
+      ipv4: 10.255.0.11/32
+    sr:
+      node_sid:
+        ipv4: 111
+  p2:
+    loopback:
+      ipv4: 10.255.0.12/32
+    sr:
+      node_sid:
+        ipv4: 112
+  pe2:
+    loopback:
+      ipv4: 10.255.0.2/32
+    sr:
+      node_sid:
+        ipv4: 102
+
+links:
+  - pe1-p1
+  - pe1-p2
+  - p1-p2
+  - p1-pe2
+  - p2-pe2

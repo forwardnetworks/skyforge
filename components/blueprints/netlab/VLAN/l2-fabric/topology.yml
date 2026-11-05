@@ -1,0 +1,40 @@
+provider: kne
+defaults.device: eos
+
+nodes: [ l1, l2, s1, s2, h1, h2 ]
+module: [ vlan ]
+
+groups:
+  # netlab 26.08 tightening: the switches must enable vlan themselves;
+  # topology-level `module:` no longer reaches nodes here.
+  switches:
+    members: [ l1, l2, s1, s2 ]
+    module: [ vlan ]
+  hosts:
+    members: [ h1, h2 ]
+    device: linux
+
+vlans:
+  fabric:
+    id: 100
+    mode: bridge
+
+links:
+- l1:
+  s1:
+  vlan.access: fabric
+- l2:
+  s1:
+  vlan.access: fabric
+- l1:
+  s2:
+  vlan.access: fabric
+- l2:
+  s2:
+  vlan.access: fabric
+- l1:
+  h1:
+  vlan.access: fabric
+- l2:
+  h2:
+  vlan.access: fabric

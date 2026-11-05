@@ -1,0 +1,121 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 12:54:11 -0500
+Subject: [PATCH 17/35] meshnet: the converge also recognises 00-multus.conf
+ (R6 follow-up)
+
+---
+diff --git a/third_party/meshnet/daemon/cni/cni.go b/third_party/meshnet/daemon/cni/cni.go
+index 2326420..02c4a48 100644
+--- a/third_party/meshnet/daemon/cni/cni.go
++++ b/third_party/meshnet/daemon/cni/cni.go
+@@ -184,6 +184,7 @@ func buildMeshnetConf(dir string) (map[string]interface{}, error) {
+ 
+ const (
+ 	multusConfName      = "00-multus.conflist"
++	multusConfFileName  = "00-multus.conf"
+ 	multusWatchInterval = 5 * time.Second
+ )
+ 
+@@ -201,14 +202,24 @@ const (
+ // conf does not parse (a write in progress: wait for the complete file, do not
+ // rebuild from cilium alone), and when there is no meshnet conf to fix.
+ func needsMultusRewrap(dir string) (bool, error) {
+-	multusPath := filepath.Join(dir, multusConfName)
+-	if _, err := os.Stat(multusPath); err != nil {
+-		if os.IsNotExist(err) {
+-			return false, nil
++	// multus writes either name: the thin_entrypoint build writes a conflist,
++	// and the upstream multus-cni daemonset (v4.1.x) writes a single conf. A
++	// file that does not parse is a write in progress, so it does not count.
++	found := false
++	for _, name := range []string{multusConfName, multusConfFileName} {
++		path := filepath.Join(dir, name)
++		if _, err := os.Stat(path); err != nil {
++			if os.IsNotExist(err) {
++				continue
++			}
++			return false, err
++		}
++		if err := parseMultusConf(path); err == nil {
++			found = true
++			break
+ 		}
+-		return false, err
+ 	}
+-	if _, err := libcni.ConfListFromFile(multusPath); err != nil {
++	if !found {
+ 		return false, nil
+ 	}
+ 
+@@ -237,6 +248,17 @@ func needsMultusRewrap(dir string) (bool, error) {
+ 	return true, nil
+ }
+ 
++// parseMultusConf reports whether path is a complete multus config, either a
++// conflist or a single conf.
++func parseMultusConf(path string) error {
++	if strings.HasSuffix(path, ".conflist") {
++		_, err := libcni.ConfListFromFile(path)
++		return err
++	}
++	_, err := libcni.ConfFromFile(path)
++	return err
++}
++
+ // reconcileMultusWrap runs one convergence step on dir. It rewrites
+ // 00-meshnet.conflist only when needsMultusRewrap says so, and reports whether
+ // it did. A healthy dir is left untouched (no write, no mtime change).
+diff --git a/third_party/meshnet/daemon/cni/cni_multus_idempotent_test.go b/third_party/meshnet/daemon/cni/cni_multus_idempotent_test.go
+index 14aa386..e4b6996 100644
+--- a/third_party/meshnet/daemon/cni/cni_multus_idempotent_test.go
++++ b/third_party/meshnet/daemon/cni/cni_multus_idempotent_test.go
+@@ -69,3 +69,45 @@ func readFileForTest(path string) (installedChain, error) {
+ 	}
+ 	return c, json.Unmarshal(raw, &c)
+ }
++
++// The upstream multus-cni daemonset writes 00-multus.conf (a single conf, not
++// a conflist). The converge must recognise it, or it never fires on that
++// multus (found by the KNE rebase kind run, 2026-10-20).
++func TestNeedsRewrapWhenMultusWroteSingleConf(t *testing.T) {
++	const fixtureMultusConf = `{
++  "cniVersion": "0.3.1",
++  "name": "multus-cni-network",
++  "type": "multus",
++  "logFile": "/var/log/multus.log",
++  "kubeconfig": "/etc/cni/net.d/multus.d/multus.kubeconfig",
++  "delegates": [{"name": "cilium"}]
++}`
++	dir := writeDir(t, map[string]string{
++		"05-cilium.conflist":  fixtureCilium,
++		"00-multus.conf":      fixtureMultusConf,
++		"00-meshnet.conflist": meshnetCiliumOnly,
++	})
++	need, err := needsMultusRewrap(dir)
++	if err != nil || !need {
++		t.Fatalf("needsMultusRewrap with 00-multus.conf = %v, %v; want true, nil", need, err)
++	}
++	if rewrote, err := reconcileMultusWrap(dir); err != nil || !rewrote {
++		t.Fatalf("reconcileMultusWrap = %v, %v; want true, nil", rewrote, err)
++	}
++	if got := readFirstType(t, filepath.Join(dir, defaultCNIFile)); got != "multus" {
++		t.Fatalf("converged first plugin = %q, want multus", got)
++	}
++}
++
++// A truncated 00-multus.conf is a write in progress: no rewrap.
++func TestNoRewrapOnTruncatedSingleMultusConf(t *testing.T) {
++	dir := writeDir(t, map[string]string{
++		"05-cilium.conflist":  fixtureCilium,
++		"00-multus.conf":      `{"cniVersion": "0.3.1", "na`,
++		"00-meshnet.conflist": meshnetCiliumOnly,
++	})
++	need, err := needsMultusRewrap(dir)
++	if err != nil || need {
++		t.Fatalf("needsMultusRewrap with truncated 00-multus.conf = %v, %v; want false, nil", need, err)
++	}
++}
+-- 
+2.56.0
+

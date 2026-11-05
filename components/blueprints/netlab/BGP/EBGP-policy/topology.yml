@@ -1,0 +1,95 @@
+---
+message: |
+  This lab demonstrates the "hairpin leak" through a customer AS, and how
+  RFC 8212 semantics stop it.
+
+  THE LEAK. customer (AS 65100) peers with isp_a (65001) and isp_b (65002),
+  which do not peer with each other. With no policy anywhere, customer accepts
+  isp_a's 10.0.0.2/32 and re-advertises it to isp_b -- and isp_b's 10.0.0.3/32
+  to isp_a. A stub customer has silently become transit between two ISPs. That
+  is the hairpin leak, and on EOS it is the DEFAULT behaviour.
+
+  RFC 8212 IS THE RULE THAT STOPS IT: no prefix crosses an EBGP session, in
+  either direction, until an operator configures policy. `netlab config
+  8212-default` (config: on the customer node below) applies it.
+
+  THIS LAB WAS PORTED FROM FRR AND THE FRAMING CHANGED WITH IT. It used to say
+  it showed "the default EBGP policy (RFC 8212) behavior of FRR", and that
+  netlab disables that behaviour. Both were true of FRR and NEITHER is true
+  here. FRR implements RFC 8212 and netlab switches it off with
+  `no bgp ebgp-requires-policy`, so on FRR the custom config only has to leave
+  that line out. ARISTA EOS DOES NOT IMPLEMENT RFC 8212 AT ALL -- there is no
+  knob, and netlab's bgp/eos.j2 has nothing to disable. So 8212-default/eos.j2
+  CONSTRUCTS the behaviour with an explicit deny-in/deny-out route-map on every
+  EBGP session. The lab therefore teaches "how to build RFC 8212 semantics by
+  hand on a platform that lacks them", not "watch a default do its job".
+  8212-default/frr.j2 is kept next to it as the contrast.
+
+  Skyforge does not admit frr as a NOS, which is why the customer is eos.
+
+  WHAT YOU SHOULD SEE. Without the custom config, isp_b has 10.0.0.2/32 in its
+  BGP table with AS path 65100 65001. With it, isp_b has no path to 10.0.0.2/32
+  at all -- and no path to customer's own 10.0.0.1/32 either, because RFC 8212
+  denies that too until policy exists. The validate: block at the bottom of this
+  file asserts exactly that, so `netlab validate` proves the lab rather than
+  asking you to take its word.
+
+provider: kne
+module: [ bgp ]
+defaults.device: eos
+
+nodes:
+  # netlab 26.08 tightening: a node using module attributes must enable the
+  # module itself (topology-level `module:` no longer reaches nodes here).
+  customer:
+    module: [ bgp ]
+    bgp.as: 65100
+    config: [ "8212-default" ]
+    device: eos
+  isp_a:
+    module: [ bgp ]
+    bgp.as: 65001
+  isp_b:
+    module: [ bgp ]
+    bgp.as: 65002
+
+links: [ customer-isp_a, customer-isp_b ]
+
+# THE LAB'S CLAIM, AS A RUNNABLE ASSERTION. These pass only when the customer is
+# enforcing RFC 8212 semantics -- i.e. AFTER `netlab config 8212-default`. Run
+# them before that and the first two SHOULD fail: that is the leak, and seeing
+# it fail first is the point of the lab.
+validate:
+  session_a:
+    description: customer's EBGP session to isp_a reaches Established
+    wait_msg: Waiting for the EBGP sessions to establish
+    wait: 120
+    nodes: [ customer ]
+    plugin: bgp_neighbor(node.bgp.neighbors,'isp_a')
+
+  session_b:
+    description: customer's EBGP session to isp_b reaches Established
+    wait: 30
+    nodes: [ customer ]
+    plugin: bgp_neighbor(node.bgp.neighbors,'isp_b')
+
+  no_hairpin_ab:
+    description: isp_b does NOT learn isp_a's loopback through the customer
+    wait_msg: Waiting for BGP convergence
+    wait: 60
+    nodes: [ isp_b ]
+    plugin: bgp_prefix(nodes.isp_a.loopback.ipv4,state='missing')
+
+  no_hairpin_ba:
+    description: isp_a does NOT learn isp_b's loopback through the customer
+    wait: 30
+    nodes: [ isp_a ]
+    plugin: bgp_prefix(nodes.isp_b.loopback.ipv4,state='missing')
+
+  cust_pfx_denied:
+    description: >
+      RFC 8212 denies the customer's OWN prefix too, not just transit -- isp_a
+      has no path to 10.0.0.1/32 either until a policy permits it
+    wait: 30
+    nodes: [ isp_a ]
+    plugin: bgp_prefix(nodes.customer.loopback.ipv4,state='missing')

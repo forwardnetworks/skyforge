@@ -1,0 +1,224 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 12:00:00 +0000
+Subject: [PATCH] devices: Keysight ixia-c controller and traffic engine
+
+---
+diff --git a/netsim/ansible/templates/initial/keysight_ixia-c-controller.j2 b/netsim/ansible/templates/initial/keysight_ixia-c-controller.j2
+new file mode 100644
+index 0000000..48e03d6
+--- /dev/null
++++ b/netsim/ansible/templates/initial/keysight_ixia-c-controller.j2
+@@ -0,0 +1,12 @@
++{#
++  DELIBERATELY EMPTY -- not a stub awaiting content.
++
++  ixia-c components are configured over the OTG API after boot. There is no
++  day-0 configuration for netlab to produce, and putting any here would make
++  this file a SECOND producer of device config, which this platform forbids.
++
++  The file exists because netlab enables `routing` on any host linked to a
++  router and then looks for a template to render. Without it `netlab create`
++  fails with "Cannot find initial configuration template". Rendering nothing is
++  the right answer; having no file reads as an oversight rather than a decision.
++#}
+diff --git a/netsim/ansible/templates/initial/keysight_ixia-c-traffic-engine.j2 b/netsim/ansible/templates/initial/keysight_ixia-c-traffic-engine.j2
+new file mode 100644
+index 0000000..48e03d6
+--- /dev/null
++++ b/netsim/ansible/templates/initial/keysight_ixia-c-traffic-engine.j2
+@@ -0,0 +1,12 @@
++{#
++  DELIBERATELY EMPTY -- not a stub awaiting content.
++
++  ixia-c components are configured over the OTG API after boot. There is no
++  day-0 configuration for netlab to produce, and putting any here would make
++  this file a SECOND producer of device config, which this platform forbids.
++
++  The file exists because netlab enables `routing` on any host linked to a
++  router and then looks for a template to render. Without it `netlab create`
++  fails with "Cannot find initial configuration template". Rendering nothing is
++  the right answer; having no file reads as an oversight rather than a decision.
++#}
+diff --git a/netsim/ansible/templates/routing/keysight_ixia-c-controller.j2 b/netsim/ansible/templates/routing/keysight_ixia-c-controller.j2
+new file mode 100644
+index 0000000..48e03d6
+--- /dev/null
++++ b/netsim/ansible/templates/routing/keysight_ixia-c-controller.j2
+@@ -0,0 +1,12 @@
++{#
++  DELIBERATELY EMPTY -- not a stub awaiting content.
++
++  ixia-c components are configured over the OTG API after boot. There is no
++  day-0 configuration for netlab to produce, and putting any here would make
++  this file a SECOND producer of device config, which this platform forbids.
++
++  The file exists because netlab enables `routing` on any host linked to a
++  router and then looks for a template to render. Without it `netlab create`
++  fails with "Cannot find initial configuration template". Rendering nothing is
++  the right answer; having no file reads as an oversight rather than a decision.
++#}
+diff --git a/netsim/ansible/templates/routing/keysight_ixia-c-traffic-engine.j2 b/netsim/ansible/templates/routing/keysight_ixia-c-traffic-engine.j2
+new file mode 100644
+index 0000000..48e03d6
+--- /dev/null
++++ b/netsim/ansible/templates/routing/keysight_ixia-c-traffic-engine.j2
+@@ -0,0 +1,12 @@
++{#
++  DELIBERATELY EMPTY -- not a stub awaiting content.
++
++  ixia-c components are configured over the OTG API after boot. There is no
++  day-0 configuration for netlab to produce, and putting any here would make
++  this file a SECOND producer of device config, which this platform forbids.
++
++  The file exists because netlab enables `routing` on any host linked to a
++  router and then looks for a template to render. Without it `netlab create`
++  fails with "Cannot find initial configuration template". Rendering nothing is
++  the right answer; having no file reads as an oversight rather than a decision.
++#}
+diff --git a/netsim/devices/keysight_ixia-c-controller.yml b/netsim/devices/keysight_ixia-c-controller.yml
+new file mode 100644
+index 0000000..08acb8e
+--- /dev/null
++++ b/netsim/devices/keysight_ixia-c-controller.yml
+@@ -0,0 +1,64 @@
++---
++description: Keysight ixia-c OTG controller (the API, no data ports)
++
++# WHY TWO DEVICES AND NOT ONE.
++#
++# The first cut of this used the `ixia-c-one` image, on the strength of a
++# design note calling it "a single container, ~2 CPU / 2 GB for two ports".
++# MEASURED on node-d 2026-09-05, that image is DOCKER-IN-DOCKER: entrypoint
++# ./bin/ixiacd, exposes 2375/2376, environment carries DOCKER_VERSION and
++# DIND_COMMIT. It reaches Running and then serves nothing at all --
++#
++#   Cannot connect to the Docker daemon at unix:///var/run/docker.sock
++#   Could not start control loop: could not wait for docker daemon
++#
++# -- with no port listening. It wants privileged mode and a Docker daemon
++# inside the pod, on Talos nodes running containerd. It is not usable here.
++#
++# The COMPONENT images are ordinary containers and they work. The controller
++# was verified standalone: unprivileged, 200m CPU, HTTP 200 on /config at 8443.
++# A KNE node is a single-container pod (our fork's only sidecar mechanism is
++# KubeVirt-specific), so controller and engine are separate NODES.
++parent: unknown
++
++interface_name: eth{ifindex}
++mgmt_if: eth0
++role: host
++
++clab:
++  image: registry.example.com/skyforge/ixia-c-controller:0.0.1-4555
++  node:
++    kind: keysight_ixia-c-controller
++  interface:
++    name: eth{ifindex}
++
++kne:
++  interface.name: eth{ifindex}
++
++group_vars:
++  netlab_device_type: keysight_ixia-c-controller
++  netlab_ready: []
++  # Renders nothing: this device is driven over the OTG API after boot, not by
++  # generated configuration. Without this the defaults generator derives
++  # initial_policy "always" from its fallback -- measured -- and "always" is
++  # exactly what makes netlab produce day-0 config for a device that cannot
++  # accept any.
++  netlab_initial: never
++
++external:
++  image: none
++
++graphite.icon: server
++
++features:
++  initial:
++    roles: [ host ]
++    collect: false
++    reload: false
++  # netlab enables `routing` on any host the moment it is linked to a router,
++  # so it can work out how that host reaches anything past its own subnet.
++  # Declaring it is not optional -- without it netlab refuses the node with
++  # "does not support module routing". It renders nothing here; see the empty
++  # templates beside this file for why that is deliberate.
++  routing:
++    static: true
+diff --git a/netsim/devices/keysight_ixia-c-traffic-engine.yml b/netsim/devices/keysight_ixia-c-traffic-engine.yml
+new file mode 100644
+index 0000000..10e38bb
+--- /dev/null
++++ b/netsim/devices/keysight_ixia-c-traffic-engine.yml
+@@ -0,0 +1,67 @@
++---
++description: Keysight ixia-c OTG traffic engine (one data port)
++
++# WHY TWO DEVICES AND NOT ONE.
++#
++# The first cut used the `ixia-c-one` image, on the strength of a design note
++# calling it "a single container, ~2 CPU / 2 GB for two ports". MEASURED on
++# node-d 2026-09-05, that image is DOCKER-IN-DOCKER: entrypoint
++# ./bin/ixiacd, exposes 2375/2376, DIND_COMMIT in its environment. It reaches
++# Running and then serves nothing at all --
++#
++#   Cannot connect to the Docker daemon at unix:///var/run/docker.sock
++#   Could not start control loop: could not wait for docker daemon
++#
++# -- with no port listening. It wants privileged mode and a Docker daemon
++# inside the pod, on Talos nodes running containerd. Not usable here.
++#
++# The component images are ordinary containers. A KNE node is a
++# single-container pod (our fork's only sidecar mechanism is KubeVirt-specific)
++# so the controller and each engine are separate NODES. This is the node an
++# interface gets attached to; the controller beside it is the API.
++parent: unknown
++
++interface_name: eth{ifindex}
++mgmt_if: eth0
++role: host
++
++clab:
++  image: registry.example.com/skyforge/ixia-c-traffic-engine:1.8.0.544
++  node:
++    kind: keysight_ixia-c-traffic-engine
++  interface:
++    name: eth{ifindex}
++
++kne:
++  interface.name: eth{ifindex}
++  # The engine's env is set by add_ixia_c_engine_env() in the KNE provider, not
++  # here. It has to be, because ARG_IFACE_LIST must name the node's REAL data
++  # interfaces -- which are only known once links are resolved -- and eth0 must
++  # be excluded, or the engine claims the management path it is reached over.
++  # A static list here would be right for one topology and wrong for the next.
++
++group_vars:
++  netlab_device_type: keysight_ixia-c-traffic-engine
++  netlab_ready: []
++  # Renders nothing: driven over the OTG API after boot, not by generated
++  # config. Without this the defaults generator derives initial_policy
++  # "always" from its fallback -- measured -- and "always" is exactly what
++  # makes netlab produce day-0 config for a device that cannot accept any.
++  netlab_initial: never
++
++external:
++  image: none
++
++graphite.icon: server
++
++features:
++  initial:
++    roles: [ host ]
++    collect: false
++    reload: false
++  # netlab enables `routing` on any host the moment it is linked to a router.
++  # Declaring it is not optional -- without it netlab refuses the node with
++  # "does not support module routing". It renders nothing; see the empty
++  # templates beside this file.
++  routing:
++    static: true
+-- 
+2.56.0
+

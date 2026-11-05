@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 13:39:06 -0500
+Subject: [PATCH 21/35] meshnet: RepairLinkNow counting test exercises the
+ failed branch (M0024 follow-up)
+
+---
+diff --git a/third_party/meshnet/daemon/meshnet/handler.go b/third_party/meshnet/daemon/meshnet/handler.go
+index 8e3ad70..68bb2f1 100644
+--- a/third_party/meshnet/daemon/meshnet/handler.go
++++ b/third_party/meshnet/daemon/meshnet/handler.go
+@@ -589,6 +589,13 @@ func (m *Meshnet) RepairLinkNow(ctx context.Context, pod *mpb.PodQuery) (*mpb.Re
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	return m.repairLinks(ctx, pod, topo, m.ReconcilePodLinks)
++}
++
++// repairLinks is RepairLinkNow with the reconcile step passed in, so the
++// counting contract can be tested without a live pod netns.
++func (m *Meshnet) repairLinks(ctx context.Context, pod *mpb.PodQuery, topo *unstructured.Unstructured,
++	reconcile func(context.Context, *unstructured.Unstructured) error) (*mpb.RepairLinkNowResponse, error) {
+ 	links, err := parsePodLinks(topo)
+ 	if err != nil {
+ 		return nil, err
+@@ -596,7 +603,7 @@ func (m *Meshnet) RepairLinkNow(ctx context.Context, pod *mpb.PodQuery) (*mpb.Re
+ 	if len(links) == 0 {
+ 		return &mpb.RepairLinkNowResponse{}, nil
+ 	}
+-	if err := m.ReconcilePodLinks(ctx, topo); err != nil {
++	if err := reconcile(ctx, topo); err != nil {
+ 		mnetdLogger.Warnf("RepairLinkNow(%s/%s): %d link(s) not rebuilt: %v", pod.GetKubeNs(), pod.GetName(), len(links), err)
+ 		return &mpb.RepairLinkNowResponse{Failed: int32(len(links))}, nil
+ 	}
+diff --git a/third_party/meshnet/daemon/meshnet/repair_test.go b/third_party/meshnet/daemon/meshnet/repair_test.go
+index da9024d..d79b683 100644
+--- a/third_party/meshnet/daemon/meshnet/repair_test.go
++++ b/third_party/meshnet/daemon/meshnet/repair_test.go
+@@ -2,6 +2,7 @@ package meshnet
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"testing"
+ 
+ 	fakeTopology "github.com/openconfig/kne/third_party/meshnet/api/clientset/v1beta1/fake"
+@@ -9,6 +10,7 @@ import (
+ 	mpb "github.com/openconfig/kne/third_party/meshnet/daemon/proto/meshnet/v1beta1"
+ 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+ 	"k8s.io/apimachinery/pkg/runtime"
+ )
+ 
+@@ -45,23 +47,36 @@ func TestRepairLinkNowPodWithoutLinksRepairsNothing(t *testing.T) {
+ 	}
+ }
+ 
+-// Links that cannot be built here (no netns for the pod, so the wire is
+-// refused) are counted as failed, not returned as an error.
+-func TestRepairLinkNowCountsUnbuildableLinksAsFailed(t *testing.T) {
++// When the reconcile fails, the declared links are counted as failed and no
++// error is returned: the server reports the counts, the Topology status holds
++// the reason.
++func TestRepairLinkNowCountsFailedReconcileAsFailed(t *testing.T) {
+ 	topo := &topologyv1.Topology{
+ 		ObjectMeta: metav1.ObjectMeta{Name: "r2", Namespace: "default"},
+ 		Spec: topologyv1.TopologySpec{Links: []topologyv1.Link{
+ 			{UID: 1, PeerPod: "p", LocalIntf: "eth1", PeerIntf: "eth1", LocalIP: "10.0.0.1/30", PeerIP: "10.0.0.2/30"},
+ 			{UID: 2, PeerPod: "q", LocalIntf: "eth2", PeerIntf: "eth2", LocalIP: "10.0.1.1/30", PeerIP: "10.0.1.2/30"},
+ 		}},
+-		Status: topologyv1.TopologyStatus{SrcIP: "/proc/1/ns/net"},
+ 	}
+-	m := newRepairMeshnet(t, topo)
+-	resp, err := m.RepairLinkNow(context.Background(), &mpb.PodQuery{Name: "r2", KubeNs: "default"})
+-	if err != nil {
+-		t.Fatalf("RepairLinkNow(r2) returned error %v; want counts only", err)
++	m := newRepairMeshnet(t)
++	u := mustUnstructured(t, topo)
++	fail := func(context.Context, *unstructured.Unstructured) error { return errors.New("peer not admitted") }
++	resp, err := m.repairLinks(context.Background(), &mpb.PodQuery{Name: "r2", KubeNs: "default"}, u, fail)
++	if err != nil || resp.GetFailed() != 2 || resp.GetRepaired() != 0 {
++		t.Fatalf("failed reconcile = %v, %v; want failed=2 repaired=0 nil", resp, err)
+ 	}
+-	if resp.GetRepaired()+resp.GetFailed() != 2 {
+-		t.Fatalf("repaired=%d failed=%d; want the two declared links accounted for", resp.GetRepaired(), resp.GetFailed())
++	ok := func(context.Context, *unstructured.Unstructured) error { return nil }
++	resp, err = m.repairLinks(context.Background(), &mpb.PodQuery{Name: "r2", KubeNs: "default"}, u, ok)
++	if err != nil || resp.GetRepaired() != 2 || resp.GetFailed() != 0 {
++		t.Fatalf("good reconcile = %v, %v; want repaired=2 failed=0 nil", resp, err)
++	}
++}
++
++func mustUnstructured(t *testing.T, topo *topologyv1.Topology) *unstructured.Unstructured {
++	t.Helper()
++	obj, err := runtime.DefaultUnstructuredConverter.ToUnstructured(topo)
++	if err != nil {
++		t.Fatal(err)
+ 	}
++	return &unstructured.Unstructured{Object: obj}
+ }
+-- 
+2.56.0
+

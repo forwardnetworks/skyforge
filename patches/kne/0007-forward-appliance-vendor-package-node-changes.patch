@@ -1,0 +1,382 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 13:47:32 -0500
+Subject: [PATCH 07/35] forward: appliance vendor package node changes
+
+---
+diff --git a/topo/node/forward/f5_test.go b/topo/node/forward/f5_test.go
+new file mode 100644
+index 0000000..90c7ade
+--- /dev/null
++++ b/topo/node/forward/f5_test.go
+@@ -0,0 +1,39 @@
++package forward
++
++import (
++	"testing"
++
++	topopb "github.com/openconfig/kne/proto/topo"
++)
++
++func TestF5Defaults(t *testing.T) {
++	got := defaults(&topopb.Node{
++		Name:   "f5-slot-001",
++		Vendor: topopb.Vendor_F5,
++		Model:  "f5-bigip",
++		Config: &topopb.Config{},
++	})
++	if got.GetConstraints()["cpu"] != "4000m" || got.GetConstraints()["memory"] != "12Gi" {
++		t.Fatalf("F5 constraints = %#v, want 4000m/12Gi", got.GetConstraints())
++	}
++	for port, name := range map[uint32]string{22: "ssh", 161: "snmp", 443: "https"} {
++		service, ok := got.GetServices()[port]
++		if !ok || service.GetInside() != port || service.GetName() != name {
++			t.Fatalf("F5 service %d = %#v, want %q", port, service, name)
++		}
++	}
++}
++
++func TestF5DefaultsPreserveExplicitResources(t *testing.T) {
++	got := defaults(&topopb.Node{
++		Model: "f5-bigip",
++		Constraints: map[string]string{
++			"cpu":    "8000m",
++			"memory": "16Gi",
++		},
++		Config: &topopb.Config{},
++	})
++	if got.GetConstraints()["cpu"] != "8000m" || got.GetConstraints()["memory"] != "16Gi" {
++		t.Fatalf("explicit F5 constraints changed: %#v", got.GetConstraints())
++	}
++}
+diff --git a/topo/node/forward/forward.go b/topo/node/forward/forward.go
+index 850f6ee..21d0d06 100644
+--- a/topo/node/forward/forward.go
++++ b/topo/node/forward/forward.go
+@@ -40,7 +40,31 @@ const (
+ var (
+ 	// DefaultImage is the container image used for FORWARD nodes that do not
+ 	// specify one. It must provide the `kne bridge` daemon as its entrypoint.
+-	DefaultImage = "us-west1-docker.pkg.dev/kne-external/kne/bridge:ga"
++	DefaultImage              = "us-west1-docker.pkg.dev/kne-external/kne/bridge:ga"
++	defaultFortiosConstraints = node.Constraints{
++		CPU:    "2000m",
++		Memory: "4Gi",
++	}
++
++	defaultDellos10Constraints = node.Constraints{
++		CPU:    "2000m",
++		Memory: "4Gi",
++	}
++
++	defaultA10Constraints = node.Constraints{
++		CPU:    "2000m",
++		Memory: "4Gi",
++	}
++
++	defaultPanosConstraints = node.Constraints{
++		CPU:    "4000m",
++		Memory: "8Gi",
++	}
++
++	defaultF5Constraints = node.Constraints{
++		CPU:    "4000m",
++		Memory: "12Gi",
++	}
+ 
+ 	defaultNode = tpb.Node{
+ 		Name: "default_forward_node",
+@@ -76,6 +100,9 @@ func (n *Node) Create(ctx context.Context) error {
+ 	if err := n.ValidateConstraints(); err != nil {
+ 		return fmt.Errorf("node %s failed to validate node with errors: %s", n.Name(), err)
+ 	}
++	if n.UsesKubeVirtVM() {
++		return n.Impl.Create(ctx)
++	}
+ 	if err := n.CreatePod(ctx); err != nil {
+ 		return fmt.Errorf("node %s failed to create pod %w", n.Name(), err)
+ 	}
+@@ -311,8 +338,11 @@ func (n *Node) CreatePod(ctx context.Context) error {
+ 			Containers:                    containers,
+ 			TerminationGracePeriodSeconds: pointer.Int64(0),
+ 			EnableServiceLinks:            pointer.Bool(false),
+-			NodeSelector:                  map[string]string{},
++			PriorityClassName:             node.KNEPriorityClassName(),
++			NodeSelector:                  node.KNENodeSelector(),
++			Tolerations:                   node.KNETolerations(),
+ 			Affinity: &corev1.Affinity{
++				NodeAffinity: node.KNEContainerNodeAffinity(),
+ 				PodAntiAffinity: &corev1.PodAntiAffinity{
+ 					PreferredDuringSchedulingIgnoredDuringExecution: []corev1.WeightedPodAffinityTerm{{
+ 						Weight: 100,
+@@ -334,23 +364,8 @@ func (n *Node) CreatePod(ctx context.Context) error {
+ 	for label, v := range n.GetProto().GetLabels() {
+ 		pod.ObjectMeta.Labels[label] = v
+ 	}
+-	if pb.Config.ConfigData != nil {
+-		vol, err := n.CreateConfig(ctx)
+-		if err != nil {
+-			return err
+-		}
+-		pod.Spec.Volumes = append(pod.Spec.Volumes, *vol)
+-		vm := corev1.VolumeMount{
+-			Name:      node.ConfigVolumeName,
+-			MountPath: pb.Config.ConfigPath + "/" + pb.Config.ConfigFile,
+-			ReadOnly:  true,
+-		}
+-		if vol.VolumeSource.ConfigMap != nil {
+-			vm.SubPath = pb.Config.ConfigFile
+-		}
+-		for i, c := range pod.Spec.Containers {
+-			pod.Spec.Containers[i].VolumeMounts = append(c.VolumeMounts, vm)
+-		}
++	if err := n.AttachStartupConfig(ctx, pod, pb.Config.ConfigPath+"/"+pb.Config.ConfigFile); err != nil {
++		return err
+ 	}
+ 	sPod, err := n.KubeClient.CoreV1().Pods(n.Namespace).Create(ctx, pod, metav1.CreateOptions{})
+ 	if err != nil {
+@@ -377,9 +392,109 @@ func defaults(pb *tpb.Node) *tpb.Node {
+ 	if pb.Config.ConfigFile == "" {
+ 		pb.Config.ConfigFile = defaultNodeClone.Config.ConfigFile
+ 	}
++	switch pb.Model {
++	case "fortios":
++		if pb.Constraints == nil {
++			pb.Constraints = map[string]string{}
++		}
++		if pb.Constraints["cpu"] == "" {
++			pb.Constraints["cpu"] = defaultFortiosConstraints.CPU
++		}
++		if pb.Constraints["memory"] == "" {
++			pb.Constraints["memory"] = defaultFortiosConstraints.Memory
++		}
++		ensureSNMPService(pb)
++	case "dellos10":
++		if pb.Constraints == nil {
++			pb.Constraints = map[string]string{}
++		}
++		if pb.Constraints["cpu"] == "" {
++			pb.Constraints["cpu"] = defaultDellos10Constraints.CPU
++		}
++		if pb.Constraints["memory"] == "" {
++			pb.Constraints["memory"] = defaultDellos10Constraints.Memory
++		}
++		ensureSNMPService(pb)
++	case "a10":
++		if pb.Constraints == nil {
++			pb.Constraints = map[string]string{}
++		}
++		if pb.Constraints["cpu"] == "" {
++			pb.Constraints["cpu"] = defaultA10Constraints.CPU
++		}
++		if pb.Constraints["memory"] == "" {
++			pb.Constraints["memory"] = defaultA10Constraints.Memory
++		}
++		ensureSNMPService(pb)
++	case "panos":
++		if pb.Constraints == nil {
++			pb.Constraints = map[string]string{}
++		}
++		if pb.Constraints["cpu"] == "" {
++			pb.Constraints["cpu"] = defaultPanosConstraints.CPU
++		}
++		if pb.Constraints["memory"] == "" {
++			pb.Constraints["memory"] = defaultPanosConstraints.Memory
++		}
++		ensureSNMPService(pb)
++	case "f5-bigip":
++		if pb.Constraints == nil {
++			pb.Constraints = map[string]string{}
++		}
++		if pb.Constraints["cpu"] == "" {
++			pb.Constraints["cpu"] = defaultF5Constraints.CPU
++		}
++		if pb.Constraints["memory"] == "" {
++			pb.Constraints["memory"] = defaultF5Constraints.Memory
++		}
++		ensureF5ManagementServices(pb)
++	}
+ 	return pb
+ }
+ 
++func ensureSNMPService(pb *tpb.Node) {
++	if pb.Services == nil {
++		pb.Services = map[uint32]*tpb.Service{}
++	}
++	for port, service := range pb.Services {
++		if port == 161 || strings.EqualFold(service.GetName(), "snmp") {
++			return
++		}
++		for _, name := range service.GetNames() {
++			if strings.EqualFold(strings.TrimSpace(name), "snmp") {
++				return
++			}
++		}
++	}
++	pb.Services[161] = &tpb.Service{
++		Name:   "snmp",
++		Names:  []string{"snmp"},
++		Inside: 161,
++	}
++}
++
++func ensureF5ManagementServices(pb *tpb.Node) {
++	if pb.Services == nil {
++		pb.Services = map[uint32]*tpb.Service{}
++	}
++	for port, name := range map[uint32]string{22: "ssh", 443: "https"} {
++		if _, ok := pb.Services[port]; ok {
++			continue
++		}
++		pb.Services[port] = &tpb.Service{
++			Name:   name,
++			Names:  []string{name},
++			Inside: port,
++		}
++	}
++	ensureSNMPService(pb)
++}
++
+ func init() {
+-	node.Vendor(tpb.Vendor_FORWARD, New)
++	node.Vendor(tpb.Vendor_A10, New)
++	node.Vendor(tpb.Vendor_ARUBA, New)
++	node.Vendor(tpb.Vendor_DELL, New)
++	node.Vendor(tpb.Vendor_F5, New)
++	node.Vendor(tpb.Vendor_FORTINET, New)
++	node.Vendor(tpb.Vendor_PALOALTO, New)
+ }
+diff --git a/topo/node/forward/forward_test.go b/topo/node/forward/forward_test.go
+index 0aa9f46..dff9eaa 100644
+--- a/topo/node/forward/forward_test.go
++++ b/topo/node/forward/forward_test.go
+@@ -100,6 +100,126 @@ func TestNew(t *testing.T) {
+ 				ConfigFile:   "config",
+ 			},
+ 		},
++	}, {
++		desc: "fortios kubevirt defaults add constraints",
++		nImpl: &node.Impl{
++			Proto: &topopb.Node{
++				Name:   "forti1",
++				Vendor: topopb.Vendor_FORTINET,
++				Model:  "fortios",
++				Config: &topopb.Config{
++					Image: "registry.example.com/skyforge/kubevirt/fortios:7.0.9-build0444-kne-r1",
++				},
++			},
++		},
++		want: &topopb.Node{
++			Name:   "forti1",
++			Vendor: topopb.Vendor_FORTINET,
++			Model:  "fortios",
++			Config: &topopb.Config{
++				Image:        "registry.example.com/skyforge/kubevirt/fortios:7.0.9-build0444-kne-r1",
++				EntryCommand: fmt.Sprintf("kubectl exec -it %s -- sh", "forti1"),
++				ConfigPath:   "/etc",
++				ConfigFile:   "config",
++			},
++			Constraints: map[string]string{
++				"cpu":    "2000m",
++				"memory": "4Gi",
++			},
++			Services: map[uint32]*topopb.Service{
++				161: {Name: "snmp", Names: []string{"snmp"}, Inside: 161},
++			},
++		},
++	}, {
++		desc: "dellos10 kubevirt defaults add constraints",
++		nImpl: &node.Impl{
++			Proto: &topopb.Node{
++				Name:   "os101",
++				Vendor: topopb.Vendor_DELL,
++				Model:  "dellos10",
++				Config: &topopb.Config{
++					Image: "registry.example.com/skyforge/kubevirt/vr-ftosv:10.6.1.1.67V-kne-r1",
++				},
++			},
++		},
++		want: &topopb.Node{
++			Name:   "os101",
++			Vendor: topopb.Vendor_DELL,
++			Model:  "dellos10",
++			Config: &topopb.Config{
++				Image:        "registry.example.com/skyforge/kubevirt/vr-ftosv:10.6.1.1.67V-kne-r1",
++				EntryCommand: fmt.Sprintf("kubectl exec -it %s -- sh", "os101"),
++				ConfigPath:   "/etc",
++				ConfigFile:   "config",
++			},
++			Constraints: map[string]string{
++				"cpu":    "2000m",
++				"memory": "4Gi",
++			},
++			Services: map[uint32]*topopb.Service{
++				161: {Name: "snmp", Names: []string{"snmp"}, Inside: 161},
++			},
++		},
++	}, {
++		desc: "a10 kubevirt defaults add constraints",
++		nImpl: &node.Impl{
++			Proto: &topopb.Node{
++				Name:   "a101",
++				Vendor: topopb.Vendor_A10,
++				Model:  "a10",
++				Config: &topopb.Config{
++					Image: "registry.example.com/skyforge/kubevirt/a10_vthunder:5.2.0-kne-r1",
++				},
++			},
++		},
++		want: &topopb.Node{
++			Name:   "a101",
++			Vendor: topopb.Vendor_A10,
++			Model:  "a10",
++			Config: &topopb.Config{
++				Image:        "registry.example.com/skyforge/kubevirt/a10_vthunder:5.2.0-kne-r1",
++				EntryCommand: fmt.Sprintf("kubectl exec -it %s -- sh", "a101"),
++				ConfigPath:   "/etc",
++				ConfigFile:   "config",
++			},
++			Constraints: map[string]string{
++				"cpu":    "2000m",
++				"memory": "4Gi",
++			},
++			Services: map[uint32]*topopb.Service{
++				161: {Name: "snmp", Names: []string{"snmp"}, Inside: 161},
++			},
++		},
++	}, {
++		desc: "panos kubevirt defaults add constraints",
++		nImpl: &node.Impl{
++			Proto: &topopb.Node{
++				Name:   "panos1",
++				Vendor: topopb.Vendor_PALOALTO,
++				Model:  "panos",
++				Config: &topopb.Config{
++					Image: "registry.example.com/skyforge/kubevirt/vr-pan:11.0.0-kne-r1",
++				},
++			},
++		},
++		want: &topopb.Node{
++			Name:   "panos1",
++			Vendor: topopb.Vendor_PALOALTO,
++			Model:  "panos",
++			Config: &topopb.Config{
++				Image:        "registry.example.com/skyforge/kubevirt/vr-pan:11.0.0-kne-r1",
++				EntryCommand: fmt.Sprintf("kubectl exec -it %s -- sh", "panos1"),
++				ConfigPath:   "/etc",
++				ConfigFile:   "config",
++			},
++			Constraints: map[string]string{
++				"cpu":    "4000m",
++				"memory": "8Gi",
++			},
++			Services: map[uint32]*topopb.Service{
++				161: {Name: "snmp", Names: []string{"snmp"}, Inside: 161},
++			},
++		},
+ 	}}
+ 	for _, tt := range tests {
+ 		t.Run(tt.desc, func(t *testing.T) {
+-- 
+2.56.0
+

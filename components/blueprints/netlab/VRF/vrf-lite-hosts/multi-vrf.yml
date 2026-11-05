@@ -1,0 +1,16 @@
+defaults.device: linux
+
+vrfs:
+  red:
+    links: [ rtr-h1, rtr-h2 ]
+  blue:
+    links: [ rtr-h3, rtr-h4 ]
+
+nodes:
+  rtr:
+    module: [ vrf ]
+    device: eos
+  h1:
+  h2:
+  h3:
+  h4:

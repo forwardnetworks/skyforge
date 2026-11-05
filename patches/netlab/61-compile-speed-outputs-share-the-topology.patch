@@ -1,0 +1,282 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 00:00:00 +0000
+Subject: [PATCH] SKYFORGE-SPECIFIC: netlab compile 10-11% faster and 16% less
+ memory: the outputs stop deep-copying the topology, byte-identical output
+
+---
+diff --git a/netsim/augment/nodes.py b/netsim/augment/nodes.py
+index d81433f..be6cf32 100644
+--- a/netsim/augment/nodes.py
++++ b/netsim/augment/nodes.py
+@@ -797,9 +797,16 @@ def cleanup(topology: Box) -> None:
+ 
+ '''
+ Return a copy of the topology (leaving original topology unchanged) with unmanaged devices removed
++
++SKYFORGE-SPECIFIC (patch 61): copy=False lets a caller that never changes what it gets back (or copies what it
++changes itself) receive the topology ITSELF when there is nothing to remove. With an unmanaged node it is the
++same full copy as always.
+ '''
+-def ghost_buster(topology: Box) -> Box:
++def ghost_buster(topology: Box, copy: bool = True) -> Box:
+   log.print_verbose('Removing unmanaged devices from topology')
++  if not copy and not any(n.get('unmanaged',False) for n in topology.nodes.values()):
++    return topology
++
+   # Create a copy of topology
+   topo_copy = data.get_box(topology)
+   
+diff --git a/netsim/outputs/common.py b/netsim/outputs/common.py
+index d086b90..00eaf05 100644
+--- a/netsim/outputs/common.py
++++ b/netsim/outputs/common.py
+@@ -115,7 +115,23 @@ def adjust_inventory_host(
+ def create_adjusted_topology(
+       topology: Box,
+       ignore: typing.Optional[list] = ['name'],
+-      template_vars: bool = False) -> Box:
++      template_vars: bool = False,
++      share: bool = False) -> Box:
++  if share:
++    # SKYFORGE-SPECIFIC (patch 61): the caller only READS what it gets back (config templates). Everything but the
++    # nodes is the topology's own data; each node is copied one level because template_vars writes four keys on it
++    # and adjust_inventory_host builds a new host from it. Not for callers that modify the result.
++    topo_copy = fastbox.shallow(topology)
++    new_nodes = fastbox.shallow(topology.nodes)
++    for node in list(new_nodes.keys()):
++      fastbox.set_reference(new_nodes,node,adjust_inventory_host(
++                              node=fastbox.shallow(topology.nodes[node]),
++                              defaults=topology.defaults,
++                              ignore=ignore,
++                              group_vars=True,
++                              template_vars=template_vars))
++    fastbox.set_reference(topo_copy,'nodes',new_nodes)
++    return topo_copy
+   topo_copy = fastbox.deep_copy(topology)                         # SKYFORGE-SPECIFIC: same result as get_box(topology.to_dict()), one pass
+   for node in list(topo_copy.nodes.keys()):
+     fastbox.set_item(topo_copy.nodes,node,adjust_inventory_host(     # SKYFORGE-SPECIFIC: same as topo_copy.nodes[node] = ...
+diff --git a/netsim/outputs/config.py b/netsim/outputs/config.py
+index f3bbcf7..ae494d4 100644
+--- a/netsim/outputs/config.py
++++ b/netsim/outputs/config.py
+@@ -54,7 +54,19 @@ class ConfigurationFiles(_TopologyOutput):
+ 
+     # Creates a "ghost clean" topology after transformation
+     # (AKA, remove unmanaged devices)
+-    topology = output_common.create_adjusted_topology(nodes.ghost_buster(topology),ignore=[],template_vars=True)
++    # SKYFORGE-SPECIFIC (patch 61): when the nodes are rendered in forked workers (parallel_config), the templates read
++    # the topology in the workers, so it is shared instead of deep-copied: python-box's default_box creates a key on
++    # a read of a missing one, and that must not reach this process (the pickle output runs here, after this one).
++    share = parallel_config.usable(topology)
++    real_topology = topology
++    topology = output_common.create_adjusted_topology(nodes.ghost_buster(topology,copy=not share),ignore=[],template_vars=True,share=share)
++
++    def unshare() -> Box:
++      # parallel_config renders every node in THIS process when a worker logged something: do that on a private deep
++      # copy, as the original loop did, not on the shared one
++      nonlocal topology
++      topology = output_common.create_adjusted_topology(nodes.ghost_buster(real_topology),ignore=[],template_vars=True)
++      return topology
+     shared_list = []
+     if 'unprovisioned' in topology.groups:
+       unprovisioned = groups.group_members(topology,'unprovisioned')
+@@ -132,7 +144,7 @@ class ConfigurationFiles(_TopologyOutput):
+     # SKYFORGE-SPECIFIC (patch 57): render the nodes in forked workers when the lab is big enough (exact same files,
+     # same console lines in the same order); otherwise the original loop.
+     if parallel_config.usable(topology):
+-      parallel_config.run(topology,one_node,lambda n_data: self._shared_sources(n_data,topology))
++      parallel_config.run(topology,one_node,lambda n_data: self._shared_sources(n_data,topology),unshare if share else None)
+     else:
+       for n_name,n_data in topology.nodes.items():
+         one_node(n_name,n_data,shared_list)
+diff --git a/netsim/outputs/parallel_config.py b/netsim/outputs/parallel_config.py
+index bb9532a..577f8b6 100644
+--- a/netsim/outputs/parallel_config.py
++++ b/netsim/outputs/parallel_config.py
+@@ -39,7 +39,7 @@ def usable(topology: Box) -> bool:
+   return len(topology.nodes) >= min_nodes and _workers() > 1
+ 
+ 
+-def run(topology: Box, one_node: typing.Callable, shared_sources: typing.Callable) -> None:
++def run(topology: Box, one_node: typing.Callable, shared_sources: typing.Callable, unshare: typing.Optional[typing.Callable] = None) -> None:
+   names = list(topology.nodes.keys())
+   shared: list = []                             # simulate the sequential loop's shared_list
+   start_state = {}
+@@ -71,6 +71,8 @@ def run(topology: Box, one_node: typing.Callable, shared_sources: typing.Callabl
+   # right by this process: start the node files again and render every node here, exactly as the original loop does.
+   if os.path.exists('node_files'):
+     shutil.rmtree('node_files')
++  if unshare is not None:                       # SKYFORGE-SPECIFIC (patch 61): the topology was shared with the caller's
++    topology = unshare()                        # ... own, and the original loop rendered a private copy
+   shared_list: list = []
+   for n_name in names:
+     one_node(n_name, topology.nodes[n_name], shared_list)
+diff --git a/netsim/outputs/provider.py b/netsim/outputs/provider.py
+index f5d7efa..25175c1 100644
+--- a/netsim/outputs/provider.py
++++ b/netsim/outputs/provider.py
+@@ -28,7 +28,7 @@ class ProviderConfiguration(_TopologyOutput):
+ 
+     # Creates a "ghost clean" topology after transformation
+     # (AKA, remove unmanaged devices)
+-    topology = output_common.create_adjusted_topology(nodes.ghost_buster(topology),ignore=[],template_vars=True)
++    topology = output_common.create_adjusted_topology(nodes.ghost_buster(topology,copy=False),ignore=[],template_vars=True)
+     p_module = providers.get_provider_module(topology,topology.provider)
+     providers.mark_providers(topology)
+     p_module.call('pre_output_transform',topology)
+diff --git a/tests/test_compile_speed.py b/tests/test_compile_speed.py
+index d3b73e0..1eda47a 100644
+--- a/tests/test_compile_speed.py
++++ b/tests/test_compile_speed.py
+@@ -547,3 +547,147 @@ def test_readonly_consolidated_device_data_equals_the_original(tmp_path: Path, m
+       node = Box({'device': dev, 'name': 'x'} | ({'provider': provider} if provider else {}), **_OPTS)
+       assert devices.get_consolidated_device_data_readonly(node, topology.defaults) == \
+              devices.get_consolidated_device_data(node, topology.defaults), f'{dev}/{provider}'
++
++
++#
++# patch 61: the outputs stop deep-copying the topology
++#
++
++def _bgp_lab_topology() -> str:
++  return textwrap.dedent("""
++    defaults.device: eos
++    module: [ bgp, ospf ]
++    bgp.as_list:
++      65000: { members: [ s1, s2, l1, l2, x1 ], rr: [ s1, s2 ] }
++      65001: { members: [ m1, m2, m3 ] }
++    nodes:
++      s1:
++      s2:
++      l1:
++      l2:
++      x1: { module: [ bgp ] }
++      m1:
++      m2:
++      m3:
++      h1: { device: linux, module: [] }
++    links:
++    - s1-l1
++    - s1-l2
++    - s2-l1
++    - s2-l2
++    - s1-x1
++    - l1-m1
++    - m1-m2
++    - m2-m3
++    - m3-m1
++    - l2-h1
++    """).strip() + '\n'
++
++
++def _compile_text(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, text: str, outputs=('config', 'provider', 'ansible:dir', 'pickle')) -> Path:
++  lab = tmp_path / name / 'lab'
++  lab.mkdir(parents=True)
++  monkeypatch.chdir(lab)
++  memo.invalidate()
++  (lab / 'topology.yml').write_text(text)
++  _init_log()
++  args = []
++  for o in outputs:
++    args += ['-o', o]
++  create.run(args + [str(lab / 'topology.yml')])
++  return lab
++
++
++def _unmanaged_topology() -> Box:
++  return get_box({
++    'name': 'lab', 'defaults': {}, 'nodes': {'a': {'name': 'a'}, 'g': {'name': 'g', 'unmanaged': True}, 'b': {'name': 'b'}},
++    'links': [{'node_count': 2, 'type': 'p2p', 'linkindex': 1, 'interfaces': [{'node': 'a'}, {'node': 'b'}]},
++              {'node_count': 2, 'type': 'p2p', 'linkindex': 2, 'interfaces': [{'node': 'a'}, {'node': 'g'}]},
++              {'node_count': 2, 'type': 'p2p', 'linkindex': 3, 'interfaces': [{'node': 'g'}, {'node': 'g'}]}]})
++
++
++def test_ghost_buster_without_copy_returns_the_topology_only_when_nothing_is_unmanaged() -> None:
++  from netsim.augment import nodes
++  _init_log()
++  clean = get_box({'name': 'lab', 'nodes': {'a': {'name': 'a'}, 'b': {'name': 'b'}}, 'links': []})
++  assert nodes.ghost_buster(clean, copy=False) is clean
++  assert nodes.ghost_buster(clean) is not clean                       # the default is still a copy
++  _same(nodes.ghost_buster(clean), clean)
++
++  topo = _unmanaged_topology()
++  for kw in ({}, {'copy': False}):                                      # an unmanaged node: always the full copy
++    out = nodes.ghost_buster(topo, **kw)
++    assert out is not topo and list(out.nodes) == ['a', 'b']
++    assert [[i.node for i in l.interfaces] for l in out.links] == [['a', 'b'], ['a']]
++    topo = _unmanaged_topology()                                        # (this copy shares its links with the source: as it always did)
++
++
++def _snap(topology: Box) -> dict:
++  d = fastbox.to_dict(topology)
++  d.pop('_Providers', None)                                             # provider instances compare by identity
++  return d
++
++
++def test_shared_adjusted_topology_equals_the_deep_copied_one_and_leaves_the_source_alone(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  from netsim.outputs import common
++  _, topology = _compile(tmp_path, monkeypatch, 'adj', fast=True)
++  memo.invalidate()
++  before = copy.deepcopy(_snap(topology))
++  for tv in (True, False):
++    for ignore in ([], ['name']):
++      deep = common.create_adjusted_topology(topology, ignore=ignore, template_vars=tv)
++      shared = common.create_adjusted_topology(topology, ignore=ignore, template_vars=tv, share=True)
++      assert _snap(deep) == _snap(shared)
++      assert list(deep.nodes) == list(shared.nodes) and list(deep.keys()) == list(shared.keys())
++      assert _snap(topology) == before                        # nothing written to the source (template_vars adds keys)
++  # positive control: the check above can fail. Adjusting the REAL node, without the one-level copy, does write to it.
++  name = next(iter(topology.nodes))
++  common.adjust_inventory_host(node=topology.nodes[name], defaults=topology.defaults, ignore=[], group_vars=True, template_vars=True)
++  assert _snap(topology) != before
++  # the shared result is what a deep copy would be for everything but the nodes: same objects, by design
++  assert shared.defaults is topology.defaults and shared.nodes is not topology.nodes
++
++
++@pytest.mark.parametrize('lab_text', ['tiny', 'bgp'])
++def test_output_is_identical_when_the_config_output_shares_the_topology(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lab_text: str) -> None:
++  """Requirement: sharing is invisible in every file. Forced on (workers from 2 nodes) against forced off."""
++  from netsim.outputs import common
++  text = _bgp_lab_topology() if lab_text == 'bgp' else textwrap.dedent(_TOPOLOGY).strip() + '\n'
++  calls = []
++  real = common.create_adjusted_topology
++  def spy(*a, **kw):
++    calls.append(kw.get('share', False))
++    return real(*a, **kw)
++  monkeypatch.setattr(common, 'create_adjusted_topology', spy)
++  _compile_text(tmp_path, monkeypatch, 'warm', text)
++  monkeypatch.setenv('SKYFORGE_NETLAB_PARALLEL_CONFIG_MIN', '100000')
++  calls.clear()
++  off = _tree(_compile_text(tmp_path, monkeypatch, 'off', text), tmp_path / 'off')
++  assert True not in calls
++  monkeypatch.setenv('SKYFORGE_NETLAB_PARALLEL_CONFIG_MIN', '2')
++  calls.clear()
++  on = _tree(_compile_text(tmp_path, monkeypatch, 'on', text), tmp_path / 'on')
++  assert True in calls, 'the shared path did not run: this comparison proves nothing'
++  assert set(on) == set(off) and len(on) > 10
++  assert [k for k in on if on[k] != off[k]] == []
++
++
++def test_when_a_config_worker_logs_something_the_parent_renders_a_private_copy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  """parallel_config falls back to rendering every node in the parent; that must not touch the shared topology."""
++  from netsim.outputs import common, parallel_config
++  text = _bgp_lab_topology()
++  calls = []
++  real = common.create_adjusted_topology
++  def spy(*a, **kw):
++    calls.append(kw.get('share', False))
++    return real(*a, **kw)
++  monkeypatch.setattr(common, 'create_adjusted_topology', spy)
++  _compile_text(tmp_path, monkeypatch, 'warm', text)
++  monkeypatch.setenv('SKYFORGE_NETLAB_PARALLEL_CONFIG_MIN', '100000')
++  off = _tree(_compile_text(tmp_path, monkeypatch, 'off', text), tmp_path / 'off')
++  monkeypatch.setenv('SKYFORGE_NETLAB_PARALLEL_CONFIG_MIN', '2')
++  monkeypatch.setattr(parallel_config.forkrun, 'clean', lambda result: False)    # every worker "logged something"
++  calls.clear()
++  on = _tree(_compile_text(tmp_path, monkeypatch, 'on', text, outputs=('config',)), tmp_path / 'on')
++  assert calls == [True, False], f'expected a shared topology and then a private one, got {calls}'
++  assert [k for k in on if on[k] != off.get(k)] == [] and any(k.startswith('node_files/') for k in on)
+-- 
+2.56.0
+

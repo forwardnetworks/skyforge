@@ -1,0 +1,17 @@
+---
+defaults:
+  device: cat8000v
+  # KNE deployability: a single-node ("stub") link has no far end, and KNE wires
+  # every link as a veth pair, so the provider rejects the topology outright.
+  # netlab's own remedy (docs/links.md, "additional loopbacks") turns stub links
+  # into loopback INTERFACES -- same node, same prefix, same address, same
+  # advertisement -- and removes the link. No extra device, no wire, no change
+  # to what this lab demonstrates: the UNNUMBERED links (rtr-c1, rtr-c2) are
+  # untouched -- only the per-device stub LAN behind each router moves from an
+  # Ethernet port to Loopback1, keeping the same /24. The lab diagram in
+  # README.md draws those as LAN clouds; they are loopbacks now.
+  links.stub_loopback: True
+
+nodes: [ rtr, c1, c2 ]
+
+links: [ rtr-c1, rtr-c2, rtr, c1, c2 ]

@@ -1,0 +1,112 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 13:47:23 -0500
+Subject: [PATCH 05/35] juniper: node changes (vJunos and startup config)
+
+---
+diff --git a/topo/node/juniper/juniper.go b/topo/node/juniper/juniper.go
+index e1351c3..7ca0415 100644
+--- a/topo/node/juniper/juniper.go
++++ b/topo/node/juniper/juniper.go
+@@ -514,6 +514,15 @@ func (n *Node) ResetCfg(ctx context.Context) error {
+ }
+ 
+ func (n *Node) Create(ctx context.Context) error {
++	// vjunos-router/vjunos-switch are KubeVirt VMs, not cPTX containers. Without
++	// this the VM models fall through to the cPTX pod builder below and a POD is
++	// created for them: kne then reports the node "created" while the Service it
++	// made selects vm.kubevirt.io/name, which matches nothing, so nothing ever
++	// becomes ready and the failure names admission rather than the dispatch.
++	// Mirrors the identical guard in topo/node/cisco/cisco.go.
++	if n.UsesKubeVirtVM() {
++		return n.Impl.Create(ctx)
++	}
+ 	log.Infof("Creating cPTX node resource %s model %s", n.Name(), n.Proto.Model)
+ 
+ 	hpd := corev1.HostPathDirectory
+@@ -618,8 +627,11 @@ func (n *Node) Create(ctx context.Context) error {
+ 			},
+ 			TerminationGracePeriodSeconds: pointer.Int64(0),
+ 			EnableServiceLinks:            pointer.Bool(false),
+-			NodeSelector:                  map[string]string{},
++			PriorityClassName:             node.KNEPriorityClassName(),
++			NodeSelector:                  node.KNENodeSelector(),
++			Tolerations:                   node.KNETolerations(),
+ 			Affinity: &corev1.Affinity{
++				NodeAffinity: node.KNEContainerNodeAffinity(),
+ 				PodAntiAffinity: &corev1.PodAntiAffinity{
+ 					PreferredDuringSchedulingIgnoredDuringExecution: []corev1.WeightedPodAffinityTerm{{
+ 						Weight: 100,
+@@ -818,7 +830,7 @@ func defaults(pb *tpb.Node) *tpb.Node {
+ 		if pb.Config.Image == "" {
+ 			pb.Config.Image = defaultNodeClone.Config.Image
+ 		}
+-	default:
++	case ModelCPTX:
+ 		if pb.Constraints == nil {
+ 			pb.Constraints = map[string]string{}
+ 		}
+@@ -836,11 +848,23 @@ func defaults(pb *tpb.Node) *tpb.Node {
+ 		if pb.Config.Image == "" {
+ 			pb.Config.Image = "cptx:latest"
+ 		}
++	default:
++		// For non-cPTX Juniper models (for example vmx/vjunos), do not force
++		// a cPTX-specific command. Let image defaults define startup behavior.
++		if pb.Constraints == nil {
++			pb.Constraints = map[string]string{}
++		}
++		if pb.Constraints["cpu"] == "" {
++			pb.Constraints["cpu"] = defaultNCPTXConstraints.CPU
++		}
++		if pb.Constraints["memory"] == "" {
++			pb.Constraints["memory"] = defaultNCPTXConstraints.Memory
++		}
+ 	}
+ 	if pb.Services == nil {
+ 		pb.Services = defaultNodeClone.Services
+ 	}
+-	if pb.Config.Cert == nil {
++	if pb.Config.Cert == nil && (pb.Model == ModelNCPTX || pb.Model == ModelCPTX) {
+ 		pb.Config.Cert = defaultNodeClone.Config.Cert
+ 	}
+ 	if pb.Config.Env == nil {
+diff --git a/topo/node/juniper/juniper_test.go b/topo/node/juniper/juniper_test.go
+index 4953059..b0a506d 100644
+--- a/topo/node/juniper/juniper_test.go
++++ b/topo/node/juniper/juniper_test.go
+@@ -1245,3 +1245,31 @@ fi
+ 		}
+ 	}
+ }
++
++func TestDefaultsNonCPTXModelDoesNotForceCPTXConfig(t *testing.T) {
++	pb := &tpb.Node{
++		Name:  "vmx-node",
++		Model: "vmx",
++		Config: &tpb.Config{
++			Image: "vmx-custom:1.0",
++		},
++	}
++
++	got := defaults(pb)
++
++	if got.Config.Image != "vmx-custom:1.0" {
++		t.Fatalf("defaults() image = %q, want %q", got.Config.Image, "vmx-custom:1.0")
++	}
++	if len(got.Config.Command) != 0 {
++		t.Fatalf("defaults() command = %v, want image-defined entrypoint (empty command)", got.Config.Command)
++	}
++	if got.Config.Cert != nil {
++		t.Fatalf("defaults() cert = %v, want nil for non-cPTX Juniper model", got.Config.Cert)
++	}
++	if got.Constraints["cpu"] != defaultNCPTXConstraints.CPU {
++		t.Fatalf("defaults() cpu = %q, want %q", got.Constraints["cpu"], defaultNCPTXConstraints.CPU)
++	}
++	if got.Constraints["memory"] != defaultNCPTXConstraints.Memory {
++		t.Fatalf("defaults() memory = %q, want %q", got.Constraints["memory"], defaultNCPTXConstraints.Memory)
++	}
++}
+-- 
+2.56.0
+

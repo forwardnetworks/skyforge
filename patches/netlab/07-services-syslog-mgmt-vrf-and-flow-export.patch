@@ -1,0 +1,1440 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 12:00:00 +0000
+Subject: [PATCH] services: syslog to the management VRF and flow export client
+
+---
+diff --git a/netsim/ansible/templates/services/asa.j2 b/netsim/ansible/templates/services/asa.j2
+index 5a2722e..1f73d30 100644
+--- a/netsim/ansible/templates/services/asa.j2
++++ b/netsim/ansible/templates/services/asa.j2
+@@ -8,3 +8,77 @@
+ #}
+ snmp-server community {{ services.server.snmp.community|default('skyforge') }}
+ {% endif %}
++{#
++  THE COLLECTOR IS REACHED OVER MANAGEMENT, and on an ASA every logging and
++  export destination is written in terms of an interface NAME, not an interface.
++  That name is `management`: netlab's own asav day-0 (netsim/install/libvirt/
++  asav/day0-config) sets `interface Management0/0 / nameif management`, and the
++  live demo-lab cdg-fw01 agrees -- `show nameif` reports Management0/0 -> management
++  while every data port keeps its own ifname. mgmt.ifname is "Management0/0",
++  which is the INTERFACE and not the name, so it deliberately is not used here.
++#}
++{% set _asa_mgmt_nameif = asa_mgmt_nameif|default('management') %}
++{% if services.syslog._server_list is defined %}
++{#
++  SYSLOG CLIENT. Measured 2026-09-11 on the live demo-lab cdg-fw01, with a
++  negative control so an empty answer could not be mistaken for an absent
++  feature:
++
++    show flarble wibble      -> ERROR: % Invalid input detected   (control)
++    show logging setting     -> "Syslog logging: disabled" and the full setting
++                                table                            -> client present
++    show running-config logging -> empty, no error                -> unconfigured
++
++  `logging enable` is the switch the setting table reports as disabled; without
++  it every other line here is inert configuration that reads as configured.
++#}
++logging enable
++logging timestamp
++logging trap informational
++{%   for _syslog_host in services.syslog._server_list[:4] %}
++logging host {{ _asa_mgmt_nameif }} {{ _syslog_host }}
++{%   endfor %}
++{% endif %}
++{% if services.flow.protocol|default('') == 'netflow' and services.flow._server_list is defined %}
++{#
++  NSEL, WHICH IS NOT CLASSIC NETFLOW AND THE DIFFERENCE MATTERS.
++
++  NetFlow Secure Event Logging exports NetFlow v9 records, so the wire protocol
++  and the collector's listener are the ones `netflow` already names -- but the
++  records are EVENTS on the firewall's connection table (created, torn down,
++  denied) and not a sampled or timed digest of forwarded packets. A firewall
++  does not sample; it knows every flow it permitted. That is why this block
++  declares netflow and NOT ipfix (the ASA has no IPFIX export) and NOT sflow
++  (`show sflow` does not exist here), and why it asks for no sampler: there is
++  no packet sampling to configure, and `services.flow.sampling` is deliberately
++  NOT declared on this device so the module leaves it alone rather than the
++  template pretending to honour it.
++
++  MEASURED 2026-09-11 on the live demo-lab cdg-fw01 (ASA 9.24(1)), against the
++  same `show flarble wibble` control that errors:
++
++    show flow-export counters       -> empty, no error   -> NSEL present
++    show running-config flow-export -> empty, no error   -> unconfigured
++
++  IT MUST JOIN global_policy, NOT ADD A POLICY. An ASA permits exactly ONE
++  global service-policy and this one already has it -- `show running-config
++  service-policy` on cdg-fw01 returns `service-policy global_policy global`, and
++  a second `service-policy ... global` is refused. So the export class is added
++  to the policy that is already applied, which is also the form Cisco documents.
++#}
++{%   for _flow_host in services.flow._server_list[:2] %}
++flow-export destination {{ _asa_mgmt_nameif }} {{ _flow_host }} {{ services.flow.port|default(2055) }}
++{%   endfor %}
++flow-export template timeout-rate 1
++flow-export active refresh-interval 1
++!
++class-map skyforge-flow-export
++ match any
++!
++policy-map global_policy
++ class skyforge-flow-export
++{%   for _flow_host in services.flow._server_list[:2] %}
++  flow-export event-type all destination {{ _flow_host }}
++{%   endfor %}
++!
++{% endif %}
+diff --git a/netsim/ansible/templates/services/asav.j2 b/netsim/ansible/templates/services/asav.j2
+index 5a2722e..1f73d30 100644
+--- a/netsim/ansible/templates/services/asav.j2
++++ b/netsim/ansible/templates/services/asav.j2
+@@ -8,3 +8,77 @@
+ #}
+ snmp-server community {{ services.server.snmp.community|default('skyforge') }}
+ {% endif %}
++{#
++  THE COLLECTOR IS REACHED OVER MANAGEMENT, and on an ASA every logging and
++  export destination is written in terms of an interface NAME, not an interface.
++  That name is `management`: netlab's own asav day-0 (netsim/install/libvirt/
++  asav/day0-config) sets `interface Management0/0 / nameif management`, and the
++  live demo-lab cdg-fw01 agrees -- `show nameif` reports Management0/0 -> management
++  while every data port keeps its own ifname. mgmt.ifname is "Management0/0",
++  which is the INTERFACE and not the name, so it deliberately is not used here.
++#}
++{% set _asa_mgmt_nameif = asa_mgmt_nameif|default('management') %}
++{% if services.syslog._server_list is defined %}
++{#
++  SYSLOG CLIENT. Measured 2026-09-11 on the live demo-lab cdg-fw01, with a
++  negative control so an empty answer could not be mistaken for an absent
++  feature:
++
++    show flarble wibble      -> ERROR: % Invalid input detected   (control)
++    show logging setting     -> "Syslog logging: disabled" and the full setting
++                                table                            -> client present
++    show running-config logging -> empty, no error                -> unconfigured
++
++  `logging enable` is the switch the setting table reports as disabled; without
++  it every other line here is inert configuration that reads as configured.
++#}
++logging enable
++logging timestamp
++logging trap informational
++{%   for _syslog_host in services.syslog._server_list[:4] %}
++logging host {{ _asa_mgmt_nameif }} {{ _syslog_host }}
++{%   endfor %}
++{% endif %}
++{% if services.flow.protocol|default('') == 'netflow' and services.flow._server_list is defined %}
++{#
++  NSEL, WHICH IS NOT CLASSIC NETFLOW AND THE DIFFERENCE MATTERS.
++
++  NetFlow Secure Event Logging exports NetFlow v9 records, so the wire protocol
++  and the collector's listener are the ones `netflow` already names -- but the
++  records are EVENTS on the firewall's connection table (created, torn down,
++  denied) and not a sampled or timed digest of forwarded packets. A firewall
++  does not sample; it knows every flow it permitted. That is why this block
++  declares netflow and NOT ipfix (the ASA has no IPFIX export) and NOT sflow
++  (`show sflow` does not exist here), and why it asks for no sampler: there is
++  no packet sampling to configure, and `services.flow.sampling` is deliberately
++  NOT declared on this device so the module leaves it alone rather than the
++  template pretending to honour it.
++
++  MEASURED 2026-09-11 on the live demo-lab cdg-fw01 (ASA 9.24(1)), against the
++  same `show flarble wibble` control that errors:
++
++    show flow-export counters       -> empty, no error   -> NSEL present
++    show running-config flow-export -> empty, no error   -> unconfigured
++
++  IT MUST JOIN global_policy, NOT ADD A POLICY. An ASA permits exactly ONE
++  global service-policy and this one already has it -- `show running-config
++  service-policy` on cdg-fw01 returns `service-policy global_policy global`, and
++  a second `service-policy ... global` is refused. So the export class is added
++  to the policy that is already applied, which is also the form Cisco documents.
++#}
++{%   for _flow_host in services.flow._server_list[:2] %}
++flow-export destination {{ _asa_mgmt_nameif }} {{ _flow_host }} {{ services.flow.port|default(2055) }}
++{%   endfor %}
++flow-export template timeout-rate 1
++flow-export active refresh-interval 1
++!
++class-map skyforge-flow-export
++ match any
++!
++policy-map global_policy
++ class skyforge-flow-export
++{%   for _flow_host in services.flow._server_list[:2] %}
++  flow-export event-type all destination {{ _flow_host }}
++{%   endfor %}
++!
++{% endif %}
+diff --git a/netsim/ansible/templates/services/eos.j2 b/netsim/ansible/templates/services/eos.j2
+index 18c12a9..1e50990 100644
+--- a/netsim/ansible/templates/services/eos.j2
++++ b/netsim/ansible/templates/services/eos.j2
+@@ -38,3 +38,35 @@ management api gnmi
+ #}
+ snmp-server community {{ services.server.snmp.community|default('skyforge') }} ro
+ {% endif %}
++{% if services.syslog._server_list is defined and services.syslog._mgmt|default(False) %}
++{#
++  Skyforge: `transport_vrf: mgmt` (see services.py). The collector is reached
++  over management, so logs are sourced from the management interface.
++#}
++logging source-interface {{ mgmt_if|default('Management0') }}
++{% endif %}
++{% if services.flow.protocol|default('') == 'sflow' and services.flow._server_list is defined %}
++{#
++  sFLOW EXPORT -- the point of which is evidence, not telemetry.
++
++  Monitoring collects over the management interface, so a completely dead data
++  plane certifies green today. An sFlow record says THIS DEVICE forwarded these
++  packets: a claim about the fabric, made by the fabric, which no counter on a
++  traffic generator can make about itself.
++
++  All GLOBAL on EOS -- `sflow run` enables it, and there is no per-interface
++  line to emit. Other platforms (IOS-XE flow monitors, Junos sampling) need a
++  per-interface loop, which a template can do: services/panos.j2 already
++  iterates `interfaces` and skips the management one. That exclusion matters
++  here too -- an exporter on the management interface reports the traffic our
++  own monitoring generates, which is noise wearing the costume of evidence.
++#}
++{%   for _flow_host in services.flow._server_list[:2] %}
++sflow destination {{ _flow_host }} {{ services.flow.port|default(6343) }}
++{%   endfor %}
++sflow source-interface {{ mgmt_if|default('Management0') }}
++{%   if services.flow.sampling is defined %}
++sflow sample {{ services.flow.sampling }}
++{%   endif %}
++sflow run
++{% endif %}
+diff --git a/netsim/ansible/templates/services/ios.j2 b/netsim/ansible/templates/services/ios.j2
+index 6155a85..7eba15d 100644
+--- a/netsim/ansible/templates/services/ios.j2
++++ b/netsim/ansible/templates/services/ios.j2
+@@ -40,3 +40,110 @@ logging host {{ "ipv6 " if ':' in syslog_host else "" }}{{ syslog_host }}{%
+ #}
+ snmp-server community {{ services.server.snmp.community|default('skyforge') }} RO
+ {% endif %}
++{% if services.syslog._server_list is defined and services.syslog._mgmt|default(False) %}
++{#
++  Skyforge: `transport_vrf: mgmt` (see services.py). The collector is reached
++  over management, so logs are sourced from the management interface.
++#}
++logging source-interface {{ mgmt_if|default(mgmt.ifname|default('Ethernet0/0')) }}{%
++   if services.syslog.transport_vrf is defined %} vrf {{ services.syslog.transport_vrf }}{% endif +%}
++{% endif %}
++{% set _flow_mgmt = mgmt_if|default(mgmt.ifname|default('')) %}
++{% set _flow_l3 = [] %}
++{% for intf in interfaces|default([]) if intf.ifname != _flow_mgmt
++     and ((intf.ipv4 is defined and intf.ipv4) or (intf.ipv6 is defined and intf.ipv6)) %}
++{%   set _ = _flow_l3.append(intf.ifname) %}
++{% endfor %}
++{#
++  NOT ON AN SD-WAN EDGE. A controller-mode cat8000v does not own its running
++  configuration -- vManage does. This block would land in the CVAC day-0 seed
++  and then sit inside whatever the service-side lane reads back and re-pushes as
++  that edge's CLI template, which is a fight over the same bytes. Worse, a day-0
++  the appliance rejects costs the whole SD-WAN bootstrap, which is the most
++  expensive thing in this tree to get back. A plain (autonomous-mode) cat8000v
++  has none of that and exports normally. Revisit by adding the exporter to the
++  SERVICE-SIDE overlay template (sdwan_service_vpn.cli.j2), where vManage is the
++  one pushing it.
++#}
++{% if 'sdwan' not in module|default([])
++      and services.flow.protocol|default('') in ['netflow','ipfix']
++      and services.flow._server_list is defined and _flow_l3 %}
++{#
++  FLEXIBLE NETFLOW EXPORT -- the point of which is evidence, not telemetry.
++
++  Monitoring collects over the management interface, so a completely dead data
++  plane certifies green. A flow record says THIS DEVICE forwarded these packets:
++  a claim about the fabric, made by the fabric, which no counter on a traffic
++  generator can make about itself.
++
++  IOS SPEAKS NO sFLOW. Measured 2026-09-11 on a live IOL: `show sflow` is
++  "% Invalid input detected", while `show flow record` lists the full built-in
++  Flexible NetFlow set and `show flow exporter` answers empty rather than
++  erroring. So this platform declares netflow/ipfix and NOT sflow, which is what
++  makes the module refuse `protocol: sflow` here instead of rendering nothing
++  and looking configured.
++
++  PER-INTERFACE, AND NOT ON MANAGEMENT. Unlike EOS -- where `sflow run` is one
++  global line -- a flow monitor does nothing until it is applied to an
++  interface. The management interface is excluded on purpose: an exporter there
++  reports the traffic our own monitoring generates, which is noise wearing the
++  costume of evidence.
++
++  ONLY ON ADDRESSED INTERFACES. `ip flow monitor` is an L3 interface command:
++  an L2 switchport (ioll2, measured 2026-09-11 on demo-lab dc-sdwan-sw01) rejects
++  it. The monitor therefore follows the L3 ADDRESS, not the interface name --
++  routed ports, subinterfaces and addressed SVI/BDI -- and a node with no routed
++  interface renders no flow block at all rather than an exporter attached to
++  nothing.
++#}
++flow record skyforge-ipv4
++ match ipv4 protocol
++ match ipv4 source address
++ match ipv4 destination address
++ match transport source-port
++ match transport destination-port
++ match ipv4 tos
++ match interface input
++ collect interface output
++ collect counter bytes
++ collect counter packets
++ collect timestamp sys-uptime first
++ collect timestamp sys-uptime last
++!
++{%   for _flow_host in services.flow._server_list[:2] %}
++flow exporter skyforge-{{ loop.index }}
++ destination {{ _flow_host }}{% if services.flow.transport_vrf is defined %} vrf {{ services.flow.transport_vrf }}{% endif +%}
++{%     if _flow_mgmt %}
++ source {{ _flow_mgmt }}
++{%     endif %}
++ transport udp {{ services.flow.port|default(2055) }}
++ export-protocol {{ 'ipfix' if services.flow.protocol == 'ipfix' else 'netflow-v9' }}
++ template data timeout 60
++!
++{%   endfor %}
++flow monitor skyforge
++{%   for _flow_host in services.flow._server_list[:2] %}
++ exporter skyforge-{{ loop.index }}
++{%   endfor %}
++ record skyforge-ipv4
++ cache timeout active 60
++!
++{%   if services.flow.sampling is defined %}
++{#
++  1-in-N. Unsampled export from a traffic generator's own load is a denial of
++  service against the collector, so sampling is not the optional nicety it looks.
++#}
++sampler skyforge
++ mode random 1 out-of {{ services.flow.sampling }}
++!
++{%   endif %}
++{%   for _flow_intf in _flow_l3 %}
++interface {{ _flow_intf }}
++{%     if services.flow.sampling is defined %}
++ ip flow monitor skyforge sampler skyforge input
++{%     else %}
++ ip flow monitor skyforge input
++{%     endif %}
++!
++{%   endfor %}
++{% endif %}
+diff --git a/netsim/ansible/templates/services/vjunos-router.j2 b/netsim/ansible/templates/services/vjunos-router.j2
+index 9916d04..0aae39b 100644
+--- a/netsim/ansible/templates/services/vjunos-router.j2
++++ b/netsim/ansible/templates/services/vjunos-router.j2
+@@ -1,3 +1,10 @@
++{#
++    DNS and syslog come from upstream services/junos.j2. This file exists
++    because netlab picks services/<netlab_device_type>.j2 BEFORE
++    services/<ansible_network_os>.j2, so a per-device file that did not include
++    the parent would silently take those clients away from this device.
++#}
++{% include 'junos.j2' +%}
+ {% if services.server.snmp is defined %}
+ {#
+     SNMP agent. Junos configuration is HIERARCHICAL everywhere else in netlab
+@@ -30,3 +37,86 @@ snmp {
+   }
+ }
+ {% endif %}
++{#
++  sFLOW EXPORT -- the point of which is evidence, not telemetry.
++
++  Monitoring collects over the management interface, so a completely dead data
++  plane certifies green. An sFlow record says THIS DEVICE forwarded these
++  packets: a claim about the fabric, made by the fabric, which no counter on a
++  traffic generator can make about itself.
++
++  sFLOW AND NOT IPFIX, AND THE REASON IS NOT THE ONE IN THE DOCS. Patch 0042
++  wrote that "Juniper divides by platform, sFlow on the switch and inline IPFIX
++  on the router". That is true of real EX and real MX and it is NOT true of the
++  two images in this tree. MEASURED 2026-09-11 on live demo-lab:
++
++    cdg-cor-sw01 (vjunos-router)  show version -> Model: vmx, RE-VMX
++    cdg-acc-sw01 (vjunos-switch)  show version -> Model: vmx, RE-VMX
++
++  Distinct container disks (juniper_vjunos-router and juniper_vjunos-switch,
++  different digests), one platform underneath. Their mgd schemas are identical
++  token for token -- `set protocols sflow ?`, `set forwarding-options sampling ?`
++  and `set services flow-monitoring ?` return the same completions on both -- so
++  there is no split here to follow, and a template that pretended there was
++  would render inline-jflow on one of two identical vMXs.
++
++  WHAT WAS ACTUALLY PROVEN is that this exact block is ACCEPTED. On
++  cdg-cor-sw01, in `configure private`, `commit check` over
++  agent-id/source-ip/collector+udp-port/sample-rate ingress/polling-interval/
++  interfaces returned "configuration check succeeds"; `rollback` then
++  `show | compare` came back EMPTY and nothing was committed. Inline IPFIX got
++  no such proof: `forwarding-options sampling instance` and
++  `services flow-monitoring version-ipfix` are both in the schema, but inline
++  jflow needs a PFE that implements it and this one is riot, so declaring ipfix
++  here would be a claim about hardware nobody checked.
++
++  STILL UNPROVEN, and this is the next lab's job: that records ARRIVE. The
++  collector sits at a cluster address reached over management, and sFlow
++  datagrams leave from the forwarding plane. `show sflow collector` on any
++  vJunos is the evidence.
++
++  NO agent-id OR source-ip, for the same reason Skyforge never sets a syslog
++  source-address: netlab's mgmt.ipv4 is not the address this device has.
++
++  PHYSICAL INTERFACES, DE-DUPLICATED. netlab hands us unit names (ge-0/0/1.0);
++  sFlow is configured on the port. Management is absent from `interfaces`
++  already and is filtered again here, because an exporter on the management
++  interface reports the traffic our own monitoring generates, which is noise
++  wearing the costume of evidence. irb is filtered too: it isn't physical,
++  and on the switch persona `sflow interfaces irb` is a hard mgd error at
++  boot ("sFlow can be configured only on ge/xe/et interfaces"), so the
++  vjunos-switch template must never emit it -- kept consistent here rather
++  than diverging per persona.
++#}
++{% set _sflow_ports = [] %}
++{% for intf in interfaces|default([]) %}
++{%   set _phy = intf.ifname.split('.')[0] %}
++{%   if _phy not in _sflow_ports and not _phy.startswith('fxp') and not _phy.startswith('em') and not _phy.startswith('irb') %}
++{%     set _ = _sflow_ports.append(_phy) %}
++{%   endif %}
++{% endfor %}
++{% if services.flow.protocol|default('') == 'sflow'
++      and services.flow._server_list is defined and _sflow_ports %}
++protocols {
++  sflow {
++    polling-interval 20;
++{%   if services.flow.sampling is defined %}
++{#
++  1-in-N. Unsampled export from a traffic generator's own load is a denial of
++  service against the collector, so sampling is not the optional nicety it looks.
++#}
++    sample-rate {
++      ingress {{ services.flow.sampling }};
++    }
++{%   endif %}
++{%   for _flow_host in services.flow._server_list[:2] %}
++    collector {{ _flow_host }} {
++      udp-port {{ services.flow.port|default(6343) }};
++    }
++{%   endfor %}
++{%   for _sflow_port in _sflow_ports %}
++    interfaces {{ _sflow_port }};
++{%   endfor %}
++  }
++}
++{% endif %}
+diff --git a/netsim/ansible/templates/services/vjunos-switch.j2 b/netsim/ansible/templates/services/vjunos-switch.j2
+index 9916d04..f573cc2 100644
+--- a/netsim/ansible/templates/services/vjunos-switch.j2
++++ b/netsim/ansible/templates/services/vjunos-switch.j2
+@@ -1,3 +1,10 @@
++{#
++    DNS and syslog come from upstream services/junos.j2. This file exists
++    because netlab picks services/<netlab_device_type>.j2 BEFORE
++    services/<ansible_network_os>.j2, so a per-device file that did not include
++    the parent would silently take those clients away from this device.
++#}
++{% include 'junos.j2' +%}
+ {% if services.server.snmp is defined %}
+ {#
+     SNMP agent. Junos configuration is HIERARCHICAL everywhere else in netlab
+@@ -30,3 +37,86 @@ snmp {
+   }
+ }
+ {% endif %}
++{#
++  sFLOW EXPORT -- the point of which is evidence, not telemetry.
++
++  Monitoring collects over the management interface, so a completely dead data
++  plane certifies green. An sFlow record says THIS DEVICE forwarded these
++  packets: a claim about the fabric, made by the fabric, which no counter on a
++  traffic generator can make about itself.
++
++  sFLOW AND NOT IPFIX, AND THE REASON IS NOT THE ONE IN THE DOCS. Patch 0042
++  wrote that "Juniper divides by platform, sFlow on the switch and inline IPFIX
++  on the router". That is true of real EX and real MX and it is NOT true of the
++  two images in this tree. MEASURED 2026-09-11 on live demo-lab:
++
++    cdg-cor-sw01 (vjunos-router)  show version -> Model: vmx, RE-VMX
++    cdg-acc-sw01 (vjunos-switch)  show version -> Model: vmx, RE-VMX
++
++  Distinct container disks (juniper_vjunos-router and juniper_vjunos-switch,
++  different digests), one platform underneath. Their mgd schemas are identical
++  token for token -- `set protocols sflow ?`, `set forwarding-options sampling ?`
++  and `set services flow-monitoring ?` return the same completions on both -- so
++  there is no split here to follow, and a template that pretended there was
++  would render inline-jflow on one of two identical vMXs.
++
++  WHAT WAS ACTUALLY PROVEN is that this exact block is ACCEPTED. On
++  cdg-cor-sw01, in `configure private`, `commit check` over
++  agent-id/source-ip/collector+udp-port/sample-rate ingress/polling-interval/
++  interfaces returned "configuration check succeeds"; `rollback` then
++  `show | compare` came back EMPTY and nothing was committed. Inline IPFIX got
++  no such proof: `forwarding-options sampling instance` and
++  `services flow-monitoring version-ipfix` are both in the schema, but inline
++  jflow needs a PFE that implements it and this one is riot, so declaring ipfix
++  here would be a claim about hardware nobody checked.
++
++  STILL UNPROVEN, and this is the next lab's job: that records ARRIVE. The
++  collector sits at a cluster address reached over management, and sFlow
++  datagrams leave from the forwarding plane. `show sflow collector` on any
++  vJunos is the evidence.
++
++  NO agent-id OR source-ip, for the same reason Skyforge never sets a syslog
++  source-address: netlab's mgmt.ipv4 is not the address this device has.
++
++  PHYSICAL INTERFACES, DE-DUPLICATED. netlab hands us unit names (ge-0/0/1.0);
++  sFlow is configured on the port. Management is absent from `interfaces`
++  already and is filtered again here, because an exporter on the management
++  interface reports the traffic our own monitoring generates, which is noise
++  wearing the costume of evidence. irb is filtered too: `sflow interfaces
++  irb` is a hard mgd error at boot on this persona ("sFlow can be
++  configured only on ge/xe/et interfaces") -- an irb slipping through here
++  fails day-0 config load and leaves the box running against a stale
++  config until a later commit overwrites it.
++#}
++{% set _sflow_ports = [] %}
++{% for intf in interfaces|default([]) %}
++{%   set _phy = intf.ifname.split('.')[0] %}
++{%   if _phy not in _sflow_ports and not _phy.startswith('fxp') and not _phy.startswith('em') and not _phy.startswith('irb') %}
++{%     set _ = _sflow_ports.append(_phy) %}
++{%   endif %}
++{% endfor %}
++{% if services.flow.protocol|default('') == 'sflow'
++      and services.flow._server_list is defined and _sflow_ports %}
++protocols {
++  sflow {
++    polling-interval 20;
++{%   if services.flow.sampling is defined %}
++{#
++  1-in-N. Unsampled export from a traffic generator's own load is a denial of
++  service against the collector, so sampling is not the optional nicety it looks.
++#}
++    sample-rate {
++      ingress {{ services.flow.sampling }};
++    }
++{%   endif %}
++{%   for _flow_host in services.flow._server_list[:2] %}
++    collector {{ _flow_host }} {
++      udp-port {{ services.flow.port|default(6343) }};
++    }
++{%   endfor %}
++{%   for _sflow_port in _sflow_ports %}
++    interfaces {{ _sflow_port }};
++{%   endfor %}
++  }
++}
++{% endif %}
+diff --git a/netsim/ansible/templates/services/vmx.j2 b/netsim/ansible/templates/services/vmx.j2
+index 9916d04..1b78a20 100644
+--- a/netsim/ansible/templates/services/vmx.j2
++++ b/netsim/ansible/templates/services/vmx.j2
+@@ -1,3 +1,10 @@
++{#
++    DNS and syslog come from upstream services/junos.j2. This file exists
++    because netlab picks services/<netlab_device_type>.j2 BEFORE
++    services/<ansible_network_os>.j2, so a per-device file that did not include
++    the parent would silently take those clients away from this device.
++#}
++{% include 'junos.j2' +%}
+ {% if services.server.snmp is defined %}
+ {#
+     SNMP agent. Junos configuration is HIERARCHICAL everywhere else in netlab
+diff --git a/netsim/ansible/templates/services/vptx.j2 b/netsim/ansible/templates/services/vptx.j2
+index 9916d04..1b78a20 100644
+--- a/netsim/ansible/templates/services/vptx.j2
++++ b/netsim/ansible/templates/services/vptx.j2
+@@ -1,3 +1,10 @@
++{#
++    DNS and syslog come from upstream services/junos.j2. This file exists
++    because netlab picks services/<netlab_device_type>.j2 BEFORE
++    services/<ansible_network_os>.j2, so a per-device file that did not include
++    the parent would silently take those clients away from this device.
++#}
++{% include 'junos.j2' +%}
+ {% if services.server.snmp is defined %}
+ {#
+     SNMP agent. Junos configuration is HIERARCHICAL everywhere else in netlab
+diff --git a/netsim/ansible/templates/services/vsrx.j2 b/netsim/ansible/templates/services/vsrx.j2
+index 9916d04..1b78a20 100644
+--- a/netsim/ansible/templates/services/vsrx.j2
++++ b/netsim/ansible/templates/services/vsrx.j2
+@@ -1,3 +1,10 @@
++{#
++    DNS and syslog come from upstream services/junos.j2. This file exists
++    because netlab picks services/<netlab_device_type>.j2 BEFORE
++    services/<ansible_network_os>.j2, so a per-device file that did not include
++    the parent would silently take those clients away from this device.
++#}
++{% include 'junos.j2' +%}
+ {% if services.server.snmp is defined %}
+ {#
+     SNMP agent. Junos configuration is HIERARCHICAL everywhere else in netlab
+diff --git a/netsim/devices/asav.yml b/netsim/devices/asav.yml
+index 40f5316..9c8670c 100644
+--- a/netsim/devices/asav.yml
++++ b/netsim/devices/asav.yml
+@@ -24,6 +24,22 @@ external:
+   image: none
+ features:
+   services:
++    # SYSLOG + NSEL CLIENT. Both dial a collector and neither was declared here,
++    # so Skyforge's syslog receiver had nothing from a firewall and neither ASA
++    # in demo-lab exported a record. MEASURED 2026-09-11 on the live cdg-fw01
++    # (ASA 9.24(1)), with `show flarble wibble` as the negative control so an
++    # empty answer could not be read as an absent feature: `show logging
++    # setting` returns the full table, `show flow-export counters` and
++    # `show running-config flow-export` answer empty rather than erroring.
++    #
++    # netflow AND NOTHING ELSE. NSEL exports NetFlow v9 records -- the wire
++    # protocol `netflow` names -- but they are connection EVENTS, not sampled
++    # packets. There is no IPFIX export on this platform and no `show sflow` at
++    # all, and `flow.sampling` is left undeclared on purpose: a firewall knows
++    # every flow it permitted and has no sampler to set, so the module must not
++    # be told it has one.
++    syslog: True
++    flow.netflow: True
+     # SNMP agent: this device answers an NMS. Ported from the
+     # snmp_config custom config module.
+     server.snmp: True
+diff --git a/netsim/devices/cat8000v.yml b/netsim/devices/cat8000v.yml
+index c4e1de0..e4c87d9 100644
+--- a/netsim/devices/cat8000v.yml
++++ b/netsim/devices/cat8000v.yml
+@@ -28,6 +28,19 @@ node:
+   min_mtu: 1500
+ features:
+   services:
++    # SYSLOG + FLOW CLIENT. Both dial a collector; both were declared nowhere on
++    # this platform, so Skyforge's syslog receiver had nothing sending to it and
++    # no IOS device exported a flow record. MEASURED 2026-09-11 on a live IOL:
++    # `show flow record` lists the full built-in Flexible NetFlow set and
++    # `show flow exporter` answers empty rather than erroring, while
++    # `show sflow` is "% Invalid input detected" -- so netflow and ipfix, and
++    # deliberately NOT sflow. Declaring the split is what makes the module
++    # refuse `protocol: sflow` here rather than render nothing and look
++    # configured.
++    syslog: True
++    flow.netflow: True
++    flow.ipfix: True
++    flow.sampling: True
+     # SNMP agent: this device answers an NMS. Ported from the
+     # snmp_config custom config module.
+     server.snmp: True
+diff --git a/netsim/devices/eos.yml b/netsim/devices/eos.yml
+index 2bb901f..ab731a2 100644
+--- a/netsim/devices/eos.yml
++++ b/netsim/devices/eos.yml
+@@ -154,6 +154,12 @@ features:
+   services:
+     dns: True
+     syslog: True
++    # sFLOW. EOS speaks sFlow, not NetFlow, on cEOS: `flow tracking hardware`
++    # needs an ASIC this image does not have. Declaring only sflow is what makes
++    # the module REFUSE `protocol: netflow` here rather than render nothing and
++    # look configured.
++    flow.sflow: True
++    flow.sampling: True
+     # SNMP agent. Declared on the SERVER half: the device answers an NMS.
+     server.snmp: True
+     server.gnmi: True
+diff --git a/netsim/devices/iol.yml b/netsim/devices/iol.yml
+index 889c022..a169e79 100644
+--- a/netsim/devices/iol.yml
++++ b/netsim/devices/iol.yml
+@@ -17,6 +17,19 @@ clab:
+ 
+ features:
+   services:
++    # SYSLOG + FLOW CLIENT. Both dial a collector; both were declared nowhere on
++    # this platform, so Skyforge's syslog receiver had nothing sending to it and
++    # no IOS device exported a flow record. MEASURED 2026-09-11 on a live IOL:
++    # `show flow record` lists the full built-in Flexible NetFlow set and
++    # `show flow exporter` answers empty rather than erroring, while
++    # `show sflow` is "% Invalid input detected" -- so netflow and ipfix, and
++    # deliberately NOT sflow. Declaring the split is what makes the module
++    # refuse `protocol: sflow` here rather than render nothing and look
++    # configured.
++    syslog: True
++    flow.netflow: True
++    flow.ipfix: True
++    flow.sampling: True
+     # SNMP agent: this device answers an NMS. Ported from the
+     # snmp_config custom config module.
+     server.snmp: True
+diff --git a/netsim/devices/ios.yml b/netsim/devices/ios.yml
+index 8e64a10..f1811e1 100644
+--- a/netsim/devices/ios.yml
++++ b/netsim/devices/ios.yml
+@@ -160,6 +160,17 @@ features:
+       discard: True
+     acl: True
+   services:
++    # FLOW CLIENT (syslog is upstream's, below). No IOS device exported a flow
++    # record before this. MEASURED 2026-09-11 on a live IOL:
++    # `show flow record` lists the full built-in Flexible NetFlow set and
++    # `show flow exporter` answers empty rather than erroring, while
++    # `show sflow` is "% Invalid input detected" -- so netflow and ipfix, and
++    # deliberately NOT sflow. Declaring the split is what makes the module
++    # refuse `protocol: sflow` here rather than render nothing and look
++    # configured.
++    flow.netflow: True
++    flow.ipfix: True
++    flow.sampling: True
+     dns: True
+     syslog: True
+     # SNMP agent. Declared on the SERVER half: the device answers an NMS.
+diff --git a/netsim/devices/iosv.yml b/netsim/devices/iosv.yml
+index 46daf53..27e95f5 100644
+--- a/netsim/devices/iosv.yml
++++ b/netsim/devices/iosv.yml
+@@ -17,6 +17,19 @@ libvirt:
+   create_template: iosv.xml.j2
+ features:
+   services:
++    # SYSLOG + FLOW CLIENT. Both dial a collector; both were declared nowhere on
++    # this platform, so Skyforge's syslog receiver had nothing sending to it and
++    # no IOS device exported a flow record. MEASURED 2026-09-11 on a live IOL:
++    # `show flow record` lists the full built-in Flexible NetFlow set and
++    # `show flow exporter` answers empty rather than erroring, while
++    # `show sflow` is "% Invalid input detected" -- so netflow and ipfix, and
++    # deliberately NOT sflow. Declaring the split is what makes the module
++    # refuse `protocol: sflow` here rather than render nothing and look
++    # configured.
++    syslog: True
++    flow.netflow: True
++    flow.ipfix: True
++    flow.sampling: True
+     # SNMP agent: this device answers an NMS. Ported from the
+     # snmp_config custom config module.
+     server.snmp: True
+diff --git a/netsim/devices/vjunos-router.yml b/netsim/devices/vjunos-router.yml
+index cc5912b..cd0b051 100644
+--- a/netsim/devices/vjunos-router.yml
++++ b/netsim/devices/vjunos-router.yml
+@@ -10,6 +10,28 @@ group_vars:
+ 
+ features:
+   services:
++    # SYSLOG + sFLOW CLIENT. Neither was declared on any Juniper device in this
++    # tree, so the syslog block services/junos.j2 has carried upstream all along
++    # could never render and Skyforge's receiver saw nothing from Junos.
++    #
++    # sflow AND NOT ipfix, and the reason is measured rather than documented.
++    # Patch 0042 recorded the usual Juniper split -- sFlow on the switch, inline
++    # IPFIX on the router -- which is true of real EX and real MX and NOT true
++    # of these two images: on live demo-lab 2026-09-11, vjunos-router
++    # (cdg-cor-sw01) and vjunos-switch (cdg-acc-sw01) BOTH answer `show version`
++    # with "Model: vmx" and `show chassis hardware` with RE-VMX, from two
++    # distinct container disks, and their mgd schemas complete identically.
++    # So there is no split to follow here.
++    #
++    # What was proven is acceptance: on cdg-cor-sw01, `commit check` inside
++    # `configure private` over the exact sFlow block services/vjunos-*.j2 emits
++    # returned "configuration check succeeds", and the following `rollback` +
++    # `show | compare` came back empty -- nothing was committed. Inline IPFIX is
++    # in the schema but needs a PFE that implements it, and nobody has checked
++    # that this one does, so it is not claimed.
++    syslog: True
++    flow.sflow: True
++    flow.sampling: True
+     # SNMP agent: this device answers an NMS. Ported from the
+     # snmp_config custom config module.
+     server.snmp: True
+diff --git a/netsim/devices/vjunos-switch.yml b/netsim/devices/vjunos-switch.yml
+index f4a8d6f..6f463a1 100644
+--- a/netsim/devices/vjunos-switch.yml
++++ b/netsim/devices/vjunos-switch.yml
+@@ -7,6 +7,28 @@ group_vars:
+ 
+ features:
+   services:
++    # SYSLOG + sFLOW CLIENT. Neither was declared on any Juniper device in this
++    # tree, so the syslog block services/junos.j2 has carried upstream all along
++    # could never render and Skyforge's receiver saw nothing from Junos.
++    #
++    # sflow AND NOT ipfix, and the reason is measured rather than documented.
++    # Patch 0042 recorded the usual Juniper split -- sFlow on the switch, inline
++    # IPFIX on the router -- which is true of real EX and real MX and NOT true
++    # of these two images: on live demo-lab 2026-09-11, vjunos-router
++    # (cdg-cor-sw01) and vjunos-switch (cdg-acc-sw01) BOTH answer `show version`
++    # with "Model: vmx" and `show chassis hardware` with RE-VMX, from two
++    # distinct container disks, and their mgd schemas complete identically.
++    # So there is no split to follow here.
++    #
++    # What was proven is acceptance: on cdg-cor-sw01, `commit check` inside
++    # `configure private` over the exact sFlow block services/vjunos-*.j2 emits
++    # returned "configuration check succeeds", and the following `rollback` +
++    # `show | compare` came back empty -- nothing was committed. Inline IPFIX is
++    # in the schema but needs a PFE that implements it, and nobody has checked
++    # that this one does, so it is not claimed.
++    syslog: True
++    flow.sflow: True
++    flow.sampling: True
+     # SNMP agent: this device answers an NMS. Ported from the
+     # snmp_config custom config module.
+     server.snmp: True
+diff --git a/netsim/modules/services.py b/netsim/modules/services.py
+index e2f2d7b..d6945e0 100644
+--- a/netsim/modules/services.py
++++ b/netsim/modules/services.py
+@@ -80,6 +80,97 @@ def check_feature_support(ndata: Box, svc_data: Box, topology: Box, mod_attr: Bo
+         attribute=f'services.server.{kw}',
+         check_mode=devices.FC_MODE.BLACKLIST)
+ 
++# Which protocol to pick when a node was given a flow client but no protocol.
++# IPFIX first because it is the standard and our collector's NetFlow listener
++# decodes it; netflow-v9 next for devices that predate IPFIX export; sFlow last
++# because it is a sampling protocol, not a flow record -- prefer the device that
++# can tell us what it actually forwarded.
++FLOW_PROTOCOL_PREFERENCE = ['ipfix','netflow','sflow']
++
++def device_flow_protocols(ndata: Box, topology: Box) -> list:
++  """Which flow protocols this node's device declares, in preference order."""
++  features = devices.get_device_features(ndata,topology.defaults)
++  offered = features.get('services',{}).get('flow',{}) or {}
++  return [p for p in FLOW_PROTOCOL_PREFERENCE if offered.get(p,False)]
++
++def resolve_flow_protocol(ndata: Box, topology: Box) -> None:
++  """Pick the protocol from the DEVICE when the topology did not name one.
++
++  The type of flow export is device-dependent and most platforms speak one of
++  the three. Forcing a single protocol across a mixed fleet either refuses the
++  topology or, worse, renders nothing and looks configured. Absence of
++  `protocol` therefore means "whatever this device speaks", which is exactly
++  what a fleet-wide block wants to say and cannot otherwise express.
++
++  An EXPLICIT protocol is left alone in every case, including an unsupported
++  one: check_flow_protocol still refuses it, so an author who names a protocol
++  their device cannot speak hears about it rather than silently getting another.
++
++  The port follows the protocol. `services.flow.ports` is the collector's
++  listener map; the resolved protocol selects its entry. An explicit `port`
++  wins, and the map is consumed here so no device template has to know it
++  exists.
++  """
++  flow = ndata.get('services.flow',None)
++  if not flow:
++    return
++
++  if not flow.get('protocol',None):
++    speaks = device_flow_protocols(ndata,topology)
++    if speaks:
++      flow.protocol = speaks[0]
++
++  proto = flow.get('protocol',None)
++  ports = flow.get('ports',None)
++  if proto and ports and not flow.get('port',None):
++    mapped = ports.get(proto,None)
++    if mapped:
++      flow.port = mapped
++  if ports is not None:
++    flow.pop('ports',None)
++
++def check_flow_protocol(ndata: Box, svc_data: Box, topology: Box) -> None:
++  """
++  Refuse a flow protocol the device does not speak.
++
++  WITHOUT THIS THE PROTOCOL SPLIT IS DECORATION. check_feature_support above
++  asks "does this device support the flow CLIENT", which is one bit -- it
++  cannot tell sFlow from NetFlow. Measured before this existed: a topology
++  asking for `protocol: netflow` against cEOS, which speaks only sFlow,
++  compiled CLEAN and rendered nothing. The device looked configured and
++  exported nothing, which is the exact failure this feature is meant to prevent
++  -- a lab that certifies green while its data plane is unobserved.
++
++  The split is not pedantry. Juniper divides by platform: sFlow on the switch,
++  inline IPFIX on the router. One flat `flow: True` capability would render
++  nothing on half the fleet and say so nowhere.
++  """
++  proto = ndata.get('services.flow.protocol',None)
++  if not proto:
++    return
++
++  features = devices.get_device_features(ndata,topology.defaults)
++  supported = features.get('services',{}).get(f'flow.{proto}',False)
++  if supported:
++    return
++
++  # Dotted feature keys are NESTED by the time they reach here -- the device
++  # file writes `flow.sflow: True` but get_device_features returns a Box where
++  # that is services.flow.sflow. Iterating the top level and matching on a
++  # 'flow.' prefix finds nothing, which is why the first cut of this message
++  # told the operator the device "exports no flow protocol" while it was
++  # happily exporting sFlow. A diagnostic that misdescribes the thing it is
++  # diagnosing sends the reader somewhere else entirely.
++  flow_features = features.get('services',{}).get('flow',{}) or {}
++  offered = sorted(
++    name for name,enabled in flow_features.items()
++    if enabled and name != 'sampling')
++  log.error(
++    f'Device {ndata.device} (node {ndata.name}) does not support flow protocol {proto}'
++    + (f' -- it speaks {", ".join(offered)}' if offered else ' -- it exports no flow protocol'),
++    category=log.IncorrectValue,
++    module='services')
++
+ def print_client_server_errors(svc_cache: Box, mod_attr: Box) -> None:
+   for kw in mod_attr.clients:
+     for srv_name,srv_data in svc_cache.items():
+@@ -105,6 +196,37 @@ def check_vrf(ndata: Box,mod_attr: Box) -> None:
+         category=log.MissingDependency,
+         module='services')
+ 
++# MANAGEMENT-VRF TRANSPORT (Skyforge extension). Upstream `transport_vrf` must
++# name a LAB VRF -- check_vrf() refuses anything else -- but a collector that
++# lives outside the lab (Skyforge's syslog and flow receivers) is reached over
++# the MANAGEMENT interface, whose VRF is a device property (the netlab_mgmt_vrf
++# group variable), not a lab VRF, and differs per device across one fleet.
++# `transport_vrf: mgmt` therefore means "whatever this device calls its
++# management VRF": it is set aside before check_vrf() and put back afterwards as
++# the device's own VRF name, so upstream's templates render it unchanged. A
++# device whose management interface sits in the global table simply gets no VRF.
++# A real lab VRF that happens to be called `mgmt` wins.
++MGMT_TRANSPORT = 'mgmt'
++
++def take_mgmt_transport(ndata: Box, mod_attr: Box) -> None:
++  for kw in mod_attr.clients:
++    cdata = ndata.get(f'services.{kw}',None)
++    if not isinstance(cdata,Box) or cdata.get('transport_vrf',None) != MGMT_TRANSPORT:
++      continue
++    if MGMT_TRANSPORT in ndata.get('vrfs',{}):
++      continue
++    cdata.pop('transport_vrf')
++    cdata._mgmt = True                            # templates: source from the management interface
++
++def set_mgmt_transport(ndata: Box, topology: Box, mod_attr: Box) -> None:
++  mgmt_vrf = devices.get_node_group_var(ndata,'netlab_mgmt_vrf',topology.defaults)
++  if not isinstance(mgmt_vrf,str) or not mgmt_vrf:
++    return
++  for kw in mod_attr.clients:
++    cdata = ndata.get(f'services.{kw}',None)
++    if isinstance(cdata,Box) and cdata.get('_mgmt',False):
++      cdata.transport_vrf = mgmt_vrf
++
+ def set_dns_fields(ndata: Box) -> None:
+   """
+   Set DNS-related extra fields to simplify configuration templates:
+@@ -155,6 +277,13 @@ class Services(_Module):
+       set_dns_fields(ndata)
+       disable_shared_hosts(ndata)
+       check_feature_support(ndata,svc_data,topology,mod_attr)
++      # Resolve BEFORE the check: a node that named no protocol takes its
++      # device's, and check_flow_protocol then judges the resolved value -- so
++      # the resolution can never hand a template something the device refuses.
++      resolve_flow_protocol(ndata,topology)
++      check_flow_protocol(ndata,svc_data,topology)
++      take_mgmt_transport(ndata,mod_attr)
+       check_vrf(ndata,mod_attr)
++      set_mgmt_transport(ndata,topology,mod_attr)
+ 
+     print_client_server_errors(svc_cache,mod_attr)
+diff --git a/netsim/modules/services.yml b/netsim/modules/services.yml
+index 98edf46..e605491 100644
+--- a/netsim/modules/services.yml
++++ b/netsim/modules/services.yml
+@@ -26,9 +26,56 @@ attributes:
+         type: list
+         _subtype: { type: ipv6, use: address }
+       transport_vrf: id
++    # FLOW EXPORT (NetFlow / IPFIX / sFlow). A CLIENT, exactly like syslog: the
++    # device dials a collector. An SNMP agent is a server because it listens and
++    # an NMS dials IT -- putting an exporter under `server` would be that
++    # mistake mirrored, and would lose resolve_servers(), which is the whole
++    # reason the client half exists.
++    #
++    # WHY THIS EXISTS AT ALL: monitoring collects over the management interface,
++    # so a completely dead data plane certifies green today. A flow record comes
++    # from the NOS and says the DEVICE forwarded these packets -- evidence about
++    # the fabric, made by the fabric, which no counter on a traffic generator
++    # can provide about itself.
++    flow:
++      server: { type: list, _subtype: node_id }
++      ipv4:
++        type: list
++        _subtype: { type: ipv4, use: address }
++      ipv6:
++        type: list
++        _subtype: { type: ipv6, use: address }
++      # Which wire protocol to speak. The per-device feature flags below gate
++      # this: a device declaring only sflow refuses `protocol: netflow` rather
++      # than rendering nothing and looking configured.
++      protocol: { type: str, valid_values: [ netflow, ipfix, sflow ] }
++      port: { type: int, min_value: 1, max_value: 65535 }
++      # 1-in-N. Sampling is not optional at lab scale in the way it looks:
++      # unsampled export from a traffic generator's own load is a denial of
++      # service against the collector.
++      sampling: { type: int, min_value: 1 }
++      # PER-PROTOCOL LISTENER PORTS. Which protocol a device can speak is a
++      # property of the DEVICE -- IOS has no sFlow at all (measured: `show
++      # sflow` is "% Invalid input" on IOL, while `show flow record` lists the
++      # full Flexible NetFlow set), cEOS has no ASIC for `flow tracking
++      # hardware` and so speaks only sFlow. Which port to dial is a property of
++      # the COLLECTOR. A deployer that can inject only one `protocol` and one
++      # `port` can therefore serve a single-NOS fleet and no other: measured
++      # 2026-09-11, injecting `protocol: sflow` fleet-wide onto demo-lab made
++      # `netlab create` FAIL on all 22 IOL nodes rather than export anything.
++      # Declare the listener map once; each node takes the entry for whichever
++      # protocol it resolved to. An explicit `port` still wins over the map.
++      ports:
++        type: dict
++        _keys:
++          netflow: { type: int, min_value: 1, max_value: 65535 }
++          ipfix: { type: int, min_value: 1, max_value: 65535 }
++          sflow: { type: int, min_value: 1, max_value: 65535 }
++      transport_vrf: id
+   node:
+     dns: { copy: global }
+     syslog: { copy: global }
++    flow: { copy: global }
+     server:
+       dns:
+         type: dict
+@@ -82,9 +129,20 @@ attributes:
+       ignore: []
+       must_have: [ server, ipv4, ipv6 ]
+       check_when: [ _server_list ]
++    flow:                                         # Skyforge: flow export (NetFlow/IPFIX/sFlow) client
++      ignore: []
++      must_have: [ server, ipv4, ipv6 ]
++      check_when: [ _server_list ]
+ features:
+   dns: DNS client
+   syslog: syslog client
++  # Split by PROTOCOL, not a flat `flow: True`. Juniper splits by platform --
++  # sFlow on the switch, inline IPFIX on the router -- so one capability flag
++  # would silently render nothing on half the fleet.
++  flow.sflow: sFlow export
++  flow.netflow: NetFlow v5/v9 export
++  flow.ipfix: IPFIX (NetFlow v10) export
++  flow.sampling: Configurable sampling rate
+   server.dns: DNS server
+   server.snmp: SNMP agent (responds to an NMS)
+   server.gnmi: gNMI/gRPC telemetry endpoint
+diff --git a/tests/test_services_flow.py b/tests/test_services_flow.py
+new file mode 100644
+index 0000000..aaac033
+--- /dev/null
++++ b/tests/test_services_flow.py
+@@ -0,0 +1,87 @@
++"""The flow protocol is the DEVICE's to choose, and a platform default degrades.
++
++Both behaviours were added because the alternative was measured and was worse
++than doing nothing: injecting one `protocol` fleet-wide made `netlab create`
++exit 1 on every node whose NOS did not speak it, which is why flow export had
++never run outside a pure-cEOS lab.
++
++These tests drive the real module functions against real device definitions --
++`iol` genuinely declares netflow/ipfix and no sflow, `eos` genuinely declares
++sflow only -- so they fail if either declaration is changed out from under the
++resolution logic, which a mock would not catch.
++"""
++import pytest
++
++from box import Box
++
++from netsim.modules import services
++from netsim.utils import strings          # noqa: F401  (import side effects)
++from netsim import data
++
++
++def _topology() -> Box:
++    from netsim.augment import devices as _d      # noqa: F401
++    from netsim.utils import read as _read
++    topo = _read.read_yaml('package:topology-defaults.yml')
++    return Box({'defaults': topo}, default_box=True, box_dots=True)
++
++
++def _node(name: str, device: str, **svc) -> Box:
++    n = Box({'name': name, 'device': device}, default_box=True, box_dots=True)
++    if svc:
++        n.services = Box(svc, default_box=True, box_dots=True)
++    return n
++
++
++def test_iol_speaks_netflow_and_ipfix_but_never_sflow():
++    """The split is the whole point: measured on a live IOL, `show sflow` is
++    '% Invalid input detected' while `show flow record` lists the full built-in
++    Flexible NetFlow set."""
++    topo = _topology()
++    assert services.device_flow_protocols(_node('r1', 'iol'), topo) == ['ipfix', 'netflow']
++    assert services.device_flow_protocols(_node('r2', 'eos'), topo) == ['sflow']
++    # A device that declares nothing offers nothing -- not a default.
++    assert services.device_flow_protocols(_node('r3', 'linux'), topo) == []
++
++
++def test_absent_protocol_resolves_to_what_the_device_speaks():
++    topo = _topology()
++    n = _node('r1', 'iol', flow={'ipv4': ['10.0.0.1'], 'ports': {'ipfix': 2055, 'sflow': 6343}})
++    services.resolve_flow_protocol(n, topo)
++    assert n.services.flow.protocol == 'ipfix'
++    # The port FOLLOWS the protocol, and the map is consumed so no device
++    # template has to know it existed.
++    assert n.services.flow.port == 2055
++    assert 'ports' not in n.services.flow
++
++    e = _node('r2', 'eos', flow={'ipv4': ['10.0.0.1'], 'ports': {'ipfix': 2055, 'sflow': 6343}})
++    services.resolve_flow_protocol(e, topo)
++    assert e.services.flow.protocol == 'sflow'
++    assert e.services.flow.port == 6343
++
++
++def test_an_explicit_protocol_is_never_substituted():
++    """Including an unsupported one. check_flow_protocol must still get the
++    chance to refuse it -- an author who names a protocol their device cannot
++    speak has to hear so, not silently receive a different one."""
++    topo = _topology()
++    n = _node('r1', 'iol', flow={'ipv4': ['10.0.0.1'], 'protocol': 'sflow',
++                                 'ports': {'ipfix': 2055, 'sflow': 6343}})
++    services.resolve_flow_protocol(n, topo)
++    assert n.services.flow.protocol == 'sflow'
++    assert n.services.flow.port == 6343
++
++
++def test_an_explicit_port_beats_the_listener_map():
++    topo = _topology()
++    n = _node('r1', 'iol', flow={'ipv4': ['10.0.0.1'], 'port': 9995,
++                                 'ports': {'ipfix': 2055}})
++    services.resolve_flow_protocol(n, topo)
++    assert n.services.flow.port == 9995
++
++
++def test_a_device_that_exports_nothing_gets_no_protocol():
++    topo = _topology()
++    n = _node('r1', 'linux', flow={'ipv4': ['10.0.0.1'], 'ports': {'ipfix': 2055}})
++    services.resolve_flow_protocol(n, topo)
++    assert 'protocol' not in n.services.flow
+diff --git a/tests/test_services_flow_fleet.py b/tests/test_services_flow_fleet.py
+new file mode 100644
+index 0000000..8e9d4ad
+--- /dev/null
++++ b/tests/test_services_flow_fleet.py
+@@ -0,0 +1,324 @@
++"""Flow export and syslog beyond the IOS routers: IOL-L2, vJunos and the ASA.
++
++Patch 0064 made the protocol a property of the device and gave the IOS ROUTERS
++a client. What it left behind was measured on demo-lab: 17 of 77 nodes are
++`ioll2`, which inherits `features.services` from `parent: iol` -- so it had
++DECLARED ipfix/netflow and passed every capability check while
++services/ioll2.j2 had no flow block at all. A declaration without a template is
++the failure this whole feature exists to prevent, wearing the costume of a
++pass.
++
++These tests drive the real module functions and render the real templates
++against the real device definitions, so they go red if either side is changed
++out from under the other -- which is exactly the drift a mock cannot see.
++
++The L2 rule is the one worth the most here: `ip flow monitor` is an L3
++interface command and an access/trunk port refuses it. Measured on live demo-lab
++2026-09-11, jfk-acc-sw01 has three ROUTED ports and dc-sdwan-sw01 has six
++`switchport access vlan 1000` ports and an address-less SVI, so one of them
++must render the monitor and the other must render NOTHING.
++"""
++import re
++
++import pytest
++
++from box import Box
++
++from netsim.modules import services
++from netsim.augment import devices as _devices
++from netsim.utils import log, templates
++from netsim.utils import read as _read
++
++
++SERVICES_TEMPLATE_PATH = 'ansible/templates/services'
++
++
++@pytest.fixture
++def topo() -> Box:
++    """topology-defaults WITH device inheritance processed.
++
++    Without process_device_inheritance, `ioll2` reports only server.snmp and
++    the single most important fact in this file -- that it inherits iol's flow
++    declaration -- is invisible. That is precisely how the gap survived 0064.
++    """
++    t = Box({'defaults': _read.read_yaml('package:topology-defaults.yml')},
++            default_box=True, box_dots=True)
++    _devices.process_device_inheritance(t)
++    return t
++
++
++def _node(name: str, device: str, **svc) -> Box:
++    n = Box({'name': name, 'device': device}, default_box=True, box_dots=True)
++    if svc:
++        n.services = Box(svc, default_box=True, box_dots=True)
++    return n
++
++
++def _render(device_template: str, **data) -> str:
++    return templates.render_template(
++        data=Box(data, default_box=True, box_dots=True).to_dict(),
++        j2_file=f'{device_template}.j2',
++        path=SERVICES_TEMPLATE_PATH)
++
++
++# ---------------------------------------------------------------- declarations
++
++def test_ioll2_inherits_the_iol_flow_declaration(topo):
++    """The fact that hid the gap. ioll2 redefines features.services with only
++    server.snmp, and the parent's syslog/flow survive the merge -- so every
++    capability check passed and 17 nodes rendered nothing."""
++    assert services.device_flow_protocols(_node('s1', 'ioll2'), topo) == ['ipfix', 'netflow']
++    assert services.device_flow_protocols(_node('r1', 'iol'), topo) == ['ipfix', 'netflow']
++    ioll2 = _devices.get_device_features(_node('s1', 'ioll2'), topo.defaults)
++    assert ioll2.services.syslog is True
++    assert ioll2.services.server.snmp is True       # ... and its own declaration is not lost
++
++
++@pytest.mark.parametrize('device,speaks', [
++    ('asav',           ['netflow']),
++    ('vjunos-router',  ['sflow']),
++    ('vjunos-switch',  ['sflow']),
++])
++def test_the_firewall_and_the_junipers_declare_what_was_probed(topo, device, speaks):
++    """asav: `show flow-export counters` answers empty where `show flarble
++    wibble` errors, and there is no IPFIX export and no `show sflow` at all.
++    vjunos-*: both images report Model: vmx, and the sFlow block is the one
++    `commit check` accepted on cdg-cor-sw01."""
++    assert services.device_flow_protocols(_node('n1', device), topo) == speaks
++
++
++def test_the_asa_is_not_given_a_sampler_it_does_not_have(topo):
++    """NSEL exports connection EVENTS, not sampled packets. Declaring
++    flow.sampling would make the module believe a sampler exists; leaving it
++    undeclared makes check_optional_features skip the injected value in
++    blacklist mode instead of honouring it."""
++    asa = _devices.get_device_features(_node('f1', 'asav'), topo.defaults)
++    assert 'sampling' not in asa.services.flow
++    assert _devices.get_device_features(_node('s1', 'ioll2'), topo.defaults).services.flow.sampling is True
++    assert _devices.get_device_features(_node('j1', 'vjunos-router'), topo.defaults).services.flow.sampling is True
++
++
++# ------------------------------------------------------------------ resolution
++
++@pytest.mark.parametrize('device,proto,port', [
++    ('ioll2',          'ipfix',   2055),
++    ('asav',           'netflow', 2055),
++    ('vjunos-router',  'sflow',   6343),
++    ('vjunos-switch',  'sflow',   6343),
++])
++def test_each_new_platform_takes_its_own_listener_port(topo, device, proto, port):
++    n = _node('n1', device, flow={'ipv4': ['198.19.255.53'],
++                                  'ports': {'ipfix': 2055, 'netflow': 2055, 'sflow': 6343}})
++    services.resolve_flow_protocol(n, topo)
++    assert n.services.flow.protocol == proto
++    assert n.services.flow.port == port
++
++
++def test_an_explicit_protocol_the_firewall_cannot_speak_is_still_refused(topo):
++    """0064's refusal must survive every new declaration. An author who asks an
++    ASA for sFlow has said something false about their lab."""
++    log.init_log_system(header=False)
++    n = _node('f1', 'asav', flow={'ipv4': ['198.19.255.53'], 'protocol': 'sflow'})
++    services.check_flow_protocol(n, n.services, topo)
++    errors = '\n'.join(log.get_error_log())
++    assert 'does not support flow protocol sflow' in errors
++    assert 'it speaks netflow' in errors
++    log.init_log_system(header=False)
++
++
++# -------------------------------------------------------------------- IOL-L2
++
++_L2_ONLY = [
++    {'ifname': 'Ethernet0/1', 'type': 'lan', 'vlan': {'access': 'sdwan_ctrl', 'access_id': 1000}},
++    {'ifname': 'Ethernet0/2', 'type': 'lan', 'vlan': {'access': 'sdwan_ctrl', 'access_id': 1000}},
++    {'ifname': 'Vlan1000', 'type': 'svi', 'virtual_interface': True,
++     'vlan': {'mode': 'bridge', 'name': 'sdwan_ctrl'}},
++]
++
++_ROUTED = [
++    {'ifname': 'Ethernet0/1', 'type': 'p2p', 'ipv4': '10.1.0.1/30'},
++    {'ifname': 'Ethernet0/2', 'type': 'p2p', 'ipv4': '10.1.0.5/30'},
++    {'ifname': 'Ethernet0/3', 'type': 'lan', 'ipv4': '172.16.1.15/24'},
++]
++
++# ioll2 has no services/ioll2.j2 of its own: paths.t_files falls through
++# netlab_device_type to ansible_network_os, so it renders upstream's
++# services/ios.j2, which carries the flow block for every IOS device.
++IOLL2_TEMPLATE = 'ios'
++
++
++def test_ioll2_renders_the_ios_services_template(topo):
++    """If someone adds services/ioll2.j2 it shadows ios.j2 and drops upstream's
++    syslog/DNS for 17 demo-lab nodes -- the tests below would then be rendering
++    a template ioll2 no longer uses."""
++    import pathlib
++    import netsim
++    tdir = pathlib.Path(netsim.__file__).parent / SERVICES_TEMPLATE_PATH
++    assert not (tdir / 'ioll2.j2').exists()
++    assert (tdir / f'{IOLL2_TEMPLATE}.j2').exists()
++    assert topo.defaults.devices.ioll2.group_vars.ansible_network_os == IOLL2_TEMPLATE
++
++
++_FLOW = {'protocol': 'ipfix', 'port': 2055, 'sampling': 1000,
++         '_server_list': ['198.19.255.53']}
++_SYSLOG = {'_server_list': ['198.19.255.54']}
++
++
++def test_an_ioll2_switchport_never_gets_a_flow_monitor():
++    """dc-sdwan-sw01 in one test. Six access ports and an address-less SVI:
++    `ip flow monitor` would be refused on every one of them, so the whole block
++    -- record, exporter, monitor -- must be absent rather than present and
++    attached to nothing."""
++    out = _render(IOLL2_TEMPLATE,
++                  services={'flow': _FLOW, 'syslog': _SYSLOG, 'server': {'snmp': {}}},
++                  interfaces=_L2_ONLY,
++                  mgmt={'ifname': 'Ethernet0/0'})
++    assert 'ip flow monitor' not in out
++    assert 'flow monitor skyforge' not in out
++    assert 'flow exporter' not in out
++    assert 'flow record' not in out
++    # ... and the node is not left unobserved: syslog and SNMP still render.
++    assert 'logging host 198.19.255.54' in out
++    assert 'snmp-server community skyforge RO' in out
++
++
++def test_an_ioll2_routed_port_gets_one_and_management_does_not():
++    out = _render(IOLL2_TEMPLATE,
++                  services={'flow': _FLOW, 'syslog': _SYSLOG, 'server': {'snmp': {}}},
++                  interfaces=_ROUTED,
++                  mgmt={'ifname': 'Ethernet0/0'})
++    assert out.count(' ip flow monitor skyforge sampler skyforge input') == 3
++    for ifname in ('Ethernet0/1', 'Ethernet0/2', 'Ethernet0/3'):
++        assert f'interface {ifname}\n' in out
++    assert '\ninterface Ethernet0/0\n' not in out        # management is not a witness to itself
++    assert 'export-protocol ipfix' in out
++    assert 'source Ethernet0/0' in out                   # ... but it IS the source
++    assert 'sampler skyforge' in out
++
++
++def test_an_ioll2_with_a_mix_takes_only_the_routed_half():
++    out = _render(IOLL2_TEMPLATE,
++                  services={'flow': _FLOW, 'syslog': _SYSLOG, 'server': {'snmp': {}}},
++                  interfaces=_L2_ONLY + _ROUTED[:1] + [
++                      {'ifname': 'Vlan200', 'type': 'svi', 'ipv4': '10.9.0.1/24'}],
++                  mgmt={'ifname': 'Ethernet0/0'})
++    assert out.count(' ip flow monitor') == 2
++    assert 'interface Vlan200\n' in out                  # an ADDRESSED SVI is routed
++    assert 'interface Vlan1000\n' not in out             # an address-less one is not
++    assert 'interface Ethernet0/2\n' not in out          # and an access port never is
++
++
++# -------------------------------------------------------------------- vJunos
++
++@pytest.mark.parametrize('device_template', ['vjunos-router', 'vjunos-switch'])
++def test_the_junos_block_is_the_one_that_passed_commit_check(device_template):
++    """Every statement here was accepted by `commit check` on the live
++    cdg-cor-sw01 inside `configure private`, and rolled back to an empty
++    `show | compare`. Both images are the same vMX, so both render the same."""
++    out = _render(device_template,
++                  services={'flow': {'protocol': 'sflow', 'port': 6343, 'sampling': 1000,
++                                     '_server_list': ['198.19.255.53']},
++                            'syslog': {'_server_list': ['198.19.255.54']},
++                            'server': {'snmp': {}}},
++                  interfaces=[{'ifname': 'ge-0/0/0.0'}, {'ifname': 'ge-0/0/1.0'},
++                              {'ifname': 'ge-0/0/1.100'}, {'ifname': 'fxp0.0'}])
++    assert 'collector 198.19.255.53 {' in out
++    assert 'udp-port 6343;' in out
++    assert 'ingress 1000;' in out
++    assert 'polling-interval 20;' in out
++    # PHYSICAL ports, de-duplicated -- two units of ge-0/0/1 are one interface.
++    assert out.count('    interfaces ') == 2
++    assert 'interfaces ge-0/0/0;' in out
++    assert 'interfaces ge-0/0/1;' in out
++    assert 'ge-0/0/1.100' not in out
++    assert 'fxp0' not in out
++    # NO address netlab invented for a management interface KNE actually
++    # addresses: the live cdg-cor-sw01 answers 10.0.2.2 on fxp0, not the
++    # 172.20.20.x mgmt.ipv4 in host_vars.
++    assert 'source-ip' not in out
++    assert 'agent-id' not in out
++    assert 'source-address' not in out
++    # Syslog is hierarchical, like every other Junos fragment -- a `set` line
++    # here makes mgd reject the whole file.
++    assert 'host "198.19.255.54" {' in out
++    assert not any(line.startswith('set ') for line in out.splitlines())
++
++
++def test_a_junos_node_with_no_data_interface_renders_no_sflow():
++    out = _render('vjunos-router',
++                  services={'flow': {'protocol': 'sflow', 'port': 6343,
++                                     '_server_list': ['198.19.255.53']},
++                            'syslog': {'_server_list': ['198.19.255.54']}},
++                  interfaces=[{'ifname': 'fxp0.0'}])
++    assert 'sflow' not in out
++    assert 'host "198.19.255.54" {' in out
++
++
++# ----------------------------------------------------------------------- ASA
++
++@pytest.mark.parametrize('device_template', ['asa', 'asav'])
++def test_the_asa_export_joins_the_policy_that_is_already_applied(device_template):
++    """An ASA permits exactly ONE global service-policy and cdg-fw01 already has
++    it: `show running-config service-policy` returns `service-policy
++    global_policy global`. A second one is refused, so the class joins the
++    existing policy instead."""
++    out = _render(device_template,
++                  services={'flow': {'protocol': 'netflow', 'port': 2055,
++                                     '_server_list': ['198.19.255.53']},
++                            'syslog': {'_server_list': ['198.19.255.54']},
++                            'server': {'snmp': {}}},
++                  interfaces=[{'ifname': 'GigabitEthernet0/0', 'ipv4': '10.1.0.146/30'}],
++                  mgmt={'ifname': 'Management0/0'})
++    assert 'policy-map global_policy' in out
++    assert 'service-policy' not in out
++    assert 'flow-export event-type all destination 198.19.255.53' in out
++    # The NAME of the management interface, never the interface itself: the ASA
++    # writes destinations in terms of nameif, and netlab's own asav day-0 sets
++    # `nameif management` on Management0/0.
++    assert 'flow-export destination management 198.19.255.53 2055' in out
++    assert 'logging host management 198.19.255.54' in out
++    assert 'Management0/0' not in out
++    # NSEL has no sampler, so nothing here may pretend to configure one.
++    assert 'sampler' not in out
++    assert 'logging enable' in out
++
++
++def test_the_asa_renders_nothing_new_when_no_collector_is_given():
++    """A cluster with no collector deployed must render no client block at all.
++    The SNMP agent is unaffected -- it is a server, and it was already there."""
++    out = _render('asav', services={'server': {'snmp': {}}},
++                  interfaces=[{'ifname': 'GigabitEthernet0/0'}],
++                  mgmt={'ifname': 'Management0/0'})
++    assert 'flow-export' not in out
++    assert 'logging' not in out
++    assert out.strip() == 'snmp-server community skyforge'
++
++
++# ------------------------------------------------------------ SD-WAN edges
++
++def test_a_controller_mode_edge_gets_no_flow_block_in_its_day0():
++    """vManage owns a controller-mode cEdge's configuration, and a day-0 the
++    appliance rejects costs the whole SD-WAN bootstrap. The same node without
++    the sdwan module is the control: it exports."""
++    data = dict(services={'flow': _FLOW, 'syslog': _SYSLOG, 'server': {'snmp': {}}},
++                interfaces=_ROUTED, mgmt={'ifname': 'GigabitEthernet1'})
++    plain = _render(IOLL2_TEMPLATE, **data)
++    edge = _render(IOLL2_TEMPLATE, module=['sdwan', 'services'], **data)
++    assert 'flow exporter skyforge-1' in plain
++    assert 'flow exporter' not in edge
++    assert 'ip flow monitor' not in edge
++    assert 'logging host' in edge                          # syslog still goes
++
++
++# ------------------------------------------------------ Junos include join
++
++@pytest.mark.parametrize('device_template', ['vjunos-router', 'vjunos-switch', 'vmx', 'vptx', 'vsrx'])
++def test_the_upstream_junos_fragment_does_not_run_into_the_next_stanza(device_template):
++    """The upstream services default `dns.domain: netlab.local` makes junos.j2
++    end in `system { ... }`; with trim_blocks the include ate the newline and
++    the next stanza started on the closing-brace line (`}snmp {`)."""
++    out = _render(device_template,
++                  services={'dns': {'domain': 'netlab.local'}, 'server': {'snmp': {}}})
++    assert 'domain-name netlab.local;' in out
++    assert 'snmp {' in out
++    assert not re.search(r'\}[^\s}]', out), out
+-- 
+2.56.0
+

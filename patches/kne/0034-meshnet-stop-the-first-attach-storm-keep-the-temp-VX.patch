@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 15:45:01 -0500
+Subject: [PATCH 34/35] meshnet: stop the first-attach storm: keep the temp
+ VXLAN name out of the status text (M0009 damping)
+
+---
+diff --git a/third_party/meshnet/daemon/meshnet/controller.go b/third_party/meshnet/daemon/meshnet/controller.go
+index 704d6ed..f03054f 100644
+--- a/third_party/meshnet/daemon/meshnet/controller.go
++++ b/third_party/meshnet/daemon/meshnet/controller.go
+@@ -5,6 +5,7 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"os"
++	"regexp"
+ 	"strings"
+ 	"sync"
+ 	"time"
+@@ -148,7 +149,7 @@ func (m *Meshnet) ReconcilePodLinks(ctx context.Context, topo *unstructured.Unst
+ 	}
+ 	err := m.reconcilePodLinksInternal(ctx, topo)
+ 	if err != nil {
+-		if statusErr := m.updatePlumbingErrorStatus(ctx, topo, err.Error()); statusErr != nil {
++		if statusErr := m.updatePlumbingErrorStatus(ctx, topo, plumbingErrorText(err)); statusErr != nil {
+ 			mnetdLogger.Warnf("ReconcilePodLinks: failed to update plumbing error status: %v", statusErr)
+ 		}
+ 		return err
+@@ -1095,3 +1096,17 @@ func (m *Meshnet) liveNetNS(ctx context.Context, topo *unstructured.Unstructured
+ 	netNS, _, _ := unstructured.NestedString(live.Object, "status", "net_ns")
+ 	return netNS, nil
+ }
++
++// tempVxlanName matches the random name makeVxLan gives a wire before it moves
++// it into the pod (vx-%08x).
++var tempVxlanName = regexp.MustCompile(`vx-[0-9a-f]{8}`)
++
++// plumbingErrorText is the text recorded in Topology status.plumbing_error. It
++// drops the random temporary link name. updatePlumbingErrorStatus skips a write
++// whose text is unchanged. Left in, the name made every failed attempt a new
++// text, so each status write re-triggered the reconcile, and a VM whose wire
++// could not be built yet was retried about 16 times a second for ~30 s (measured
++// 2026-10-20: 398 attempts, 794 errors, then it settled when KubeVirt bound).
++func plumbingErrorText(err error) string {
++	return tempVxlanName.ReplaceAllString(err.Error(), "vx-<tmp>")
++}
+diff --git a/third_party/meshnet/daemon/meshnet/plumbing_error_test.go b/third_party/meshnet/daemon/meshnet/plumbing_error_test.go
+new file mode 100644
+index 0000000..5c71d87
+--- /dev/null
++++ b/third_party/meshnet/daemon/meshnet/plumbing_error_test.go
+@@ -0,0 +1,28 @@
++package meshnet
++
++import (
++	"errors"
++	"testing"
++)
++
++// The requirement: two attempts that fail the same way record the same status
++// text, whatever temporary names they used (the status write is skipped on an
++// unchanged text, which is what ends the reconcile loop).
++func TestPlumbingErrorTextIgnoresTemporaryName(t *testing.T) {
++	a := plumbingErrorText(errors.New("failed to add vxlan vx-edfbf456: file exists"))
++	b := plumbingErrorText(errors.New("failed to add vxlan vx-0a1b2c3d: file exists"))
++	if a != b {
++		t.Fatalf("texts differ: %q vs %q", a, b)
++	}
++	if a != "failed to add vxlan vx-<tmp>: file exists" {
++		t.Fatalf("text = %q", a)
++	}
++}
++
++// Text without a temporary name is unchanged.
++func TestPlumbingErrorTextKeepsOtherErrors(t *testing.T) {
++	const msg = "node advertised meshnet underlay interface \"eno1\" has MTU 1500, need at least 9000"
++	if got := plumbingErrorText(errors.New(msg)); got != msg {
++		t.Fatalf("text = %q, want unchanged", got)
++	}
++}
+-- 
+2.56.0
+

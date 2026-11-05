@@ -1,0 +1,35 @@
+module: [ isis, sr, mpls, bgp ]
+
+defaults.device: eos
+provider: kne
+bgp.as: 65000
+mpls.bgp:
+  ipv4: True
+  explicit_null: True
+mpls.ldp: False
+
+nodes:
+  # netlab 26.08 tightening: a node using module attributes must enable the
+  # module itself (topology-level `module:` no longer reaches nodes here).
+  pe1:
+    module: [ isis, sr, mpls, bgp ]
+  pe2:
+    module: [ isis, sr, mpls, bgp ]
+  p:
+    module: [ isis, sr ]
+  rr:
+    module: [ isis, sr, mpls, bgp ]
+    bgp.rr: True
+  ce1:
+    module: [ bgp ]
+    bgp.as: 65101
+  ce2:
+    module: [ bgp, mpls ]
+    bgp.as: 65102
+
+links:
+- pe1-ce1
+- pe2-ce2
+- pe1-p
+- pe2-p
+- rr-p

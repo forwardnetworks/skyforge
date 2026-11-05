@@ -1,0 +1,32 @@
+# Test multi-node links
+#
+provider: kne
+# netlab 26.08 / platform: srlinux cannot run the platform-mandated `services`
+# module (no services template), so it cannot compile here at all. The lab
+# teaches multi-node LINK syntax, not a NOS — moved to eos.
+defaults:
+  device: eos
+
+nodes:
+- r1
+- r2
+- r3
+
+links:
+
+# P2P link
+- r1-r2
+
+# LAN link
+- [ r1, r2, r3 ]
+
+# Named P2P link
+- r1:
+  r2:
+  name: P2P link
+
+# Named LAN link
+- r1:
+  r2:
+  r3:
+  name: LAN link

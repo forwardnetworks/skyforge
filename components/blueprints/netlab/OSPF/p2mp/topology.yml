@@ -1,0 +1,32 @@
+# OSPF point-to-multipoint over a shared (NBMA-like) segment.
+#
+# The three routers share one bridge domain and run OSPF with the
+# point-to-multipoint network type, so each neighbour is treated as a
+# separate p2p adjacency instead of electing a DR/BDR.
+#
+# netlab 26.08: the old `isolated: true` interface attribute this lab used to
+# fake private-VLAN ports does not exist in netlab and made the topology
+# unrenderable; `ospf.network_type: point-to-multipoint` is the supported way
+# to ask for the behaviour the lab is actually about.
+defaults:
+  device: iol
+  mgmt: 192.168.121.1%02d
+  mac: 08-4F-A9-00-00-%02d
+  lan: 10.0.0.0/16
+  lan_subnet: 24
+  p2p: 10.1.0.0/16
+  p2p_subnet: 30
+
+module: [ ospf ]
+
+nodes:
+- name: c1
+- name: c2
+- name: c3
+
+links:
+- c1:
+  c2:
+  c3:
+  bridge: PVLAN
+  ospf.network_type: point-to-multipoint

@@ -1,0 +1,212 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 00:00:00 +0000
+Subject: [PATCH] SKYFORGE-SPECIFIC: netlab compile 7-11% faster on top of
+ 54/56/57, byte-identical output (BGP scans, plain iBGP neighbours, cached
+ device data)
+
+---
+diff --git a/netsim/augment/devices.py b/netsim/augment/devices.py
+index 08eeff1..065cd46 100644
+--- a/netsim/augment/devices.py
++++ b/netsim/augment/devices.py
+@@ -154,6 +154,25 @@ def get_consolidated_device_data(node: Box, defaults: Box) -> Box:
+ 
+   return data
+ 
++def get_consolidated_device_data_readonly(node: Box, defaults: Box) -> Box:
++  """
++  SKYFORGE-SPECIFIC: get_consolidated_device_data for a caller that only READS the result (.get(), `in`, existing
++  keys). The merged device definition is the same for every node of a device type and provider, so it is built once
++  (netsim.data.memo: same source objects and unchanged content, dropped around every hook) and shared: never modify
++  it, never read a missing key with attribute or [] access.
++  """
++  devtype  = node.device
++  provider = get_provider(node,defaults)
++  if not devtype in defaults.devices:
++    return get_consolidated_device_data(node,defaults)
++  devdata = defaults.devices[devtype]
++  return memo.memo(
++    'consolidated_device_data',
++    (id(defaults),devtype,provider),
++    (defaults,devdata),
++    lambda: get_consolidated_device_data(node,defaults),
++    watch=(devdata,tuple(defaults.providers.keys())))     # the merge drops every provider's own block
++
+ """
+ Get group variable from node or device data
+ """
+diff --git a/netsim/augment/nodes.py b/netsim/augment/nodes.py
+index e366a23..d81433f 100644
+--- a/netsim/augment/nodes.py
++++ b/netsim/augment/nodes.py
+@@ -553,7 +553,7 @@ augment_node_device_data: copy attributes that happen to be node attributes from
+ def augment_node_device_data(n: Box, topology: Box) -> None:
+   defaults = topology.defaults
+   node_attr = defaults.attributes.get('node',[])
+-  dev_data  = devices.get_consolidated_device_data(n,defaults)
++  dev_data  = devices.get_consolidated_device_data_readonly(n,defaults)     # SKYFORGE-SPECIFIC: read only, see devices.py
+ 
+   for attr in node_attr:                      # Copy known node attributes from device+provider data into node data
+     if attr in dev_data and not attr in n:
+diff --git a/netsim/modules/bgp.py b/netsim/modules/bgp.py
+index b740b4a..0e0701e 100644
+--- a/netsim/modules/bgp.py
++++ b/netsim/modules/bgp.py
+@@ -87,10 +87,22 @@ find_bgp_rr: find route reflectors in the specified autonomous system
+ 
+ Given an autonomous system and lab topology, return a list of node names that are route reflectors in that AS
+ """
++_NO_BGP = object()
++
+ def find_bgp_rr(bgp_as: int, topology: Box) -> typing.List[Box]:
+-  return [ n 
+-    for n in topology.nodes.values() 
+-      if 'bgp' in n and n.bgp["as"] == bgp_as and n.bgp.get("rr",None) ]
++  # SKYFORGE-SPECIFIC: every BGP node scans every node; read the usual shape (bgp is a dictionary with an 'as') at
++  # dictionary level and leave anything else to the original expression (which, through python-box, may create keys)
++  result = []
++  for n in topology.nodes.values():
++    bgp = dict.get(n,'bgp',_NO_BGP)
++    if bgp is _NO_BGP:
++      continue
++    if isinstance(bgp,dict) and 'as' in bgp:
++      if dict.__getitem__(bgp,'as') == bgp_as and bgp.get('rr',None):
++        result.append(n)
++    elif 'bgp' in n and n.bgp["as"] == bgp_as and n.bgp.get("rr",None):
++      result.append(n)
++  return result
+ 
+ """
+ bgp_neighbor: Create BGP neighbor data structure
+@@ -151,6 +163,28 @@ build_ibgp_sessions: create IBGP session data structure
+ * BGP route reflectors need IBGP session with all other nodes in the same AS
+ * Other nodes need IBGP sessions with all RRs in the same AS
+ """
++def _ibgp_neighbor_plain(n: Box, intf: Box, sessions: Box, extra_data: typing.Optional[dict] = None) -> typing.Optional[dict]:
++  """
++  SKYFORGE-SPECIFIC: bgp_neighbor(n,intf,'ibgp',sessions,extra_data) as a PLAIN dict with the same keys in the same
++  order. build_ibgp_sessions appends it to a BoxList, which converts it once; bgp_neighbor's Box was converted key by
++  key and then copied again by the append. Same appended result, one conversion per session instead of two.
++  """
++  ngb = dict(extra_data or {})
++  ngb['name'] = n.name
++  ngb['as'] = n.bgp.get('as')
++  ngb['type'] = 'ibgp'
++  af_count = 0
++  for af in ['ipv4','ipv6']:
++    if 'ibgp' in sessions.get(af,[]):
++      if af in intf:
++        af_count = af_count + 1
++        if isinstance(intf[af],bool):
++          ngb[af] = intf[af]
++        else:
++          ngb[af] = _rp_utils.get_intf_address(intf[af])
++
++  return ngb if af_count > 0 else None
++
+ def _bgp_as(n: Box) -> typing.Any:
+   """SKYFORGE-SPECIFIC: n.get('bgp.as',None) without python-box's dotted-key machinery for the usual shape"""
+   bgp = dict.get(n,'bgp',None)
+@@ -168,8 +202,8 @@ def build_ibgp_sessions(node: Box, sessions: Box, topology: Box) -> None:
+   if is_rr or not rrlist:                         # If the current node is RR or we have a full mesh
+     ibgp_ngb_list = [                             # ... we need IBGP sessions to all nodes in the AS
+       ngb for ngb in topology.nodes.values()      # ... but while building the node list
+-        if ngb.name != node.name and              # ... skip current node
+-           _bgp_as(ngb) == node_as]               # ... and everyone not in the current AS (or not running BGP)
++        if _bgp_as(ngb) == node_as and            # ... skip everyone not in the current AS (or not running BGP)
++           ngb.name != node.name]                 # ... and the current node
+     if is_rr and not rr_mesh:                     # Are we a RR and the user hates inter-RR sessions?
+       ibgp_ngb_list = [                           # ... Let's exclude other RRs from neighbor list
+         ngb for ngb in ibgp_ngb_list              # Iterate over IBGP neighbors we found so far
+@@ -180,17 +214,17 @@ def build_ibgp_sessions(node: Box, sessions: Box, topology: Box) -> None:
+ 
+   for n in ibgp_ngb_list:
+     n_intf = get_remote_ibgp_endpoint(n)
+-    neighbor_data = bgp_neighbor(n,n_intf,'ibgp',sessions,get_neighbor_rr(n))
++    neighbor_data = _ibgp_neighbor_plain(n,n_intf,sessions,get_neighbor_rr(n))
+     if not neighbor_data is None:
+       if 'loopback' in node:
+         # SKYFORGE-SPECIFIC: store the loopback as it is; append_box below re-creates it in the appended neighbor (the
+         # assignment copied it once more, and that copy was thrown away by the append that copied it again)
+-        fastbox.set_reference(neighbor_data,'_source_intf',node.loopback)
++        neighbor_data['_source_intf'] = node.loopback
+       if bgp_nhs:
+-        neighbor_data.next_hop_self = 'ebgp'
++        neighbor_data['next_hop_self'] = 'ebgp'
+       if is_rr and not 'rr' in neighbor_data:
+-        neighbor_data.rr_client = True
+-      fastbox.append_box(node.bgp.neighbors,neighbor_data)   # SKYFORGE-SPECIFIC: same as .append(), faster
++        neighbor_data['rr_client'] = True
++      fastbox.append_box(node.bgp.neighbors,neighbor_data)   # SKYFORGE-SPECIFIC: converted once, here (same result)
+       has_ibgp = True
+ 
+   if not has_ibgp:
+diff --git a/tests/test_compile_speed.py b/tests/test_compile_speed.py
+index 8dbde9c..d3b73e0 100644
+--- a/tests/test_compile_speed.py
++++ b/tests/test_compile_speed.py
+@@ -490,3 +490,60 @@ def test_recursive_validation_on_a_private_table_matches_the_uncached_code(monke
+   slow = sequence()
+   assert fast == slow
+   assert slow[0][2] != fastbox.to_dict(attrs + extra)  # the strip happened (the test exercises the side effect)
++
++
++#
++# patch 60: BGP scans and neighbour build, consolidated device data
++#
++
++def _reference_find_bgp_rr(bgp_as, topology):
++  return [ n for n in topology.nodes.values() if 'bgp' in n and n.bgp["as"] == bgp_as and n.bgp.get("rr",None) ]
++
++
++def test_find_bgp_rr_matches_the_original_expression_including_odd_shapes() -> None:
++  from netsim.modules import bgp
++  def topo():
++    return get_box({'nodes': {
++      'a': {'name': 'a', 'bgp': {'as': 1, 'rr': True}}, 'b': {'name': 'b', 'bgp': {'as': 1}},
++      'c': {'name': 'c'}, 'd': {'name': 'd', 'bgp': {'as': 2, 'rr': True}},
++      'e': {'name': 'e', 'bgp': {'rr': True}},           # no 'as': python-box creates one on read
++    }})
++  t1, t2 = topo(), topo()
++  for asn in (1, 2, 3):
++    assert [n.name for n in bgp.find_bgp_rr(asn, t1)] == [n.name for n in _reference_find_bgp_rr(asn, t2)]
++  _same(t1, t2)                                      # the same side effects, too
++  t3, t4 = topo(), topo()
++  t3.nodes.f = get_box({'name': 'f'}); dict.__setitem__(t3.nodes.f, 'bgp', None)
++  t4.nodes.f = get_box({'name': 'f'}); dict.__setitem__(t4.nodes.f, 'bgp', None)
++  with pytest.raises(TypeError):
++    _reference_find_bgp_rr(1, t4)
++  with pytest.raises(TypeError):                     # bgp: null fails exactly as before
++    bgp.find_bgp_rr(1, t3)
++
++
++@pytest.mark.parametrize('extra', [None, {}, {'rr': True}, {'rr': '10.0.0.1'}])
++@pytest.mark.parametrize('intf', [{'ipv4': '10.0.0.1/32'}, {'ipv4': '10.0.0.1/32', 'ipv6': '2001:db8::1/128'}, {'ipv4': True}, {}])
++def test_plain_ibgp_neighbor_appends_exactly_like_bgp_neighbor(extra, intf) -> None:
++  from netsim.modules import bgp
++  n = get_box({'name': 'peer', 'bgp': {'as': 65000}})
++  sessions = get_box({'ipv4': ['ibgp', 'ebgp'], 'ipv6': ['ibgp']})
++  boxed = bgp.bgp_neighbor(n, get_box(intf), 'ibgp', sessions, extra)
++  plain = bgp._ibgp_neighbor_plain(n, get_box(intf), sessions, extra)
++  assert (boxed is None) == (plain is None)
++  if boxed is None:
++    return
++  host = get_box({'bgp': {'neighbors': []}})
++  l1, l2 = host.bgp.neighbors, get_box({'bgp': {'neighbors': []}}).bgp.neighbors
++  l1.append(boxed)
++  fastbox.append_box(l2, plain)
++  _same(l1[0], l2[0])
++
++
++def test_readonly_consolidated_device_data_equals_the_original(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  _, topology = _compile(tmp_path, monkeypatch, 'cons', fast=True)
++  memo.invalidate()
++  for dev in topology.defaults.devices.keys():
++    for provider in (None, 'clab', 'kne', 'libvirt'):
++      node = Box({'device': dev, 'name': 'x'} | ({'provider': provider} if provider else {}), **_OPTS)
++      assert devices.get_consolidated_device_data_readonly(node, topology.defaults) == \
++             devices.get_consolidated_device_data(node, topology.defaults), f'{dev}/{provider}'
+-- 
+2.56.0
+

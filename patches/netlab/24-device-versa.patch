@@ -1,0 +1,155 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 12:00:00 +0000
+Subject: [PATCH] devices: Versa Director and FlexVNF
+
+---
+diff --git a/netsim/ansible/templates/initial/versa-director.j2 b/netsim/ansible/templates/initial/versa-director.j2
+new file mode 100644
+index 0000000..cb78373
+--- /dev/null
++++ b/netsim/ansible/templates/initial/versa-director.j2
+@@ -0,0 +1,3 @@
++{# versa-director: no-op initial config. Device boots with image-default admin creds;
++   the collector collects over SSH. Full base-config templating is a device-onboarding
++   follow-up (Viptela/Versa CLI). This lets netlab initial complete cleanly. #}
+diff --git a/netsim/ansible/templates/initial/versa-flexvnf.j2 b/netsim/ansible/templates/initial/versa-flexvnf.j2
+new file mode 100644
+index 0000000..92ed62e
+--- /dev/null
++++ b/netsim/ansible/templates/initial/versa-flexvnf.j2
+@@ -0,0 +1,3 @@
++{# versa-flexvnf: no-op initial config. Device boots with image-default admin creds;
++   the collector collects over SSH. Full base-config templating is a device-onboarding
++   follow-up (Viptela/Versa CLI). This lets netlab initial complete cleanly. #}
+diff --git a/netsim/ansible/templates/services/versa-director.j2 b/netsim/ansible/templates/services/versa-director.j2
+new file mode 100644
+index 0000000..afe0247
+--- /dev/null
++++ b/netsim/ansible/templates/services/versa-director.j2
+@@ -0,0 +1,15 @@
++{#
++    versa-director renders NOTHING here, deliberately.
++
++    netlab resolves a config template for EVERY node whose module list includes
++    `services`, and groups.all force-adds `module: [ services ]` fleet-wide, so
++    this file must exist or every topology containing a versa-director node dies at
++    compile with "Cannot find services configuration template" -- which is
++    exactly how 0042 first landed: declaring features.services without the
++    template moved the failure rather than fixing it.
++
++    It is empty because Versa takes no SNMP agent over this CLI. the collector
++    collects this device with versa_director_api, so there is nothing for netlab to
++    render here, and features.services.server.snmp is deliberately not declared.
++    Do not "complete" this template.
++#}
+diff --git a/netsim/ansible/templates/services/versa-flexvnf.j2 b/netsim/ansible/templates/services/versa-flexvnf.j2
+new file mode 100644
+index 0000000..d76b248
+--- /dev/null
++++ b/netsim/ansible/templates/services/versa-flexvnf.j2
+@@ -0,0 +1,15 @@
++{#
++    versa-flexvnf renders NOTHING here, deliberately.
++
++    netlab resolves a config template for EVERY node whose module list includes
++    `services`, and groups.all force-adds `module: [ services ]` fleet-wide, so
++    this file must exist or every topology containing a versa-flexvnf node dies at
++    compile with "Cannot find services configuration template" -- which is
++    exactly how 0042 first landed: declaring features.services without the
++    template moved the failure rather than fixing it.
++
++    It is empty because Versa takes no SNMP agent over this CLI. the collector
++    collects this device with versa_flexvnf_ssh, so there is nothing for netlab to
++    render here, and features.services.server.snmp is deliberately not declared.
++    Do not "complete" this template.
++#}
+diff --git a/netsim/devices/versa-director.yml b/netsim/devices/versa-director.yml
+new file mode 100644
+index 0000000..01c24a5
+--- /dev/null
++++ b/netsim/devices/versa-director.yml
+@@ -0,0 +1,37 @@
++---
++description: Versa Director
++parent: unknown
++interface_name: eth{ifindex}
++mgmt_if: eth0
++skip_config: [ initial ]
++clab:
++  image: vrnetlab/vr-versa-director
++group_vars:
++  ansible_user: admin
++  ansible_ssh_pass: versa123
++  ansible_password: versa123
++  netlab_device_type: versa-director
++  ansible_network_os: versa
++  ansible_connection: network_cli
++features:
++  # Declares that this device SUPPORTS the services module, which is what puts
++  # it in services.supported_on and lets `netlab create` proceed -- groups.all
++  # force-adds `module: [ services ]` to every node, so without this the device
++  # failed `netlab create` with
++  #   IncorrectValue in modules: Device type versa-director (node n1)
++  #   does not support module services
++  #
++  # Declared GLOBALLY, not under a provider key: add_device_module_support skips
++  # a device already present in a module's supported_on map, so a provider-scoped
++  # declaration can be silently ignored depending on registration order. Same
++  # shape 0038 used for the Viptela pair.
++  #
++  # server.snmp is deliberately ABSENT. Versa does not take an SNMP agent over
++  # this CLI, and the collector collects these with versa_director_api. Claiming server.snmp would
++  # make the fleet-wide attribute look renderable here and invite someone to
++  # emit syntax the NOS rejects.
++  services:
++    dns:
++      transport_vrf: false
++  sdwan:
++    types: [ controller ]
+diff --git a/netsim/devices/versa-flexvnf.yml b/netsim/devices/versa-flexvnf.yml
+new file mode 100644
+index 0000000..1662b7e
+--- /dev/null
++++ b/netsim/devices/versa-flexvnf.yml
+@@ -0,0 +1,37 @@
++---
++description: Versa FlexVNF
++parent: unknown
++interface_name: eth{ifindex}
++mgmt_if: eth0
++skip_config: [ initial ]
++clab:
++  image: vrnetlab/vr-versa-flexvnf
++group_vars:
++  ansible_user: versa
++  ansible_ssh_pass: versa123
++  ansible_password: versa123
++  netlab_device_type: versa-flexvnf
++  ansible_network_os: versa
++  ansible_connection: network_cli
++features:
++  # Declares that this device SUPPORTS the services module, which is what puts
++  # it in services.supported_on and lets `netlab create` proceed -- groups.all
++  # force-adds `module: [ services ]` to every node, so without this the device
++  # failed `netlab create` with
++  #   IncorrectValue in modules: Device type versa-flexvnf (node n1)
++  #   does not support module services
++  #
++  # Declared GLOBALLY, not under a provider key: add_device_module_support skips
++  # a device already present in a module's supported_on map, so a provider-scoped
++  # declaration can be silently ignored depending on registration order. Same
++  # shape 0038 used for the Viptela pair.
++  #
++  # server.snmp is deliberately ABSENT. Versa does not take an SNMP agent over
++  # this CLI, and the collector collects these with versa_flexvnf_ssh. Claiming server.snmp would
++  # make the fleet-wide attribute look renderable here and invite someone to
++  # emit syntax the NOS rejects.
++  services:
++    dns:
++      transport_vrf: false
++  sdwan:
++    types: [ edge ]
+-- 
+2.56.0
+

@@ -1,0 +1,108 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 14:00:05 -0500
+Subject: [PATCH 23/35] meshnet: a stale netns view must not clear a pod's live
+ status (R12, node restart)
+
+---
+diff --git a/third_party/meshnet/daemon/meshnet/controller.go b/third_party/meshnet/daemon/meshnet/controller.go
+index 864cb79..710f0ec 100644
+--- a/third_party/meshnet/daemon/meshnet/controller.go
++++ b/third_party/meshnet/daemon/meshnet/controller.go
+@@ -219,6 +219,21 @@ func (m *Meshnet) reconcilePodLinksInternal(ctx context.Context, topo *unstructu
+ 	currentNetNS, _, _ := unstructured.NestedString(topo.Object, "status", "net_ns")
+ 	if srcIP != "" && m.nodeIP != "" && srcIP == m.nodeIP {
+ 		if currentNetNS != "" && !isNetNSValid(currentNetNS) {
++			// This view can lag a SetAlive write. The informer may still hold
++			// the netns of the sandbox that just died, while SetAlive has already
++			// recorded the new one. Clearing on a stale view erased the new
++			// status and left the pod unwired until its next ADD (measured on
++			// the kind cluster 2026-10-20: a node restart re-created pod "a", and
++			// its wire never came back). Confirm with a live read first.
++			if live, err := m.liveNetNS(ctx, topo); err == nil && live != currentNetNS {
++				mnetdLogger.Infof("ReconcilePodLinks: %s's netns is now %s (this view had %s); reconciling again", topo.GetName(), live, currentNetNS)
++				// Enqueue directly: triggerReconcile falls back to itself when the
++				// queue is nil (enqueueFullReconcile), so it must not be used here.
++				if m.reconcileQueue != nil {
++					m.reconcileQueue.EnqueueFull()
++				}
++				return nil
++			}
+ 			mnetdLogger.Warnf("ReconcilePodLinks: local pod %s has stale netns path %s; clearing active status", topo.GetName(), currentNetNS)
+ 			_ = m.CleanupPodLinks(ctx, topo)
+ 			_ = grpcwire.DeletePodWires(topo.GetNamespace(), topo.GetName())
+@@ -1055,3 +1070,17 @@ func (m *Meshnet) updatePlumbingErrorStatus(ctx context.Context, topo *unstructu
+ 
+ 	return err
+ }
++
++// liveNetNS reads the pod's netns from the API server, not the informer, so it
++// sees a status write that the informer has not caught up with yet.
++func (m *Meshnet) liveNetNS(ctx context.Context, topo *unstructured.Unstructured) (string, error) {
++	if m.tClient == nil {
++		return "", fmt.Errorf("topology client not initialized")
++	}
++	live, err := m.tClient.Topology(topo.GetNamespace()).Unstructured(ctx, topo.GetName(), metav1.GetOptions{})
++	if err != nil {
++		return "", err
++	}
++	netNS, _, _ := unstructured.NestedString(live.Object, "status", "net_ns")
++	return netNS, nil
++}
+diff --git a/third_party/meshnet/daemon/meshnet/netns_race_test.go b/third_party/meshnet/daemon/meshnet/netns_race_test.go
+new file mode 100644
+index 0000000..5951a3a
+--- /dev/null
++++ b/third_party/meshnet/daemon/meshnet/netns_race_test.go
+@@ -0,0 +1,48 @@
++package meshnet
++
++import (
++	"context"
++	"testing"
++
++	fakeTopology "github.com/openconfig/kne/third_party/meshnet/api/clientset/v1beta1/fake"
++	topologyv1 "github.com/openconfig/kne/third_party/meshnet/api/types/v1beta1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++)
++
++// The requirement (found on the kind cluster 2026-10-20): a reconcile that
++// sees the netns of a dead sandbox must not clear the pod's status when the
++// API server already holds the netns of the live sandbox. The live status
++// stays, so the pod is still wired on its next pass.
++func TestStaleNetNSViewDoesNotClearLiveStatus(t *testing.T) {
++	InitLogger()
++	const nodeIP = "172.18.0.2"
++	const oldNS = "/var/run/netns/cni-dead-sandbox"
++	const newNS = "/var/run/netns/cni-live-sandbox"
++	live := &topologyv1.Topology{
++		ObjectMeta: metav1.ObjectMeta{Name: "a", Namespace: "default"},
++		Status:     topologyv1.TopologyStatus{SrcIP: nodeIP, NetNS: newNS},
++	}
++	c, err := fakeTopology.NewSimpleClientset(live)
++	if err != nil {
++		t.Fatal(err)
++	}
++	m := &Meshnet{tClient: c, nodeIP: nodeIP}
++
++	// The stale view: same node, the dead sandbox's netns.
++	stale := mustUnstructured(t, &topologyv1.Topology{
++		ObjectMeta: metav1.ObjectMeta{Name: "a", Namespace: "default"},
++		Status:     topologyv1.TopologyStatus{SrcIP: nodeIP, NetNS: oldNS},
++	})
++	if err := m.reconcilePodLinksInternal(context.Background(), stale); err != nil {
++		t.Fatalf("reconcilePodLinksInternal = %v, want nil", err)
++	}
++
++	got, err := c.Topology("default").Unstructured(context.Background(), "a", metav1.GetOptions{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if ns, _, _ := unstructured.NestedString(got.Object, "status", "net_ns"); ns != newNS {
++		t.Fatalf("live status net_ns = %q after a stale-view reconcile, want %q (the status was cleared)", ns, newNS)
++	}
++}
+-- 
+2.56.0
+

@@ -1,0 +1,50 @@
+---
+module: [ bgp ]
+defaults.device: eos
+provider: kne
+nodes:
+  # netlab 26.08 tightening: a node using module attributes must enable the
+  # module itself (topology-level `module:` no longer reaches nodes here).
+  r1:
+    module: [ bgp ]
+    bgp.as: 65001
+  r2:
+    module: [ bgp ]
+    bgp.as: 65002
+
+links:
+- r1:
+  r2:
+  unnumbered: True
+- r1:
+  r2:
+  unnumbered: True
+
+message:
+  The "EBGP Unnumbered" lab is ready. Use "netlab connect" to connect to the lab
+  devices and "netlab status" if you forgot their names.
+
+# Closed-loop verification: `netlab validate` (the platform's Validate action /
+# deployment_action validate) runs these against the LIVE devices over netlab
+# connect. Sessions first, then propagation -- a session can be Established
+# while advertising nothing.
+validate:
+  session_r1:
+    description: r1's EBGP unnumbered sessions to r2 reach Established
+    wait_msg: Waiting for the EBGP sessions to establish
+    wait: 120
+    nodes: [ r1 ]
+    plugin: bgp_neighbor(node.bgp.neighbors,'r2')
+
+  session_r2:
+    description: r2's EBGP unnumbered sessions to r1 reach Established
+    wait: 30
+    nodes: [ r2 ]
+    plugin: bgp_neighbor(node.bgp.neighbors,'r1')
+
+  prefix:
+    description: r1 learns r2's loopback over BGP
+    wait_msg: Waiting for BGP convergence
+    wait: 60
+    nodes: [ r1 ]
+    plugin: bgp_prefix(nodes.r2.loopback.ipv4)

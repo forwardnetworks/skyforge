@@ -1,0 +1,137 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 14:15:53 -0500
+Subject: [PATCH 27/35] meshnet: bound the CNI plugin's calls, ADD 90 s, DEL 45
+ s, RPC 30 s (M0004, ported)
+
+---
+diff --git a/third_party/meshnet/plugin/budget.go b/third_party/meshnet/plugin/budget.go
+new file mode 100644
+index 0000000..fa8a969
+--- /dev/null
++++ b/third_party/meshnet/plugin/budget.go
+@@ -0,0 +1,37 @@
++package main
++
++import (
++	"context"
++	"time"
++
++	"google.golang.org/grpc"
++)
++
++// Budgets (M0004, patches/meshnet-cni 0004). An unbounded CNI call holds
++// kubelet's sandbox creation for as long as a daemon or API call is wedged.
++const (
++	// addBudget bounds one CNI ADD. The readiness wait inside it has its own
++	// shorter bound, so this is the backstop for a wedged daemon call.
++	addBudget = 90 * time.Second
++	// delBudget bounds one CNI DEL. DEL is best-effort: on expiry it logs and
++	// returns success, so pod teardown is never blocked by meshnet cleanup.
++	delBudget = 45 * time.Second
++	// rpcTimeout bounds one unary RPC to the local daemon, under the command's
++	// budget.
++	rpcTimeout = 30 * time.Second
++)
++
++// boundedUnaryInterceptor gives every unary call its own timeout under the
++// caller's overall context.
++func boundedUnaryInterceptor(d time.Duration) grpc.UnaryClientInterceptor {
++	return func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
++		c, cancel := context.WithTimeout(ctx, d)
++		defer cancel()
++		return invoker(c, method, req, reply, cc, opts...)
++	}
++}
++
++// rpcTimeoutOption is the dial option for the local daemon connection.
++func rpcTimeoutOption(d time.Duration) grpc.DialOption {
++	return grpc.WithChainUnaryInterceptor(boundedUnaryInterceptor(d))
++}
+diff --git a/third_party/meshnet/plugin/budget_test.go b/third_party/meshnet/plugin/budget_test.go
+new file mode 100644
+index 0000000..eb18bce
+--- /dev/null
++++ b/third_party/meshnet/plugin/budget_test.go
+@@ -0,0 +1,38 @@
++package main
++
++import (
++	"context"
++	"errors"
++	"testing"
++	"time"
++
++	"google.golang.org/grpc"
++)
++
++// The requirement: a unary call that never answers returns at its per-call
++// deadline with DeadlineExceeded, instead of holding the CNI command.
++func TestBoundedInterceptorReturnsAtDeadline(t *testing.T) {
++	const d = 50 * time.Millisecond
++	blocking := func(ctx context.Context, _ string, _ any, _ any, _ *grpc.ClientConn, _ ...grpc.CallOption) error {
++		<-ctx.Done()
++		return ctx.Err()
++	}
++	start := time.Now()
++	err := boundedUnaryInterceptor(d)(context.Background(), "/meshnet.v1beta1.Local/Get", nil, nil, nil, blocking)
++	elapsed := time.Since(start)
++	if !errors.Is(err, context.DeadlineExceeded) {
++		t.Fatalf("err = %v, want DeadlineExceeded", err)
++	}
++	if elapsed > 2*d+time.Second {
++		t.Fatalf("blocked for %v, want about %v", elapsed, d)
++	}
++}
++
++func TestBudgetsAreBounded(t *testing.T) {
++	if addBudget <= 0 || delBudget <= 0 || rpcTimeout <= 0 {
++		t.Fatal("a budget is zero or negative: the call would be unbounded")
++	}
++	if rpcTimeout >= addBudget {
++		t.Fatalf("per-RPC timeout %v must be inside the ADD budget %v", rpcTimeout, addBudget)
++	}
++}
+diff --git a/third_party/meshnet/plugin/meshnet.go b/third_party/meshnet/plugin/meshnet.go
+index f722a76..54b22da 100644
+--- a/third_party/meshnet/plugin/meshnet.go
++++ b/third_party/meshnet/plugin/meshnet.go
+@@ -147,7 +147,7 @@ func removeLink(netNS, linkName string) error {
+ // Adds interfaces to a POD. the POD name and the POD Namespace is passed as arguments.
+ func cmdAdd(args *skel.CmdArgs) error {
+ 	startTime := time.Now()
+-	ctx, cancel := context.WithCancel(context.Background())
++	ctx, cancel := context.WithTimeout(context.Background(), addBudget)
+ 	defer cancel()
+ 
+ 	log.Info("Parsing cni .conf file")
+@@ -165,7 +165,7 @@ func cmdAdd(args *skel.CmdArgs) error {
+ 	defer log.Infof("DONE > Processing ADD POD %s in namespace %s, container_id %s", string(cniArgs.K8S_POD_NAME), string(cniArgs.K8S_POD_NAMESPACE), string(cniArgs.K8S_POD_INFRA_CONTAINER_ID))
+ 
+ 	log.Infof("Attempting to connect to local meshnet daemon")
+-	conn, err := grpc.Dial(localDaemon, grpc.WithTransportCredentials(insecure.NewCredentials()))
++	conn, err := grpc.Dial(localDaemon, grpc.WithTransportCredentials(insecure.NewCredentials()), rpcTimeoutOption(rpcTimeout))
+ 	if err != nil {
+ 		log.Errorf("Failed to connect to local meshnetd on %s", localDaemon)
+ 		return err
+@@ -320,7 +320,7 @@ WaitDone:
+ // -------------------------------------------------------------------------------------------------
+ // Deletes interfaces from a POD
+ func cmdDel(args *skel.CmdArgs) error {
+-	ctx, cancel := context.WithCancel(context.Background())
++	ctx, cancel := context.WithTimeout(context.Background(), delBudget)
+ 	defer cancel()
+ 
+ 	cniArgs := k8sArgs{}
+@@ -339,7 +339,7 @@ func cmdDel(args *skel.CmdArgs) error {
+ 		return err
+ 	}
+ 
+-	conn, err := grpc.Dial(localDaemon, grpc.WithTransportCredentials(insecure.NewCredentials()))
++	conn, err := grpc.Dial(localDaemon, grpc.WithTransportCredentials(insecure.NewCredentials()), rpcTimeoutOption(rpcTimeout))
+ 	if err != nil {
+ 		log.Errorf("Failed to connect to local meshnetd on %s", localDaemon)
+ 		return err
+-- 
+2.56.0
+

@@ -1,0 +1,22 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 17:19:18 -0500
+Subject: [PATCH 35/35] manifests: meshnet vxlan manifest grants nodes read
+ (matches base RBAC)
+
+---
+diff --git a/manifests/meshnet/vxlan/manifest.yaml b/manifests/meshnet/vxlan/manifest.yaml
+index f9475b5..cd4001b 100644
+--- a/manifests/meshnet/vxlan/manifest.yaml
++++ b/manifests/meshnet/vxlan/manifest.yaml
+@@ -250,6 +250,7 @@ rules:
+       - ""
+     resources:
+       - pods
++      - nodes
+     verbs:
+       - get
+       - list
+-- 
+2.56.0
+

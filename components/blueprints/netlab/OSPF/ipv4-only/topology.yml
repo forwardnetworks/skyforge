@@ -1,0 +1,20 @@
+addressing:
+  loopback.ipv6: 2001:db8:cafe::/48    # Routers are always debating stuff
+  p2p.ipv6: True                       # Use LLA-only P2P links
+  lan.ipv6: 3fff:1::/48                # Hey, we got RFC 9637
+
+defaults.device: eos
+provider: kne
+module: [ ospf ]
+ospf.af: [ ipv4 ]
+
+# KNE deployability: a link with a single node (`r1`, `r2` below) is a STUB, and
+# KNE wires every link as a veth pair, so a one-ended link has nowhere to land --
+# the provider rejects the topology outright. netlab's own remedy for exactly
+# this (docs/links.md, "additional loopbacks") turns stub links into loopback
+# INTERFACES: same node, same prefix, same OSPF advertisement, no second device
+# and no wire. The dual-stack + OSPFv2-only point of this lab is unchanged.
+defaults.links.stub_loopback: True
+
+nodes: [ r1, r2 ]
+links: [ r1, r1-r2, r2 ]

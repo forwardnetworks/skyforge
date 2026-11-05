@@ -1,0 +1,520 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 09:14:30 -0500
+Subject: [PATCH 46/46] meshnet: a KubeVirt secondary ADD realizes only its own
+ slot (r7)
+
+---
+diff --git a/third_party/meshnet/daemon/meshnet/controller.go b/third_party/meshnet/daemon/meshnet/controller.go
+index 8ae29dd..5a416e2 100644
+--- a/third_party/meshnet/daemon/meshnet/controller.go
++++ b/third_party/meshnet/daemon/meshnet/controller.go
+@@ -52,6 +52,7 @@ func (m *Meshnet) clearPodAliveStatus(ctx context.Context, topo *unstructured.Un
+ 		unstructured.RemoveNestedField(latestTopo.Object, "status", "net_ns")
+ 		unstructured.RemoveNestedField(latestTopo.Object, "status", "container_id")
+ 		unstructured.RemoveNestedField(latestTopo.Object, "status", "plumbing_error")
++		clearKubeVirtAdmission(latestTopo)
+ 
+ 		_, err = m.tClient.Topology(latestTopo.GetNamespace()).Update(ctx, latestTopo, metav1.UpdateOptions{})
+ 		if err == nil && m.topoCache != nil {
+@@ -256,6 +257,10 @@ func (m *Meshnet) reconcilePodLinksInternal(ctx context.Context, topo *unstructu
+ 	}
+ 
+ 	m.cleanupRemovedPodLinks(ctx, topo, netNS, links)
++	// A KubeVirt pod realizes only the slots its secondary ADDs admitted. A
++	// sibling slot not yet admitted must not exist in the netns when its own
++	// Multus ADD runs (see kubevirt_slot_gate.go).
++	links = admittedLinks(topo, links)
+ 
+ 	if len(links) == 0 {
+ 		return nil
+diff --git a/third_party/meshnet/daemon/meshnet/handler.go b/third_party/meshnet/daemon/meshnet/handler.go
+index 3960bd9..e03f884 100644
+--- a/third_party/meshnet/daemon/meshnet/handler.go
++++ b/third_party/meshnet/daemon/meshnet/handler.go
+@@ -143,6 +143,23 @@ func (m *Meshnet) SetAlive(ctx context.Context, pod *mpb.Pod) (*mpb.BoolResponse
+ 			return err
+ 		}
+ 
++		// A KubeVirt secondary ADD admits its own slot, in the sandbox it runs in.
++		// Deactivation (DEL, empty container_id) drops the record, so the next
++		// sandbox starts empty.
++		if pod.GetKubevirtSecondary() {
++			prev, _ := kubeVirtAdmissionOf(result)
++			requested := make([]string, 0, len(pod.Links))
++			for _, l := range pod.Links {
++				requested = append(requested, l.GetLocalIntf())
++			}
++			admitted := admitKubeVirtSlots(prev.Slots, prev.ContainerID == pod.ContainerId, requested)
++			if aerr := setKubeVirtAdmission(result, kubeVirtAdmission{ContainerID: pod.ContainerId, Slots: admitted}); aerr != nil {
++				mnetdLogger.Errorf("Failed to record kubevirt admission for %s: %v", pod.Name, aerr)
++			}
++		} else if pod.ContainerId == "" {
++			clearKubeVirtAdmission(result)
++		}
++
+ 		if err = unstructured.SetNestedField(result.Object, pod.SrcIp, "status", "src_ip"); err != nil {
+ 			mnetdLogger.Errorf("Failed to update pod's src_ip")
+ 		}
+diff --git a/third_party/meshnet/daemon/meshnet/kubevirt_slot_gate.go b/third_party/meshnet/daemon/meshnet/kubevirt_slot_gate.go
+new file mode 100644
+index 0000000..3b9ba64
+--- /dev/null
++++ b/third_party/meshnet/daemon/meshnet/kubevirt_slot_gate.go
+@@ -0,0 +1,128 @@
++package meshnet
++
++import (
++	"encoding/json"
++
++	"github.com/openconfig/kne/third_party/meshnet/utils/wireutil"
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++)
++
++// KubeVirt secondary slots and Multus.
++//
++// A VM's meshnet wires are attached as Multus secondary networks: one NAD ADD
++// per requested interface, each named pod<hash>. Before a delegate runs, Multus
++// (pkg/multus DelegateAdd -> validateIfName) fails the ADD if the requested
++// interface already exists in the sandbox netns. The daemon realizes a pod's
++// links from its Topology, so an ADD for slot 1 that marks the pod alive also
++// realized slot 2, and the ADD for slot 2 then failed with
++//
++//	DelegateAdd: cannot set "meshnet" interface name to "pod24bf8ab8fca":
++//	validateIfName: interface name pod24bf8ab8fca already exists
++//
++// The gate: a KubeVirt secondary SetAlive admits only the slot it requested.
++// The admitted slots and their sandbox are recorded in a metadata annotation,
++// not in status. The live Topology CRD has a structural status schema and a
++// status subresource, so a status key outside its schema would be pruned.
++// For a pod with an admission record, reconcile realizes only the admitted
++// slots. A new sandbox (container id changed) starts the list again. Pods
++// that never sent a kubevirt_secondary SetAlive have no record and are not
++// gated.
++
++// kubeVirtAdmittedAnnotation holds the kubeVirtAdmission JSON.
++const kubeVirtAdmittedAnnotation = "meshnet.networkop.co.uk/kubevirt-admitted"
++
++// kubeVirtAdmission is the admitted slots for one sandbox.
++type kubeVirtAdmission struct {
++	ContainerID string   `json:"container_id"`
++	Slots       []string `json:"slots"`
++}
++
++// kubeVirtAdmissionOf returns the admission record and whether the pod is
++// gated at all. A record that does not parse gates the pod with no slots
++// (fail closed): nothing is realized until a KubeVirt ADD rewrites it.
++func kubeVirtAdmissionOf(topo *unstructured.Unstructured) (kubeVirtAdmission, bool) {
++	if topo == nil {
++		return kubeVirtAdmission{}, false
++	}
++	raw, ok := topo.GetAnnotations()[kubeVirtAdmittedAnnotation]
++	if !ok {
++		return kubeVirtAdmission{}, false
++	}
++	var a kubeVirtAdmission
++	if err := json.Unmarshal([]byte(raw), &a); err != nil {
++		return kubeVirtAdmission{}, true
++	}
++	return a, true
++}
++
++// setKubeVirtAdmission records the admission on the Topology object. The
++// caller writes the object.
++func setKubeVirtAdmission(topo *unstructured.Unstructured, a kubeVirtAdmission) error {
++	raw, err := json.Marshal(a)
++	if err != nil {
++		return err
++	}
++	ann := topo.GetAnnotations()
++	if ann == nil {
++		ann = map[string]string{}
++	}
++	ann[kubeVirtAdmittedAnnotation] = string(raw)
++	topo.SetAnnotations(ann)
++	return nil
++}
++
++// clearKubeVirtAdmission removes the admission record. The caller writes the object.
++func clearKubeVirtAdmission(topo *unstructured.Unstructured) {
++	ann := topo.GetAnnotations()
++	if _, ok := ann[kubeVirtAdmittedAnnotation]; !ok {
++		return
++	}
++	delete(ann, kubeVirtAdmittedAnnotation)
++	topo.SetAnnotations(ann)
++}
++
++// admittedLinks returns the links that may be realized in the pod netns now.
++// An ungated pod gets every link. A gated pod gets only the links whose slot
++// (LocalIntf) was admitted, in topology order. The caller keeps the full link
++// list for cleanup, so a slot not yet admitted is never treated as removed.
++func admittedLinks(topo *unstructured.Unstructured, links []wireutil.PodLinkConfig) []wireutil.PodLinkConfig {
++	adm, gated := kubeVirtAdmissionOf(topo)
++	if !gated {
++		return links
++	}
++	set := make(map[string]bool, len(adm.Slots))
++	for _, s := range adm.Slots {
++		set[s] = true
++	}
++	out := make([]wireutil.PodLinkConfig, 0, len(links))
++	for _, l := range links {
++		if set[l.LocalIntf] {
++			out = append(out, l)
++		}
++	}
++	return out
++}
++
++// admitKubeVirtSlots returns the admitted list after a KubeVirt secondary
++// SetAlive. A request in the same sandbox adds to the list (the sibling
++// attachment already admitted its slot). A request in a new sandbox starts the
++// list again, so a stale slot from a dead sandbox is never realized.
++func admitKubeVirtSlots(existing []string, sameSandbox bool, requested []string) []string {
++	seen := make(map[string]bool)
++	var out []string
++	if sameSandbox {
++		for _, s := range existing {
++			if !seen[s] {
++				seen[s] = true
++				out = append(out, s)
++			}
++		}
++	}
++	for _, s := range requested {
++		if s != "" && !seen[s] {
++			seen[s] = true
++			out = append(out, s)
++		}
++	}
++	return out
++}
+diff --git a/third_party/meshnet/daemon/meshnet/kubevirt_slot_gate_test.go b/third_party/meshnet/daemon/meshnet/kubevirt_slot_gate_test.go
+new file mode 100644
+index 0000000..cda8542
+--- /dev/null
++++ b/third_party/meshnet/daemon/meshnet/kubevirt_slot_gate_test.go
+@@ -0,0 +1,131 @@
++package meshnet
++
++import (
++	"reflect"
++	"testing"
++
++	"github.com/openconfig/kne/third_party/meshnet/utils/wireutil"
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++)
++
++// A VM r1 with two meshnet slots, as on the cat8000v lab.
++const (
++	slotA = "pod151b6d47576" // attachment 1 (to h1)
++	slotB = "pod24bf8ab8fca" // attachment 2 (to h2)
++)
++
++func slotLinks() []wireutil.PodLinkConfig {
++	return []wireutil.PodLinkConfig{{LocalIntf: slotA}, {LocalIntf: slotB}}
++}
++
++func intfs(links []wireutil.PodLinkConfig) []string {
++	var out []string
++	for _, l := range links {
++		out = append(out, l.LocalIntf)
++	}
++	return out
++}
++
++// topoWithAdmission returns a Topology object carrying the given admission
++// record. A nil record means an ordinary, ungated pod.
++func topoWithAdmission(t *testing.T, a *kubeVirtAdmission) *unstructured.Unstructured {
++	t.Helper()
++	topo := &unstructured.Unstructured{Object: map[string]interface{}{}}
++	if a != nil {
++		if err := setKubeVirtAdmission(topo, *a); err != nil {
++			t.Fatalf("set admission: %v", err)
++		}
++	}
++	return topo
++}
++
++// Requirement: a pod with no KubeVirt admission (an ordinary pod) keeps every link.
++func TestAdmittedLinksOrdinaryPodIsUngated(t *testing.T) {
++	got := intfs(admittedLinks(topoWithAdmission(t, nil), slotLinks()))
++	if want := []string{slotA, slotB}; !reflect.DeepEqual(got, want) {
++		t.Fatalf("ungated pod: want %v, got %v", want, got)
++	}
++}
++
++// Requirement: a KubeVirt pod realizes only the slot its ADD admitted. The
++// sibling slot must not exist before its own ADD.
++func TestAdmittedLinksRealizesOnlyAdmittedSlot(t *testing.T) {
++	topo := topoWithAdmission(t, &kubeVirtAdmission{ContainerID: "sb1", Slots: []string{slotA}})
++	got := intfs(admittedLinks(topo, slotLinks()))
++	if want := []string{slotA}; !reflect.DeepEqual(got, want) {
++		t.Fatalf("gated pod with slot A admitted: want %v, got %v", want, got)
++	}
++}
++
++// Requirement: an admission record that does not parse fails closed (no slot
++// is realized), so a corrupt record can never open the collision.
++func TestAdmittedLinksCorruptRecordFailsClosed(t *testing.T) {
++	topo := &unstructured.Unstructured{Object: map[string]interface{}{}}
++	topo.SetAnnotations(map[string]string{kubeVirtAdmittedAnnotation: "{not json"})
++	if got := admittedLinks(topo, slotLinks()); len(got) != 0 {
++		t.Fatalf("corrupt record must realize nothing, got %v", intfs(got))
++	}
++}
++
++// Requirement: a sibling ADD in the same sandbox adds its slot; the first stays.
++func TestAdmitKubeVirtSlotsSameSandboxAccumulates(t *testing.T) {
++	got := admitKubeVirtSlots([]string{slotA}, true, []string{slotB})
++	if want := []string{slotA, slotB}; !reflect.DeepEqual(got, want) {
++		t.Fatalf("same sandbox: want %v, got %v", want, got)
++	}
++}
++
++// Requirement: a new sandbox (new container) starts with only its own slot, so
++// a slot admitted in a dead sandbox is never realized in the new one.
++func TestAdmitKubeVirtSlotsNewSandboxResets(t *testing.T) {
++	got := admitKubeVirtSlots([]string{slotA, slotB}, false, []string{slotA})
++	if want := []string{slotA}; !reflect.DeepEqual(got, want) {
++		t.Fatalf("new sandbox: want %v, got %v", want, got)
++	}
++}
++
++// Requirement (the collision): ADD 1 marks the pod alive. Only slot A may be
++// realized. ADD 2 then runs Multus's pre-check for slot B, which must still be
++// absent. After ADD 2 admits B, both slots are realized.
++func TestSecondAttachmentFindsItsSlotAbsent(t *testing.T) {
++	topo := topoWithAdmission(t, nil)
++	const sandbox = "sandbox-1"
++
++	// ADD 1 (slot A): SetAlive records A for this sandbox.
++	prev, _ := kubeVirtAdmissionOf(topo)
++	admitted1 := admitKubeVirtSlots(prev.Slots, prev.ContainerID == sandbox, []string{slotA})
++	if err := setKubeVirtAdmission(topo, kubeVirtAdmission{ContainerID: sandbox, Slots: admitted1}); err != nil {
++		t.Fatal(err)
++	}
++	realized1 := intfs(admittedLinks(topo, slotLinks()))
++	if want := []string{slotA}; !reflect.DeepEqual(realized1, want) {
++		t.Fatalf("after ADD 1 only A may exist; want %v, got %v", want, realized1)
++	}
++	// Multus pre-check for ADD 2: slot B must not be realized yet.
++	for _, name := range realized1 {
++		if name == slotB {
++			t.Fatalf("slot B exists before its own ADD: Multus validateIfName would fail")
++		}
++	}
++
++	// ADD 2 (slot B) in the same sandbox admits B.
++	prev, _ = kubeVirtAdmissionOf(topo)
++	admitted2 := admitKubeVirtSlots(prev.Slots, prev.ContainerID == sandbox, []string{slotB})
++	if err := setKubeVirtAdmission(topo, kubeVirtAdmission{ContainerID: sandbox, Slots: admitted2}); err != nil {
++		t.Fatal(err)
++	}
++	realized2 := intfs(admittedLinks(topo, slotLinks()))
++	if want := []string{slotA, slotB}; !reflect.DeepEqual(realized2, want) {
++		t.Fatalf("after ADD 2 both slots must exist; want %v, got %v", want, realized2)
++	}
++}
++
++// Requirement: clearing the record (pod deactivated) returns the pod to
++// ungated behaviour. The next sandbox then starts from an empty record.
++func TestClearKubeVirtAdmissionRemovesRecord(t *testing.T) {
++	topo := topoWithAdmission(t, &kubeVirtAdmission{ContainerID: "sb1", Slots: []string{slotA}})
++	clearKubeVirtAdmission(topo)
++	if _, gated := kubeVirtAdmissionOf(topo); gated {
++		t.Fatalf("record must be gone after clear")
++	}
++}
+diff --git a/third_party/meshnet/daemon/proto/meshnet/v1beta1/meshnet.pb.go b/third_party/meshnet/daemon/proto/meshnet/v1beta1/meshnet.pb.go
+index 1b2260b..972f30d 100644
+--- a/third_party/meshnet/daemon/proto/meshnet/v1beta1/meshnet.pb.go
++++ b/third_party/meshnet/daemon/proto/meshnet/v1beta1/meshnet.pb.go
+@@ -22,17 +22,23 @@ const (
+ )
+ 
+ type Pod struct {
+-	state         protoimpl.MessageState `protogen:"open.v1"`
+-	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+-	SrcIp         string                 `protobuf:"bytes,2,opt,name=src_ip,json=srcIp,proto3" json:"src_ip,omitempty"`
+-	NetNs         string                 `protobuf:"bytes,3,opt,name=net_ns,json=netNs,proto3" json:"net_ns,omitempty"`
+-	KubeNs        string                 `protobuf:"bytes,4,opt,name=kube_ns,json=kubeNs,proto3" json:"kube_ns,omitempty"`
+-	Links         []*Link                `protobuf:"bytes,5,rep,name=links,proto3" json:"links,omitempty"`
+-	NodeIp        string                 `protobuf:"bytes,6,opt,name=node_ip,json=nodeIp,proto3" json:"node_ip,omitempty"`
+-	NodeIntf      string                 `protobuf:"bytes,7,opt,name=node_intf,json=nodeIntf,proto3" json:"node_intf,omitempty"`
+-	ContainerId   string                 `protobuf:"bytes,8,opt,name=container_id,json=containerId,proto3" json:"container_id,omitempty"`
+-	unknownFields protoimpl.UnknownFields
+-	sizeCache     protoimpl.SizeCache
++	state       protoimpl.MessageState `protogen:"open.v1"`
++	Name        string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
++	SrcIp       string                 `protobuf:"bytes,2,opt,name=src_ip,json=srcIp,proto3" json:"src_ip,omitempty"`
++	NetNs       string                 `protobuf:"bytes,3,opt,name=net_ns,json=netNs,proto3" json:"net_ns,omitempty"`
++	KubeNs      string                 `protobuf:"bytes,4,opt,name=kube_ns,json=kubeNs,proto3" json:"kube_ns,omitempty"`
++	Links       []*Link                `protobuf:"bytes,5,rep,name=links,proto3" json:"links,omitempty"`
++	NodeIp      string                 `protobuf:"bytes,6,opt,name=node_ip,json=nodeIp,proto3" json:"node_ip,omitempty"`
++	NodeIntf    string                 `protobuf:"bytes,7,opt,name=node_intf,json=nodeIntf,proto3" json:"node_intf,omitempty"`
++	ContainerId string                 `protobuf:"bytes,8,opt,name=container_id,json=containerId,proto3" json:"container_id,omitempty"`
++	// Set by a KubeVirt secondary (NAD) ADD. Its links are the one requested
++	// slot. The daemon admits only those slots for the pod (Topology annotation
++	// meshnet.networkop.co.uk/kubevirt-admitted) and realizes no other slot, so a
++	// sibling attachment's Multus validateIfName pre-check still sees its slot
++	// as absent.
++	KubevirtSecondary bool `protobuf:"varint,9,opt,name=kubevirt_secondary,json=kubevirtSecondary,proto3" json:"kubevirt_secondary,omitempty"`
++	unknownFields     protoimpl.UnknownFields
++	sizeCache         protoimpl.SizeCache
+ }
+ 
+ func (x *Pod) Reset() {
+@@ -121,6 +127,13 @@ func (x *Pod) GetContainerId() string {
+ 	return ""
+ }
+ 
++func (x *Pod) GetKubevirtSecondary() bool {
++	if x != nil {
++		return x.KubevirtSecondary
++	}
++	return false
++}
++
+ type Link struct {
+ 	state     protoimpl.MessageState `protogen:"open.v1"`
+ 	PeerPod   string                 `protobuf:"bytes,1,opt,name=peer_pod,json=peerPod,proto3" json:"peer_pod,omitempty"`
+@@ -998,7 +1011,7 @@ var File_daemon_proto_meshnet_v1beta1_meshnet_proto protoreflect.FileDescriptor
+ 
+ const file_daemon_proto_meshnet_v1beta1_meshnet_proto_rawDesc = "" +
+ 	"\n" +
+-	"*daemon/proto/meshnet/v1beta1/meshnet.proto\x12\x0fmeshnet.v1beta1\"\xe6\x01\n" +
++	"*daemon/proto/meshnet/v1beta1/meshnet.proto\x12\x0fmeshnet.v1beta1\"\x95\x02\n" +
+ 	"\x03Pod\x12\x12\n" +
+ 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x15\n" +
+ 	"\x06src_ip\x18\x02 \x01(\tR\x05srcIp\x12\x15\n" +
+@@ -1007,7 +1020,8 @@ const file_daemon_proto_meshnet_v1beta1_meshnet_proto_rawDesc = "" +
+ 	"\x05links\x18\x05 \x03(\v2\x15.meshnet.v1beta1.LinkR\x05links\x12\x17\n" +
+ 	"\anode_ip\x18\x06 \x01(\tR\x06nodeIp\x12\x1b\n" +
+ 	"\tnode_intf\x18\a \x01(\tR\bnodeIntf\x12!\n" +
+-	"\fcontainer_id\x18\b \x01(\tR\vcontainerId\"\xca\x01\n" +
++	"\fcontainer_id\x18\b \x01(\tR\vcontainerId\x12-\n" +
++	"\x12kubevirt_secondary\x18\t \x01(\bR\x11kubevirtSecondary\"\xca\x01\n" +
+ 	"\x04Link\x12\x19\n" +
+ 	"\bpeer_pod\x18\x01 \x01(\tR\apeerPod\x12\x1d\n" +
+ 	"\n" +
+diff --git a/third_party/meshnet/daemon/proto/meshnet/v1beta1/meshnet.proto b/third_party/meshnet/daemon/proto/meshnet/v1beta1/meshnet.proto
+index 2bc6ebe..c167d92 100644
+--- a/third_party/meshnet/daemon/proto/meshnet/v1beta1/meshnet.proto
++++ b/third_party/meshnet/daemon/proto/meshnet/v1beta1/meshnet.proto
+@@ -14,6 +14,12 @@ message Pod {
+   string node_ip = 6;
+   string node_intf = 7;
+   string container_id = 8;
++  // Set by a KubeVirt secondary (NAD) ADD. Its links are the one requested
++  // slot. The daemon admits only those slots for the pod (Topology annotation
++  // meshnet.networkop.co.uk/kubevirt-admitted) and realizes no other slot, so a
++  // sibling attachment's Multus validateIfName pre-check still sees its slot
++  // as absent.
++  bool kubevirt_secondary = 9;
+ }
+ 
+ message Link {
+diff --git a/third_party/meshnet/plugin/kubevirt_slot_test.go b/third_party/meshnet/plugin/kubevirt_slot_test.go
+new file mode 100644
+index 0000000..ce07233
+--- /dev/null
++++ b/third_party/meshnet/plugin/kubevirt_slot_test.go
+@@ -0,0 +1,39 @@
++package main
++
++import (
++	"testing"
++
++	mpb "github.com/openconfig/kne/third_party/meshnet/daemon/proto/meshnet/v1beta1"
++)
++
++// Requirement: a KubeVirt secondary ADD for slot B must carry only slot B, so
++// the daemon does not create slot A (which Multus would then find occupied by
++// the sibling ADD). The NAD asks for pod24bf8ab8fca.
++func TestKubeVirtSlotLinksPicksOnlyRequestedSlot(t *testing.T) {
++	links := []*mpb.Link{
++		{LocalIntf: "pod151b6d47576", PeerPod: "h1"},
++		{LocalIntf: "pod24bf8ab8fca", PeerPod: "h2"},
++	}
++	got, err := kubeVirtSlotLinks(links, "pod24bf8ab8fca")
++	if err != nil {
++		t.Fatalf("kubeVirtSlotLinks: %v", err)
++	}
++	if len(got) != 1 || got[0].LocalIntf != "pod24bf8ab8fca" || got[0].PeerPod != "h2" {
++		t.Fatalf("want only slot pod24bf8ab8fca (peer h2), got %+v", got)
++	}
++}
++
++// Requirement: a NAD that names a slot the topology does not declare fails
++// closed rather than realizing every link.
++func TestKubeVirtSlotLinksFailsClosedWithoutMatch(t *testing.T) {
++	links := []*mpb.Link{{LocalIntf: "pod151b6d47576"}}
++	if _, err := kubeVirtSlotLinks(links, "pod99999999999"); err == nil {
++		t.Fatalf("want an error for an unmatched requested interface")
++	}
++}
++
++func TestKubeVirtSlotLinksRequiresRequestedInterface(t *testing.T) {
++	if _, err := kubeVirtSlotLinks([]*mpb.Link{{LocalIntf: "pod151b6d47576"}}, "  "); err == nil {
++		t.Fatalf("want an error when the requested interface is empty")
++	}
++}
+diff --git a/third_party/meshnet/plugin/meshnet.go b/third_party/meshnet/plugin/meshnet.go
+index d47df24..d6c8a4d 100644
+--- a/third_party/meshnet/plugin/meshnet.go
++++ b/third_party/meshnet/plugin/meshnet.go
+@@ -81,6 +81,29 @@ func alignResultInterfaceName(result *types100.Result, ifName string) {
+ 	result.Interfaces[len(result.Interfaces)-1].Name = ifName
+ }
+ 
++// kubeVirtSlotLinks returns the one meshnet link a KubeVirt secondary ADD
++// requests: the link whose LocalIntf is the requested interface. The ADD
++// realizes and waits for that slot only. Sibling slots stay unrealized until
++// their own ADDs, because Multus fails an ADD whose interface already exists.
++// No matching link is an error (fail closed), as the NAD names a slot the
++// topology does not declare.
++func kubeVirtSlotLinks(links []*mpb.Link, ifName string) ([]*mpb.Link, error) {
++	ifName = strings.TrimSpace(ifName)
++	if ifName == "" {
++		return nil, fmt.Errorf("kubevirt secondary ADD has no requested interface")
++	}
++	var out []*mpb.Link
++	for _, l := range links {
++		if l != nil && strings.TrimSpace(l.LocalIntf) == ifName {
++			out = append(out, l)
++		}
++	}
++	if len(out) == 0 {
++		return nil, fmt.Errorf("requested CNI interface %q matches no meshnet link of this pod", ifName)
++	}
++	return out, nil
++}
++
+ // printAddResult prints the ADD result. For a KubeVirt secondary NAD the
+ // interface is aligned to the requested name first.
+ func printAddResult(n *netConf, result *types100.Result, args *skel.CmdArgs) error {
+@@ -272,6 +295,19 @@ func cmdAdd(args *skel.CmdArgs) error {
+ 		return printAddResult(n, result, args)
+ 	}
+ 
++	if n.KubeVirtSecondary {
++		// One requested slot per ADD. The daemon admits only this slot (see
++		// daemon/meshnet/kubevirt_slot_gate.go), so sibling slots are not
++		// created before their own ADD.
++		slot, err := kubeVirtSlotLinks(localPod.Links, requestedIfName(args))
++		if err != nil {
++			log.Errorf("Add[%s]: %v", string(cniArgs.K8S_POD_NAME), err)
++			return err
++		}
++		localPod.Links = slot
++		localPod.KubevirtSecondary = true
++	}
++
+ 	if err := checkCrossNamespaceLinks(string(cniArgs.K8S_POD_NAMESPACE), localPod.Links, interNodeLinkType); err != nil {
+ 		return err
+ 	}
+-- 
+2.56.0
+
