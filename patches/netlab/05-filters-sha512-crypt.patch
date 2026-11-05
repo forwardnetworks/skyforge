@@ -69,6 +69,15 @@ index 619bad8..a09abb0 100644
 +  'to_nice_yaml': bi_yaml,
 +  'sha512_crypt': bi_sha512_crypt
  }
+diff --git a/requirements.txt b/requirements.txt
+index daa8e91..2c41a52 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -11,3 +11,4 @@ filelock >= 3.16.1
+ packaging
+ requests
+ rich
++passlib
 -- 
 2.56.0
 
