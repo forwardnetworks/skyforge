@@ -10,6 +10,8 @@ We run it on Talos Linux with Cilium, KubeVirt and Multus. netlab compiles each 
 - `components/blueprints/netlab/`: [ipspace/netlab-examples](https://github.com/ipspace/netlab-examples) adapted to run on KNE.
 - `scripts/apply-patches.sh`: clones a pinned upstream and applies its series.
 
+To deploy the stack from scratch (Talos, add-ons, KNE, netlab), see [INSTALL.md](INSTALL.md).
+
 ## Apply
 
 ```bash
