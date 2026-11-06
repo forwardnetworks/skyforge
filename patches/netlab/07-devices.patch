@@ -1,10 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
-Date: Sun, 27 Sep 2026 12:00:00 +0000
-Subject: [PATCH] devices: Palo Alto PAN-OS (panos)
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
+Date: Thu, 19 Nov 2026 00:00:00 +0000
+Subject: [PATCH] devices: PAN-OS, A10 vThunder, F5 BIG-IP, Versa, Keysight
+ ixia-c; netmiko waits for a loading device
 
 ---
 diff --git a/docs/module/bgp.md b/docs/module/bgp.md
@@ -33,6 +31,62 @@ index 57f2176..0c8c9a4 100644
  * **ospf.router_id** -- set [static router ID](routing_router_id).
  * **ospf.passive** -- node-level default for passive interfaces (default: False)
  * **ospf.timers** -- default OSPF interface timers. You can override the node values on individual interfaces.
+diff --git a/docs/platforms.md b/docs/platforms.md
+index c5fec46..7632027 100644
+--- a/docs/platforms.md
++++ b/docs/platforms.md
+@@ -31,6 +31,7 @@
+ | Cumulus Linux 5.x (NVUE) [❗](caveats-cumulus-nvue) | cumulus_nvue | minimal |
+ | Dell OS10 [❗](caveats-os10) | dellos10     | full          |
+ | Extreme Networks EXOS [❗](caveats-exos) | exos | minimal  |
++| F5 BIG-IP VE | f5 | minimal |
+ | Fortinet FortiOS [❗](caveats-fortios) | fortios | minimal  |
+ | FRRouting (FRR) [❗](caveats-frr) | frr     | full          |
+ | [Generic Linux host](generic-linux-devices) | linux | full          |
+diff --git a/docs/plugins/loadbalancer.md b/docs/plugins/loadbalancer.md
+index dd2e926..cc60a4e 100644
+--- a/docs/plugins/loadbalancer.md
++++ b/docs/plugins/loadbalancer.md
+@@ -21,6 +21,29 @@ nodes:
+ 
+ Malformed structures are reported as transformation errors.
+ 
++### Structured model and VIP advertisement
++
++The structured `loadbalancer` node attribute (`monitors`, `pools`,
++`virtual_servers`) is what the device templates render. A virtual server can
++set `advertise: true` to inject its VIP into the node's routing protocols:
++
++```yaml
++nodes:
++  lb1:
++    device: a10
++    module: [ ospf ]
++    loadbalancer:
++      pools:
++      - name: web
++        members: [ { name: s1, address: 10.0.0.11, port: 80 } ]
++      virtual_servers:
++      - { name: vip1, vip: 203.0.113.10, port: 80, pool: web, advertise: true }
++```
++
++On A10 ACOS this renders `redistribution-flagged` on that virtual server and
++`redistribute vip only-flagged` under `router ospf`; virtual servers without
++`advertise` stay local.
++
+ ### Health monitors
+ 
+ `loadbalancer.monitors` declares named probes and three attributes bind them,
+@@ -86,6 +109,9 @@ To onboard a new load-balancer device:
+ 1. Add/extend device definition in `netsim/devices/<device>.yml`
+    - include `features.loadbalancer: {}`
+ 2. Add template in `netsim/extra/loadbalancer/<device>.j2`
++3. Ensure the device has a delivery lane: an Ansible deploy path (`deploy-config/<device>.yml`) or
++   `netlab_config_mode: netmiko`. Without one netlab renders the template and silently skips the push
++   (A10 is delivered over netmiko, device type `a10`, saved with `netmiko_save_command`)
+ 4. Add/update tests:
+    - positive rendering test (`netlab create ...` without warning)
+    - negative/unsupported test (warning still emitted when capability is missing)
 diff --git a/mypy.ini b/mypy.ini
 index 5f33029..9f3161f 100644
 --- a/mypy.ini
@@ -972,6 +1026,40 @@ index 0000000..435029a
 +      - "{{ lookup('template', config_template) }}\ncommit\nexit\n"
 +      '.*#': "exit\n"
 +  tags: [ print_action, always ]
+diff --git a/netsim/ansible/tasks/readiness-check/a10.yml b/netsim/ansible/tasks/readiness-check/a10.yml
+new file mode 100644
+index 0000000..f2d244f
+--- /dev/null
++++ b/netsim/ansible/tasks/readiness-check/a10.yml
+@@ -0,0 +1,28 @@
++# A10 vThunder (ACOS) readiness: SSH is not enough.
++#
++# vThunder accepts SSH (and even logs in) while its configuration subsystem is
++# still LOADING; a config push in that window fails on the first submode. The
++# `ssh` readiness step (connect-only, netlab_check_command: "") runs first and
++# proves the management plane; this step then proves what the deploy lane
++# actually needs -- enable mode with the blank enable password, and a
++# `configure terminal` session that opens and closes -- over the same
++# a10.acos_cli network_cli connection the deploy uses.
++#
++# Retry budget comes from a10_config_retries / a10_config_delay (device or
++# runtime group_vars) so the wait is declared data, not a deploy-time retry.
++---
++- name: "Wait for {{ inventory_hostname }} ACOS enable + configure terminal"
++  a10.acos_cli.acos_command:
++    commands:
++    - show version
++    - configure terminal
++    - end
++  become: "{{ ansible_become | default(true) }}"
++  register: a10_ready
++  until: a10_ready is succeeded
++  retries: "{{ a10_config_retries | default(30) }}"
++  delay: "{{ a10_config_delay | default(20) }}"
++
++- name: Confirm {{ inventory_hostname }} ACOS CLI is ready
++  debug:
++    msg: "Node {{ inventory_hostname }} is ready (ACOS enable + configure terminal)."
 diff --git a/netsim/ansible/templates/bgp/panos.j2 b/netsim/ansible/templates/bgp/panos.j2
 new file mode 100644
 index 0000000..8c385ea
@@ -1169,6 +1257,68 @@ index 0000000..8c385ea
 +{% endfor %}
 +set network virtual-router {{ vr }} protocol bgp enable yes
 +{% endif %}
+diff --git a/netsim/ansible/templates/initial/a10.j2 b/netsim/ansible/templates/initial/a10.j2
+new file mode 100644
+index 0000000..581a2e9
+--- /dev/null
++++ b/netsim/ansible/templates/initial/a10.j2
+@@ -0,0 +1,13 @@
++hostname {{ inventory_hostname }}
++{# LLDP. Global `lldp enable rx tx` plus the same per-interface line, the
++   exact seed syntax (demo-lab atl-dc1-a10-lb1_shared configuration.txt).
++   Without this the device never sources or is sourced by any LLDP-derived
++   adjacency, dropping every neighbor link a collector infers from LLDP
++   alone. #}
++lldp enable rx tx
++{% for l in interfaces | default([]) if l.ipv4 is defined and l.ipv4 | ansible.utils.ipv4 %}
++interface ethernet {{ l.ifindex }}
++  enable
++  lldp enable rx tx
++  ip address {{ l.ipv4 | ansible.utils.ipaddr('address') }} /{{ l.ipv4 | ansible.utils.ipaddr('prefix') }}
++{% endfor %}
+diff --git a/netsim/ansible/templates/initial/f5.j2 b/netsim/ansible/templates/initial/f5.j2
+new file mode 100644
+index 0000000..6a77b22
+--- /dev/null
++++ b/netsim/ansible/templates/initial/f5.j2
+@@ -0,0 +1 @@
++{# BIG-IP VE day-0 is handled by containerlab/vrnetlab. Keep netlab initial config empty for now. #}
+diff --git a/netsim/ansible/templates/initial/keysight_ixia-c-controller.j2 b/netsim/ansible/templates/initial/keysight_ixia-c-controller.j2
+new file mode 100644
+index 0000000..48e03d6
+--- /dev/null
++++ b/netsim/ansible/templates/initial/keysight_ixia-c-controller.j2
+@@ -0,0 +1,12 @@
++{#
++  DELIBERATELY EMPTY -- not a stub awaiting content.
++
++  ixia-c components are configured over the OTG API after boot. There is no
++  day-0 configuration for netlab to produce, and putting any here would make
++  this file a SECOND producer of device config, which this platform forbids.
++
++  The file exists because netlab enables `routing` on any host linked to a
++  router and then looks for a template to render. Without it `netlab create`
++  fails with "Cannot find initial configuration template". Rendering nothing is
++  the right answer; having no file reads as an oversight rather than a decision.
++#}
+diff --git a/netsim/ansible/templates/initial/keysight_ixia-c-traffic-engine.j2 b/netsim/ansible/templates/initial/keysight_ixia-c-traffic-engine.j2
+new file mode 100644
+index 0000000..48e03d6
+--- /dev/null
++++ b/netsim/ansible/templates/initial/keysight_ixia-c-traffic-engine.j2
+@@ -0,0 +1,12 @@
++{#
++  DELIBERATELY EMPTY -- not a stub awaiting content.
++
++  ixia-c components are configured over the OTG API after boot. There is no
++  day-0 configuration for netlab to produce, and putting any here would make
++  this file a SECOND producer of device config, which this platform forbids.
++
++  The file exists because netlab enables `routing` on any host linked to a
++  router and then looks for a template to render. Without it `netlab create`
++  fails with "Cannot find initial configuration template". Rendering nothing is
++  the right answer; having no file reads as an oversight rather than a decision.
++#}
 diff --git a/netsim/ansible/templates/initial/panos.j2 b/netsim/ansible/templates/initial/panos.j2
 new file mode 100644
 index 0000000..0783e39
@@ -1255,6 +1405,87 @@ index 0000000..0783e39
 +set network interface loopback units {{ loopback.ifname }} comment "netlab loopback"
 +set network virtual-router {{ vr_name }} interface {{ loopback.ifname }}
 +{% endif %}
+diff --git a/netsim/ansible/templates/initial/versa-director.j2 b/netsim/ansible/templates/initial/versa-director.j2
+new file mode 100644
+index 0000000..cb78373
+--- /dev/null
++++ b/netsim/ansible/templates/initial/versa-director.j2
+@@ -0,0 +1,3 @@
++{# versa-director: no-op initial config. Device boots with image-default admin creds;
++   the collector collects over SSH. Full base-config templating is a device-onboarding
++   follow-up (Viptela/Versa CLI). This lets netlab initial complete cleanly. #}
+diff --git a/netsim/ansible/templates/initial/versa-flexvnf.j2 b/netsim/ansible/templates/initial/versa-flexvnf.j2
+new file mode 100644
+index 0000000..92ed62e
+--- /dev/null
++++ b/netsim/ansible/templates/initial/versa-flexvnf.j2
+@@ -0,0 +1,3 @@
++{# versa-flexvnf: no-op initial config. Device boots with image-default admin creds;
++   the collector collects over SSH. Full base-config templating is a device-onboarding
++   follow-up (Viptela/Versa CLI). This lets netlab initial complete cleanly. #}
+diff --git a/netsim/ansible/templates/loadbalancer/a10.j2 b/netsim/ansible/templates/loadbalancer/a10.j2
+index 4e304a9..dc39bde 100644
+--- a/netsim/ansible/templates/loadbalancer/a10.j2
++++ b/netsim/ansible/templates/loadbalancer/a10.j2
+@@ -28,12 +28,31 @@ health monitor {{ m.name }}
+ 
+ {%   endif %}
+ {% endfor %}
++{% for pool in loadbalancer.pools | default([]) %}
++{%   for member in pool.members | default([]) %}
++slb server {{ member.name }} {{ member.address }}
+ {%     if member.server_monitor | default('default') != 'default' %}
+   {{ hc(member.server_monitor) }}
+ {%     endif %}
++  port {{ member.port }} {{ pool.protocol | default('tcp') }}
+ {%     if member.monitor | default('default') != 'default' %}
+     {{ hc(member.monitor) }}
+ {%     endif %}
++{%   endfor %}
++slb service-group {{ pool.name }} {{ pool.protocol | default('tcp') }}
+ {%   if pool.monitor | default('default', true) != 'default' %}
+   {{ hc(pool.monitor) }}
+ {%   endif %}
++{%   for member in pool.members | default([]) %}
++  member {{ member.name }} {{ member.port }}
++{%   endfor %}
++{% endfor %}
++
++{% for vs in loadbalancer.virtual_servers | default([]) %}
++slb virtual-server {{ vs.name }} {{ vs.vip }}
++{%   if vs.advertise | default(false) %}
++  redistribution-flagged
++{%   endif %}
++  port {{ vs.port }} {{ vs.protocol | default('tcp') }}
++    service-group {{ vs.pool }}
++{% endfor %}
+diff --git a/netsim/ansible/templates/ospf/a10.j2 b/netsim/ansible/templates/ospf/a10.j2
+new file mode 100644
+index 0000000..ef48b47
+--- /dev/null
++++ b/netsim/ansible/templates/ospf/a10.j2
+@@ -0,0 +1,21 @@
++router ospf {{ ospf.process | default(1) }}
++{% if ospf.router_id is defined %}
++  router-id {{ ospf.router_id }}
++{% endif %}
++{% for intf in netlab_interfaces | default([]) if intf.ospf is defined and intf.ipv4 is defined %}
++  network {{ intf.ipv4 | ansible.utils.ipaddr('subnet') }} area {{ intf.ospf.area | default('0.0.0.0') }}
++{%   if intf.ospf.passive | default(false) %}
++  passive-interface ethernet {{ intf.ifindex }}
++{%   endif %}
++{% endfor %}
++{#
++    VIP redistribution. ACOS injects a VIP into a routing protocol only when
++    the protocol redistributes `vip`; `only-flagged` limits that to virtual
++    servers marked redistribution-flagged, which the loadbalancer template
++    renders from loadbalancer.virtual_servers[].advertise. Keyed off the same
++    attribute so the two halves cannot disagree.
++#}
++{% set _lb_vs = loadbalancer.virtual_servers|default([]) if loadbalancer is defined else [] %}
++{% if _lb_vs | selectattr('advertise','defined') | selectattr('advertise') | list %}
++  redistribute vip only-flagged
++{% endif %}
 diff --git a/netsim/ansible/templates/ospf/panos.j2 b/netsim/ansible/templates/ospf/panos.j2
 new file mode 100644
 index 0000000..15d25c9
@@ -1329,6 +1560,51 @@ index 0000000..15d25c9
 +set network virtual-router {{ vr }} protocol redist-profile {{ pname }} action redist
 +set network virtual-router {{ vr }} protocol ospf export-rules {{ pname }} new-path-type ext-2
 +{% endfor %}
+diff --git a/netsim/ansible/templates/routing/a10.j2 b/netsim/ansible/templates/routing/a10.j2
+new file mode 100644
+index 0000000..d937030
+--- /dev/null
++++ b/netsim/ansible/templates/routing/a10.j2
+@@ -0,0 +1,3 @@
++{% for route in routing.static | default([]) %}
++ip route {{ route.ipv4|ansible.utils.ipaddr('network') }} /{{ route.ipv4|ansible.utils.ipaddr('prefix') }} {{ route.nexthop.ipv4 }}
++{% endfor %}
+diff --git a/netsim/ansible/templates/routing/keysight_ixia-c-controller.j2 b/netsim/ansible/templates/routing/keysight_ixia-c-controller.j2
+new file mode 100644
+index 0000000..48e03d6
+--- /dev/null
++++ b/netsim/ansible/templates/routing/keysight_ixia-c-controller.j2
+@@ -0,0 +1,12 @@
++{#
++  DELIBERATELY EMPTY -- not a stub awaiting content.
++
++  ixia-c components are configured over the OTG API after boot. There is no
++  day-0 configuration for netlab to produce, and putting any here would make
++  this file a SECOND producer of device config, which this platform forbids.
++
++  The file exists because netlab enables `routing` on any host linked to a
++  router and then looks for a template to render. Without it `netlab create`
++  fails with "Cannot find initial configuration template". Rendering nothing is
++  the right answer; having no file reads as an oversight rather than a decision.
++#}
+diff --git a/netsim/ansible/templates/routing/keysight_ixia-c-traffic-engine.j2 b/netsim/ansible/templates/routing/keysight_ixia-c-traffic-engine.j2
+new file mode 100644
+index 0000000..48e03d6
+--- /dev/null
++++ b/netsim/ansible/templates/routing/keysight_ixia-c-traffic-engine.j2
+@@ -0,0 +1,12 @@
++{#
++  DELIBERATELY EMPTY -- not a stub awaiting content.
++
++  ixia-c components are configured over the OTG API after boot. There is no
++  day-0 configuration for netlab to produce, and putting any here would make
++  this file a SECOND producer of device config, which this platform forbids.
++
++  The file exists because netlab enables `routing` on any host linked to a
++  router and then looks for a template to render. Without it `netlab create`
++  fails with "Cannot find initial configuration template". Rendering nothing is
++  the right answer; having no file reads as an oversight rather than a decision.
++#}
 diff --git a/netsim/ansible/templates/routing/panos.j2 b/netsim/ansible/templates/routing/panos.j2
 new file mode 100644
 index 0000000..a668f12
@@ -1336,6 +1612,35 @@ index 0000000..a668f12
 +++ b/netsim/ansible/templates/routing/panos.j2
 @@ -0,0 +1 @@
 +{# PAN-OS static routing is deployed through Ansible modules / feature templates. #}
+diff --git a/netsim/ansible/templates/services/a10.j2 b/netsim/ansible/templates/services/a10.j2
+new file mode 100644
+index 0000000..e33a8ed
+--- /dev/null
++++ b/netsim/ansible/templates/services/a10.j2
+@@ -0,0 +1,23 @@
++{% if services.server.snmp is defined %}
++{#
++    SNMP agent. The community is a parameter defaulting to `skyforge` -- the
++    community the collector's collectors poll with. Any other default leaves every
++    device reachable and unpollable.
++
++    TOP-LEVEL `snmp-server community read`, deliberately, NOT the SNMPv1-v2c
++    submode this was first ported as. Per A10's own AXAPI schema (vendored at
++    a10/acos_axapi), these are two DIFFERENT objects:
++      /snmp-server/community/read/{user}   user = "SNMPv1/v2c community string"
++      /snmp-server/SNMPv1-v2c/user/{user}  user = "community configuration key",
++                                           whose value comes from `passwd`
++    so `community read` is not a child of the SNMPv1-v2c submode in either
++    form. The submode version could only ever be pushed by a bespoke
++    snmp_config deploy playbook, which the services module has no equivalent
++    of -- the rendered file goes out as FLAT config lines, where the indented
++    line lands in plain (config) mode and ACOS answers
++    `% Unrecognized command`. This form needs no deploy override at all.
++#}
++snmp-server enable service
++snmp-server community read {{ services.server.snmp.community|default('skyforge') }}
++lldp enable rx tx
++{% endif %}
 diff --git a/netsim/ansible/templates/services/panos.j2 b/netsim/ansible/templates/services/panos.j2
 new file mode 100644
 index 0000000..2ee24cd
@@ -1357,6 +1662,409 @@ index 0000000..2ee24cd
 +set network interface ethernet {{ intf.ifname }} layer3 lldp enable yes
 +{% endfor %}
 +{% endif %}
+diff --git a/netsim/ansible/templates/services/versa-director.j2 b/netsim/ansible/templates/services/versa-director.j2
+new file mode 100644
+index 0000000..afe0247
+--- /dev/null
++++ b/netsim/ansible/templates/services/versa-director.j2
+@@ -0,0 +1,15 @@
++{#
++    versa-director renders NOTHING here, deliberately.
++
++    netlab resolves a config template for EVERY node whose module list includes
++    `services`, and groups.all force-adds `module: [ services ]` fleet-wide, so
++    this file must exist or every topology containing a versa-director node dies at
++    compile with "Cannot find services configuration template" -- which is
++    exactly how 0042 first landed: declaring features.services without the
++    template moved the failure rather than fixing it.
++
++    It is empty because Versa takes no SNMP agent over this CLI. the collector
++    collects this device with versa_director_api, so there is nothing for netlab to
++    render here, and features.services.server.snmp is deliberately not declared.
++    Do not "complete" this template.
++#}
+diff --git a/netsim/ansible/templates/services/versa-flexvnf.j2 b/netsim/ansible/templates/services/versa-flexvnf.j2
+new file mode 100644
+index 0000000..d76b248
+--- /dev/null
++++ b/netsim/ansible/templates/services/versa-flexvnf.j2
+@@ -0,0 +1,15 @@
++{#
++    versa-flexvnf renders NOTHING here, deliberately.
++
++    netlab resolves a config template for EVERY node whose module list includes
++    `services`, and groups.all force-adds `module: [ services ]` fleet-wide, so
++    this file must exist or every topology containing a versa-flexvnf node dies at
++    compile with "Cannot find services configuration template" -- which is
++    exactly how 0042 first landed: declaring features.services without the
++    template moved the failure rather than fixing it.
++
++    It is empty because Versa takes no SNMP agent over this CLI. the collector
++    collects this device with versa_flexvnf_ssh, so there is nothing for netlab to
++    render here, and features.services.server.snmp is deliberately not declared.
++    Do not "complete" this template.
++#}
+diff --git a/netsim/cli/initial/netmiko.py b/netsim/cli/initial/netmiko.py
+index f22fdbc..79bb1ea 100644
+--- a/netsim/cli/initial/netmiko.py
++++ b/netsim/cli/initial/netmiko.py
+@@ -31,6 +31,67 @@ def _session_tail(session_log: str, lines: int = 40) -> str:
+   return '\n--- last ' + str(len(tail)) + ' lines of ' + session_log + ' ---\n' + '\n'.join(tail) + '\n--- end of session log ---'
+ 
+ 
++def _wait_until_ready(net_connect, n_data: Box, topology: Box, reconnect=None, sleep=time.sleep):
++  """Wait for a device that announces "still loading" in its own CLI prompt.
++
++  Some devices accept SSH, log in, and even enter enable and configuration modes while
++  their configuration subsystem is still starting, then reject the first real
++  configuration line. A10 vThunder is the case this was written for: its prompt reads
++  `vThunder(LOADING)#` and the login banner says "System is not ready. Please wait a
++  moment." until it is done, and `hostname <name>` is "Unrecognized command" until then.
++  It can also close the SSH session while it finishes loading, so a closed socket during the
++  wait is answered by reconnecting (`reconnect`), within the same budget.
++
++  The device declares the signal as `netmiko_not_ready_regexp` (matched against the CLI
++  prompt); the wait is bounded by the same netlab_check_retries * netlab_check_delay
++  budget the readiness checks use. This is a wait for a state the device itself reports,
++  not a retry of the configuration push. A device that declares no pattern is unaffected.
++
++  Returns the connection to use (a new one after a reconnect) or None if the device never
++  became ready.
++  """
++  pattern = a_devices.get_node_group_var(n_data,'netmiko_not_ready_regexp',topology.defaults)
++  if not pattern:
++    return net_connect
++  retries = int(a_devices.get_node_group_var(n_data,'netlab_check_retries',topology.defaults) or 30)
++  delay = int(a_devices.get_node_group_var(n_data,'netlab_check_delay',topology.defaults) or 10)
++  state = ''
++  for attempt in range(retries + 1):
++    try:
++      prompt = net_connect.find_prompt()
++      state = f'CLI prompt: {prompt} (matches netmiko_not_ready_regexp {pattern})'
++      if not re.search(pattern,prompt):
++        if attempt:
++          net_connect.set_base_prompt()
++          log.info(f'{n_data.name} reports ready after {attempt * delay} seconds (prompt {prompt})',module='netmiko')
++        return net_connect
++    except Exception as ex:
++      state = f'session error while waiting: {type(ex).__name__}: {ex}'
++      if reconnect:
++        fresh = reconnect()
++        if fresh:
++          net_connect = fresh
++          continue
++    if attempt < retries:
++      sleep(delay)
++  log.error(
++    f'{n_data.name} still reports it is not ready after {retries * delay} seconds',
++    more_data=state,
++    more_hints='The device never left its loading state; configuration was not attempted',
++    module='netmiko')
++  return None
++
++
++def _reconnect(n_data: Box, netmiko_params: dict):
++  """A quiet second connection attempt (netmiko.connect() reports a failure as fatal)."""
++  try:
++    fresh = _netmiko._netmiko.ConnectHandler(**netmiko_params)
++    fresh.enable()
++    return fresh
++  except Exception:
++    return None
++
++
+ def deploy(n_data: Box,topology: Box,n_deploy: list) -> None:
+   node_config = n_data.get('_node_config',None)
+   if not node_config:
+@@ -57,6 +118,11 @@ def deploy(n_data: Box,topology: Box,n_deploy: list) -> None:
+   if netmiko_delay:
+     time.sleep(netmiko_delay)
+ 
++  net_connect = _wait_until_ready(net_connect,n_data,topology,reconnect=lambda: _reconnect(n_data,netmiko_params))
++  if not net_connect:
++    append_to_list(n_data._deploy,'failed',n_deploy[0])
++    return
++
+   netmiko_err_list = features.get('netmiko.error_regexp',None)
+   netmiko_errors = rf"({'|'.join(netmiko_err_list)})" if isinstance(netmiko_err_list,list) else (netmiko_err_list or "")
+   if log.debug_active('netmiko'):
+diff --git a/netsim/devices/a10.yml b/netsim/devices/a10.yml
+new file mode 100644
+index 0000000..85cb93a
+--- /dev/null
++++ b/netsim/devices/a10.yml
+@@ -0,0 +1,87 @@
++---
++description: A10 vThunder load balancer
++support:
++  level: minimal
++  caveats:
++  - A10 vThunder configuration is deployed with netmiko (device type `a10`, enable mode) for
++    every module template and saved with `write memory` unless `netlab_save_config` is false.
++    Readiness is still checked with the a10.acos_cli collection.
++  - Load-balancer VIPs marked `advertise` are flagged for redistribution and injected into OSPF
++    with `redistribute vip only-flagged`.
++interface_name: ethernet {ifindex}
++mgmt_if: management
++role: host
++clab:
++  image: vrnetlab/a10_vthunder:5.2.0
++  node:
++    kind: a10_vthunder
++    env:
++      PASSWORD: a10
++      QEMU_MEMORY: "4096"
++      QEMU_SMP: "4"
++      QEMU_CPU: host
++  interface:
++    name: eth{ifindex}
++group_vars:
++  ansible_network_os: acos
++  ansible_user: admin
++  ansible_password: a10
++  ansible_ssh_pass: a10
++  ansible_connection: network_cli
++  collections:
++  - a10.acos_cli
++  - a10.acos_axapi
++  ansible_become: yes
++  ansible_become_method: enable
++  # The default vThunder enable password is blank. The A10 terminal plugin uses
++  # enable mode to disable CLI paging before running show/config commands.
++  ansible_become_password: ""
++  ansible_timeout: 180
++  ansible_command_timeout: 180
++  # ACOS accepts SSH before the interactive CLI can return ssh-exec output.
++  # Use netlab's connect-only SSH readiness contract; the configuration is
++  # applied over netmiko after management is reachable.
++  netlab_check_command: ""
++  ansible_ssh_common_args: >-
++    -o StrictHostKeyChecking=no
++    -o UserKnownHostsFile=/dev/null
++    -o ConnectTimeout=30
++    -o ConnectionAttempts=10
++  netlab_ssh_args: -tt
++  netlab_device_type: a10
++  netlab_config_mode: netmiko
++  netmiko_device_type: a10
++  netmiko_error_regexp:
++  - '% Invalid input'
++  - '% Incomplete command'
++  - Unrecognized command
++  # netmiko's A10 driver cannot save_config()
++  netmiko_save_command: write memory
++  # vThunder accepts SSH and enters config mode while still LOADING, then rejects the first
++  # configuration line; its own prompt (vThunder(LOADING)#) is the not-ready signal.
++  netmiko_not_ready_regexp: '\(LOADING\)'
++  netlab_console_connection: ssh
++  # ssh first (connect-only, above), then readiness-check/a10.yml proves enable
++  # mode and a configure-terminal session before netmiko pushes the config.
++  netlab_ready: [ ssh, ansible ]
++  netlab_check_retries: 90
++  netlab_check_delay: 10
++external:
++  image: none
++graphite.icon: server
++features:
++  services:
++    # SNMP agent: this device answers an NMS. Ported from the
++    # snmp_config custom config module.
++    server.snmp: True
++  loadbalancer: true
++  initial:
++    config_mode: [ netmiko ]
++    roles: [ host ]
++  ospf:
++    ipv4: true
++  routing:
++    static: true
++
++kne:
++  interface.name: eth{ifindex}
+diff --git a/netsim/devices/f5.yml b/netsim/devices/f5.yml
+new file mode 100644
+index 0000000..bec98aa
+--- /dev/null
++++ b/netsim/devices/f5.yml
+@@ -0,0 +1,35 @@
++---
++description: F5 BIG-IP VE load balancer
++support:
++  level: minimal
++interface_name: 1.{ifindex}
++mgmt_if: mgmt
++role: host
++clab:
++  image: vrnetlab/f5_bigip-ve
++  build: https://containerlab.dev/manual/kinds/f5_bigipve/
++  node:
++    kind: f5_bigip-ve
++    env:
++      PASSWORD: Labl@b!234
++      F5_NEW_PASSWORD: Labl@b!234
++  interface:
++    name: eth{ifindex}
++group_vars:
++  ansible_user: admin
++  ansible_ssh_pass: Labl@b!234
++  ansible_connection: ssh
++  ansible_network_os: f5
++  netlab_device_type: f5
++  netlab_ready: [ ssh ]
++  netlab_check_command: show sys version
++  netlab_check_retries: 180
++external:
++  image: none
++graphite.icon: server
++features:
++  initial:
++    roles: [ host ]
++  loadbalancer: {}
++kne:
++  interface.name: eth{ifindex}
+diff --git a/netsim/devices/keysight_ixia-c-controller.yml b/netsim/devices/keysight_ixia-c-controller.yml
+new file mode 100644
+index 0000000..08acb8e
+--- /dev/null
++++ b/netsim/devices/keysight_ixia-c-controller.yml
+@@ -0,0 +1,64 @@
++---
++description: Keysight ixia-c OTG controller (the API, no data ports)
++
++# WHY TWO DEVICES AND NOT ONE.
++#
++# The first cut of this used the `ixia-c-one` image, on the strength of a
++# design note calling it "a single container, ~2 CPU / 2 GB for two ports".
++# MEASURED on node-d 2026-09-05, that image is DOCKER-IN-DOCKER: entrypoint
++# ./bin/ixiacd, exposes 2375/2376, environment carries DOCKER_VERSION and
++# DIND_COMMIT. It reaches Running and then serves nothing at all --
++#
++#   Cannot connect to the Docker daemon at unix:///var/run/docker.sock
++#   Could not start control loop: could not wait for docker daemon
++#
++# -- with no port listening. It wants privileged mode and a Docker daemon
++# inside the pod, on Talos nodes running containerd. It is not usable here.
++#
++# The COMPONENT images are ordinary containers and they work. The controller
++# was verified standalone: unprivileged, 200m CPU, HTTP 200 on /config at 8443.
++# A KNE node is a single-container pod (our fork's only sidecar mechanism is
++# KubeVirt-specific), so controller and engine are separate NODES.
++parent: unknown
++
++interface_name: eth{ifindex}
++mgmt_if: eth0
++role: host
++
++clab:
++  image: registry.example.com/skyforge/ixia-c-controller:0.0.1-4555
++  node:
++    kind: keysight_ixia-c-controller
++  interface:
++    name: eth{ifindex}
++
++kne:
++  interface.name: eth{ifindex}
++
++group_vars:
++  netlab_device_type: keysight_ixia-c-controller
++  netlab_ready: []
++  # Renders nothing: this device is driven over the OTG API after boot, not by
++  # generated configuration. Without this the defaults generator derives
++  # initial_policy "always" from its fallback -- measured -- and "always" is
++  # exactly what makes netlab produce day-0 config for a device that cannot
++  # accept any.
++  netlab_initial: never
++
++external:
++  image: none
++
++graphite.icon: server
++
++features:
++  initial:
++    roles: [ host ]
++    collect: false
++    reload: false
++  # netlab enables `routing` on any host the moment it is linked to a router,
++  # so it can work out how that host reaches anything past its own subnet.
++  # Declaring it is not optional -- without it netlab refuses the node with
++  # "does not support module routing". It renders nothing here; see the empty
++  # templates beside this file for why that is deliberate.
++  routing:
++    static: true
+diff --git a/netsim/devices/keysight_ixia-c-traffic-engine.yml b/netsim/devices/keysight_ixia-c-traffic-engine.yml
+new file mode 100644
+index 0000000..10e38bb
+--- /dev/null
++++ b/netsim/devices/keysight_ixia-c-traffic-engine.yml
+@@ -0,0 +1,67 @@
++---
++description: Keysight ixia-c OTG traffic engine (one data port)
++
++# WHY TWO DEVICES AND NOT ONE.
++#
++# The first cut used the `ixia-c-one` image, on the strength of a design note
++# calling it "a single container, ~2 CPU / 2 GB for two ports". MEASURED on
++# node-d 2026-09-05, that image is DOCKER-IN-DOCKER: entrypoint
++# ./bin/ixiacd, exposes 2375/2376, DIND_COMMIT in its environment. It reaches
++# Running and then serves nothing at all --
++#
++#   Cannot connect to the Docker daemon at unix:///var/run/docker.sock
++#   Could not start control loop: could not wait for docker daemon
++#
++# -- with no port listening. It wants privileged mode and a Docker daemon
++# inside the pod, on Talos nodes running containerd. Not usable here.
++#
++# The component images are ordinary containers. A KNE node is a
++# single-container pod (our fork's only sidecar mechanism is KubeVirt-specific)
++# so the controller and each engine are separate NODES. This is the node an
++# interface gets attached to; the controller beside it is the API.
++parent: unknown
++
++interface_name: eth{ifindex}
++mgmt_if: eth0
++role: host
++
++clab:
++  image: registry.example.com/skyforge/ixia-c-traffic-engine:1.8.0.544
++  node:
++    kind: keysight_ixia-c-traffic-engine
++  interface:
++    name: eth{ifindex}
++
++kne:
++  interface.name: eth{ifindex}
++  # The engine's env is set by add_ixia_c_engine_env() in the KNE provider, not
++  # here. It has to be, because ARG_IFACE_LIST must name the node's REAL data
++  # interfaces -- which are only known once links are resolved -- and eth0 must
++  # be excluded, or the engine claims the management path it is reached over.
++  # A static list here would be right for one topology and wrong for the next.
++
++group_vars:
++  netlab_device_type: keysight_ixia-c-traffic-engine
++  netlab_ready: []
++  # Renders nothing: driven over the OTG API after boot, not by generated
++  # config. Without this the defaults generator derives initial_policy
++  # "always" from its fallback -- measured -- and "always" is exactly what
++  # makes netlab produce day-0 config for a device that cannot accept any.
++  netlab_initial: never
++
++external:
++  image: none
++
++graphite.icon: server
++
++features:
++  initial:
++    roles: [ host ]
++    collect: false
++    reload: false
++  # netlab enables `routing` on any host the moment it is linked to a router.
++  # Declaring it is not optional -- without it netlab refuses the node with
++  # "does not support module routing". It renders nothing; see the empty
++  # templates beside this file.
++  routing:
++    static: true
 diff --git a/netsim/devices/panos.yml b/netsim/devices/panos.yml
 new file mode 100644
 index 0000000..707a57a
@@ -1467,6 +2175,120 @@ index 0000000..707a57a
 +
 +kne:
 +  interface.name: eth{ifindex}
+diff --git a/netsim/devices/versa-director.yml b/netsim/devices/versa-director.yml
+new file mode 100644
+index 0000000..01c24a5
+--- /dev/null
++++ b/netsim/devices/versa-director.yml
+@@ -0,0 +1,37 @@
++---
++description: Versa Director
++parent: unknown
++interface_name: eth{ifindex}
++mgmt_if: eth0
++skip_config: [ initial ]
++clab:
++  image: vrnetlab/vr-versa-director
++group_vars:
++  ansible_user: admin
++  ansible_ssh_pass: versa123
++  ansible_password: versa123
++  netlab_device_type: versa-director
++  ansible_network_os: versa
++  ansible_connection: network_cli
++features:
++  # Declares that this device SUPPORTS the services module, which is what puts
++  # it in services.supported_on and lets `netlab create` proceed -- groups.all
++  # force-adds `module: [ services ]` to every node, so without this the device
++  # failed `netlab create` with
++  #   IncorrectValue in modules: Device type versa-director (node n1)
++  #   does not support module services
++  #
++  # Declared GLOBALLY, not under a provider key: add_device_module_support skips
++  # a device already present in a module's supported_on map, so a provider-scoped
++  # declaration can be silently ignored depending on registration order. Same
++  # shape 0038 used for the Viptela pair.
++  #
++  # server.snmp is deliberately ABSENT. Versa does not take an SNMP agent over
++  # this CLI, and the collector collects these with versa_director_api. Claiming server.snmp would
++  # make the fleet-wide attribute look renderable here and invite someone to
++  # emit syntax the NOS rejects.
++  services:
++    dns:
++      transport_vrf: false
++  sdwan:
++    types: [ controller ]
+diff --git a/netsim/devices/versa-flexvnf.yml b/netsim/devices/versa-flexvnf.yml
+new file mode 100644
+index 0000000..1662b7e
+--- /dev/null
++++ b/netsim/devices/versa-flexvnf.yml
+@@ -0,0 +1,37 @@
++---
++description: Versa FlexVNF
++parent: unknown
++interface_name: eth{ifindex}
++mgmt_if: eth0
++skip_config: [ initial ]
++clab:
++  image: vrnetlab/vr-versa-flexvnf
++group_vars:
++  ansible_user: versa
++  ansible_ssh_pass: versa123
++  ansible_password: versa123
++  netlab_device_type: versa-flexvnf
++  ansible_network_os: versa
++  ansible_connection: network_cli
++features:
++  # Declares that this device SUPPORTS the services module, which is what puts
++  # it in services.supported_on and lets `netlab create` proceed -- groups.all
++  # force-adds `module: [ services ]` to every node, so without this the device
++  # failed `netlab create` with
++  #   IncorrectValue in modules: Device type versa-flexvnf (node n1)
++  #   does not support module services
++  #
++  # Declared GLOBALLY, not under a provider key: add_device_module_support skips
++  # a device already present in a module's supported_on map, so a provider-scoped
++  # declaration can be silently ignored depending on registration order. Same
++  # shape 0038 used for the Viptela pair.
++  #
++  # server.snmp is deliberately ABSENT. Versa does not take an SNMP agent over
++  # this CLI, and the collector collects these with versa_flexvnf_ssh. Claiming server.snmp would
++  # make the fleet-wide attribute look renderable here and invite someone to
++  # emit syntax the NOS rejects.
++  services:
++    dns:
++      transport_vrf: false
++  sdwan:
++    types: [ edge ]
+diff --git a/netsim/extra/loadbalancer/a10.j2 b/netsim/extra/loadbalancer/a10.j2
+index cbe8233..dc39bde 100644
+--- a/netsim/extra/loadbalancer/a10.j2
++++ b/netsim/extra/loadbalancer/a10.j2
+@@ -50,6 +50,9 @@ slb service-group {{ pool.name }} {{ pool.protocol | default('tcp') }}
+ 
+ {% for vs in loadbalancer.virtual_servers | default([]) %}
+ slb virtual-server {{ vs.name }} {{ vs.vip }}
++{%   if vs.advertise | default(false) %}
++  redistribution-flagged
++{%   endif %}
+   port {{ vs.port }} {{ vs.protocol | default('tcp') }}
+     service-group {{ vs.pool }}
+ {% endfor %}
+diff --git a/netsim/extra/loadbalancer/defaults.yml b/netsim/extra/loadbalancer/defaults.yml
+index 957d12b..b5c9884 100644
+--- a/netsim/extra/loadbalancer/defaults.yml
++++ b/netsim/extra/loadbalancer/defaults.yml
+@@ -108,3 +108,9 @@ attributes:
+     pool:
+       type: str
+       _required: true
++    advertise:
++      type: bool
++      _description: |
++        Advertise the VIP into the node's routing protocols. On A10 ACOS the
++        virtual server is marked redistribution-flagged and OSPF gets
++        `redistribute vip only-flagged`; unflagged VIPs stay local.
 diff --git a/netsim/modules/bgp.py b/netsim/modules/bgp.py
 index 741d866..5ccb6e3 100644
 --- a/netsim/modules/bgp.py
@@ -1581,6 +2403,227 @@ index 6045a98..3c95078 100644
    digest: MD5 authentication
    gr: OSPF graceful restart (restart and helper)
    import: Import routes from other routing protocols
+diff --git a/tests/test_a10_deploy_and_vip_advertise.py b/tests/test_a10_deploy_and_vip_advertise.py
+new file mode 100644
+index 0000000..dbd030f
+--- /dev/null
++++ b/tests/test_a10_deploy_and_vip_advertise.py
+@@ -0,0 +1,127 @@
++#!/usr/bin/env python3
++"""
++A10 vThunder (ACOS):
++
++  * every module template the a10 device renders must be delivered -- when
++    deploy-config/a10.yml was missing, deploy-module.yml found the template,
++    found no deploy script and SKIPPED it, and the lab reported configured while
++    the vThunder ran its factory config. It is now delivered over netmiko, so
++    every module must map to the netmiko lane;
++  * loadbalancer.virtual_servers[].advertise renders BOTH halves of ACOS VIP
++    redistribution: `redistribution-flagged` on that virtual server and
++    `redistribute vip only-flagged` under router ospf. Unflagged VIPs stay
++    local, and a node with no flagged VIP gets no redistribution at all.
++"""
++
++import textwrap
++from pathlib import Path
++
++import pytest
++import yaml
++
++from netsim.augment import devices
++from netsim.cli import create
++from netsim.utils import log
++
++NETSIM = Path(__file__).resolve().parents[1] / 'netsim'
++
++
++def init_log(raise_error: bool = False) -> None:
++  log.init_log_system(header=False)
++  log.set_flag(quiet=True,raise_error=raise_error,warning=False,logging=False,verbose=0)
++
++
++def write_topology(tmp_path: Path, advertise: str) -> Path:
++  topo_file = tmp_path / 'topology.yml'
++  topo_file.write_text(textwrap.dedent(f"""
++    provider: kne
++    plugin: [ loadbalancer ]
++    module: [ ospf ]
++    nodes:
++      lb:
++        device: a10
++        module: [ ospf ]              # real A10 labs list their modules too
++        ospf.router_id: 10.254.2.6
++        loadbalancer:
++          pools:
++          - name: web
++            members:
++            - {{ name: s1, address: 10.55.101.11, port: 80 }}
++          virtual_servers:
++          - {{ name: flagged_vip, vip: 210.140.140.140, port: 80, pool: web {advertise} }}
++          - {{ name: local_vip, vip: 210.140.140.141, port: 80, pool: web }}
++      r1: {{ device: iol }}
++    links: [ lb-r1 ]
++    """).strip() + '\n')
++  return topo_file
++
++
++def module_cfg(node: str, module: str) -> str:
++  return Path(f'node_files/{node}/{module}').read_text()
++
++
++def test_a10_vip_advertise_renders_flag_and_ospf_redistribution(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.chdir(tmp_path)
++  init_log()
++  create.run(['-o','config','-o','provider',str(write_topology(tmp_path,', advertise: true'))])
++
++  lb = module_cfg('lb','loadbalancer')
++  assert 'slb virtual-server flagged_vip 210.140.140.140\n  redistribution-flagged\n  port 80 tcp\n' in lb
++  assert 'slb virtual-server local_vip 210.140.140.141\n  port 80 tcp\n' in lb   # unflagged stays local
++  assert lb.count('redistribution-flagged') == 1
++
++  ospf = module_cfg('lb','ospf')
++  assert ospf.startswith('router ospf 1\n')
++  assert '  redistribute vip only-flagged\n' in ospf
++
++
++def test_a10_without_advertise_renders_no_redistribution(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.chdir(tmp_path)
++  init_log()
++  create.run(['-o','config','-o','provider',str(write_topology(tmp_path,''))])
++
++  assert 'redistribution-flagged' not in module_cfg('lb','loadbalancer')
++  ospf = module_cfg('lb','ospf')
++  assert 'router ospf 1' in ospf                                          # positive control: OSPF did render
++  assert 'redistribute vip' not in ospf
++
++
++def test_a10_advertise_must_be_a_bool(tmp_path: Path) -> None:
++  init_log(raise_error=True)
++  with pytest.raises(log.ErrorAbort):
++    create.run(['-o','none',str(write_topology(tmp_path,', advertise: sometimes'))])
++
++
++def test_every_a10_module_template_is_delivered_over_netmiko(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.chdir(tmp_path)
++  init_log()
++  topology = create.run(['-o','config','-o','provider',str(write_topology(tmp_path,', advertise: true'))])
++  lb = topology.nodes.lb
++
++  assert devices.get_node_group_var(lb,'netlab_config_mode',topology.defaults) == 'netmiko'
++  modules = ['initial','ospf','loadbalancer']
++  for m in modules:
++    assert lb._node_config[m] == ':netmiko', m
++    assert Path(f'node_files/lb/{m}').exists(), m
++  assert set(lb.netlab_ansible_skip_module) >= set(modules)   # nothing left for the Ansible lane
++
++  device = yaml.safe_load((NETSIM / 'devices' / 'a10.yml').read_text())
++  assert device['group_vars']['netmiko_device_type'] == 'a10'
++  assert device['group_vars']['netmiko_save_command'] == 'write memory'
++  # The acos_config lane is retired, not dormant
++  assert not (NETSIM / 'ansible' / 'tasks' / 'deploy-config' / 'a10.yml').exists()
++  assert not (NETSIM / 'ansible' / 'tasks' / 'a10').exists()
++
++  templates = sorted(p.parent.name for p in (NETSIM / 'ansible' / 'templates').glob('*/a10.j2'))
++  assert {'initial','ospf','routing','services','loadbalancer'} <= set(templates)
++
++
++def test_a10_readiness_proves_the_cli_not_just_ssh() -> None:
++  device = yaml.safe_load((NETSIM / 'devices' / 'a10.yml').read_text())
++  assert device['group_vars']['netlab_ready'] == ['ssh','ansible']
++  ready = yaml.safe_load((NETSIM / 'ansible' / 'tasks' / 'readiness-check' / 'a10.yml').read_text())
++  probe = ready[0]
++  cmds = probe['a10.acos_cli.acos_command']['commands']
++  assert 'configure terminal' in cmds and cmds[-1] == 'end'
++  assert probe['until'] == 'a10_ready is succeeded'
++  assert 'a10_config_retries' in str(probe['retries'])
+diff --git a/tests/test_netmiko_wait_until_ready.py b/tests/test_netmiko_wait_until_ready.py
+new file mode 100644
+index 0000000..b82f8c6
+--- /dev/null
++++ b/tests/test_netmiko_wait_until_ready.py
+@@ -0,0 +1,82 @@
++"""A device that reports "still loading" in its CLI prompt is waited for, not configured early.
++
++SKYFORGE-SPECIFIC: A10 vThunder answers `hostname <name>` with "Unrecognized command" while its
++prompt reads `vThunder(LOADING)#`.
++"""
++import pytest
++from box import Box
++
++from netsim.cli.initial import netmiko as nm
++
++
++class _FakeConn:
++  def __init__(self, prompts):
++    self.prompts = list(prompts)
++    self.polls = 0
++    self.base_prompt_resets = 0
++
++  def find_prompt(self):
++    self.polls += 1
++    return self.prompts.pop(0) if len(self.prompts) > 1 else self.prompts[0]
++
++  def set_base_prompt(self):
++    self.base_prompt_resets += 1
++
++
++def _topology(**group_vars):
++  gv = {'netlab_check_retries': 3, 'netlab_check_delay': 7, **group_vars}
++  return Box({'provider': 'kne', 'defaults': {'provider': 'kne', 'devices': {'a10': {'group_vars': gv}}}}, box_dots=True)
++
++
++def _node():
++  return Box({'name': 'lb1', 'device': 'a10', 'provider': 'kne'}, box_dots=True)
++
++
++def test_waits_for_a_loading_prompt_then_proceeds() -> None:
++  conn = _FakeConn(['vThunder(LOADING)#', 'vThunder(LOADING)#', 'vThunder#'])
++  slept: list = []
++  topo = _topology(netmiko_not_ready_regexp=r'\(LOADING\)')
++  assert nm._wait_until_ready(conn, _node(), topo, sleep=slept.append) is conn
++  assert slept == [7, 7]               # waited twice, once per LOADING prompt
++  assert conn.base_prompt_resets == 1  # the prompt changed, so the session re-learns it
++
++
++def test_a_ready_device_is_not_delayed() -> None:
++  conn = _FakeConn(['vThunder#'])
++  slept: list = []
++  assert nm._wait_until_ready(conn, _node(), _topology(netmiko_not_ready_regexp=r'\(LOADING\)'), sleep=slept.append) is conn
++  assert slept == [] and conn.base_prompt_resets == 0
++
++
++def test_a_device_that_never_loads_fails_within_the_budget() -> None:
++  conn = _FakeConn(['vThunder(LOADING)#'])
++  slept: list = []
++  assert nm._wait_until_ready(conn, _node(), _topology(netmiko_not_ready_regexp=r'\(LOADING\)'), sleep=slept.append) is None
++  assert len(slept) == 3 and conn.polls == 4   # retries=3: four looks, three waits, then give up
++
++
++def test_a_device_with_no_declared_signal_is_untouched() -> None:
++  conn = _FakeConn(['anything(LOADING)#'])
++  assert nm._wait_until_ready(conn, _node(), _topology(), sleep=lambda s: pytest.fail('must not wait')) is conn
++  assert conn.polls == 0
++
++
++class _ClosedConn(_FakeConn):
++  def find_prompt(self):
++    self.polls += 1
++    raise OSError('Socket is closed')
++
++
++def test_a_closed_session_during_the_wait_is_reconnected() -> None:
++  dead, fresh = _ClosedConn(['x']), _FakeConn(['vThunder#'])
++  topo = _topology(netmiko_not_ready_regexp=r'\(LOADING\)')
++  assert nm._wait_until_ready(dead, _node(), topo, reconnect=lambda: fresh, sleep=lambda s: None) is fresh
++  assert dead.polls == 1 and fresh.polls == 1
++
++
++def test_a_session_that_cannot_be_reestablished_fails_within_the_budget() -> None:
++  dead = _ClosedConn(['x'])
++  slept: list = []
++  topo = _topology(netmiko_not_ready_regexp=r'\(LOADING\)')
++  assert nm._wait_until_ready(dead, _node(), topo, reconnect=lambda: None, sleep=slept.append) is None
++  assert len(slept) == 3 and dead.polls == 4
 diff --git a/tests/test_panos_initial_gates.py b/tests/test_panos_initial_gates.py
 new file mode 100644
 index 0000000..56d3486

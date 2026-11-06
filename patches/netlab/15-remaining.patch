@@ -1,0 +1,1319 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 00:00:00 +0000
+Subject: [PATCH] netlab: remove cSRX, overlap Ansible lane, plain lldp
+ attribute for Linux hosts
+
+---
+diff --git a/docs/caveats.md b/docs/caveats.md
+index fb58315..8d8c798 100644
+--- a/docs/caveats.md
++++ b/docs/caveats.md
+@@ -565,14 +565,6 @@ Implementation limitations in import/export route filters (reported as errors th
+ * VRRPv3 for IPv4 implementation uses the [checksum calculation that is incompatible with most other VRRP implementations](https://blog.ipspace.net/2025/01/sturgeon-law-vrrp-edition/). The `checksum-without-pseudoheader` configuration command does not seem to be available.
+ * Anycast gateway is unsupported
+ 
+-(caveats-csrx)=
+-## Juniper cSRX
+-
+-* cSRX is a native container and should not be confused with vSRX which is a vrnetlab VM in a container. See [Juniper's cSRX documentation](https://www.juniper.net/documentation/us/en/software/csrx/csrx-consolidated-deployment-guide/topics/concept/security-csrx-docker-feature-support.html) for more details.
+-* cSRX might require a license file to unlock additional features. You can specify the location of the license file with the **clab.license** node parameter or **defaults.devices.csrx.clab.node.license** [device default](topo-defaults).
+-* cSRX supports up to 17 interfaces: 1 out-of-band management Interface (eth0) and 16 in-band interfaces (ge-0/0/0 to ge-0/0/15).
+-* Since cSRX does not support any dynamic routing protocols, use the **routing** module and static routes.
+-
+ (caveats-vmx)=
+ ## Juniper vMX
+ 
+diff --git a/docs/labs/linux.md b/docs/labs/linux.md
+index 63ee43f..9946c91 100644
+--- a/docs/labs/linux.md
++++ b/docs/labs/linux.md
+@@ -111,6 +111,12 @@ LLDP is started on Ubuntu virtual machines if the **netlab_lldp_enable** group v
+ 
+ To enable LLDP on Ubuntu virtual machines, set the **netlab_lldp_enable** node parameter or **defaults.devices.linux.group_vars.netlab_lldp_enable** variable to **True**.
+ 
++### LLDP on KNE Linux hosts
++
++Linux hosts running under the **kne** provider use the **lldp** attribute instead; LLDP is **off** by default. Set **lldp** to *True* on a node (or on a group through **node_data**, or **defaults.devices.linux.lldp**) to run LLDP on that host. A link-level or per-interface **lldp** attribute (for example `- h1: { lldp: true }` in a link definition) selects the individual interface and overrides the node setting for that interface; a node with **lldp: true** whose interfaces are all set to *False* runs no LLDP.
++
++The attribute is accepted only on devices that declare the *lldp* feature (**linux** with the **kne** provider). Using it on any other device, or putting a link-level **lldp** on a link whose other end is such a device, stops the topology with *Device X does not support lldp*; set it on the Linux end of the link only.
++
+ (linux-dhcp-relay)=
+ ## DHCP Relaying on Linux
+ 
+diff --git a/docs/nodes.md b/docs/nodes.md
+index ff3a473..5ace638 100644
+--- a/docs/nodes.md
++++ b/docs/nodes.md
+@@ -79,6 +79,7 @@ nodes:
+ * **provider** -- virtualization provider used by this node (see [](labs/multi-provider.md) for more details).
+ * **role** -- when set to **host**, the device does not get a loopback IP address and [uses static routing](node-router-host) toward the [default gateway](links-gateway) ([more details](node-router-host))
+ * **skip_config** -- the list of configuration items that should not be deployed on this device. Use this attribute to set up partially configured training labs.
++* **lldp** -- when set to *True* on a Linux host running under the *kne* provider, the host runs LLDP (default: *False*); see [](linux-lldp). The same attribute on a link or interface selects LLDP for that interface. Devices without the *lldp* feature reject it.
+ * **unmanaged** -- when set to *True*, the node is not managed or configured by *netlab*. Use this parameter when integrating *netlab* topologies with additional external devices, which should not be configured by *netlab* ([more details](external-unmanaged)).
+ 
+ ```{tip}
+diff --git a/docs/platforms.md b/docs/platforms.md
+index 7632027..8f7d8db 100644
+--- a/docs/platforms.md
++++ b/docs/platforms.md
+@@ -37,7 +37,6 @@
+ | [Generic Linux host](generic-linux-devices) | linux | full          |
+ | IP Infusion OcNOS [❗](caveats-ocnos) | ocnos | minimal |
+ | Juniper cRPD | crpd | full |
+-| Juniper cSRX [❗](caveats-csrx) | csrx | minimal |
+ | Juniper vMX [❗](caveats-vmx) | vmx         | best effort   |
+ | Juniper vPTX (vJunos EVO) [❗](caveats-vptx) | vptx | full  |
+ | Juniper vSRX 3.0 [❗](caveats-vsrx) | vsrx  | best effort   |
+@@ -142,7 +141,6 @@ You cannot use all supported network devices with all virtualization providers.
+ | Generic Linux (Ubuntu/Alpine)  |  [❗](labs/linux.md)  |  ✅  |
+ | IP Infusion OcNOS  |  ❌  |  ✅[❗](caveats-ocnos)  |
+ | Juniper cRPD       |  ❌  |  ✅   |
+-| Juniper cSRX       |  ❌  |  ✅   |
+ | Juniper vMX        |  ❌  |  ✅[❗](clab-vrnetlab)   |
+ | Juniper vPTX       |  [✅](build-vptx)  |  ✅[❗](clab-vrnetlab)  |
+ | Juniper vSRX 3.0   |  [✅](build-vsrx)  |  ✅[❗](caveats-vsrx)  |
+@@ -215,7 +213,7 @@ Use the **netlab initial -o** command to create configuration files in a custom
+ 
+ [^XE]: Includes Cisco CSR 1000v, Cisco Catalyst 8000v, Cisco IOS-on-Linux (IOL) and IOL Layer-2 image
+ 
+-[^Junos]: Includes cRPD, vMX, vSRX, vPTX, vJunos-switch, and vJunos-router, but not cSRX
++[^Junos]: Includes cRPD, vMX, vSRX, vPTX, vJunos-switch, and vJunos-router
+ 
+ [^SROS]: Includes the Nokia SR-SIM container and the Virtualized 7750 SR and 7950 XRS Simulator (vSIM) virtual machine
+ 
+@@ -315,7 +313,6 @@ The following system-wide features are configured on supported network operating
+ | FRR                      | ✅  | ✅[^HIF]  |  ❌  | ✅  | ✅  |
+ | Generic Linux            | ✅  | ✅[^HIF]  |  ✅[❗](linux-lldp) | ✅  | ✅  |
+ | IP Infusion OcNOS        | ✅  |  ❌  |  ❌  | ✅  | ✅  |
+-| Juniper cSRX            | ✅  | ✅  |  ❌  |  ❌  |  ❌  |
+ | Junos[^Junos]            | ✅  |  ❌  | ✅  | ✅  | ✅  |
+ | Mikrotik RouterOS 6      | ✅  | ✅  | ✅[❗](caveats-routeros6) | ✅ | ✅ |
+ | Mikrotik RouterOS 7      | ✅ | ✅ | ✅[❗](caveats-routeros7) | ✅ | ✅ |
+@@ -350,7 +347,6 @@ The following interface parameters are configured on supported network operating
+ | FRR                   | ✅  | ✅  | ✅  | ✅  |
+ | Generic Linux         |  ❌  |  ❌  | ✅  |  ❌  |
+ | IP Infusion OcNOS     | ✅  |  ❌  | ✅  | ✅  |
+-| Juniper cSRX         | ✅  |  ❌  | ✅  |  ❌  |
+ | Junos[^Junos]         | ✅  | ✅  | ✅  |  ❌  |
+ | Mikrotik RouterOS 6   | ✅  |  ❌  | ✅  |  ❌  |
+ | Mikrotik RouterOS 7   | ✅  |  ❌  | ✅  | ✅  |
+@@ -382,7 +378,6 @@ The following interface addresses are supported on various platforms; most daemo
+ | FRR                   | ✅  | ✅  | ✅  | ✅  |
+ | Generic Linux         | ✅  | ✅  |  ❌  |  ❌  |
+ | IP Infusion OcNOS     | ✅  | ✅  |  ❌  |  ❌  |
+-| Juniper cSRX         | ✅  | ✅  |  ❌  |  ❌  |
+ | Junos[^Junos]         | ✅  | ✅  | ✅  |  ❌  |
+ | Mikrotik RouterOS 6   | ✅  | ✅  |  ❌  |  ❌  |
+ | Mikrotik RouterOS 7   | ✅  | ✅  |  ❌  |  ❌  |
+diff --git a/netsim/ansible/tasks/fetch-config/csrx.yml b/netsim/ansible/tasks/fetch-config/csrx.yml
+deleted file mode 100644
+index a9e0849..0000000
+--- a/netsim/ansible/tasks/fetch-config/csrx.yml
++++ /dev/null
+@@ -1,20 +0,0 @@
+-# fetch cSRX configuration with a SSH command
+-#
+----
+-- name: Check if 'sshpass' is installed
+-  local_action:
+-    module: shell
+-    cmd: which sshpass
+-  changed_when: False
+-  run_once: True
+-  any_errors_fatal: True
+-
+-- name: Fetch cSRX configuration
+-  delegate_to: localhost
+-  command:
+-    sshpass -p '{{ ansible_ssh_pass }}'
+-    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+-    {{ ansible_user }}@{{ ansible_host }} 'cli show configuration'
+-  register: config
+-
+-- set_fact: ansible_net_config={{ config.stdout }}
+diff --git a/netsim/ansible/templates/initial/csrx.j2 b/netsim/ansible/templates/initial/csrx.j2
+deleted file mode 100644
+index 9200d7b..0000000
+--- a/netsim/ansible/templates/initial/csrx.j2
++++ /dev/null
+@@ -1,80 +0,0 @@
+-system {
+-  host-name {{ inventory_hostname }};
+-  root-authentication {
+-    encrypted-password "$6$lB5c6$Zeud8c6IhCTE6hnZxXBl3ZMZTC2hOx9pxxYUWTHKW1oC32SATWLMH2EXarxWS5k685qMggUfFur1lq.o4p4cg1"; ## SECRET-DATA
+-  }
+-  services {
+-    ssh {
+-      root-login allow;
+-    }
+-    netconf {
+-      ssh;
+-    }
+-  }
+-  static-host-mapping {
+-{% for k,v in hostvars.items() if k != inventory_hostname %}
+-{%   if v.loopback.ipv4 is defined %}
+-    {{ k|replace('_','') }} inet {{ v.loopback.ipv4|ansible.utils.ipaddr('address') }};
+-{%   elif v.interfaces|default([]) and v.interfaces[0].ipv4|default(False) is string %}
+-    {{ k|replace('_','') }} inet {{ v.interfaces[0].ipv4|ansible.utils.ipaddr('address') }};
+-{%   endif %}
+-{% endfor %}
+-  }
+-}
+-
+-interfaces {
+-{% for l in netlab_interfaces|default([]) %}
+-  {{ l.ifname }} {
+-{% if l.name is defined %}
+-    description "{{ l.name }}{{ " ["+l.role+"]" if l.role is defined else "" }}";
+-{% elif l.type|default("") == "stub" %}
+-    description "Stub interface";
+-{% endif %}
+-{% if l.shutdown|default(False) %}
+-    disable;
+-{% endif %}
+-    unit 0 {
+-{% if 'ipv4' in l %}
+-      family inet {
+-{%   if l.ipv4|ansible.utils.ipv4 %}
+-        address {{ l.ipv4 }};
+-{%   endif %}
+-{%   if l.mtu is defined %}
+-        mtu {{ l.mtu }};
+-{%   endif %}
+-      }
+-{% endif %}
+-{% if 'ipv6' in l %}
+-      family inet6 {
+-{%   if l.ipv6 is string %}
+-        address {{ l.ipv6 }};
+-{%   endif %}
+-{%   if l.mtu is defined %}
+-        mtu {{ l.mtu }};
+-{%   endif %}
+-      }
+-{% endif %}
+-    }
+-  }
+-{% endfor %}
+-}
+-
+-security {
+-  zones {
+-    security-zone default {
+-      host-inbound-traffic {
+-        system-services {
+-          all;
+-        }
+-        protocols {
+-          all;
+-        }
+-      }
+-      interfaces {
+-{% for l in netlab_interfaces|default([]) %}
+-        {{ l.ifname }}.0;
+-{% endfor %}
+-      }
+-    }
+-  }
+-}
+diff --git a/netsim/ansible/templates/initial/eos.j2 b/netsim/ansible/templates/initial/eos.j2
+index 5a45a0a..886558f 100644
+--- a/netsim/ansible/templates/initial/eos.j2
++++ b/netsim/ansible/templates/initial/eos.j2
+@@ -124,7 +124,7 @@ interface {{ l.ifname }}
+   Reported 2026-09-03.
+ 
+   ios.j2, nxos.j2, iosxr.j2, asa.j2, arubacx.j2 and dellos10.j2 already emit the
+-  explicit form, and junos/vyos/sros/routeros7/csrx emit their own disable
++  explicit form, and junos/vyos/sros/routeros7 emit their own disable
+   syntax; EOS and the IOL ifstate templates were the outliers.
+ #}
+ {%   if l.shutdown|default(False) %}
+diff --git a/netsim/ansible/templates/routing/csrx.j2 b/netsim/ansible/templates/routing/csrx.j2
+deleted file mode 100644
+index 3554877..0000000
+--- a/netsim/ansible/templates/routing/csrx.j2
++++ /dev/null
+@@ -1,3 +0,0 @@
+-{% if routing.static is defined %}
+-{%   include 'junos/static.j2' %}
+-{% endif %}
+diff --git a/netsim/ansible/templates/services/csrx.j2 b/netsim/ansible/templates/services/csrx.j2
+deleted file mode 100644
+index 947005b..0000000
+--- a/netsim/ansible/templates/services/csrx.j2
++++ /dev/null
+@@ -1,14 +0,0 @@
+-{% if services.server.snmp is defined %}
+-{#
+-    SNMP agent, ported VERBATIM from the snmp_config custom config module so the
+-    generated configuration is byte-for-byte what this platform emitted before.
+-    The only change is that the community is a parameter, defaulting to
+-    `skyforge` -- the community the collector's collectors poll with. Any other default
+-    leaves every device reachable and unpollable.
+-#}
+-snmp {
+-  community {{ services.server.snmp.community|default('skyforge') }} {
+-    authorization read-only;
+-  }
+-}
+-{% endif %}
+diff --git a/netsim/ansible/templates/services/vjunos-router.j2 b/netsim/ansible/templates/services/vjunos-router.j2
+index 0aae39b..8833854 100644
+--- a/netsim/ansible/templates/services/vjunos-router.j2
++++ b/netsim/ansible/templates/services/vjunos-router.j2
+@@ -8,7 +8,7 @@
+ {% if services.server.snmp is defined %}
+ {#
+     SNMP agent. Junos configuration is HIERARCHICAL everywhere else in netlab
+-    (initial/junos.j2, bgp/junos.j2, ... and csrx.j2 right here), and every
++    (initial/junos.j2, bgp/junos.j2, ... right here), and every
+     module fragment is concatenated into ONE juniper.conf. A `set ...` line
+     inside that file is a syntax error: mgd rejects the WHOLE file and boots the
+     FACTORY configuration -- no management address, no ssh, nothing for the collector
+diff --git a/netsim/ansible/templates/services/vjunos-switch.j2 b/netsim/ansible/templates/services/vjunos-switch.j2
+index f573cc2..82ec829 100644
+--- a/netsim/ansible/templates/services/vjunos-switch.j2
++++ b/netsim/ansible/templates/services/vjunos-switch.j2
+@@ -8,7 +8,7 @@
+ {% if services.server.snmp is defined %}
+ {#
+     SNMP agent. Junos configuration is HIERARCHICAL everywhere else in netlab
+-    (initial/junos.j2, bgp/junos.j2, ... and csrx.j2 right here), and every
++    (initial/junos.j2, bgp/junos.j2, ... right here), and every
+     module fragment is concatenated into ONE juniper.conf. A `set ...` line
+     inside that file is a syntax error: mgd rejects the WHOLE file and boots the
+     FACTORY configuration -- no management address, no ssh, nothing for the collector
+diff --git a/netsim/ansible/templates/services/vmx.j2 b/netsim/ansible/templates/services/vmx.j2
+index 1b78a20..6bfcba3 100644
+--- a/netsim/ansible/templates/services/vmx.j2
++++ b/netsim/ansible/templates/services/vmx.j2
+@@ -8,7 +8,7 @@
+ {% if services.server.snmp is defined %}
+ {#
+     SNMP agent. Junos configuration is HIERARCHICAL everywhere else in netlab
+-    (initial/junos.j2, bgp/junos.j2, ... and csrx.j2 right here), and every
++    (initial/junos.j2, bgp/junos.j2, ... right here), and every
+     module fragment is concatenated into ONE juniper.conf. A `set ...` line
+     inside that file is a syntax error: mgd rejects the WHOLE file and boots the
+     FACTORY configuration -- no management address, no ssh, nothing for the collector
+diff --git a/netsim/ansible/templates/services/vptx.j2 b/netsim/ansible/templates/services/vptx.j2
+index 1b78a20..6bfcba3 100644
+--- a/netsim/ansible/templates/services/vptx.j2
++++ b/netsim/ansible/templates/services/vptx.j2
+@@ -8,7 +8,7 @@
+ {% if services.server.snmp is defined %}
+ {#
+     SNMP agent. Junos configuration is HIERARCHICAL everywhere else in netlab
+-    (initial/junos.j2, bgp/junos.j2, ... and csrx.j2 right here), and every
++    (initial/junos.j2, bgp/junos.j2, ... right here), and every
+     module fragment is concatenated into ONE juniper.conf. A `set ...` line
+     inside that file is a syntax error: mgd rejects the WHOLE file and boots the
+     FACTORY configuration -- no management address, no ssh, nothing for the collector
+diff --git a/netsim/ansible/templates/services/vsrx.j2 b/netsim/ansible/templates/services/vsrx.j2
+index 1b78a20..6bfcba3 100644
+--- a/netsim/ansible/templates/services/vsrx.j2
++++ b/netsim/ansible/templates/services/vsrx.j2
+@@ -8,7 +8,7 @@
+ {% if services.server.snmp is defined %}
+ {#
+     SNMP agent. Junos configuration is HIERARCHICAL everywhere else in netlab
+-    (initial/junos.j2, bgp/junos.j2, ... and csrx.j2 right here), and every
++    (initial/junos.j2, bgp/junos.j2, ... right here), and every
+     module fragment is concatenated into ONE juniper.conf. A `set ...` line
+     inside that file is a syntax error: mgd rejects the WHOLE file and boots the
+     FACTORY configuration -- no management address, no ssh, nothing for the collector
+diff --git a/netsim/augment/main.py b/netsim/augment/main.py
+index 6d58b94..c1722c8 100644
+--- a/netsim/augment/main.py
++++ b/netsim/augment/main.py
+@@ -105,6 +105,8 @@ def transform_data(topology: Box) -> None:
+   modules.post_link_transform(topology)
+ 
+ def post_transform(topology: Box) -> None:
++  augment.nodes.check_lldp_support(topology)          # SKYFORGE-SPECIFIC (patch 55): lldp is limited to devices with the lldp feature
++  log.exit_on_error()
+   augment.validate.process_validation(topology)
+   modules.post_transform(topology)                    # Call module post-transform routines
+   augment.plugin.execute('post_transform',topology)   # ... and the plugin ones
+diff --git a/netsim/augment/nodes.py b/netsim/augment/nodes.py
+index 937a790..be6cf32 100644
+--- a/netsim/augment/nodes.py
++++ b/netsim/augment/nodes.py
+@@ -447,7 +447,7 @@ def find_node_image(n: Box, topology: Box) -> bool:
+     # platform ships in a ConfigMap precisely so a device image can be moved
+     # without a runtime rebuild -- lose to the baked default for every device
+     # whose default is fully qualified, i.e. all of them. MEASURED 2026-09-12:
+-    # NETLAB_KNE_IMAGE__OVERRIDES=csrx:<x> rendered the baked csrx digest.
++    # NETLAB_KNE_IMAGE__OVERRIDES=<device>:<x> rendered the baked default digest.
+     # The two agreed byte-for-byte in production, which is the only reason
+     # nothing was seen to move.
+     if author_clab_image:
+@@ -654,6 +654,20 @@ def transform(topology: Box, defaults: Box, pools: Box) -> None:
+ Cleanup non-Ansible configuration file data -- remove all daemon/node config mappings that
+ are not used by a module, a plugin (based on "config" data) or a device itself
+ '''
++"""
++SKYFORGE-SPECIFIC (patch 55): the 'lldp' node/interface attribute exists only on devices that declare the 'lldp' feature
++(today: linux with the kne provider). netlab's usual rule for a device that lacks an optional feature applies: the
++topology is rejected with "Device <device> does not support lldp used in <path>". That includes a link-level 'lldp' that
++propagates onto the interface of a node that cannot do it, and an explicit 'lldp: false' (the attribute is not accepted at all).
++"""
++def check_lldp_support(topology: Box) -> None:
++  for name,node in topology.nodes.items():
++    if 'lldp' in node:
++      devices.check_optional_features(node.lldp,f'nodes.{name}.lldp',node,topology,'lldp')
++    for idx,intf in enumerate(node.get('interfaces',[])):
++      if 'lldp' in intf:
++        devices.check_optional_features(intf.lldp,f'nodes.{name}.interfaces[{idx}].lldp (ifname {intf.get("ifname","?")})',node,topology,'lldp')
++
+ def cleanup_non_ansible_config(n: Box) -> None:
+   for kw in ('_daemon_config','_node_config'):
+     if kw not in n:
+diff --git a/netsim/cli/initial/deploy.py b/netsim/cli/initial/deploy.py
+index f8084c8..65635f9 100644
+--- a/netsim/cli/initial/deploy.py
++++ b/netsim/cli/initial/deploy.py
+@@ -5,6 +5,8 @@
+ #
+ import argparse
+ import concurrent.futures
++import os
++import threading
+ import typing
+ from pathlib import Path
+ 
+@@ -134,12 +136,80 @@ def recreate_configs(topology: Box, args: argparse.Namespace, nodeset: list) ->
+       default_suffix="none",
+     )
+ 
++"""
++SKYFORGE-SPECIFIC: overlap the Ansible lane with the internal (kubectl exec) fan-out.
++
++Upstream runs deploy_internal_config (a thread pool that execs shell/cEOS fragments into pods) to completion and
++only then starts the Ansible playbook for the nodes that need it (PAN-OS and the other VM NOS). The two lanes touch
++disjoint nodes: a node whose whole configuration set is in netlab_ansible_skip_module is never in the playbook
++(utils.nodeset_ansible_skip) and the internal lane never runs Ansible. fleet40 (2026-10-10): the fan-out took 27 s and
++PAN-OS config could not start until it ended; at 4,000 nodes the fan-out is ~8 minutes while a PAN-OS guest is
++usually ready long before.
++
++SKYFORGE_NETLAB_OVERLAP_ANSIBLE_LANE = 1 | true | yes | on: run() calls start_overlapped_ansible_lane() just before the
++internal fan-out; it starts the playbook in a thread. The unchanged call to deploy_ansible_playbook() further down then
++JOINS that thread and returns its (used, status) instead of running the playbook a second time. Unset or anything else:
++nothing is started and every line below runs exactly as upstream. The verdicts are unchanged: a failing lane still
++fails the run with the same message, a failure in one lane never skips the other (it did not before either), and an
++exception in the playbook thread is re-raised from that call, after the internal lane finished.
++"""
++_OVERLAPPED_LANE: typing.Optional[dict] = None
++_LANE_THREAD = threading.local()
++
++def overlap_ansible_lane_enabled() -> bool:
++  return os.environ.get('SKYFORGE_NETLAB_OVERLAP_ANSIBLE_LANE','').strip().lower() in ('1','true','yes','on')
++
++def start_overlapped_ansible_lane(
++      topology: Box,
++      args: argparse.Namespace,
++      nodeset: list,
++      rest: list) -> bool:
++  """Start the Ansible lane in a thread when the switch is on and some node needs it. Returns whether it started."""
++  global _OVERLAPPED_LANE
++  _OVERLAPPED_LANE = None
++  if not overlap_ansible_lane_enabled() or is_dry_run() or args.normalize:
++    return False
++  ansible_skip_list = utils.nodeset_ansible_skip(nodeset, topology, args)
++  if len(ansible_skip_list) == len(nodeset):                # Nothing needs Ansible: nothing to overlap
++    return False
++
++  outcome: dict = {}
++  def ansible_lane() -> None:
++    _LANE_THREAD.active = True                              # deploy_ansible_playbook must RUN, not join, in this thread
++    try:
++      outcome['result'] = deploy_ansible_playbook(topology,args,nodeset,rest,'deploy')
++    except BaseException as ex:                             # Re-raised by the joining call
++      outcome['error'] = ex
++
++  log.info(
++    f'Running the Ansible playbook for {len(nodeset) - len(ansible_skip_list)} node(s) while the other nodes are configured '
++    f'directly (SKYFORGE_NETLAB_OVERLAP_ANSIBLE_LANE)')
++  lane = threading.Thread(target=ansible_lane,name='ansible-lane')
++  _OVERLAPPED_LANE = { 'thread': lane, 'outcome': outcome }
++  lane.start()
++  return True
++
++def join_overlapped_ansible_lane() -> typing.Optional[typing.Tuple[bool, bool]]:
++  """The overlapped lane's (used, status) once it finished; None when no lane was started (run the playbook as upstream)."""
++  global _OVERLAPPED_LANE
++  lane, _OVERLAPPED_LANE = _OVERLAPPED_LANE, None
++  if lane is None:
++    return None
++  lane['thread'].join()
++  if 'error' in lane['outcome']:
++    raise lane['outcome']['error']
++  return lane['outcome']['result']
++
+ def deploy_ansible_playbook(
+       topology: Box,
+       args: argparse.Namespace,
+       nodeset: list,
+       rest: list,
+       deploy_step: str = '') -> typing.Tuple[bool, bool]:
++  if not getattr(_LANE_THREAD,'active',False):
++    overlapped = join_overlapped_ansible_lane()
++    if overlapped is not None:
++      return overlapped
+   ansible_skip_list = utils.nodeset_ansible_skip(nodeset, topology, args)
+   if len(ansible_skip_list) == len(nodeset):
+     return (False,True)
+@@ -205,6 +275,7 @@ def run(
+ 
+   log.section_header('Config',f'Deploying device configurations')
+   lab_status_change(topology, f"deploying configuration: {deploy_text}")
++  start_overlapped_ansible_lane(topology,args,nodeset,rest)
+   (used_internal, status_internal) = deploy_internal_config(nodeset, topology, args)
+   (used_ansible, status_ansible) = deploy_ansible_playbook(topology,args,nodeset,rest,'deploy' if used_internal else '')
+ 
+diff --git a/netsim/defaults/attributes.yml b/netsim/defaults/attributes.yml
+index 6aaab20..c636f88 100644
+--- a/netsim/defaults/attributes.yml
++++ b/netsim/defaults/attributes.yml
+@@ -102,6 +102,7 @@ link:                       # Global link attributes
+   bandwidth: int
+   bridge: id
+   disable: bool
++  lldp: bool                # SKYFORGE-SPECIFIC (patch 55): LLDP on this interface, linux hosts only (see devices/linux.yml)
+   shutdown: bool            # Shut down then interface during the initial configuration
+   name: str
+   linkid: id
+@@ -184,6 +185,7 @@ node:
+   cpu:
+   memory: int
+   unmanaged: bool
++  lldp: bool                # SKYFORGE-SPECIFIC (patch 55): run LLDP on this linux host (default off); devices without the lldp feature reject it
+ 
+ loopback:
+   ipv4: { type: ipv4, use: host_prefix, _alt_types: [ bool ] }
+diff --git a/netsim/devices/cisco_sdwan-controller.yml b/netsim/devices/cisco_sdwan-controller.yml
+index 6448a99..0b7e2f9 100644
+--- a/netsim/devices/cisco_sdwan-controller.yml
++++ b/netsim/devices/cisco_sdwan-controller.yml
+@@ -41,7 +41,7 @@ group_vars:
+   # reads like the image is broken.
+   #
+   # Every other VM NOS already declares a boot-sized budget (asav 240x5 =
+-  # 1200s, csrx 60x5 = 300s); these two were the only ones left on the
++  # 1200s); these two were the only ones left on the
+   # container-sized default.
+   #
+   # 180x5 = 900s, NOT asav's 240x5. The first attempt used 1200s and made
+diff --git a/netsim/devices/csrx.py b/netsim/devices/csrx.py
+deleted file mode 100644
+index 97d2c31..0000000
+--- a/netsim/devices/csrx.py
++++ /dev/null
+@@ -1,23 +0,0 @@
+-#
+-# Juniper cSRX quirks
+-#
+-from box import Box
+-
+-from ..utils import log
+-from . import _Quirks
+-
+-
+-def csrx_port_num(node: Box) -> None:
+-  if_count = len(node.get('interfaces', []))
+-  node.clab.env.CSRX_PORT_NUM = if_count + 1 # +1 for the management interface
+-  if if_count > 16:
+-    log.error(
+-      f'cSRX supports a maximum of 16 interfaces. Node {node.name} has {if_count} interfaces.',
+-      category=log.IncorrectValue,
+-      module=node.device)
+-
+-class CSRX(_Quirks):
+-
+-  @classmethod
+-  def device_quirks(self, node: Box, topology: Box) -> None:
+-    csrx_port_num(node)
+diff --git a/netsim/devices/csrx.yml b/netsim/devices/csrx.yml
+deleted file mode 100644
+index d02c8c5..0000000
+--- a/netsim/devices/csrx.yml
++++ /dev/null
+@@ -1,64 +0,0 @@
+----
+-description: Juniper cSRX container
+-docname: Juniper cSRX
+-group_vars:
+-  ansible_user: root
+-  ansible_ssh_pass: "clab123"
+-  ansible_network_os: junos
+-  netlab_device_type: csrx
+-  netlab_check_retries: 20
+-
+-mgmt_if: fxp0
+-ifindex_offset: 0
+-interface_name: ge-0/0/{ifindex}
+-mtu: 1500
+-
+-features:
+-  services:
+-    # SNMP agent: this device answers an NMS. Ported from the
+-    # snmp_config custom config module.
+-    server.snmp: True
+-  initial:
+-    ipv4:
+-      unnumbered: false               # The 'unnumbered-address' family inet command does not work on cSRX
+-    ipv6:
+-      lla: true
+-    collect: true
+-    reload: false
+-  routing:
+-    static:
+-      vrf: False
+-      discard: True
+-
+-clab:
+-  image: csrx:23.4R1.9
+-  build: https://containerlab.dev/manual/kinds/csrx/
+-  node:
+-    kind: juniper_csrx
+-    config_templates:
+-      hosts: /etc/hosts:shared
+-      netlab-config: /config/netlab/netlab-config.sh:sh
+-  interface:
+-    name: eth{ifindex+1}
+-  features:
+-    initial:
+-      config_mode: [ sh ]
+-  group_vars:
+-    netlab_config_mode: sh
+-    netlab_show_command: [ cli, -c, 'show $@' ]
+-    netlab_check_command: who
+-    netlab_ready: [ ssh ]
+-    netlab_default_shebang: '#!/config/netlab/netlab-config.sh'
+-    netlab_config_path: /config/netlab/
+-
+-graphite.icon: firewall
+-
+-kne:
+-  group_vars:
+-    netlab_config_mode: sh
+-    netlab_show_command: [ cli, -c, 'show $@' ]
+-    netlab_check_command: who
+-    netlab_ready: [ ssh ]
+-    netlab_default_shebang: '#!/config/netlab/netlab-config.sh'
+-    netlab_config_path: /config/netlab/
+-  interface.name: eth{ifindex+1}
+diff --git a/netsim/devices/linux.yml b/netsim/devices/linux.yml
+index fda0c1b..dde2d6c 100644
+--- a/netsim/devices/linux.yml
++++ b/netsim/devices/linux.yml
+@@ -100,6 +100,9 @@ kne:
+   # kne" (user report, 2026-09-12). Same declaration as clab, because the KNE
+   # linux pod is the same vanilla distro reached over its network namespace.
+   features:
++    # SKYFORGE-SPECIFIC (patch 55): the `lldp` node/interface attribute is supported here only (the kne provider renders it
++    # into the pod env). Devices without this feature reject the attribute (augment/nodes.py check_lldp_support).
++    lldp: true
+     initial:
+       roles: [ host, bridge ]
+       generate_mac: [ svi ]
+@@ -120,7 +123,6 @@ kne:
+     # Declared here so a cluster with different ranges is a CONFIG change,
+     # not a template edit.
+     skyforge_mgmt_cidrs: [ 198.18.0.0/16, 198.19.0.0/16 ]
+-    netlab_lldp_enable: true
+ external:
+   image: none
+ graphite.icon: server
+diff --git a/netsim/providers/kne.py b/netsim/providers/kne.py
+index 3859b94..2f53bfc 100644
+--- a/netsim/providers/kne.py
++++ b/netsim/providers/kne.py
+@@ -63,13 +63,6 @@ KNE_NODE_MAP: dict = {
+     'model': 'a10',
+     'os': 'a10',
+   },
+-  'csrx': {
+-    'vendor': 'JUNIPER',
+-    'model': 'csrx',
+-    'os': 'junos',
+-    'config_path': '/config',
+-    'config_file': 'juniper.conf'
+-  },
+   'panos': {
+     'vendor': 'PALOALTO',
+     'model': 'panos',
+@@ -262,11 +255,6 @@ KNE_SERVICE_MAP: dict = {
+     { 'outside': 80, 'inside': 80, 'name': 'http', 'names': ['http','httpapi'] },
+     { 'outside': 443, 'inside': 443, 'name': 'https', 'names': ['https','httpapi'] },
+   ],
+-  'csrx': [
+-    { 'outside': 22, 'inside': 22, 'name': 'ssh', 'names': ['ssh'] },
+-    { 'outside': 830, 'inside': 830, 'name': 'netconf', 'names': ['netconf'] },
+-    { 'outside': 161, 'inside': 161, 'name': 'snmp', 'names': ['snmp'] },
+-  ],
+   'panos': [
+     { 'outside': 22, 'inside': 22, 'name': 'ssh', 'names': ['ssh'] },
+     { 'outside': 443, 'inside': 443, 'name': 'https', 'names': ['https','httpapi'] },
+@@ -403,7 +391,7 @@ KNE_STARTUP_CONFIG_GENERATORS: dict = {
+ KNE_NODE_DATA_ADJUSTERS: dict = {
+   'linux': (
+     lambda kne_data, node, topology, cfg_mode, disable_startup_for_node:
+-      adjust_linux_node_data(kne_data,node),
++      adjust_linux_node_data(kne_data,node,topology),
+   ),
+   'iol': (
+     lambda kne_data, node, topology, cfg_mode, disable_startup_for_node:
+@@ -417,10 +405,6 @@ KNE_NODE_DATA_ADJUSTERS: dict = {
+     lambda kne_data, node, topology, cfg_mode, disable_startup_for_node:
+       adjust_eos_node_data(kne_data,node,topology,cfg_mode),
+   ),
+-  'csrx': (
+-    lambda kne_data, node, topology, cfg_mode, disable_startup_for_node:
+-      adjust_csrx_node_data(kne_data,node,topology),
+-  ),
+   'fortios': (
+     lambda kne_data, node, topology, cfg_mode, disable_startup_for_node:
+       adjust_fortios_node_data(kne_data,disable_startup_for_node),
+@@ -735,16 +719,14 @@ def sanitize_startup_fragment(node: Box, fragment: str, is_final: bool) -> str:
+ # killed bring-up for all 71 nodes.
+ KNE_RESERVED_ETH0_DEVICES = {
+   'asav',
+-  'csrx',
+   'iosxr',
+   # vJunos ships fxp0 as out-of-band management on the first vNIC, exactly like
+   # asav's Management0/0. Its netlab device definition has no ifindex offset, so
+   # without this entry ge-0/0/0 lands on pod eth0.
+   'vjunos-router',
+   'vjunos-switch',
+-  # vSRX 3.0 (same family, same "no ifindex offset" shape) replaced csrx
+-  # 2026-08-26 but was never added here -- csrx stayed in the set, vsrx's own
+-  # entry was simply missed. Found live 2026-09-13/14 bringing up demo-lab
++  # vSRX 3.0 (same family, same "no ifindex offset" shape) was missed here
++  # for a while -- its own entry was simply absent. Found live 2026-09-13/14 bringing up demo-lab
+   # 1.3: both vSRX firewalls took their first data link on eth0, kne dropped it
+   # from each node's own meshnet Topology CR, and the PEER on the other end of
+   # that link failed bring-up with "could not find peer ... link UID N" --
+@@ -1606,7 +1588,7 @@ def add_startup_config(node: Box, topology: Box) -> None:
+   # with no CVAC race. (asav was briefly forced day0-only on 2026-09-09 to save
+   # the ~895s replay; that traded correctness for speed and is reverted.)
+   #
+-  # The other startup-mode devices (the three cisco_sdwan roles, csrx) deliver
++  # The other startup-mode devices (the three cisco_sdwan roles) deliver
+   # day-0 by a serial injector / cloud-init seed whose payload is NOT
+   # startup_config_path(); they do not declare startup_only and are handled by
+   # their own path, not here.
+@@ -2637,6 +2619,7 @@ def adjust_iol_node_data(kne_data: Box, node: Box) -> None:
+ 
+ CALDERA_AGENT_ENV_KEYS = ('SKYFORGE_CALDERA_AGENT_ENABLED','SKYFORGE_CALDERA_SERVER')
+ LINUX_SERVICES_ENV_KEYS = ('SKYFORGE_SERVICES','SKYFORGE_SERVICES_NAME','SKYFORGE_IPERF3_SERVER_PORT')
++LINUX_LLDP_ENV_KEYS = ('SKYFORGE_LLDP_DISABLED','SKYFORGE_LLDP_INTERFACES')
+ 
+ def caldera_agent_node_selected(node: Box) -> bool:
+   '''
+@@ -2669,7 +2652,34 @@ def linux_services_env(node: Box) -> dict:
+       env['SKYFORGE_IPERF3_SERVER_PORT'] = str(e.port)
+   return env
+ 
+-def adjust_linux_node_data(kne_data: Box, node: Box) -> None:
++def linux_lldp_env(node: Box, topology: Box) -> dict:
++  '''
++  The pod env that carries the node's LLDP choice, from the plain `lldp` attribute (node, group node_data or
++  defaults.devices.linux; per-interface `lldp` on the link/interface overrides the node value for that interface).
++
++  OFF by default: SKYFORGE_LLDP_DISABLED=1. If LLDP is effectively on for at least one data-plane interface the key is not
++  written (the image runs lldpd node-wide unless told otherwise). SKYFORGE_LLDP_INTERFACES (comma list of pod ifnames) is
++  written only when a per-interface choice exists, so an image that understands it can restrict lldpd to those interfaces;
++  an absent key means every data-plane interface. A node-wide `lldp: true` whose interfaces are all explicitly false is OFF.
++  Only a real boolean True switches anything on.
++  '''
++  node_on = node.get('lldp',None)
++  if node_on is None:
++    node_on = devices.get_device_attribute(node,'lldp',topology.defaults)
++  node_on = node_on is True
++  per_interface = False
++  on_ifnames = []
++  for intf in node.get('interfaces',[]):
++    choice = intf.get('lldp',None)
++    if choice is not None:
++      per_interface = True
++    if (node_on if choice is None else choice is True) and intf.get('ifname',None):
++      on_ifnames.append(str(intf.ifname))
++  if not on_ifnames and not (node_on and not node.get('interfaces',[])):
++    return { 'SKYFORGE_LLDP_DISABLED': '1' }
++  return { 'SKYFORGE_LLDP_INTERFACES': ','.join(on_ifnames) } if per_interface else {}
++
++def adjust_linux_node_data(kne_data: Box, node: Box, topology: Box) -> None:
+   '''
+   SKYFORGE-SPECIFIC: the pod env of a linux host comes from the platform and the declaration, not from raw env.
+ 
+@@ -2683,12 +2693,19 @@ def adjust_linux_node_data(kne_data: Box, node: Box) -> None:
+   2. Listeners -- `services.listen` (node or group level) is rendered into SKYFORGE_SERVICES /
+      SKYFORGE_IPERF3_SERVER_PORT, and a topology author's own values for those keys are discarded, so the
+      declaration is the only door and the node data tells the truth about what listens.
++  3. LLDP -- OFF BY DEFAULT (owner decision 2026-10-12), switched by the plain `lldp` attribute (see linux_lldp_env). The
++     skyforge-linux-host image runs lldpd unless the pod carries SKYFORGE_LLDP_DISABLED=1, and the collector then lists every
++     LLDP-discovered host in a path trace as a device "missing from collection" (hosts are collected as endpoints, not
++     devices). A topology author's own `kne.env` values for SKYFORGE_LLDP_DISABLED / SKYFORGE_LLDP_INTERFACES are DISCARDED:
++     `lldp` is the only door.
+   '''
+   kne_data.env = kne_data.get('env',Box(default_box=True,box_dots=True))
+-  for key in CALDERA_AGENT_ENV_KEYS + LINUX_SERVICES_ENV_KEYS:
++  for key in CALDERA_AGENT_ENV_KEYS + LINUX_SERVICES_ENV_KEYS + LINUX_LLDP_ENV_KEYS:
+     kne_data.env.pop(key,None)
+   for key,value in linux_services_env(node).items():
+     kne_data.env[key] = value
++  for key,value in linux_lldp_env(node,topology).items():
++    kne_data.env[key] = value
+   server = str(os.environ.get('NETLAB_KNE_CALDERA_AGENT_SERVER','') or '').strip()
+   if not server or not caldera_agent_node_selected(node):
+     return
+@@ -2722,37 +2739,6 @@ def adjust_eos_node_data(kne_data: Box, node: Box, topology: Box, cfg_mode: str)
+   if isinstance(desired_retries,int) and desired_retries > current_retries:
+     kne_data.netlab_check_retries = desired_retries
+ 
+-def adjust_csrx_node_data(kne_data: Box, node: Box, topology: "Box | None" = None) -> None:
+-  node.netlab_config_mode = node.get('netlab_config_mode','startup') or 'startup'
+-  requested_image = str(kne_data.get('image',None) or node.get('box','') or '').strip()
+-  if not requested_image or requested_image == 'csrx:23.4R1.9':
+-    requested_image = 'contrailk8sdayone/csrx:latest'
+-  kne_data.image = requested_image
+-  node.box = kne_data.image
+-  kne_data.config_path = '/config'
+-  kne_data.config_file = 'juniper.conf'
+-  kne_data.env = kne_data.get('env',Box(default_box=True,box_dots=True))
+-  if not kne_data.env.get('CSRX_ROOT_PASSWORD',None):
+-    # The container sets root's password from this env at boot; netlab then
+-    # logs in as root with the device's ansible_ssh_pass. ONE credential, read
+-    # from the device data, so the two cannot drift -- this used to be the
+-    # literal 'kne123' against a device file that says clab123.
+-    root_pw = None
+-    if topology is not None:
+-      root_pw = devices.get_node_group_var(node,'ansible_ssh_pass',topology.defaults)
+-    kne_data.env.CSRX_ROOT_PASSWORD = str(root_pw or 'kne123')
+-  if not kne_data.env.get('CSRX_JUNOS_CONFIG',None):
+-    kne_data.env.CSRX_JUNOS_CONFIG = '/config/juniper.conf'
+-  if not kne_data.env.get('CSRX_PORT_NUM',None):
+-    kne_data.env.CSRX_PORT_NUM = str(node.get('kne.env.CSRX_PORT_NUM',len(node.get('interfaces',[])) + 1))
+-
+-  cfg_items = kne_data.get('config_templates',[])
+-  if cfg_items:
+-    kne_data.config_templates = [
+-      item for item in cfg_items
+-        if config_template_source(item) not in ('hosts','netlab-config')
+-    ]
+-
+ def adjust_panos_node_data(kne_data: Box, disable_startup_for_node: bool) -> None:
+   if disable_startup_for_node:
+     kne_data.pop('startup_config',None)
+@@ -3049,8 +3035,6 @@ class KNE(_Provider):
+           node.kne['sros_version_major'] = major
+         if image_version:
+           node.kne['sros_version'] = image_version
+-      if node.device == 'csrx':
+-        adjust_csrx_node_data(node.kne,node,topology)
+       add_default_config_mode(node,topology)
+       run_kne_hooks(node,topology,KNE_PRE_STARTUP_BOOTSTRAP_HOOKS.get(node.device,()))
+       add_config_filemaps(node,topology)
+diff --git a/netsim/templates/provider/clab/csrx/hosts.j2 b/netsim/templates/provider/clab/csrx/hosts.j2
+deleted file mode 100644
+index 42d1a3c..0000000
+--- a/netsim/templates/provider/clab/csrx/hosts.j2
++++ /dev/null
+@@ -1 +0,0 @@
+-{% include 'linux/hosts.j2' %}
+diff --git a/netsim/templates/provider/clab/csrx/netlab-config.j2 b/netsim/templates/provider/clab/csrx/netlab-config.j2
+deleted file mode 100644
+index 6578ad7..0000000
+--- a/netsim/templates/provider/clab/csrx/netlab-config.j2
++++ /dev/null
+@@ -1,19 +0,0 @@
+-#!/bin/bash
+-tail -n +2 $1 > /tmp/config.conf # stop shebang being included in pushed config
+-cat <<CONFIG | cli | tee /tmp/cli-status
+-configure
+-load merge /tmp/config.conf
+-CONFIG
+-if grep -i error /tmp/cli-status >/dev/null; then
+-  echo "Configuration load failed, aborting"
+-  exit 1
+-else
+-  cat <<CONFIG | cli | tee /tmp/cli-status
+-configure
+-commit and-quit
+-CONFIG
+-  if grep -i error /tmp/cli-status | grep -vi "Device or resource busy" >/dev/null; then
+-    echo "Commit failed, aborting"
+-    exit 1
+-  fi
+-fi
+diff --git a/tests/test_initial_overlap_lanes.py b/tests/test_initial_overlap_lanes.py
+new file mode 100644
+index 0000000..31cd8f8
+--- /dev/null
++++ b/tests/test_initial_overlap_lanes.py
+@@ -0,0 +1,161 @@
++"""netlab initial: SKYFORGE_NETLAB_OVERLAP_ANSIBLE_LANE (SKYFORGE-SPECIFIC).
++
++The requirement: with the switch on, the Ansible lane (PAN-OS and the other VM NOS) runs CONCURRENTLY with the
++internal kubectl-exec fan-out instead of after it; with it off or unrecognised, the order is today's (internal, then
++Ansible). Either way the verdicts are the same: a failing lane fails the run with the same message, and a failure in
++one lane never skips the other. Everything is driven through deploy.run(), the function `netlab initial` calls; only
++the two things that touch the world (the kubectl-exec fan-out and the ansible-playbook process) are replaced. The
++concurrency proof is a rendezvous: each fake lane blocks until it has seen the other one running, which can only
++succeed if they overlap (sequentially it times out).
++"""
++
++import argparse
++import threading
++
++import pytest
++from box import Box
++
++from netsim.cli.initial import deploy
++
++WAIT = 5
++NODES = ["ceos1", "h1", "pa"]
++
++
++class Exit(Exception):
++    pass
++
++
++@pytest.fixture()
++def world(monkeypatch):
++    state = {
++        "order": [], "internal_running": threading.Event(), "ansible_running": threading.Event(),
++        "internal_ok": True, "ansible_ok": True, "ansible_raises": None, "rendezvous": True, "saw_other": {},
++        "playbook_runs": 0, "exit_messages": [], "ansible_skip": ["ceos1", "h1"],
++    }
++
++    def internal(nodeset, topology, args):
++        state["order"].append("internal-start")
++        state["internal_running"].set()
++        if state["rendezvous"]:
++            state["saw_other"]["internal"] = state["ansible_running"].wait(WAIT)
++        state["order"].append("internal-end")
++        return (True, state["internal_ok"])
++
++    def playbook(topology, rest, name):
++        state["playbook_runs"] += 1
++        state["order"].append("ansible-start")
++        state["ansible_running"].set()
++        if state["rendezvous"]:
++            state["saw_other"]["ansible"] = state["internal_running"].wait(WAIT)
++        if state["ansible_raises"]:
++            raise state["ansible_raises"]
++        state["order"].append("ansible-end")
++        return state["ansible_ok"]
++
++    def fake_exit(message, *a, **k):
++        state["exit_messages"].append(message)
++        raise Exit(message)
++
++    monkeypatch.setattr(deploy, "deploy_internal_config", internal)
++    monkeypatch.setattr(deploy, "execute_ansible_playbook", playbook)
++    monkeypatch.setattr(deploy.utils, "nodeset_ansible_skip", lambda nodeset, topology, args: list(state["ansible_skip"]))
++    monkeypatch.setattr(deploy.utils, "ansible_skip_group", lambda skip: None)
++    monkeypatch.setattr(deploy.utils, "ansible_args", lambda args: [])
++    monkeypatch.setattr(deploy, "is_dry_run", lambda: False)
++    monkeypatch.setattr(deploy, "error_and_exit", fake_exit)
++    monkeypatch.setattr(deploy, "get_normalize_list", lambda topology, nodeset: [])
++    monkeypatch.setattr(deploy, "get_message", lambda *a, **k: "")
++    monkeypatch.setattr(deploy.devices, "process_config_sw_check", lambda topology: None)
++    monkeypatch.setattr(deploy, "lab_status_change", lambda *a, **k: None)
++    monkeypatch.setattr(deploy, "print_internal_stats", lambda *a, **k: None)
++    monkeypatch.setattr(deploy.log, "section_header", lambda *a, **k: None)
++    monkeypatch.setattr(deploy.log, "info", lambda *a, **k: None)
++    monkeypatch.setattr(deploy, "_OVERLAPPED_LANE", None)
++    state["topology"] = Box({"nodes": {n: {} for n in NODES}, "groups": {}}, default_box=True)
++    state["args"] = argparse.Namespace(
++        normalize=False, initial=False, module=None, custom=False, deploy=True, skip_ready=True, limit=None,
++        no_message=True, generate=None)
++    return state
++
++
++def run(state):
++    deploy.run(state["topology"], state["args"], [])
++
++
++def set_switch(monkeypatch, value):
++    if value is None:
++        monkeypatch.delenv("SKYFORGE_NETLAB_OVERLAP_ANSIBLE_LANE", raising=False)
++    else:
++        monkeypatch.setenv("SKYFORGE_NETLAB_OVERLAP_ANSIBLE_LANE", value)
++
++
++@pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on"])
++def test_switch_on_runs_the_two_lanes_concurrently(world, monkeypatch, value):
++    set_switch(monkeypatch, value)
++    run(world)
++    assert world["saw_other"] == {"internal": True, "ansible": True}, world["order"]
++    assert world["playbook_runs"] == 1, "the playbook must run exactly once, not once overlapped and once after"
++
++
++@pytest.mark.parametrize("value", [None, "", "0", "false", "off", "garbage"])
++def test_default_and_unrecognised_values_keep_the_sequential_order(world, monkeypatch, value):
++    set_switch(monkeypatch, value)
++    world["rendezvous"] = False
++    run(world)
++    assert world["order"] == ["internal-start", "internal-end", "ansible-start", "ansible-end"]
++    assert world["playbook_runs"] == 1
++
++
++@pytest.mark.parametrize("on", [True, False])
++@pytest.mark.parametrize("failing", ["internal", "ansible", "both"])
++def test_a_failing_lane_fails_the_run_with_the_same_message_and_never_skips_the_other(world, monkeypatch, on, failing):
++    set_switch(monkeypatch, "true" if on else None)
++    world["rendezvous"] = on  # overlapped runs rendezvous; the sequential run cannot
++    world["internal_ok"] = failing not in ("internal", "both")
++    world["ansible_ok"] = failing not in ("ansible", "both")
++    with pytest.raises(Exit):
++        run(world)
++    assert world["exit_messages"] == ["Configuration deployment failed"]
++    assert "internal-end" in world["order"] and "ansible-end" in world["order"], "both lanes ran to the end"
++
++
++@pytest.mark.parametrize("on", [True, False])
++def test_success_is_silent_in_both_modes(world, monkeypatch, on):
++    set_switch(monkeypatch, "true" if on else None)
++    world["rendezvous"] = on
++    run(world)
++    assert world["exit_messages"] == []
++
++
++def test_an_exception_in_the_playbook_thread_surfaces_after_the_internal_lane_finished(world, monkeypatch):
++    set_switch(monkeypatch, "true")
++    world["ansible_raises"] = RuntimeError("ansible-playbook vanished")
++    with pytest.raises(RuntimeError, match="vanished"):
++        run(world)
++    assert "internal-end" in world["order"], "the fan-out must not be abandoned half way"
++
++
++def test_nothing_needing_ansible_means_no_second_lane(world, monkeypatch):
++    set_switch(monkeypatch, "true")
++    world["ansible_skip"] = list(NODES)
++    world["rendezvous"] = False
++    run(world)
++    assert world["order"] == ["internal-start", "internal-end"] and world["playbook_runs"] == 0
++
++
++def test_the_normalize_step_is_never_overlapped(world, monkeypatch):
++    """The overlap is for the main deploy only: start_overlapped_ansible_lane refuses while args.normalize is set."""
++    set_switch(monkeypatch, "true")
++    world["args"].normalize = True
++    assert deploy.start_overlapped_ansible_lane(world["topology"], world["args"], NODES, []) is False
++    assert deploy._OVERLAPPED_LANE is None
++
++
++def test_upstream_lines_are_not_removed_by_the_patch():
++    """The series must keep upstream's text (scripts/check-netlab-series-reverts-upstream.sh): the two sequential calls
++    are still in run(), and the join lives INSIDE deploy_ansible_playbook."""
++    import inspect
++    run_source = inspect.getsource(deploy.run)
++    assert "(used_internal, status_internal) = deploy_internal_config(nodeset, topology, args)" in run_source
++    assert "deploy_ansible_playbook(topology,args,nodeset,rest,'deploy' if used_internal else '')" in run_source
++    assert run_source.index("start_overlapped_ansible_lane") < run_source.index("(used_internal, status_internal) = deploy_internal_config(nodeset, topology, args)\n  (used_ansible")
+diff --git a/tests/test_kne_interface_naming.py b/tests/test_kne_interface_naming.py
+index ab1db16..31ed592 100644
+--- a/tests/test_kne_interface_naming.py
++++ b/tests/test_kne_interface_naming.py
+@@ -125,8 +125,7 @@ def test_kubevirt_devices_have_a_documented_eth0_decision(
+ 
+     KNE_RESERVED_ETH0_DEVICES is hand-maintained (see its own comment and
+     test_reserved_eth0_devices_start_at_eth1 above) -- nothing forced a device
+-    newly onboarded onto a KubeVirt image to be added to it. vsrx replaced
+-    csrx (2026-08-26), was never added, and hit exactly this bug bringing up
++    newly onboarded onto a KubeVirt image to be added to it. vsrx (2026-08-26) was never added, and hit exactly this bug bringing up
+     demo-lab (2026-09-13/14): its first data link landed on pod eth0,
+     kne dropped it from that node's own meshnet Topology CR, and the link's
+     OTHER endpoint failed bring-up with "could not find peer ... link UID N".
+diff --git a/tests/test_kne_provider.py b/tests/test_kne_provider.py
+index 2920f2f..30be895 100644
+--- a/tests/test_kne_provider.py
++++ b/tests/test_kne_provider.py
+@@ -1,5 +1,6 @@
+ #!/usr/bin/env python3
+ 
++import re
+ import textwrap
+ from argparse import Namespace
+ from pathlib import Path
+@@ -1251,84 +1252,6 @@ links:
+   assert not Path('node_files/r1/startup-config').exists()
+ 
+ 
+-def test_kne_csrx_uses_vendor_startup_config_contract(
+-  tmp_path: Path,
+-  monkeypatch: pytest.MonkeyPatch,
+-) -> None:
+-  monkeypatch.chdir(tmp_path)
+-  topo_file = write_topology(tmp_path,"""
+-provider: kne
+-
+-nodes:
+-  fw1:
+-    device: csrx
+-  h1:
+-    device: linux
+-
+-links:
+-- fw1:
+-    ipv4: 192.0.2.1/30
+-  h1:
+-    ipv4: 192.0.2.2/30
+-""")
+-
+-  init_log()
+-  topology = create.run(['-o','config','-o','provider',str(topo_file)])
+-
+-  assert topology.nodes.fw1.box == pinned_image(topology,'csrx')
+-  provider_text = Path('topology.pb.txt').read_text()
+-  assert 'vendor: JUNIPER' in provider_text
+-  assert 'model: "csrx"' in provider_text
+-  assert 'os: "junos"' in provider_text
+-  assert 'config_path: "/config"' in provider_text
+-  assert 'config_file: "juniper.conf"' in provider_text
+-  assert 'key: "CSRX_ROOT_PASSWORD"' in provider_text
+-  assert 'value: "clab123"' in provider_text
+-  assert 'key: "CSRX_JUNOS_CONFIG"' in provider_text
+-  assert 'value: "/config/juniper.conf"' in provider_text
+-  assert 'key: "CSRX_PORT_NUM"' in provider_text
+-  assert 'value: "2"' in provider_text
+-  assert 'key: 161' in provider_text
+-  assert 'name: "snmp"' in provider_text
+-  assert 'a_int: "eth1"' in provider_text
+-  assert 'z_int: "eth1"' in provider_text
+-  assert 'file: "node_files/fw1/startup-config"' in provider_text
+-
+-  startup_text = Path('node_files/fw1/startup-config').read_text()
+-  assert 'root-authentication' in startup_text
+-  assert 'encrypted-password "$6$lB5c6$' in startup_text
+-  assert 'ssh {' in startup_text
+-  assert 'root-login allow' in startup_text
+-  assert 'netconf {' in startup_text
+-  assert 'ge-0/0/0' in startup_text
+-  assert 'address 192.0.2.1/30' in startup_text
+-  assert 'security-zone default' in startup_text
+-
+-
+-def test_kne_csrx_preserves_explicit_image_override(
+-  tmp_path: Path,
+-  monkeypatch: pytest.MonkeyPatch,
+-) -> None:
+-  monkeypatch.chdir(tmp_path)
+-  expected = 'registry.example/csrx@sha256:0123456789abcdef'
+-  monkeypatch.setenv('NETLAB_KNE_IMAGE__OVERRIDES',f'csrx: {expected}')
+-  topo_file = write_topology(tmp_path,"""
+-provider: kne
+-
+-nodes:
+-  fw1:
+-    device: csrx
+-""")
+-
+-  init_log()
+-  topology = create.run([str(topo_file)])
+-
+-  snapshot = load_snapshot(Namespace(snapshot='netlab.snapshot.pickle'))
+-  assert topology.nodes.fw1.box == expected
+-  assert snapshot.kne.nodeMeta.fw1.image == expected
+-  assert f'image: "{expected}"' in Path('topology.pb.txt').read_text()
+-
+-
+ def test_kne_asav_reserves_eth0_for_mgmt_and_starts_data_links_at_eth1(
+   tmp_path: Path,
+   monkeypatch: pytest.MonkeyPatch,
+@@ -1410,7 +1333,7 @@ def test_kne_reserved_eth0_covers_every_kubevirt_vm_nos_skyforge_ships() -> None
+   """
+   from netsim.providers.kne import KNE_RESERVED_ETH0_DEVICES
+ 
+-  for device in ('asav','csrx','iosxr','vjunos-router','vjunos-switch'):
++  for device in ('asav','iosxr','vjunos-router','vjunos-switch'):
+     assert device in KNE_RESERVED_ETH0_DEVICES, f'{device} must reserve pod eth0 for management'
+ 
+ 
+@@ -1526,7 +1449,6 @@ nodes:
+   ('a10','a10','A10','a10',False),
+   ('dellos10','dellos10','DELL','os10',True),
+   ('fortios','fortios','FORTINET','fortios',True),
+-  ('csrx','csrx','JUNIPER','junos',True),
+   ('panos','panos','PALOALTO','panos',True),
+   ('sros','sros','NOKIA','sros',False),
+   ('vjunos-switch','vjunos-switch','JUNIPER','junos',True),
+@@ -1723,6 +1645,169 @@ def test_kne_linux_caldera_agent_env_follows_the_per_run_fact(tmp_path: Path, mo
+   assert 'attacker.example' not in provider_text
+ 
+ 
++def _lldp_pod_env_by_node(tmp_path: Path, topology_yaml: str) -> dict:
++  '''Render the KNE provider file; return {node: (SKYFORGE_LLDP_DISABLED, SKYFORGE_LLDP_INTERFACES)}, None where the key is absent.'''
++  init_log()
++  create.run(['-o','config','-o','provider',str(write_topology(tmp_path,topology_yaml))])
++  text = Path('topology.pb.txt').read_text()
++  assert 'KEEP_ME' in text, 'the author\'s unrelated env must survive'
++  result = {}
++  for block in text.split('\nnodes: {')[1:]:
++    name = re.search(r'name: "([^"]+)"',block).group(1)
++    vals = []
++    for key in ('SKYFORGE_LLDP_DISABLED','SKYFORGE_LLDP_INTERFACES'):
++      found = re.findall(r'key: "' + key + r'"\s+value: "([^"]*)"',block)
++      assert len(found) <= 1, f'{name}: {key} must appear at most once, got {found}'
++      vals.append(found[0] if found else None)
++    result[name] = tuple(vals)
++  return result
++
++
++def _lldp_rejected(tmp_path: Path, topology_yaml: str, capsys: pytest.CaptureFixture) -> str:
++  topo_file = write_topology(tmp_path,topology_yaml)
++  init_log(raise_error=True)
++  with pytest.raises(log.ErrorAbort):
++    topology = _read.load(str(topo_file),relative_topo_name=True,user_defaults=[])
++    augment.main.transform(topology)
++  captured = capsys.readouterr()
++  return captured.out + captured.err
++
++
++# The author's own raw env values (which would keep lldpd on / pick interfaces) must never survive.
++LLDP_RAW_ENV = """
++    kne:
++      env:
++        SKYFORGE_LLDP_DISABLED: "0"
++        SKYFORGE_LLDP_INTERFACES: "eth9"
++        KEEP_ME: "yes"
++"""
++OFF = ('1',None)
++ON_ALL = (None,None)
++
++
++def test_kne_linux_lldp_is_off_by_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.chdir(tmp_path)
++  got = _lldp_pod_env_by_node(tmp_path,"provider: kne\nnodes:\n  h1:\n    device: linux" + LLDP_RAW_ENV + "  h2:\n    device: linux\n")
++  assert got == { 'h1': OFF, 'h2': OFF }
++
++
++def test_kne_linux_lldp_node_true_and_explicit_false(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.chdir(tmp_path)
++  got = _lldp_pod_env_by_node(tmp_path,"provider: kne\nnodes:\n  h1:\n    device: linux\n    lldp: true" + LLDP_RAW_ENV + "  h2:\n    device: linux\n    lldp: false\n  h3:\n    device: linux\n")
++  assert got == { 'h1': ON_ALL, 'h2': OFF, 'h3': OFF }
++
++
++def test_kne_linux_lldp_group_level_true(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.chdir(tmp_path)
++  got = _lldp_pod_env_by_node(tmp_path,"""
++provider: kne
++groups:
++  lldp_on:
++    members: [ h1, h2 ]
++    node_data:
++      lldp: true
++nodes:
++  h1:
++    device: linux""" + LLDP_RAW_ENV + """  h2:
++    device: linux
++  h3:
++    device: linux
++""")
++  assert got == { 'h1': ON_ALL, 'h2': ON_ALL, 'h3': OFF }
++
++
++def test_kne_linux_lldp_defaults_level_true(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.chdir(tmp_path)
++  got = _lldp_pod_env_by_node(tmp_path,"""
++provider: kne
++defaults.devices.linux.lldp: true
++nodes:
++  h1:
++    device: linux""" + LLDP_RAW_ENV + """  h2:
++    device: linux
++    lldp: false
++""")
++  # the device default switches h1 on; a node's own value beats it
++  assert got == { 'h1': ON_ALL, 'h2': OFF }
++
++
++LLDP_TWO_LINKS = """
++provider: kne
++nodes:
++  h1:
++    device: linux""" + LLDP_RAW_ENV + """  s1:
++    device: linux
++  s2:
++    device: linux
++links:
++- h1: { lldp: %s }
++  s1:
++- h1: { lldp: %s }
++  s2:
++"""
++
++
++def test_kne_linux_lldp_interface_level_selects_interfaces(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.chdir(tmp_path)
++  # node off (default), interface to s1 on, interface to s2 explicitly off -> lldp runs on eth1 only
++  got = _lldp_pod_env_by_node(tmp_path,LLDP_TWO_LINKS % ('true','false'))
++  assert got['h1'] == (None,'eth1')
++  assert got['s1'] == OFF and got['s2'] == OFF
++
++
++def test_kne_linux_lldp_interface_false_overrides_node_true(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.chdir(tmp_path)
++  got = _lldp_pod_env_by_node(tmp_path,LLDP_TWO_LINKS.replace("    device: linux" + LLDP_RAW_ENV,"    device: linux\n    lldp: true" + LLDP_RAW_ENV,1) % ('false','true'))
++  # node true, but the interface to s1 is off: only the interface to s2 (eth2) runs LLDP
++  assert got['h1'] == (None,'eth2')
++
++
++def test_kne_linux_lldp_every_interface_false_is_off_even_with_node_true(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.chdir(tmp_path)
++  got = _lldp_pod_env_by_node(tmp_path,LLDP_TWO_LINKS.replace("    device: linux" + LLDP_RAW_ENV,"    device: linux\n    lldp: true" + LLDP_RAW_ENV,1) % ('false','false'))
++  assert got['h1'] == OFF
++
++
++@pytest.mark.parametrize('where',[ "nodes:\n  h1:\n    device: linux\n    lldp: maybe\n",
++                                   "nodes: [ h1, h2 ]\ndefaults.device: linux\nlinks:\n- h1: { lldp: 5 }\n  h2:\n" ])
++def test_kne_lldp_rejects_a_non_boolean(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, where: str) -> None:
++  monkeypatch.chdir(tmp_path)
++  out = _lldp_rejected(tmp_path,"provider: kne\n" + where,capsys)
++  assert 'lldp' in out and 'bool' in out.lower()
++
++
++def test_kne_lldp_is_rejected_on_a_non_linux_node(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
++  monkeypatch.chdir(tmp_path)
++  out = _lldp_rejected(tmp_path,"provider: kne\nnodes:\n  h1:\n    device: linux\n  r1:\n    device: eos\n    lldp: true\nlinks: [ h1-r1 ]\n",capsys)
++  assert 'Device eos does not support lldp used in nodes.r1.lldp' in out
++
++
++def test_kne_lldp_false_is_also_rejected_on_a_non_linux_node(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
++  monkeypatch.chdir(tmp_path)
++  out = _lldp_rejected(tmp_path,"provider: kne\nnodes:\n  r1:\n    device: eos\n    lldp: false\n",capsys)
++  assert 'Device eos does not support lldp' in out
++
++
++def test_kne_lldp_on_the_switch_side_of_a_link_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
++  monkeypatch.chdir(tmp_path)
++  # netlab's rule for an unsupported optional feature is an error, not a warning, so a switch-side lldp stops the compile
++  out = _lldp_rejected(tmp_path,"provider: kne\nnodes:\n  h1:\n    device: linux\n  s1:\n    device: eos\nlinks:\n- h1: { lldp: true }\n  s1: { lldp: true }\n",capsys)
++  assert 'Device eos does not support lldp used in nodes.s1.interfaces' in out
++  assert 'Device linux does not support' not in out
++
++
++def test_kne_lldp_link_level_reaches_the_switch_interface_and_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
++  monkeypatch.chdir(tmp_path)
++  out = _lldp_rejected(tmp_path,"provider: kne\nnodes:\n  h1:\n    device: linux\n  s1:\n    device: eos\nlinks:\n- h1:\n  s1:\n  lldp: true\n",capsys)
++  assert 'Device eos does not support lldp used in nodes.s1.interfaces' in out
++
++
++def test_kne_lldp_on_the_host_side_of_a_host_switch_link_is_accepted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.chdir(tmp_path)
++  got = _lldp_pod_env_by_node(tmp_path,"provider: kne\nnodes:\n  h1:\n    device: linux" + LLDP_RAW_ENV + "  s1:\n    device: eos\nlinks:\n- h1: { lldp: true }\n  s1:\n")
++  assert got['h1'] == (None,'eth1')
++  assert got['s1'] == (None,None), "a non-linux node is never touched by the linux adjuster"
++
+ 
+ 
+ LISTEN_TOPOLOGY = """
+-- 
+2.56.0
+

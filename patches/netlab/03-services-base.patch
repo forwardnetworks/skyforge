@@ -1,17 +1,132 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
-Date: Sun, 27 Sep 2026 12:00:00 +0000
-Subject: [PATCH] services: syslog to the management VRF and flow export client
+Date: Thu, 19 Nov 2026 00:00:00 +0000
+Subject: [PATCH] services: SNMP and gNMI agent, syslog to the management VRF,
+ flow export client
 
 ---
+diff --git a/docs/dev/config/services.md b/docs/dev/config/services.md
+index 62782c6..63ce1b7 100644
+--- a/docs/dev/config/services.md
++++ b/docs/dev/config/services.md
+@@ -3,7 +3,7 @@
+ 
+ This document describes the device data model parameters one should consider when creating a network services configuration template. For a wider picture, please see [](dev-device-features) or [](../devices.md).
+ 
+-The services module currently supports two client-server services: **DNS** (fully implemented) and **syslog** (attribute schema defined, transformation logic ready, configuration templates not yet implemented).
++This fork adds a third: **SNMP** (agent only, implemented as a SERVER -- see the SNMP note in the user documentation). Upstream, the services module currently supports two client-server services: **DNS** (fully implemented) and **syslog** (attribute schema defined, transformation logic ready, configuration templates not yet implemented).
+ 
+ **Notes:**
+ 
+diff --git a/docs/module/services.md b/docs/module/services.md
+index 6f1b212..acbbcb1 100644
+--- a/docs/module/services.md
++++ b/docs/module/services.md
+@@ -3,6 +3,8 @@
+ 
+ The Network Services configuration module implements DNS and Syslog clients and servers; NTP and SNMP are planned for future releases.
+ 
++This *netlab* fork also implements an **SNMP agent** (`services.server.snmp`) -- see [SNMP agent](#services-snmp) below.
++
+ ```eval_rst
+ .. contents:: Table of Contents
+    :depth: 2
+@@ -70,3 +72,61 @@ The DNS server is enabled on supported nodes with the **services.server.dns** pa
+ 
+ * Specify the Syslog server(s) on client nodes with the [common network services parameters](services-common-parameters)
+ * The syslog server is enabled on supported nodes with the **services.server.syslog: True** parameter.
++
++(services-snmp)=
++## SNMP agent
++
++```{note}
++SNMP is a **Skyforge extension**. Upstream *netlab* lists SNMP as planned for a
++future release; this fork implements the agent half now. Changes belong in
++`patches/netlab/`.
++```
++
++An SNMP agent is modelled as a **server**, not a client: it listens on UDP/161 and
++answers an NMS, exactly as a DNS server answers a resolver. It is therefore
++configured under `services.server.snmp`, and is deliberately absent from the
++module's `clients` list -- a node that only needs an `snmp-server community` line
++has no server to point at, and modelling it as a client would fail validation with
++*"is neither a client nor a server"*.
++
++Trap and inform *destinations* are the genuine client half of SNMP. They are not
++implemented yet and would arrive as `services.snmp.server` without disturbing this.
++
++| Operating system | SNMP agent |
++| ---------------- | :--: |
++| Arista EOS | ✅ |
++| Cisco IOS / IOS-XE | ✅ |
++
++Devices inheriting from `ios` (`iol`, `iosv`, `csr`, `cat8000v`, …) inherit the
++capability.
++
++### Parameters
++
++* `services.server.snmp.community` -- read-only community string. Defaults to `skyforge` (the community the collector's collectors poll with).
++* `services.server.snmp.location` -- optional `snmp-server location`.
++* `services.server.snmp.contact` -- optional `snmp-server contact`.
++
++Setting `services.server.snmp: True` enables the agent with the default community.
++
++### Example
++
++```yaml
++module: [ services ]
++
++nodes:
++  s1:
++    device: eos
++    services.server.snmp:
++      community: skyforge
++      location: lab-a
++```
++
++renders
++
++```
++snmp-server community skyforge ro
++snmp-server location lab-a
++```
++
++The access level is spelled per platform -- `ro` on EOS, `RO` on IOS -- because
++these strings are written to the device verbatim.
+diff --git a/netsim/ansible/templates/services/arubacx.j2 b/netsim/ansible/templates/services/arubacx.j2
+index 8a6ac80..db80f11 100644
+--- a/netsim/ansible/templates/services/arubacx.j2
++++ b/netsim/ansible/templates/services/arubacx.j2
+@@ -14,3 +14,13 @@ ip dns domain-list {{ services.dns.domain }}
+ logging {{ syslog_host }}{%
+    if services.syslog.transport_vrf is defined %} vrf {{ services.syslog.transport_vrf }}{% endif +%}
+ {% endfor %}
++{% if services.server.snmp is defined %}
++{#
++    SNMP agent, ported VERBATIM from the snmp_config custom config module so the
++    generated configuration is byte-for-byte what this platform emitted before.
++    The only change is that the community is a parameter, defaulting to
++    `skyforge` -- the community the collector's collectors poll with. Any other default
++    leaves every device reachable and unpollable.
++#}
++snmp-server community {{ services.server.snmp.community|default('skyforge') }} ro
++{% endif %}
 diff --git a/netsim/ansible/templates/services/asa.j2 b/netsim/ansible/templates/services/asa.j2
-index 5a2722e..1f73d30 100644
---- a/netsim/ansible/templates/services/asa.j2
+new file mode 100644
+index 0000000..1f73d30
+--- /dev/null
 +++ b/netsim/ansible/templates/services/asa.j2
-@@ -8,3 +8,77 @@
- #}
- snmp-server community {{ services.server.snmp.community|default('skyforge') }}
- {% endif %}
+@@ -0,0 +1,84 @@
++{% if services.server.snmp is defined %}
++{#
++    SNMP agent, ported VERBATIM from the snmp_config custom config module so the
++    generated configuration is byte-for-byte what this platform emitted before.
++    The only change is that the community is a parameter, defaulting to
++    `skyforge` -- the community the collector's collectors poll with. Any other default
++    leaves every device reachable and unpollable.
++#}
++snmp-server community {{ services.server.snmp.community|default('skyforge') }}
++{% endif %}
 +{#
 +  THE COLLECTOR IS REACHED OVER MANAGEMENT, and on an ASA every logging and
 +  export destination is written in terms of an interface NAME, not an interface.
@@ -87,13 +202,21 @@ index 5a2722e..1f73d30 100644
 +!
 +{% endif %}
 diff --git a/netsim/ansible/templates/services/asav.j2 b/netsim/ansible/templates/services/asav.j2
-index 5a2722e..1f73d30 100644
---- a/netsim/ansible/templates/services/asav.j2
+new file mode 100644
+index 0000000..1f73d30
+--- /dev/null
 +++ b/netsim/ansible/templates/services/asav.j2
-@@ -8,3 +8,77 @@
- #}
- snmp-server community {{ services.server.snmp.community|default('skyforge') }}
- {% endif %}
+@@ -0,0 +1,84 @@
++{% if services.server.snmp is defined %}
++{#
++    SNMP agent, ported VERBATIM from the snmp_config custom config module so the
++    generated configuration is byte-for-byte what this platform emitted before.
++    The only change is that the community is a parameter, defaulting to
++    `skyforge` -- the community the collector's collectors poll with. Any other default
++    leaves every device reachable and unpollable.
++#}
++snmp-server community {{ services.server.snmp.community|default('skyforge') }}
++{% endif %}
 +{#
 +  THE COLLECTOR IS REACHED OVER MANAGEMENT, and on an ASA every logging and
 +  export destination is written in terms of an interface NAME, not an interface.
@@ -168,14 +291,103 @@ index 5a2722e..1f73d30 100644
 +{%   endfor %}
 +!
 +{% endif %}
+diff --git a/netsim/ansible/templates/services/csrx.j2 b/netsim/ansible/templates/services/csrx.j2
+new file mode 100644
+index 0000000..947005b
+--- /dev/null
++++ b/netsim/ansible/templates/services/csrx.j2
+@@ -0,0 +1,14 @@
++{% if services.server.snmp is defined %}
++{#
++    SNMP agent, ported VERBATIM from the snmp_config custom config module so the
++    generated configuration is byte-for-byte what this platform emitted before.
++    The only change is that the community is a parameter, defaulting to
++    `skyforge` -- the community the collector's collectors poll with. Any other default
++    leaves every device reachable and unpollable.
++#}
++snmp {
++  community {{ services.server.snmp.community|default('skyforge') }} {
++    authorization read-only;
++  }
++}
++{% endif %}
+diff --git a/netsim/ansible/templates/services/cumulus.j2 b/netsim/ansible/templates/services/cumulus.j2
+new file mode 100644
+index 0000000..6a73ecd
+--- /dev/null
++++ b/netsim/ansible/templates/services/cumulus.j2
+@@ -0,0 +1,11 @@
++{% if services.server.snmp is defined %}
++{#
++    SNMP agent, ported VERBATIM from the snmp_config custom config module so the
++    generated configuration is byte-for-byte what this platform emitted before.
++    The only change is that the community is a parameter, defaulting to
++    `skyforge` -- the community the collector's collectors poll with. Any other default
++    leaves every device reachable and unpollable.
++#}
++net add snmp-server community {{ services.server.snmp.community|default('skyforge') }} readonly
++net commit
++{% endif %}
+diff --git a/netsim/ansible/templates/services/cumulus_nvue.j2 b/netsim/ansible/templates/services/cumulus_nvue.j2
+new file mode 100644
+index 0000000..6a73ecd
+--- /dev/null
++++ b/netsim/ansible/templates/services/cumulus_nvue.j2
+@@ -0,0 +1,11 @@
++{% if services.server.snmp is defined %}
++{#
++    SNMP agent, ported VERBATIM from the snmp_config custom config module so the
++    generated configuration is byte-for-byte what this platform emitted before.
++    The only change is that the community is a parameter, defaulting to
++    `skyforge` -- the community the collector's collectors poll with. Any other default
++    leaves every device reachable and unpollable.
++#}
++net add snmp-server community {{ services.server.snmp.community|default('skyforge') }} readonly
++net commit
++{% endif %}
+diff --git a/netsim/ansible/templates/services/dellos10.j2 b/netsim/ansible/templates/services/dellos10.j2
+new file mode 100644
+index 0000000..0e796a9
+--- /dev/null
++++ b/netsim/ansible/templates/services/dellos10.j2
+@@ -0,0 +1,10 @@
++{% if services.server.snmp is defined %}
++{#
++    SNMP agent, ported VERBATIM from the snmp_config custom config module so the
++    generated configuration is byte-for-byte what this platform emitted before.
++    The only change is that the community is a parameter, defaulting to
++    `skyforge` -- the community the collector's collectors poll with. Any other default
++    leaves every device reachable and unpollable.
++#}
++snmp-server community {{ services.server.snmp.community|default('skyforge') }} ro
++{% endif %}
 diff --git a/netsim/ansible/templates/services/eos.j2 b/netsim/ansible/templates/services/eos.j2
-index 18c12a9..1e50990 100644
+index 2850663..1e50990 100644
 --- a/netsim/ansible/templates/services/eos.j2
 +++ b/netsim/ansible/templates/services/eos.j2
-@@ -38,3 +38,35 @@ management api gnmi
- #}
- snmp-server community {{ services.server.snmp.community|default('skyforge') }} ro
- {% endif %}
+@@ -19,3 +19,54 @@ logging {% if services.syslog.transport_vrf is defined
+   %}vrf {{ services.syslog.transport_vrf }} {% endif
+   %}host {{ syslog_host }}
+ {% endfor %}
++{% if services.server.gnmi is defined %}
++{#
++    gNMI/gRPC telemetry endpoint. Ported verbatim from the snmp_config-era
++    gnmi_config/eos.j2 -- EOS names the transport rather than a port, so
++    services.server.gnmi.port is accepted by the schema and ignored here.
++#}
++management api gnmi
++   transport grpc default
++{% endif %}
++{% if services.server.snmp is defined %}
++{#
++    SNMP agent, ported VERBATIM from the snmp_config custom config module so the
++    generated configuration is byte-for-byte what this platform emitted before.
++    The only change is that the community is a parameter, defaulting to
++    `skyforge` -- the community the collector's collectors poll with. Any other default
++    leaves every device reachable and unpollable.
++#}
++snmp-server community {{ services.server.snmp.community|default('skyforge') }} ro
++{% endif %}
 +{% if services.syslog._server_list is defined and services.syslog._mgmt|default(False) %}
 +{#
 +  Skyforge: `transport_vrf: mgmt` (see services.py). The collector is reached
@@ -208,14 +420,98 @@ index 18c12a9..1e50990 100644
 +{%   endif %}
 +sflow run
 +{% endif %}
+diff --git a/netsim/ansible/templates/services/fortinet.fortios.fortios.j2 b/netsim/ansible/templates/services/fortinet.fortios.fortios.j2
+new file mode 100644
+index 0000000..7e8f9f1
+--- /dev/null
++++ b/netsim/ansible/templates/services/fortinet.fortios.fortios.j2
+@@ -0,0 +1,27 @@
++{% if services.server.snmp is defined %}
++{#
++    SNMP agent, ported VERBATIM from the snmp_config custom config module so the
++    generated configuration is byte-for-byte what this platform emitted before.
++    The only change is that the community is a parameter, defaulting to
++    `skyforge` -- the community the collector's collectors poll with. Any other default
++    leaves every device reachable and unpollable.
++#}
++config system interface
++  edit "port1"
++    set allowaccess ping http https ssh snmp
++  next
++end
++config system snmp sysinfo
++  set status enable
++end
++config system snmp community
++  edit 1
++    set name "{{ services.server.snmp.community|default('skyforge') }}"
++    config hosts
++      edit 1
++        set ip 0.0.0.0 0.0.0.0
++      next
++    end
++  next
++end
++{% endif %}
+diff --git a/netsim/ansible/templates/services/fortios.j2 b/netsim/ansible/templates/services/fortios.j2
+new file mode 100644
+index 0000000..7e8f9f1
+--- /dev/null
++++ b/netsim/ansible/templates/services/fortios.j2
+@@ -0,0 +1,27 @@
++{% if services.server.snmp is defined %}
++{#
++    SNMP agent, ported VERBATIM from the snmp_config custom config module so the
++    generated configuration is byte-for-byte what this platform emitted before.
++    The only change is that the community is a parameter, defaulting to
++    `skyforge` -- the community the collector's collectors poll with. Any other default
++    leaves every device reachable and unpollable.
++#}
++config system interface
++  edit "port1"
++    set allowaccess ping http https ssh snmp
++  next
++end
++config system snmp sysinfo
++  set status enable
++end
++config system snmp community
++  edit 1
++    set name "{{ services.server.snmp.community|default('skyforge') }}"
++    config hosts
++      edit 1
++        set ip 0.0.0.0 0.0.0.0
++      next
++    end
++  next
++end
++{% endif %}
 diff --git a/netsim/ansible/templates/services/ios.j2 b/netsim/ansible/templates/services/ios.j2
-index 6155a85..7eba15d 100644
+index d89d16a..7eba15d 100644
 --- a/netsim/ansible/templates/services/ios.j2
 +++ b/netsim/ansible/templates/services/ios.j2
-@@ -40,3 +40,110 @@ logging host {{ "ipv6 " if ':' in syslog_host else "" }}{{ syslog_host }}{%
- #}
- snmp-server community {{ services.server.snmp.community|default('skyforge') }} RO
- {% endif %}
+@@ -22,3 +22,128 @@ ip domain name {{ services.dns.domain }}
+ logging host {{ "ipv6 " if ':' in syslog_host else "" }}{{ syslog_host }}{%
+    if services.syslog.transport_vrf is defined %} vrf {{ services.syslog.transport_vrf }}{% endif +%}
+ {% endfor %}
++{% if services.server.gnmi is defined %}
++{#
++    IOS/IOL ship no gNMI configuration in this fork -- the historical
++    gnmi_config/ios.j2 was empty. The block exists so enabling the service on an
++    IOS node is a NO-OP rather than a missing-template failure, and so the gap is
++    visible here rather than looking like an oversight.
++#}
++{% endif %}
++{% if services.server.snmp is defined %}
++{#
++    SNMP agent, ported VERBATIM from the snmp_config custom config module so the
++    generated configuration is byte-for-byte what this platform emitted before.
++    The only change is that the community is a parameter, defaulting to
++    `skyforge` -- the community the collector's collectors poll with. Any other default
++    leaves every device reachable and unpollable.
++#}
++snmp-server community {{ services.server.snmp.community|default('skyforge') }} RO
++{% endif %}
 +{% if services.syslog._server_list is defined and services.syslog._mgmt|default(False) %}
 +{#
 +  Skyforge: `transport_vrf: mgmt` (see services.py). The collector is reached
@@ -323,11 +619,140 @@ index 6155a85..7eba15d 100644
 +!
 +{%   endfor %}
 +{% endif %}
+diff --git a/netsim/ansible/templates/services/iosxr.j2 b/netsim/ansible/templates/services/iosxr.j2
+index 44a7cdf..fbe9635 100644
+--- a/netsim/ansible/templates/services/iosxr.j2
++++ b/netsim/ansible/templates/services/iosxr.j2
+@@ -19,3 +19,23 @@ logging trap informational
+ logging {{ syslog_host }} port default{%
+    if services.syslog.transport_vrf is defined %} vrf {{ services.syslog.transport_vrf }}{% endif +%}
+ {% endfor %}
++{% if services.server.gnmi is defined %}
++{#
++    gNMI/gRPC telemetry endpoint. Ported verbatim from gnmi_config/iosxr.j2.
++    IOS-XR takes an explicit port; the schema default matches the historical 57400.
++#}
++grpc
++ port {{ services.server.gnmi.port|default(57400) }}
++ no-tls
++!
++{% endif %}
++{% if services.server.snmp is defined %}
++{#
++    SNMP agent, ported VERBATIM from the snmp_config custom config module so the
++    generated configuration is byte-for-byte what this platform emitted before.
++    The only change is that the community is a parameter, defaulting to
++    `skyforge` -- the community the collector's collectors poll with. Any other default
++    leaves every device reachable and unpollable.
++#}
++snmp-server community {{ services.server.snmp.community|default('skyforge') }} RO
++{% endif %}
+diff --git a/netsim/ansible/templates/services/nxos.j2 b/netsim/ansible/templates/services/nxos.j2
+index 85ff27f..6bf9951 100644
+--- a/netsim/ansible/templates/services/nxos.j2
++++ b/netsim/ansible/templates/services/nxos.j2
+@@ -14,3 +14,21 @@ ip domain-name {{ services.dns.domain }}
+ logging server {{ syslog_host }} 6{%
+    if services.syslog.transport_vrf is defined %} use-vrf {{ services.syslog.transport_vrf }}{% endif +%}
+ {% endfor %}
++{% if services.server.gnmi is defined %}
++{#
++    gNMI/gRPC telemetry endpoint. Ported verbatim from gnmi_config/nxos.j2.
++    NX-OS needs the feature enabled before the port takes effect.
++#}
++feature grpc
++grpc port {{ services.server.gnmi.port|default(50051) }}
++{% endif %}
++{% if services.server.snmp is defined %}
++{#
++    SNMP agent, ported VERBATIM from the snmp_config custom config module so the
++    generated configuration is byte-for-byte what this platform emitted before.
++    The only change is that the community is a parameter, defaulting to
++    `skyforge` -- the community the collector's collectors poll with. Any other default
++    leaves every device reachable and unpollable.
++#}
++snmp-server community {{ services.server.snmp.community|default('skyforge') }} group network-operator
++{% endif %}
+diff --git a/netsim/ansible/templates/services/sros.j2 b/netsim/ansible/templates/services/sros.j2
+index d406406..7b711b5 100644
+--- a/netsim/ansible/templates/services/sros.j2
++++ b/netsim/ansible/templates/services/sros.j2
+@@ -1,3 +1,19 @@
++{#
++    SR OS services configuration -- ONE gNMI document.
++
++    SR OS is deployed by tasks/deploy-config/sros.yml, which does
++    `yaml_config | from_yaml` and applies cfg.updates / delete / replace. That
++    makes this file a single YAML DOCUMENT, not a concatenation of blocks: two
++    top-level `updates:` keys do not merge, the second WINS, and the first
++    service's configuration is silently lost. So every service contributes
++    entries to one list, and every platform detail below is inside it.
++
++    It also means CLI text cannot be used here at all. `/configure ...` parses as
++    a plain string, and the deploy task guards `cfg.updates is not string`, so it
++    would be skipped without error -- which is exactly what the old
++    gnmi_config/sros.j2 did: SR OS gNMI was never actually applied.
++#}
++{% if services.syslog._server_list is defined or services.server.snmp is defined or services.server.gnmi is defined %}
+ updates:
+ {% if services.syslog._server_list is defined %}
+ - path: configure/log
+@@ -9,8 +25,16 @@ updates:
+ {%   for syslog_host in services.syslog._server_list %}
+     - syslog-name: "{{ syslog_host }}"
+       address: "{{ syslog_host }}"
++{#     `log syslog <n> hostname` does not exist on SR OS 22.x: 22.10 rejects the
++       whole configure/log update ("MINOR: MGMT_CORE #2201: .../hostname - Unknown
++       element"), measured 2026-09-30 on the KubeVirt vr-sros 22.10 pair. The KNE
++       provider publishes the release it reads from the image tag as
++       kne.sros_version_major; an unknown release (0, or no KNE data) keeps
++       upstream's behaviour. #}
++{%     if (kne.sros_version_major|default(0)|int) == 0 or (kne.sros_version_major|int) >= 23 %}
+       hostname:
+         use-system-name: {}
++{%     endif %}
+ {%   endfor %}
+     log-id:
+ {%   for syslog_host in services.syslog._server_list %}
+@@ -25,3 +49,32 @@ updates:
+         syslog: "{{ syslog_host }}"
+ {%   endfor %}
+ {% endif %}
++{% if services.server.snmp is defined %}
++- path: configure/system/management-interface/snmp
++  val:
++    packet-size: 9216
++    streaming:
++      admin-state: enable
++- path: configure/system/security/user-params/local-user/user[user-name=admin]
++  val:
++    access:
++      console: true
++      ftp: true
++      grpc: true
++      netconf: true
++- path: configure/system/security/snmp/community[community-string={{ services.server.snmp.community|default('skyforge') }}]
++  val:
++    access-permissions: r
++    version: v2c
++{% endif %}
++{% if services.server.gnmi is defined %}
++- path: configure/system/management-interface/netconf
++  val:
++    admin-state: enable
++- path: configure/system/grpc
++  val:
++    admin-state: enable
++    gnmi:
++      admin-state: enable
++{% endif %}
++{% endif %}
 diff --git a/netsim/ansible/templates/services/vjunos-router.j2 b/netsim/ansible/templates/services/vjunos-router.j2
-index 9916d04..0aae39b 100644
---- a/netsim/ansible/templates/services/vjunos-router.j2
+new file mode 100644
+index 0000000..0aae39b
+--- /dev/null
 +++ b/netsim/ansible/templates/services/vjunos-router.j2
-@@ -1,3 +1,10 @@
+@@ -0,0 +1,122 @@
 +{#
 +    DNS and syslog come from upstream services/junos.j2. This file exists
 +    because netlab picks services/<netlab_device_type>.j2 BEFORE
@@ -335,13 +760,38 @@ index 9916d04..0aae39b 100644
 +    the parent would silently take those clients away from this device.
 +#}
 +{% include 'junos.j2' +%}
- {% if services.server.snmp is defined %}
- {#
-     SNMP agent. Junos configuration is HIERARCHICAL everywhere else in netlab
-@@ -30,3 +37,86 @@ snmp {
-   }
- }
- {% endif %}
++{% if services.server.snmp is defined %}
++{#
++    SNMP agent. Junos configuration is HIERARCHICAL everywhere else in netlab
++    (initial/junos.j2, bgp/junos.j2, ... and csrx.j2 right here), and every
++    module fragment is concatenated into ONE juniper.conf. A `set ...` line
++    inside that file is a syntax error: mgd rejects the WHOLE file and boots the
++    FACTORY configuration -- no management address, no ssh, nothing for the collector
++    to collect. Measured 2026-08-28 on demo-lab, where all four vJunos came
++    up amnesiac. The community defaults to `skyforge`, the community the collector's
++    collectors poll with; any other default leaves every device reachable and
++    unpollable.
++#}
++snmp {
++  {#
++      The management interface (fxp0) lives in the mgmt_junos routing
++      instance -- Skyforge's initial/vjunos-*.j2 sets management-instance so
++      out-of-band default route cannot leak into the data plane. snmpd binds
++      *:161 in the DEFAULT instance and, without this statement, silently
++      drops every request that arrives on fxp0. Measured 2026-09-07 on
++      demo-lab's four vJunos with the same community from the same probe host:
++      the loopback answered, the management address timed out, and the collector
++      read the silence as "invalid snmp credentials". Two lines: this one
++      and the community's routing-instance (alone this one left snmpd
++      counting every poll as "bad community uses", measured 2026-10-09).
++  #}
++  routing-instance-access;
++  community {{ services.server.snmp.community|default('skyforge') }} {
++    authorization read-only;
++    routing-instance mgmt_junos;
++  }
++}
++{% endif %}
 +{#
 +  sFLOW EXPORT -- the point of which is evidence, not telemetry.
 +
@@ -426,10 +876,11 @@ index 9916d04..0aae39b 100644
 +}
 +{% endif %}
 diff --git a/netsim/ansible/templates/services/vjunos-switch.j2 b/netsim/ansible/templates/services/vjunos-switch.j2
-index 9916d04..f573cc2 100644
---- a/netsim/ansible/templates/services/vjunos-switch.j2
+new file mode 100644
+index 0000000..f573cc2
+--- /dev/null
 +++ b/netsim/ansible/templates/services/vjunos-switch.j2
-@@ -1,3 +1,10 @@
+@@ -0,0 +1,122 @@
 +{#
 +    DNS and syslog come from upstream services/junos.j2. This file exists
 +    because netlab picks services/<netlab_device_type>.j2 BEFORE
@@ -437,13 +888,38 @@ index 9916d04..f573cc2 100644
 +    the parent would silently take those clients away from this device.
 +#}
 +{% include 'junos.j2' +%}
- {% if services.server.snmp is defined %}
- {#
-     SNMP agent. Junos configuration is HIERARCHICAL everywhere else in netlab
-@@ -30,3 +37,86 @@ snmp {
-   }
- }
- {% endif %}
++{% if services.server.snmp is defined %}
++{#
++    SNMP agent. Junos configuration is HIERARCHICAL everywhere else in netlab
++    (initial/junos.j2, bgp/junos.j2, ... and csrx.j2 right here), and every
++    module fragment is concatenated into ONE juniper.conf. A `set ...` line
++    inside that file is a syntax error: mgd rejects the WHOLE file and boots the
++    FACTORY configuration -- no management address, no ssh, nothing for the collector
++    to collect. Measured 2026-08-28 on demo-lab, where all four vJunos came
++    up amnesiac. The community defaults to `skyforge`, the community the collector's
++    collectors poll with; any other default leaves every device reachable and
++    unpollable.
++#}
++snmp {
++  {#
++      The management interface (fxp0) lives in the mgmt_junos routing
++      instance -- Skyforge's initial/vjunos-*.j2 sets management-instance so
++      out-of-band default route cannot leak into the data plane. snmpd binds
++      *:161 in the DEFAULT instance and, without this statement, silently
++      drops every request that arrives on fxp0. Measured 2026-09-07 on
++      demo-lab's four vJunos with the same community from the same probe host:
++      the loopback answered, the management address timed out, and the collector
++      read the silence as "invalid snmp credentials". Two lines: this one
++      and the community's routing-instance (alone this one left snmpd
++      counting every poll as "bad community uses", measured 2026-10-09).
++  #}
++  routing-instance-access;
++  community {{ services.server.snmp.community|default('skyforge') }} {
++    authorization read-only;
++    routing-instance mgmt_junos;
++  }
++}
++{% endif %}
 +{#
 +  sFLOW EXPORT -- the point of which is evidence, not telemetry.
 +
@@ -528,10 +1004,11 @@ index 9916d04..f573cc2 100644
 +}
 +{% endif %}
 diff --git a/netsim/ansible/templates/services/vmx.j2 b/netsim/ansible/templates/services/vmx.j2
-index 9916d04..1b78a20 100644
---- a/netsim/ansible/templates/services/vmx.j2
+new file mode 100644
+index 0000000..1b78a20
+--- /dev/null
 +++ b/netsim/ansible/templates/services/vmx.j2
-@@ -1,3 +1,10 @@
+@@ -0,0 +1,39 @@
 +{#
 +    DNS and syslog come from upstream services/junos.j2. This file exists
 +    because netlab picks services/<netlab_device_type>.j2 BEFORE
@@ -539,14 +1016,44 @@ index 9916d04..1b78a20 100644
 +    the parent would silently take those clients away from this device.
 +#}
 +{% include 'junos.j2' +%}
- {% if services.server.snmp is defined %}
- {#
-     SNMP agent. Junos configuration is HIERARCHICAL everywhere else in netlab
++{% if services.server.snmp is defined %}
++{#
++    SNMP agent. Junos configuration is HIERARCHICAL everywhere else in netlab
++    (initial/junos.j2, bgp/junos.j2, ... and csrx.j2 right here), and every
++    module fragment is concatenated into ONE juniper.conf. A `set ...` line
++    inside that file is a syntax error: mgd rejects the WHOLE file and boots the
++    FACTORY configuration -- no management address, no ssh, nothing for the collector
++    to collect. Measured 2026-08-28 on demo-lab, where all four vJunos came
++    up amnesiac. The community defaults to `skyforge`, the community the collector's
++    collectors poll with; any other default leaves every device reachable and
++    unpollable.
++#}
++snmp {
++  {#
++      The management interface (fxp0) lives in the mgmt_junos routing
++      instance -- Skyforge's initial/vjunos-*.j2 sets management-instance so
++      out-of-band default route cannot leak into the data plane. snmpd binds
++      *:161 in the DEFAULT instance and, without this statement, silently
++      drops every request that arrives on fxp0. Measured 2026-09-07 on
++      demo-lab's four vJunos with the same community from the same probe host:
++      the loopback answered, the management address timed out, and the collector
++      read the silence as "invalid snmp credentials". Two lines: this one
++      and the community's routing-instance (alone this one left snmpd
++      counting every poll as "bad community uses", measured 2026-10-09).
++  #}
++  routing-instance-access;
++  community {{ services.server.snmp.community|default('skyforge') }} {
++    authorization read-only;
++    routing-instance mgmt_junos;
++  }
++}
++{% endif %}
 diff --git a/netsim/ansible/templates/services/vptx.j2 b/netsim/ansible/templates/services/vptx.j2
-index 9916d04..1b78a20 100644
---- a/netsim/ansible/templates/services/vptx.j2
+new file mode 100644
+index 0000000..1b78a20
+--- /dev/null
 +++ b/netsim/ansible/templates/services/vptx.j2
-@@ -1,3 +1,10 @@
+@@ -0,0 +1,39 @@
 +{#
 +    DNS and syslog come from upstream services/junos.j2. This file exists
 +    because netlab picks services/<netlab_device_type>.j2 BEFORE
@@ -554,14 +1061,44 @@ index 9916d04..1b78a20 100644
 +    the parent would silently take those clients away from this device.
 +#}
 +{% include 'junos.j2' +%}
- {% if services.server.snmp is defined %}
- {#
-     SNMP agent. Junos configuration is HIERARCHICAL everywhere else in netlab
++{% if services.server.snmp is defined %}
++{#
++    SNMP agent. Junos configuration is HIERARCHICAL everywhere else in netlab
++    (initial/junos.j2, bgp/junos.j2, ... and csrx.j2 right here), and every
++    module fragment is concatenated into ONE juniper.conf. A `set ...` line
++    inside that file is a syntax error: mgd rejects the WHOLE file and boots the
++    FACTORY configuration -- no management address, no ssh, nothing for the collector
++    to collect. Measured 2026-08-28 on demo-lab, where all four vJunos came
++    up amnesiac. The community defaults to `skyforge`, the community the collector's
++    collectors poll with; any other default leaves every device reachable and
++    unpollable.
++#}
++snmp {
++  {#
++      The management interface (fxp0) lives in the mgmt_junos routing
++      instance -- Skyforge's initial/vjunos-*.j2 sets management-instance so
++      out-of-band default route cannot leak into the data plane. snmpd binds
++      *:161 in the DEFAULT instance and, without this statement, silently
++      drops every request that arrives on fxp0. Measured 2026-09-07 on
++      demo-lab's four vJunos with the same community from the same probe host:
++      the loopback answered, the management address timed out, and the collector
++      read the silence as "invalid snmp credentials". Two lines: this one
++      and the community's routing-instance (alone this one left snmpd
++      counting every poll as "bad community uses", measured 2026-10-09).
++  #}
++  routing-instance-access;
++  community {{ services.server.snmp.community|default('skyforge') }} {
++    authorization read-only;
++    routing-instance mgmt_junos;
++  }
++}
++{% endif %}
 diff --git a/netsim/ansible/templates/services/vsrx.j2 b/netsim/ansible/templates/services/vsrx.j2
-index 9916d04..1b78a20 100644
---- a/netsim/ansible/templates/services/vsrx.j2
+new file mode 100644
+index 0000000..1b78a20
+--- /dev/null
 +++ b/netsim/ansible/templates/services/vsrx.j2
-@@ -1,3 +1,10 @@
+@@ -0,0 +1,39 @@
 +{#
 +    DNS and syslog come from upstream services/junos.j2. This file exists
 +    because netlab picks services/<netlab_device_type>.j2 BEFORE
@@ -569,14 +1106,65 @@ index 9916d04..1b78a20 100644
 +    the parent would silently take those clients away from this device.
 +#}
 +{% include 'junos.j2' +%}
- {% if services.server.snmp is defined %}
- {#
-     SNMP agent. Junos configuration is HIERARCHICAL everywhere else in netlab
++{% if services.server.snmp is defined %}
++{#
++    SNMP agent. Junos configuration is HIERARCHICAL everywhere else in netlab
++    (initial/junos.j2, bgp/junos.j2, ... and csrx.j2 right here), and every
++    module fragment is concatenated into ONE juniper.conf. A `set ...` line
++    inside that file is a syntax error: mgd rejects the WHOLE file and boots the
++    FACTORY configuration -- no management address, no ssh, nothing for the collector
++    to collect. Measured 2026-08-28 on demo-lab, where all four vJunos came
++    up amnesiac. The community defaults to `skyforge`, the community the collector's
++    collectors poll with; any other default leaves every device reachable and
++    unpollable.
++#}
++snmp {
++  {#
++      The management interface (fxp0) lives in the mgmt_junos routing
++      instance -- Skyforge's initial/vjunos-*.j2 sets management-instance so
++      out-of-band default route cannot leak into the data plane. snmpd binds
++      *:161 in the DEFAULT instance and, without this statement, silently
++      drops every request that arrives on fxp0. Measured 2026-09-07 on
++      demo-lab's four vJunos with the same community from the same probe host:
++      the loopback answered, the management address timed out, and the collector
++      read the silence as "invalid snmp credentials". Two lines: this one
++      and the community's routing-instance (alone this one left snmpd
++      counting every poll as "bad community uses", measured 2026-10-09).
++  #}
++  routing-instance-access;
++  community {{ services.server.snmp.community|default('skyforge') }} {
++    authorization read-only;
++    routing-instance mgmt_junos;
++  }
++}
++{% endif %}
+diff --git a/netsim/devices/arubacx.yml b/netsim/devices/arubacx.yml
+index bab62aa..5887a7c 100644
+--- a/netsim/devices/arubacx.yml
++++ b/netsim/devices/arubacx.yml
+@@ -122,7 +122,9 @@ features:
+       ipv6: True
+       transport_vrf: False
+     syslog: True
++    # SNMP agent: this device answers an NMS. Ported from the
+     # snmp_config custom config module.
++    server.snmp: True
+   stp:
+     supported_protocols: [ mstp, pvrst, stp ]
+     enable_per_port: True
+@@ -141,6 +143,7 @@ features:
+ external:
+   image: none
+ graphite.icon: switch
++
+ kne:
+   group_vars:
+     netlab_check_retries: 40
 diff --git a/netsim/devices/asav.yml b/netsim/devices/asav.yml
-index 40f5316..9c8670c 100644
+index 98fe629..9c8670c 100644
 --- a/netsim/devices/asav.yml
 +++ b/netsim/devices/asav.yml
-@@ -24,6 +24,22 @@ external:
+@@ -24,7 +24,25 @@ external:
    image: none
  features:
    services:
@@ -596,14 +1184,17 @@ index 40f5316..9c8670c 100644
 +    # be told it has one.
 +    syslog: True
 +    flow.netflow: True
-     # SNMP agent: this device answers an NMS. Ported from the
++    # SNMP agent: this device answers an NMS. Ported from the
      # snmp_config custom config module.
-     server.snmp: True
++    server.snmp: True
+   initial:
+     collect: true
+     reload: true
 diff --git a/netsim/devices/cat8000v.yml b/netsim/devices/cat8000v.yml
-index c4e1de0..e4c87d9 100644
+index 2410040..e4c87d9 100644
 --- a/netsim/devices/cat8000v.yml
 +++ b/netsim/devices/cat8000v.yml
-@@ -28,6 +28,19 @@ node:
+@@ -28,7 +28,22 @@ node:
    min_mtu: 1500
  features:
    services:
@@ -620,14 +1211,89 @@ index c4e1de0..e4c87d9 100644
 +    flow.netflow: True
 +    flow.ipfix: True
 +    flow.sampling: True
-     # SNMP agent: this device answers an NMS. Ported from the
++    # SNMP agent: this device answers an NMS. Ported from the
      # snmp_config custom config module.
-     server.snmp: True
++    server.snmp: True
+   sdwan:
+     types: [ controller ]
+   srv6:
+diff --git a/netsim/devices/csrx.yml b/netsim/devices/csrx.yml
+index 38fa9ea..d02c8c5 100644
+--- a/netsim/devices/csrx.yml
++++ b/netsim/devices/csrx.yml
+@@ -15,7 +15,9 @@ mtu: 1500
+ 
+ features:
+   services:
++    # SNMP agent: this device answers an NMS. Ported from the
+     # snmp_config custom config module.
++    server.snmp: True
+   initial:
+     ipv4:
+       unnumbered: false               # The 'unnumbered-address' family inet command does not work on cSRX
+@@ -50,6 +52,7 @@ clab:
+     netlab_config_path: /config/netlab/
+ 
+ graphite.icon: firewall
++
+ kne:
+   group_vars:
+     netlab_config_mode: sh
+diff --git a/netsim/devices/cumulus.yml b/netsim/devices/cumulus.yml
+index 60d1ed5..c7824c8 100644
+--- a/netsim/devices/cumulus.yml
++++ b/netsim/devices/cumulus.yml
+@@ -48,7 +48,9 @@ group_vars:
+ evpn._start_transit_vlan: 3900
+ features:
+   services:
++    # SNMP agent: this device answers an NMS. Ported from the
+     # snmp_config custom config module.
++    server.snmp: True
+   initial:
+     system_mtu: True
+     ipv4:
+diff --git a/netsim/devices/cumulus_nvue.yml b/netsim/devices/cumulus_nvue.yml
+index 6073498..45d2cd6 100644
+--- a/netsim/devices/cumulus_nvue.yml
++++ b/netsim/devices/cumulus_nvue.yml
+@@ -31,7 +31,9 @@ group_vars:
+   netlab_ready: [ ansible ]
+ features:
+   services:
++    # SNMP agent: this device answers an NMS. Ported from the
+     # snmp_config custom config module.
++    server.snmp: True
+   initial:
+     system_mtu: True
+     ipv4:
+diff --git a/netsim/devices/dellos10.yml b/netsim/devices/dellos10.yml
+index 3eb6e64..ab2ae72 100644
+--- a/netsim/devices/dellos10.yml
++++ b/netsim/devices/dellos10.yml
+@@ -6,7 +6,9 @@ loopback_interface_name: loopback{ifindex}
+ lag_interface_name: "port-channel{lag.ifindex}"
+ features:
+   services:
++    # SNMP agent: this device answers an NMS. Ported from the
+     # snmp_config custom config module.
++    server.snmp: True
+   initial:
+     system_mtu: true
+     ipv4:
+@@ -138,6 +140,7 @@ group_vars:
+ external:
+   image: none
+ graphite.icon: switch
++
+ kne:
+   group_vars:
+     ansible_user: admin
 diff --git a/netsim/devices/eos.yml b/netsim/devices/eos.yml
-index 2bb901f..ab731a2 100644
+index 27b9eb8..ab731a2 100644
 --- a/netsim/devices/eos.yml
 +++ b/netsim/devices/eos.yml
-@@ -154,6 +154,12 @@ features:
+@@ -154,6 +154,15 @@ features:
    services:
      dns: True
      syslog: True
@@ -637,14 +1303,46 @@ index 2bb901f..ab731a2 100644
 +    # look configured.
 +    flow.sflow: True
 +    flow.sampling: True
-     # SNMP agent. Declared on the SERVER half: the device answers an NMS.
-     server.snmp: True
-     server.gnmi: True
++    # SNMP agent. Declared on the SERVER half: the device answers an NMS.
++    server.snmp: True
++    server.gnmi: True
+   sr:
+     af: [ ipv4, ipv6 ]
+     protocol: [ isis, ospfv2 ]
+@@ -229,6 +238,7 @@ attributes:
+     eos:
+       serialnumber: str           # Referenced in ceos-config.j2 template
+       systemmacaddr: mac          # Probably shouldn't be multicast
++
+ kne:
+   # The sh config lane is DECLARED here, not only under clab.
+   #
+diff --git a/netsim/devices/fortios.yml b/netsim/devices/fortios.yml
+index debc23a..b65350e 100644
+--- a/netsim/devices/fortios.yml
++++ b/netsim/devices/fortios.yml
+@@ -46,7 +46,9 @@ external:
+   image: none
+ features:
+   services:
++    # SNMP agent: this device answers an NMS. Ported from the
+     # snmp_config custom config module.
++    server.snmp: True
+   bgp:
+     activate_af: true          # Per-neighbor activate / activate6
+     advertise: true            # "config network" / "config network6"
+@@ -79,5 +81,6 @@ features:
+     collect: true
+     config_mode: [ netmiko ]
+ graphite.icon: firewall
++
+ kne:
+   interface.name: eth{ifindex}
 diff --git a/netsim/devices/iol.yml b/netsim/devices/iol.yml
-index 889c022..a169e79 100644
+index 03fb86e..a169e79 100644
 --- a/netsim/devices/iol.yml
 +++ b/netsim/devices/iol.yml
-@@ -17,6 +17,19 @@ clab:
+@@ -17,7 +17,22 @@ clab:
  
  features:
    services:
@@ -661,14 +1359,47 @@ index 889c022..a169e79 100644
 +    flow.netflow: True
 +    flow.ipfix: True
 +    flow.sampling: True
-     # SNMP agent: this device answers an NMS. Ported from the
++    # SNMP agent: this device answers an NMS. Ported from the
      # snmp_config custom config module.
-     server.snmp: True
++    server.snmp: True
+   initial:
+     min_mtu: 68
+     min_phy_mtu: 1501
+@@ -43,6 +58,7 @@ features:
+     asymmetrical_irb: true
+     irb: true
+     transport: [ vxlan, mpls, sr ]
++
+ kne:
+   group_vars:
+     netlab_device_type: iol
+diff --git a/netsim/devices/ioll2.yml b/netsim/devices/ioll2.yml
+index d95ff0e..20ce92d 100644
+--- a/netsim/devices/ioll2.yml
++++ b/netsim/devices/ioll2.yml
+@@ -5,7 +5,9 @@ lag_interface_name: "Port-channel{lag.ifindex}"
+ 
+ features:
+   services:
++    # SNMP agent: this device answers an NMS. Ported from the
+     # snmp_config custom config module.
++    server.snmp: True
+   initial:
+     generate_mac: [ ethernet, svi ]
+     normalize: true
+@@ -33,6 +35,7 @@ clab:
+   node:
+     kind: cisco_iol
+     type: l2
++
+ kne:
+   group_vars:
+     netlab_device_type: ioll2
 diff --git a/netsim/devices/ios.yml b/netsim/devices/ios.yml
-index 8e64a10..f1811e1 100644
+index d91e87e..f1811e1 100644
 --- a/netsim/devices/ios.yml
 +++ b/netsim/devices/ios.yml
-@@ -160,6 +160,17 @@ features:
+@@ -160,8 +160,22 @@ features:
        discard: True
      acl: True
    services:
@@ -685,12 +1416,17 @@ index 8e64a10..f1811e1 100644
 +    flow.sampling: True
      dns: True
      syslog: True
-     # SNMP agent. Declared on the SERVER half: the device answers an NMS.
++    # SNMP agent. Declared on the SERVER half: the device answers an NMS.
++    server.snmp: True
++    server.gnmi: True
+   tunnel:
+     gre: [ vrf, ipv4, ipv6 ]
+   vlan:
 diff --git a/netsim/devices/iosv.yml b/netsim/devices/iosv.yml
-index 46daf53..27e95f5 100644
+index 74f17ea..27e95f5 100644
 --- a/netsim/devices/iosv.yml
 +++ b/netsim/devices/iosv.yml
-@@ -17,6 +17,19 @@ libvirt:
+@@ -17,7 +17,22 @@ libvirt:
    create_template: iosv.xml.j2
  features:
    services:
@@ -707,14 +1443,87 @@ index 46daf53..27e95f5 100644
 +    flow.netflow: True
 +    flow.ipfix: True
 +    flow.sampling: True
-     # SNMP agent: this device answers an NMS. Ported from the
++    # SNMP agent: this device answers an NMS. Ported from the
      # snmp_config custom config module.
-     server.snmp: True
++    server.snmp: True
+   initial:
+     min_mtu: 64
+     max_mtu: 9600
+@@ -33,5 +48,6 @@ clab:
+     kind: cisco_vios
+   interface.name: eth{ifindex}
+   build: https://github.com/srl-labs/vrnetlab/tree/master/vios
++
+ kne:
+   interface.name: eth{ifindex}
+diff --git a/netsim/devices/iosxr.yml b/netsim/devices/iosxr.yml
+index 07c0a82..a6a10f7 100644
+--- a/netsim/devices/iosxr.yml
++++ b/netsim/devices/iosxr.yml
+@@ -56,11 +56,14 @@ features:
+     # Telemetry endpoints the device SERVES: SNMP answers an NMS, gNMI
+     # answers a collector. Ported from the snmp_config/gnmi_config custom
+     # config modules.
++    server.snmp: True
++    server.gnmi: True
+   srv6:
+     isis: true
+     ebgp: true
+     bgp: true
+     vpn: true
++
+ kne:
+   # The sh config lane is DECLARED here, not only under clab -- the same gap
+   # 0023 closed for eos, which iosxr was missed by. Every variable the lane
+diff --git a/netsim/devices/nxos.yml b/netsim/devices/nxos.yml
+index 5f8eff4..4abe353 100644
+--- a/netsim/devices/nxos.yml
++++ b/netsim/devices/nxos.yml
+@@ -100,6 +100,8 @@ features:
+     # Telemetry endpoints the device SERVES: SNMP answers an NMS, gNMI
+     # answers a collector. Ported from the snmp_config/gnmi_config custom
+     # config modules.
++    server.snmp: True
++    server.gnmi: True
+   vlan:
+     model: l3-switch
+     native_routed: true
+@@ -117,6 +119,7 @@ libvirt:
+ external:
+   image: none
+ graphite.icon: nexus5000
++
+ kne:
+   group_vars:
+     ansible_ssh_pass: admin
+diff --git a/netsim/devices/sros.yml b/netsim/devices/sros.yml
+index 5d3ae98..7aacfbd 100644
+--- a/netsim/devices/sros.yml
++++ b/netsim/devices/sros.yml
+@@ -98,7 +98,10 @@ features:
+   services:
+     syslog:
+       transport_vrf: False
++    server.gnmi: True
++    # SNMP agent: this device answers an NMS. Ported from the
+     # snmp_config custom config module.
++    server.snmp: True
+   sr:
+     af: [ ipv4, ipv6 ]
+     protocol: [ isis ]
+@@ -191,6 +194,7 @@ clab:
+ external:
+   image: none
+ graphite.icon: router
++
+ kne:
+   group_vars:
+     sros_grpc_port: 57400
 diff --git a/netsim/devices/vjunos-router.yml b/netsim/devices/vjunos-router.yml
-index cc5912b..cd0b051 100644
+index 8ee4026..cd0b051 100644
 --- a/netsim/devices/vjunos-router.yml
 +++ b/netsim/devices/vjunos-router.yml
-@@ -10,6 +10,28 @@ group_vars:
+@@ -10,7 +10,31 @@ group_vars:
  
  features:
    services:
@@ -740,14 +1549,25 @@ index cc5912b..cd0b051 100644
 +    syslog: True
 +    flow.sflow: True
 +    flow.sampling: True
-     # SNMP agent: this device answers an NMS. Ported from the
++    # SNMP agent: this device answers an NMS. Ported from the
      # snmp_config custom config module.
-     server.snmp: True
++    server.snmp: True
+   evpn:
+     asymmetrical_irb: true
+     irb: true
+@@ -49,6 +73,7 @@ clab:
+     ansible_ssh_pass: admin@123
+ 
+ graphite.icon: router
++
+ kne:
+   group_vars:
+     ansible_user: admin
 diff --git a/netsim/devices/vjunos-switch.yml b/netsim/devices/vjunos-switch.yml
-index f4a8d6f..6f463a1 100644
+index 55f1966..6f463a1 100644
 --- a/netsim/devices/vjunos-switch.yml
 +++ b/netsim/devices/vjunos-switch.yml
-@@ -7,6 +7,28 @@ group_vars:
+@@ -7,7 +7,31 @@ group_vars:
  
  features:
    services:
@@ -773,9 +1593,85 @@ index f4a8d6f..6f463a1 100644
 +    syslog: True
 +    flow.sflow: True
 +    flow.sampling: True
-     # SNMP agent: this device answers an NMS. Ported from the
++    # SNMP agent: this device answers an NMS. Ported from the
      # snmp_config custom config module.
-     server.snmp: True
++    server.snmp: True
+   evpn:
+     asymmetrical_irb: true
+     irb: true
+@@ -47,6 +71,7 @@ clab:
+     netlab_check_delay: 10
+ 
+ graphite.icon: switch
++
+ kne:
+   group_vars:
+     ansible_user: admin
+diff --git a/netsim/devices/vmx.yml b/netsim/devices/vmx.yml
+index 88c2c3a..73ac24d 100644
+--- a/netsim/devices/vmx.yml
++++ b/netsim/devices/vmx.yml
+@@ -13,7 +13,9 @@ group_vars:
+ 
+ features:
+   services:
++    # SNMP agent: this device answers an NMS. Ported from the
+     # snmp_config custom config module.
++    server.snmp: True
+   vlan:
+     model: router
+     svi_interface_name: irb.{vlan}
+@@ -33,5 +35,6 @@ clab:
+     name: eth{ifindex+1}
+ 
+ graphite.icon: router
++
+ kne:
+   interface.name: eth{ifindex+1}
+diff --git a/netsim/devices/vptx.yml b/netsim/devices/vptx.yml
+index e4fea78..4c54fe0 100644
+--- a/netsim/devices/vptx.yml
++++ b/netsim/devices/vptx.yml
+@@ -8,7 +8,9 @@ group_vars:
+ 
+ features:
+   services:
++    # SNMP agent: this device answers an NMS. Ported from the
+     # snmp_config custom config module.
++    server.snmp: True
+   evpn:
+     asymmetrical_irb: true
+     irb: true
+@@ -53,6 +55,7 @@ clab:
+     netlab_check_delay: 10
+ 
+ graphite.icon: switch
++
+ kne:
+   group_vars:
+     ansible_user: admin
+diff --git a/netsim/devices/vsrx.yml b/netsim/devices/vsrx.yml
+index 052aa12..fc00e70 100644
+--- a/netsim/devices/vsrx.yml
++++ b/netsim/devices/vsrx.yml
+@@ -11,7 +11,9 @@ group_vars:
+ 
+ features:
+   services:
++    # SNMP agent: this device answers an NMS. Ported from the
+     # snmp_config custom config module.
++    server.snmp: True
+   gateway:
+     protocol: [ vrrp ]
+   lag:
+@@ -54,6 +56,7 @@ clab:
+     ansible_ssh_pass: "admin@123"
+ 
+ graphite.icon: firewall
++
+ kne:
+   group_vars:
+     ansible_user: admin
 diff --git a/netsim/modules/services.py b/netsim/modules/services.py
 index e2f2d7b..d6945e0 100644
 --- a/netsim/modules/services.py
@@ -931,7 +1827,7 @@ index e2f2d7b..d6945e0 100644
  
      print_client_server_errors(svc_cache,mod_attr)
 diff --git a/netsim/modules/services.yml b/netsim/modules/services.yml
-index 98edf46..e605491 100644
+index 5d2ffce..e605491 100644
 --- a/netsim/modules/services.yml
 +++ b/netsim/modules/services.yml
 @@ -26,9 +26,56 @@ attributes:
@@ -991,7 +1887,41 @@ index 98edf46..e605491 100644
      server:
        dns:
          type: dict
-@@ -82,9 +129,20 @@ attributes:
+@@ -45,6 +92,33 @@ attributes:
+       syslog:
+         type: bool
+         _remove_when_false: True
++      # SNMP AGENT. An agent is a SERVER, not a client: it listens on 161 and
++      # answers the NMS, exactly as a DNS server answers a resolver. Modelling it
++      # as a client would also break resolve_servers, which requires every client
++      # to name a server (or an explicit address) and errors with "is neither a
++      # client nor a server" otherwise -- a lab that only wants an
++      # `snmp-server community` line has no server to name.
++      #
++      # snmp is therefore deliberately NOT in `clients` below. Trap/inform
++      # DESTINATIONS are the genuine client half and can be added later as
++      # services.snmp.server without disturbing this.
++      snmp:
++        type: dict
++        _keys:
++          community: str
++          location: str
++          contact: str
++        true_value: {}
++        _remove_when_false: True
++      # gNMI/gRPC TELEMETRY ENDPOINT. Same reasoning as snmp: the device LISTENS
++      # and a collector dials it, so it is a server. `port` is the gRPC listener
++      # port; platforms that hard-code it ignore the value.
++      gnmi:
++        type: dict
++        _keys:
++          port: int
++        true_value: {}
++        _remove_when_false: True
+ 
+   clients:                                        # List of supported services clients
+     dns:
+@@ -55,8 +129,21 @@ attributes:
        ignore: []
        must_have: [ server, ipv4, ipv6 ]
        check_when: [ _server_list ]
@@ -1010,8 +1940,9 @@ index 98edf46..e605491 100644
 +  flow.ipfix: IPFIX (NetFlow v10) export
 +  flow.sampling: Configurable sampling rate
    server.dns: DNS server
-   server.snmp: SNMP agent (responds to an NMS)
-   server.gnmi: gNMI/gRPC telemetry endpoint
++  server.snmp: SNMP agent (responds to an NMS)
++  server.gnmi: gNMI/gRPC telemetry endpoint
+   server.syslog: syslog server
 diff --git a/tests/test_services_flow.py b/tests/test_services_flow.py
 new file mode 100644
 index 0000000..aaac033

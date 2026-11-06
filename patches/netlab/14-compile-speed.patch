@@ -1,0 +1,3379 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 00:00:00 +0000
+Subject: [PATCH] netlab: compile and render speed (lookup memo, copy-on-write
+ validation, parallel outputs and config workers, BGP scans, shared topology,
+ AS index)
+
+---
+diff --git a/netsim/augment/devices.py b/netsim/augment/devices.py
+index a5d61a7..065cd46 100644
+--- a/netsim/augment/devices.py
++++ b/netsim/augment/devices.py
+@@ -8,6 +8,7 @@ from enum import Enum
+ from box import Box
+ 
+ from .. import data
++from ..data import fastbox, memo
+ from ..utils import log, strings
+ 
+ """
+@@ -34,13 +35,17 @@ Get generic device attribute:
+   * If the provider data is a dictionary, but the device data is not, return provider data (override)
+   * Return a merge of both dictionaries
+ """
+-def get_device_attribute(node: Box, attr: str, defaults: Box) -> typing.Optional[typing.Any]:
++def _device_attribute(node: Box, attr: str, defaults: Box) -> typing.Tuple[typing.Any,bool]:
++  """
++  SKYFORGE-SPECIFIC: get_device_attribute, returning (value, shared). shared=True means the value is the CACHED merged
++  table (see netsim.data.memo): nobody may modify it, and get_device_attribute hands out a copy of it instead.
++  """
+   devtype  = node.device
+   provider = get_provider(node,defaults)
+ 
+   if not devtype in defaults.devices:    # pragma: no cover
+     log.fatal(f'Internal error: call to get_device_attribute with unknown device {devtype}')
+-    return None
++    return (None,False)
+ 
+   pvalue = None
+   devdata = defaults.devices[devtype]
+@@ -49,22 +54,37 @@ def get_device_attribute(node: Box, attr: str, defaults: Box) -> typing.Optional
+     if attr in devdata[provider]:        # Including the attribute we're looking for?
+       pvalue = devdata[provider][attr]   # Get the provider value
+       if not isinstance(pvalue,dict):    # Provider-specific value is not a dictionary
+-        return pvalue                    # No chance of merging, return it
++        return (pvalue,False)            # No chance of merging, return it
+   elif provider == 'kne' and 'clab' in devdata and attr in devdata.clab:
+     pvalue = devdata.clab[attr]
+     if not isinstance(pvalue,dict):
+-      return pvalue
++      return (pvalue,False)
+ 
+   value = devdata.get(attr,None)         # Non-specific device data
+   if isinstance(value,Box) and isinstance(pvalue,Box):
+-    return value+pvalue                  # Return merged dictionaries
++    # SKYFORGE-SPECIFIC: the merged table is the same for every node of this device type and provider
++    return (memo.memo('device_attr',(id(defaults),devtype,provider,attr),(defaults,value,pvalue),lambda: value+pvalue,watch=(value,pvalue)),True)
+ 
+   if provider in devdata and attr in devdata[provider]:          # Do we have a provider-specific value?
+-    return pvalue                        # Provider-specific dictionary overriding non-dictionary device value
++    return (pvalue,False)                # Provider-specific dictionary overriding non-dictionary device value
+   if provider == 'kne' and 'clab' in devdata and attr in devdata.clab and pvalue is not None:
+-    return pvalue
++    return (pvalue,False)
++
++  return (value,False)                   # Return whatever the device value is
+ 
+-  return value                           # Return whatever the device value is
++def get_device_attribute(node: Box, attr: str, defaults: Box) -> typing.Optional[typing.Any]:
++  value,shared = _device_attribute(node,attr,defaults)
++  # SKYFORGE-SPECIFIC: every caller still gets a merged table of its own, as it always did (python-box creates keys
++  # when a missing one is read, and callers may modify what they get)
++  return fastbox.copy_box(value) if shared else value
++
++def get_device_attribute_readonly(node: Box, attr: str, defaults: Box) -> typing.Optional[typing.Any]:
++  """
++  SKYFORGE-SPECIFIC: get_device_attribute for callers that only READ the result with .get() and `in`. The value may
++  be shared with every other node of the device type: never modify it, and never read a missing key with attribute
++  or [] access (python-box would create it). Saves a copy of the table per call.
++  """
++  return _device_attribute(node,attr,defaults)[0]
+ 
+ """
+ Get device feature flags -- uses get_device_attribute but returns a Box to keep mypy happy
+@@ -74,7 +94,7 @@ def get_device_features(node: Box, defaults: Box) -> Box:
+   if not isinstance(n_features,Box):
+     n_features = data.get_empty_box()
+ 
+-  features = get_device_attribute(node,'features',defaults)
++  features,_shared = _device_attribute(node,'features',defaults)
+   if not features:
+     return n_features
+ 
+@@ -82,7 +102,22 @@ def get_device_features(node: Box, defaults: Box) -> Box:
+     log.fatal(f'Device features for device type {node.device} should be a dictionary')
+     return data.get_empty_box()
+ 
+-  return features + n_features
++  if not n_features:                     # SKYFORGE-SPECIFIC: nothing to merge, so this is just features.copy() (one copy
++    return fastbox.copy_box(features)    # ... where the uncached code made two: the merge, then the copy; same result)
++
++  return fastbox.add(features,n_features)
++
++def get_device_features_readonly(node: Box, defaults: Box) -> Box:
++  """
++  SKYFORGE-SPECIFIC: get_device_features for callers that only READ the result with .get() and `in` (see
++  get_device_attribute_readonly). Falls back to get_device_features whenever the node has its own features.
++  """
++  if node.get('_features',None):
++    return get_device_features(node,defaults)
++  features,_shared = _device_attribute(node,'features',defaults)
++  if not features or not isinstance(features,Box):
++    return get_device_features(node,defaults)
++  return features
+ 
+ """
+ Get all device data for current provider
+@@ -119,6 +154,25 @@ def get_consolidated_device_data(node: Box, defaults: Box) -> Box:
+ 
+   return data
+ 
++def get_consolidated_device_data_readonly(node: Box, defaults: Box) -> Box:
++  """
++  SKYFORGE-SPECIFIC: get_consolidated_device_data for a caller that only READS the result (.get(), `in`, existing
++  keys). The merged device definition is the same for every node of a device type and provider, so it is built once
++  (netsim.data.memo: same source objects and unchanged content, dropped around every hook) and shared: never modify
++  it, never read a missing key with attribute or [] access.
++  """
++  devtype  = node.device
++  provider = get_provider(node,defaults)
++  if not devtype in defaults.devices:
++    return get_consolidated_device_data(node,defaults)
++  devdata = defaults.devices[devtype]
++  return memo.memo(
++    'consolidated_device_data',
++    (id(defaults),devtype,provider),
++    (defaults,devdata),
++    lambda: get_consolidated_device_data(node,defaults),
++    watch=(devdata,tuple(defaults.providers.keys())))     # the merge drops every provider's own block
++
+ """
+ Get group variable from node or device data
+ """
+@@ -126,9 +180,12 @@ def get_node_group_var(node: Box, g_var: str, defaults: Box) -> typing.Any:
+   if g_var in node:                               # Is group variable set in node?
+     return node.get(g_var)
+   else:                                           # Not set, get default device value for the node provider
+-    group_vars = get_device_attribute(node,'group_vars',defaults)
++    group_vars,shared = _device_attribute(node,'group_vars',defaults)    # SKYFORGE-SPECIFIC: no copy of the whole table
+     if isinstance(group_vars,Box):
+-      return group_vars.get(g_var,None)
++      value = group_vars.get(g_var,None)
++      if shared and type(value) is Box:     # ... but a nested table is still the caller's own, as before
++        return fastbox.copy_subtree(value,(g_var,))
++      return value
+     return None
+ 
+ """
+diff --git a/netsim/augment/links.py b/netsim/augment/links.py
+index 0e068de..113d12b 100644
+--- a/netsim/augment/links.py
++++ b/netsim/augment/links.py
+@@ -84,24 +84,29 @@ For the moment, we assume a node name is valid if it's part of the nodes
+ dictionary (obviously) or if it starts with a name of a component. The final
+ check of node names in links will be done after the component expansion.
+ '''
+-def is_nodename_valid(n: str, nodes: Box) -> bool:
++def include_prefixes(nodes: Box) -> tuple:
++  '''
++  SKYFORGE-SPECIFIC (patch 62): the name prefixes of the nodes with 'include' requests (was rebuilt on every miss of
++  is_nodename_valid: every non-node key of every dictionary-style link, a scan of all nodes each)
++  '''
++  return tuple( x+"_" for x,d in nodes.items() if 'include' in d )
++
++def is_nodename_valid(n: str, nodes: Box, c_pfx: typing.Optional[tuple] = None) -> bool:
+   if n in nodes:                          # Easy scenario: n is a known nodename
+     return True
+ 
+-  c_pfx = [ x+"_" for x,d in nodes.items() 
+-              if 'include' in d ]         # Otherwise, collect nodes with 'include' requests
+-  c_match = [ x for x in c_pfx 
+-              if n.startswith(x)]         # ... and check for a match
++  if c_pfx is None:                       # Otherwise, collect nodes with 'include' requests (callers that
++    c_pfx = include_prefixes(nodes)       # ... check many names pass the list they built once)
+ 
+-  return bool(c_match)                    # Return True if the match list is not empty
++  return bool(c_pfx) and n.startswith(c_pfx)   # ... and check for a match
+ 
+-def adjust_interface_list(iflist: list, link: Box, nodes: Box) -> list:
++def adjust_interface_list(iflist: list, link: Box, nodes: Box, c_pfx: typing.Optional[tuple] = None) -> list:
+   link_intf = []
+   intf_cnt  = 0
+   for n in iflist:                        # Sanity check of interface data
+     intf_cnt = intf_cnt + 1
+     if isinstance(n,str):                 # Another shortcut: node name as string
+-      if not is_nodename_valid(n,nodes):  # ... is it a valid node name?
++      if not is_nodename_valid(n,nodes,c_pfx):  # ... is it a valid node name?
+         log.error(                        # ... it's not, get lost
+           f'Interface {link._linkname}.interfaces.{intf_cnt} refers to an unknown node {n}',
+           log.IncorrectValue,
+@@ -122,7 +127,7 @@ def adjust_interface_list(iflist: list, link: Box, nodes: Box) -> list:
+         more_data=[ f'found {n}' ],
+         category=log.MissingValue,
+         module='links')
+-    elif not is_nodename_valid(n.node,nodes):
++    elif not is_nodename_valid(n.node,nodes,c_pfx):
+       log.error(                          # ... the node name is not valid, get lost
+         f'Interface data {link._linkname}.interfaces[{intf_cnt}] refers to an unknown node {n.node}',
+         log.IncorrectValue,
+@@ -142,14 +147,14 @@ Normalize the link objects:
+ 
+ """
+ 
+-def adjust_link_object(l: typing.Any, linkname: str, nodes: Box) -> typing.Optional[Box]:
++def adjust_link_object(l: typing.Any, linkname: str, nodes: Box, c_pfx: typing.Optional[tuple] = None) -> typing.Optional[Box]:
+   if isinstance(l,dict) and not isinstance(l,Box):            # transform dict into Box if needed
+     l = data.get_box(l)
+ 
+   if isinstance(l,Box) and 'interfaces' in l:                 # a dictionary with 'interfaces' element
+     l._linkname = linkname
+     must_be_list(l,'interfaces',linkname,module='links')
+-    l.interfaces = adjust_interface_list(l.interfaces,l,nodes)
++    l.interfaces = adjust_interface_list(l.interfaces,l,nodes,c_pfx)
+     return l
+ 
+   if isinstance(l,Box):                                       # a dictionary without 'interfaces' element
+@@ -157,7 +162,7 @@ def adjust_link_object(l: typing.Any, linkname: str, nodes: Box) -> typing.Optio
+     link_intf = []                                            # ... and a list of nodes
+     link_data._linkname = linkname                            # ... set link name
+     for k in l.keys():
+-      if is_nodename_valid(k,nodes):                          # Is this a reasonable node name?
++      if is_nodename_valid(k,nodes,c_pfx):                    # Is this a reasonable node name?
+         must_be_dict(l,k,linkname,create_empty=True)
+         if isinstance(l[k],dict):
+           l[k].node = k
+@@ -169,14 +174,14 @@ def adjust_link_object(l: typing.Any, linkname: str, nodes: Box) -> typing.Optio
+ 
+   if isinstance(l,list):                                              # List of nodes, transform into interfaces
+     link_data = data.get_box({ '_linkname' : linkname })              # ... create stub link data structure
+-    link_data.interfaces = adjust_interface_list(l,link_data,nodes)   # ... and adjust interface list
++    link_data.interfaces = adjust_interface_list(l,link_data,nodes,c_pfx)   # ... and adjust interface list
+     return link_data
+ 
+   if isinstance(l,str):                                       # String, split into a list of nodes
+     link_intf = []
+     for n in l.split('-'):                # ... split it into a list of nodes
+       n = n.strip()                       # ... strip leading and trailing spaces (fixing #816)
+-      if is_nodename_valid(n,nodes):      # If the node name is valid
++      if is_nodename_valid(n,nodes,c_pfx):  # If the node name is valid
+         link_intf.append({ 'node': n })   # ... append it to the list of interfaces
+       else:
+         log.error(
+@@ -196,8 +201,11 @@ def adjust_link_object(l: typing.Any, linkname: str, nodes: Box) -> typing.Optio
+ def adjust_link_list(
+       links: typing.Any, 
+       nodes: Box,
+-      linkname_format: str = 'links[{link_cnt}]') -> list:
++      linkname_format: str = 'links[{link_cnt}]',
++      c_pfx: typing.Optional[tuple] = None) -> list:
+   link_list: list = []
++  if c_pfx is None:                       # SKYFORGE-SPECIFIC (patch 62): one list for the whole link list
++    c_pfx = include_prefixes(nodes)
+ 
+   if not(links):
+     return link_list
+@@ -208,18 +216,18 @@ def adjust_link_list(
+     for lgn,lgdata in links.items():
+       ln_comps = linkname_format.split('[')
+       ln_group = f'{ln_comps[0]}.{lgn}[{ln_comps[1]}'
+-      link_list.extend(adjust_link_list(lgdata,nodes,ln_group))
++      link_list.extend(adjust_link_list(lgdata,nodes,ln_group,c_pfx))
+   elif isinstance(links,list):
+     for l in links:
+       link_cnt = link_cnt + 1
+       linkname = strings.eval_format_args(linkname_format,link_cnt=link_cnt)
+-      link_data = adjust_link_object(l,linkname,nodes)
++      link_data = adjust_link_object(l,linkname,nodes,c_pfx)
+       if not link_data is None:
+         if link_data.get('disable',False) is True:
+           continue
+         link_list.append(link_data)
+   elif isinstance(links,str):
+-    link_list.append(adjust_link_object(links,linkname_path,nodes))
++    link_list.append(adjust_link_object(links,linkname_path,nodes,c_pfx))
+   else:
+     log.error(
+       f'{linkname_path} must be a list or dictionary',
+@@ -351,7 +359,7 @@ def create_regular_interface(node: Box, ifdata: Box, defaults: Box) -> None:
+   # Assign MAC addresses to physical (but not VLAN member) interfaces if
+   # the device features include initial.generate_mac
+   #
+-  features = devices.get_device_features(node,defaults)
++  features = devices.get_device_features_readonly(node,defaults)        # SKYFORGE-SPECIFIC: read only
+   if 'ethernet' in features.get('initial.generate_mac',[]) and ifdata.get('type','') != 'vlan_member':
+     ifdata.mac_address = generate_interface_mac(node,ifdata,defaults)
+ 
+diff --git a/netsim/augment/nodes.py b/netsim/augment/nodes.py
+index 16a49c6..937a790 100644
+--- a/netsim/augment/nodes.py
++++ b/netsim/augment/nodes.py
+@@ -553,7 +553,7 @@ augment_node_device_data: copy attributes that happen to be node attributes from
+ def augment_node_device_data(n: Box, topology: Box) -> None:
+   defaults = topology.defaults
+   node_attr = defaults.attributes.get('node',[])
+-  dev_data  = devices.get_consolidated_device_data(n,defaults)
++  dev_data  = devices.get_consolidated_device_data_readonly(n,defaults)     # SKYFORGE-SPECIFIC: read only, see devices.py
+ 
+   for attr in node_attr:                      # Copy known node attributes from device+provider data into node data
+     if attr in dev_data and not attr in n:
+@@ -783,9 +783,16 @@ def cleanup(topology: Box) -> None:
+ 
+ '''
+ Return a copy of the topology (leaving original topology unchanged) with unmanaged devices removed
++
++SKYFORGE-SPECIFIC (patch 61): copy=False lets a caller that never changes what it gets back (or copies what it
++changes itself) receive the topology ITSELF when there is nothing to remove. With an unmanaged node it is the
++same full copy as always.
+ '''
+-def ghost_buster(topology: Box) -> Box:
++def ghost_buster(topology: Box, copy: bool = True) -> Box:
+   log.print_verbose('Removing unmanaged devices from topology')
++  if not copy and not any(n.get('unmanaged',False) for n in topology.nodes.values()):
++    return topology
++
+   # Create a copy of topology
+   topo_copy = data.get_box(topology)
+   
+diff --git a/netsim/augment/plugin.py b/netsim/augment/plugin.py
+index c5268af..09c10dc 100644
+--- a/netsim/augment/plugin.py
++++ b/netsim/augment/plugin.py
+@@ -11,6 +11,7 @@ import typing
+ from box import Box
+ 
+ from .. import data
++from ..data import memo
+ from ..utils import log, strings
+ from ..utils import read as _read
+ from ..utils import sort as _sort
+@@ -347,7 +348,9 @@ def execute_plugin_hook(action: str, plugin: object, topology: Box) -> None:
+     func = getattr(plugin,action)                           # ... yes, fetch the function to call
+     if log.debug_active('plugin'):                          # ... do some logging to help the poor debugging souls
+       print(f'plug {action}: {plugin}')
++    memo.invalidate()                                       # SKYFORGE-SPECIFIC: a plugin may edit device/attribute tables in place
+     func(topology)                                          # ... and execute the plugin function
++    memo.invalidate()
+ 
+ '''
+ Execute a plugin action:
+@@ -360,6 +363,8 @@ def execute(action: str, topology: Box) -> None:
+   if not 'Plugin' in topology:                                # No plugins, no worries
+     return
+ 
++  memo.invalidate()                                           # SKYFORGE-SPECIFIC: plugins edit device/attribute tables in place
++
+   if log.debug_active('plugin'):
+     print(f'plug hook: {action}')
+ 
+diff --git a/netsim/cli/create.py b/netsim/cli/create.py
+index 9e6c6b6..b5f56ec 100644
+--- a/netsim/cli/create.py
++++ b/netsim/cli/create.py
+@@ -16,11 +16,13 @@ import requests
+ from box import Box
+ 
+ from .. import augment
++from ..data import memo
+ from ..outputs import _TopologyOutput
+ from ..utils import log, strings
+ from ..utils import read as _read
+ from . import common_parse_args, error_and_exit, lab_status_log, load_topology, topology_parse_args
+ from ._hooks import cli_plugin_hooks
++from . import parallel_outputs
+ 
+ 
+ #
+@@ -199,16 +201,21 @@ def run(cli_args: typing.List[str],
+   # are used in search paths
+   augment.config.make_paths_absolute(topology.defaults.paths)
+ 
+-  for output_format in args.output:
+-    output_param = get_output_parameter(output_format,args.output)
+-    if not output_param:
+-      continue
+-    output_module = _TopologyOutput.load(output_param,topology.defaults.outputs[output_param.split(':')[0]])
+-    if output_module:
+-      output_module.write(topology)
+-      log.exit_on_error()
+-    else:
+-      log.error('Unknown output format %s' % output_format,log.IncorrectValue,'create')
++  if parallel_outputs.usable(args,topology):     # SKYFORGE-SPECIFIC (patch 57): independent outputs run concurrently
++    parallel_outputs.run(args,topology)
++  else:
++    for output_format in args.output:
++      output_param = get_output_parameter(output_format,args.output)
++      if not output_param:
++        continue
++      output_module = _TopologyOutput.load(output_param,topology.defaults.outputs[output_param.split(':')[0]])
++      if output_module:
++        memo.invalidate()                       # SKYFORGE-SPECIFIC: outputs work on copies of the topology, don't keep them alive
++        output_module.write(topology)
++        memo.invalidate()
++        log.exit_on_error()
++      else:
++        log.error('Unknown output format %s' % output_format,log.IncorrectValue,'create')
+ 
+   cli_plugin_hooks(topology,'create','post_output')
+ 
+diff --git a/netsim/cli/parallel_outputs.py b/netsim/cli/parallel_outputs.py
+new file mode 100644
+index 0000000..e9a2e2f
+--- /dev/null
++++ b/netsim/cli/parallel_outputs.py
+@@ -0,0 +1,109 @@
++#
++# SKYFORGE-SPECIFIC (patch 57): run the 'netlab create' output modules concurrently.
++#
++# WHY. On a large lab the output modules are about a third of the compile (measured at 512 nodes in the runtime
++# image, patches 1-55: config 17.4%, provider 7.8%, pickle 5.2%, ansible 2.9%) and most of them only read the
++# transformed topology.
++#
++# HOW. The loop below is the original output loop (create.run) with one change: a module that comes after the
++# barrier ('config') and does not change the topology has its write() run in a forked worker instead of inline.
++# Everything else happens in this process, in the original order: loading each module (which can add an empty
++# defaults.outputs.<name> entry to the topology), 'config' (later modules read the node_files it writes: the KNE
++# provider assembles each startup-config from them), and 'pickle' (it puts the provider instance cache back into
++# topology._Providers, so it must change THIS process's topology). A worker forked at module N therefore sees exactly
++# the topology the sequential loop handed module N. Each module's stdout/stderr, errors and warnings are replayed in
++# module order (utils/forkrun.py), so the console output and exit status match the sequential loop and the files are
++# byte-identical (patch tests + the Rolex ladder + the blueprint corpus).
++#
++# WHEN NOT (create.run's original loop runs instead):
++#   * SKYFORGE_NETLAB_PARALLEL_OUTPUTS=0;
++#   * the process cannot fork safely (no fork, or more than one thread);
++#   * -o on the command line, --devices, an output with options or a filename, or an unknown output module:
++#     keep netlab's exact behaviour;
++#   * fewer than two modules after the barrier.
++# One difference on FAILURE only: with sequential outputs, modules after a failing one never run; here the concurrent
++# ones may already have written their files when the error is reported. Messages and exit status are the same.
++#
++import importlib.util
++import os
++import tempfile
++import typing
++
++from box import Box
++
++from ..data import memo
++from ..outputs import _TopologyOutput
++from ..utils import forkrun, log
++
++IN_PROCESS = {'pickle'}                         # changes the topology it is handed: must run here
++BARRIER = 'config'                              # later modules read the files it writes
++
++
++def enabled() -> bool:
++  return os.environ.get('SKYFORGE_NETLAB_PARALLEL_OUTPUTS', '1') != '0'
++
++
++def usable(args: typing.Any, topology: Box) -> bool:
++  if not enabled() or not forkrun.fork_ok() or getattr(args, 'devices', None):
++    return False
++  if not isinstance(args.output, Box):          # -o on the command line: the user asked for something specific
++    return False
++  names = []
++  for name in args.output:
++    value = args.output[name]
++    if value is False:
++      continue
++    if value or ':' in name or '=' in name:     # options or an output file: not the plain default
++      return False
++    if importlib.util.find_spec(f'netsim.outputs.{name}') is None:
++      return False
++    names.append(name)
++  rest = names[names.index(BARRIER) + 1:] if BARRIER in names else names
++  return len([ n for n in rest if n not in IN_PROCESS ]) >= 1 and len(rest) >= 2
++
++
++def _write(module: typing.Any, topology: Box) -> typing.Callable[[], None]:
++  def fn() -> None:
++    memo.invalidate()                           # patch 54: the caches must not outlive a module
++    module.write(topology)
++    memo.invalidate()
++  return fn
++
++
++def run(args: typing.Any, topology: Box) -> None:
++  from .create import get_output_parameter
++
++  barrier_passed = BARRIER not in args.output
++  with tempfile.TemporaryDirectory(prefix='netlab-outputs-') as tmpdir:
++    pending: list = []                          # (tag, pid or None, local result or None, what, module)
++    for idx, output_format in enumerate(args.output):
++      output_param = get_output_parameter(output_format, args.output)
++      if not output_param:
++        continue
++      output_module = _TopologyOutput.load(output_param, topology.defaults.outputs[output_param.split(':')[0]])
++      if not output_module:                     # usable() checked the names; keep the original behaviour anyway
++        log.error('Unknown output format %s' % output_format, log.IncorrectValue, 'create')
++        continue
++      tag = f'o{idx}'
++      if not barrier_passed or output_format in IN_PROCESS:
++        if not pending:                         # nothing concurrent yet: exactly the original inline step
++          _write(output_module, topology)()
++          log.exit_on_error()
++        else:
++          pending.append((tag, None, forkrun.run_captured(_write(output_module, topology), tmpdir, tag), output_format, output_module))
++      else:
++        pending.append((tag, forkrun.start(_write(output_module, topology), tmpdir, tag), None, output_format, output_module))
++      if output_format == BARRIER:
++        barrier_passed = True
++
++    results = [ local if pid is None else forkrun.collect(pid, tmpdir, tag, f'output module {what}')
++                for tag, pid, local, what, _ in pending ]
++    for (tag, pid, _, what, module), result in zip(pending, results):   # replay in module order
++      if pid is not None and not forkrun.clean(result):
++        # The worker logged something (an error, a warning, a hint): what netlab prints once per process can only
++        # be printed right by this process, so this module runs again here, at its place in the order. The output
++        # modules after the barrier only read the topology, so the re-run writes the same files.
++        _write(module, topology)()
++        log.exit_on_error()
++      else:
++        forkrun.replay(result)
+diff --git a/netsim/data/__init__.py b/netsim/data/__init__.py
+index 9973f00..f33aa13 100644
+--- a/netsim/data/__init__.py
++++ b/netsim/data/__init__.py
+@@ -8,17 +8,21 @@ from collections.abc import Iterable
+ import typing_extensions
+ from box import Box
+ 
++from . import fastbox
++
+ #
+ # I had enough -- here's a function that returns a box with proper default settings
+ 
+ def get_box(init: dict) -> Box:
++  if type(init) is dict or type(init) is Box:   # SKYFORGE-SPECIFIC: these take the fast path (same result, see fastbox.py)
++    return fastbox.from_plain(init)
+   return Box(init,default_box=True,default_box_none_transform=False,box_dots=True)
+ 
+ def get_empty_box() -> Box:
+   return get_box({})
+ 
+ def get_new_box(b: Box) -> Box:
+-  return get_box(b.to_dict())
++  return fastbox.deep_copy(b) if type(b) is Box else get_box(b.to_dict())   # SKYFORGE-SPECIFIC: same result, one pass
+ 
+ #
+ # Another thingy we need all the time: make something a list
+diff --git a/netsim/data/fastbox.py b/netsim/data/fastbox.py
+new file mode 100644
+index 0000000..2550f96
+--- /dev/null
++++ b/netsim/data/fastbox.py
+@@ -0,0 +1,548 @@
++"""
++SKYFORGE-SPECIFIC fast paths for the two whole-topology conversions the output modules do: Box -> plain dict
++(`Box.to_dict()`) and plain dict -> Box (`get_box(dict)`).
++
++Why: python-box converts one value at a time through `__getitem__`, `__setitem__` and a configuration dictionary it
++rebuilds for every nested object. For a 512-node lab the output modules do that for about 1.3 million nested
++objects, four times over (adjusted topology for the configs, the Kubernetes snapshot, the pickle, the provider file).
++
++What these functions guarantee: the result is EQUAL to what python-box produces, including the type of every
++nested object (Box / BoxList / dict / list) and python-box's own bookkeeping (`_box_config`, `box_options`). Anything
++this module is not certain about is handed back to python-box:
++
++* `to_dict` follows python-box's own algorithm and only skips the per-key `__getitem__` call;
++* `from_plain` builds the nested objects directly ONLY for the plain data python-box would convert without
++  surprises (string keys without dots or brackets, plain dict/list/scalar values). A key with a '.' or '[' (python-box
++  splits it into nested objects), a self-referencing container, an unexpected type or an unknown python-box version
++  goes through python-box itself;
++* `SKYFORGE_NETLAB_COMPILE_FASTBOX=0` turns the module off. `SKYFORGE_NETLAB_COMPILE_FASTBOX_VERIFY=1` runs python-box too and aborts the compile when
++  the two results differ (the tests run that way).
++"""
++
++import os
++import typing
++
++import box as _box
++from box import Box, BoxList
++
++# python-box versions this was written and tested against: the one the Skyforge runtime image ships, and the newest one
++# the developers use. Any other version keeps the slow, original path.
++KNOWN_VERSIONS = ('7.3.2','7.4.1')
++ENABLED = os.environ.get('SKYFORGE_NETLAB_COMPILE_FASTBOX','1') != '0' and getattr(_box,'__version__','') in KNOWN_VERSIONS
++VERIFY = os.environ.get('SKYFORGE_NETLAB_COMPILE_FASTBOX_VERIFY','0') == '1'
++
++_SCALARS = (int,float,str,bytes,bytearray,bool,complex,set,frozenset)
++
++def _to_dict(b: Box) -> dict:
++  out = dict.copy(b)                                   # the stored values, no per-key __getitem__ round trip
++  for k,v in out.items():
++    if v is b:
++      out[k] = out
++    elif isinstance(v,Box):
++      out[k] = _to_dict(v)
++    elif isinstance(v,BoxList):
++      out[k] = _to_list(v)
++  return out
++
++def _to_list(bl: BoxList) -> list:
++  new_list: list = []
++  for x in bl:
++    if x is bl:
++      new_list.append(new_list)
++    elif isinstance(x,Box):
++      new_list.append(_to_dict(x))
++    elif isinstance(x,BoxList):
++      new_list.append(_to_list(x))
++    else:
++      new_list.append(x)
++  return new_list
++
++def to_dict(b: Box) -> dict:
++  """Same result as b.to_dict()"""
++  if not enabled() or not isinstance(b,Box):
++    return b.to_dict()
++
++  result = _to_dict(b)
++  if VERIFY:
++    expected = b.to_dict()
++    if not same_structure(result,expected):
++      from ..utils import log
++      log.fatal('netlab fastbox: to_dict differs from python-box')
++  return result
++
++#
++# plain dict -> Box
++#
++
++class _Slow(Exception):
++  """Raised when a value needs python-box's own conversion."""
++  def __init__(self, why: str = ''):
++    super().__init__(why)
++
++_safe_cache: typing.Dict[typing.Any,str] = {}
++_safe_str: typing.Dict[str,str] = {}
++
++def _new_box(cfg0: dict, ns: tuple) -> Box:
++  b = dict.__new__(Box)
++  cfg = cfg0.copy()
++  cfg['__safe_keys'] = {}
++  cfg['box_namespace'] = ns
++  object.__setattr__(b,'_box_config',cfg)
++  return b
++
++def _opts_of(cfg0: dict) -> dict:
++  return {k:v for k,v in cfg0.items() if not k.startswith('__')}
++
++def _child_options(opts0: dict, ns: tuple) -> dict:
++  opts = opts0.copy()
++  opts['box_namespace'] = ns
++  return opts
++
++def _fill(b: Box, src: dict, cfg0: dict, opts0: dict, ns: tuple, proto: Box) -> None:
++  """
++  Store the items of `src` in `b` the way Box.__init__ / Box.__convert_and_store do for this configuration:
++  dictionaries (Box or not) are re-created as boxes, a BoxList is kept (python-box keeps the very same object and
++  only updates its options), a plain list becomes a BoxList, everything else is stored as it is.
++  """
++  safe = b._box_config['__safe_keys']
++  for k,v in dict.items(src):
++    if v is src:
++      raise _Slow('self reference')
++    if k.__class__ is str and ('.' in k or '[' in k):
++      raise _Slow(f'dotted key {k!r}')
++    if k.__class__ is str:
++      sk = _safe_str.get(k)
++      if sk is None:
++        sk = _safe_str[k] = proto._safe_attr(k)
++    else:
++      ck = (k.__class__,k)
++      sk = _safe_cache.get(ck)
++      if sk is None:
++        sk = _safe_cache[ck] = proto._safe_attr(k)
++    safe[sk] = k
++    if isinstance(v,_SCALARS):
++      dict.__setitem__(b,k,v)
++    elif isinstance(v,dict):
++      child = _new_box(cfg0,ns + (k,))
++      _fill(child,v,cfg0,opts0,ns + (k,),proto)
++      dict.__setitem__(b,k,child)
++    elif isinstance(v,list):
++      if isinstance(v,BoxList):
++        v.box_options.update(_child_options(opts0,ns + (k,)))
++        dict.__setitem__(b,k,v)
++      else:
++        dict.__setitem__(b,k,_make_list(v,cfg0,opts0,ns + (k,),proto))
++    else:                                               # None, tuples and every other object are stored as they are
++      dict.__setitem__(b,k,v)
++
++def _make_list(src: list, cfg0: dict, opts0: dict, ns: tuple, proto: Box) -> BoxList:
++  bl = BoxList(**_child_options(opts0,ns))               # empty list with python-box's own options handling
++  for x in src:
++    if x is src:
++      raise _Slow('self reference')
++    if isinstance(x,dict):
++      child = _new_box(cfg0,ns)
++      _fill(child,x,cfg0,opts0,ns,proto)
++      list.append(bl,child)
++    elif isinstance(x,list):                            # python-box re-creates every list item, BoxList or not
++      list.append(bl,_make_list(x,cfg0,opts0,ns,proto))
++    else:
++      list.append(bl,x)
++  return bl
++
++_OPTS = dict(default_box=True,default_box_none_transform=False,box_dots=True)
++_MISSING = object()
++_proto: typing.Optional[Box] = None
++_cfg0: dict = {}
++_opts0: dict = {}
++_standard: dict = {}
++
++def _ensure_proto() -> None:
++  global _proto
++  if _proto is None:
++    proto = Box(**_OPTS)                                # python-box builds the configuration, once
++    _cfg0.update(proto._box_config)
++    _cfg0['__created'] = True
++    _opts0.update(_opts_of(_cfg0))
++    _standard.update({k:v for k,v in _cfg0.items() if not k.startswith('__') and k != 'box_namespace'})
++    _proto = proto
++
++def _is_standard(src: Box) -> bool:
++  """Is this Box configured the way netlab's get_box configures them (namespace aside)?"""
++  _ensure_proto()
++  cfg = src._box_config
++  return all(cfg.get(k,_MISSING) == v for k,v in _standard.items()) and \
++         all(k in _standard or k.startswith('__') or k == 'box_namespace' for k in cfg)
++
++#
++# Raw fast paths (no enable check, no verification); they raise _Slow for anything python-box must handle itself
++#
++def _from_plain_fast(init: dict) -> Box:
++  _ensure_proto()
++  result = _new_box(_cfg0,())
++  _fill(result,init,_cfg0,_opts0,(),_proto)
++  return result
++
++def _copy_fast(src: Box, ns: tuple = ()) -> Box:
++  _ensure_proto()
++  result = _new_box(_cfg0,ns)
++  _fill(result,src,_cfg0,_opts0,ns,_proto)
++  return result
++
++#
++# Public entry points: same result as python-box, or python-box itself
++#
++def from_plain(init: dict) -> Box:
++  """
++  Same result as Box(init,default_box=True,default_box_none_transform=False,box_dots=True) for a plain dict or a Box
++  (python-box ignores the configuration of a source Box and re-creates every nested dictionary).
++  """
++  if not enabled() or (type(init) is not dict and type(init) is not Box):
++    return Box(init,**_OPTS)
++  try:
++    result = _from_plain_fast(init)
++  except _Slow as why:
++    if os.environ.get('SKYFORGE_NETLAB_COMPILE_FASTBOX_DEBUG'):
++      print(f'fastbox: from_plain fell back to python-box: {why}')
++    return Box(init,**_OPTS)
++
++  if VERIFY:
++    expected = Box(init,**_OPTS)
++    if not same_structure(result,expected,check_config=True):
++      from ..utils import log
++      log.fatal('netlab fastbox: from_plain differs from python-box')
++  return result
++
++def copy_subtree(src: Box, ns: tuple = ()) -> Box:
++  """
++  Same result as src.copy() (python-box: a new Box whose nested dictionaries are re-created and whose lists are
++  shared), placed at namespace `ns` (python-box's own copy() detaches the namespace: ns=()).
++  """
++  if not enabled() or type(src) is not Box or not _is_standard(src):
++    return src.copy()
++  try:
++    result = _copy_fast(src,ns)
++  except _Slow:
++    return src.copy()
++
++  if VERIFY and not ns:
++    expected = src.copy()
++    if not same_structure(result,expected,check_config=True):
++      from ..utils import log
++      log.fatal('netlab fastbox: copy differs from Box.copy()')
++  return result
++
++def copy_box(src: Box) -> Box:
++  """Same result as src.copy()"""
++  return copy_subtree(src)
++
++def add(a: Box, b: dict) -> Box:
++  """Same result as a + b. python-box (7.3.2 and 7.4.1): copy a, then merge_update(b) on the copy (frozen aside)."""
++  if not enabled() or type(a) is not Box or not isinstance(b,dict) or a._box_config.get('frozen_box'):
++    return a + b
++  result = copy_box(a)
++  result.merge_update(b)
++  if VERIFY:
++    expected = a + b
++    if not same_structure(result,expected,check_config=True):
++      from ..utils import log
++      log.fatal('netlab fastbox: add differs from Box.__add__')
++  return result
++
++def _fill_deep(b: Box, src: dict, cfg0: dict, opts0: dict, ns: tuple, proto: Box) -> None:
++  """Like _fill, but a source BoxList is re-created as well: the result equals Box(src.to_dict()) for a Box source"""
++  safe = b._box_config['__safe_keys']
++  for k,v in dict.items(src):
++    if v is src:
++      raise _Slow('self reference')
++    if k.__class__ is str and ('.' in k or '[' in k):
++      raise _Slow(f'dotted key {k!r}')
++    if k.__class__ is str:
++      sk = _safe_str.get(k)
++      if sk is None:
++        sk = _safe_str[k] = proto._safe_attr(k)
++    else:
++      ck = (k.__class__,k)
++      sk = _safe_cache.get(ck)
++      if sk is None:
++        sk = _safe_cache[ck] = proto._safe_attr(k)
++    safe[sk] = k
++    if isinstance(v,_SCALARS):
++      dict.__setitem__(b,k,v)
++    elif isinstance(v,dict):
++      child = _new_box(cfg0,ns + (k,))
++      _fill_deep(child,v,cfg0,opts0,ns + (k,),proto)
++      dict.__setitem__(b,k,child)
++    elif isinstance(v,list):
++      dict.__setitem__(b,k,_make_list_deep(v,cfg0,opts0,ns + (k,),proto))
++    else:
++      dict.__setitem__(b,k,v)
++
++def _make_list_deep(src: list, cfg0: dict, opts0: dict, ns: tuple, proto: Box) -> BoxList:
++  bl = BoxList(**_child_options(opts0,ns))
++  for x in src:
++    if x is src:
++      raise _Slow('self reference')
++    if isinstance(x,dict):
++      child = _new_box(cfg0,ns)
++      _fill_deep(child,x,cfg0,opts0,ns,proto)
++      list.append(bl,child)
++    elif isinstance(x,list):
++      list.append(bl,_make_list_deep(x,cfg0,opts0,ns,proto))
++    else:
++      list.append(bl,x)
++  return bl
++
++def _deep_copy_fast(src: Box) -> Box:
++  _ensure_proto()
++  result = _new_box(_cfg0,())
++  _fill_deep(result,src,_cfg0,_opts0,(),_proto)
++  return result
++
++def deep_copy(src: Box) -> Box:
++  """
++  SKYFORGE-SPECIFIC: same result as get_box(src.to_dict()) -- a completely independent copy -- in one pass,
++  without building the intermediate plain dictionary.
++  """
++  if not enabled() or type(src) is not Box:
++    return Box(src.to_dict(),**_OPTS)
++  try:
++    result = _deep_copy_fast(src)
++  except _Slow:
++    return from_plain(to_dict(src))
++  if VERIFY:
++    expected = Box(src.to_dict(),**_OPTS)
++    if not same_structure(result,expected,check_config=True):
++      from ..utils import log
++      log.fatal('netlab fastbox: deep_copy differs from get_box(to_dict())')
++  return result
++
++
++def _set_item_fast(b: Box, key: typing.Any, value: typing.Any) -> None:
++  """Raw: what Box.__setitem__ / __convert_and_store do for a standard Box and a plain key; raises _Slow"""
++  _ensure_proto()
++  ns = b._box_config['box_namespace'] + (key,)
++  if isinstance(value,_SCALARS) or value is None:
++    stored = value
++  elif isinstance(value,dict):
++    if value is b:
++      raise _Slow('self reference')
++    stored = _new_box(_cfg0,ns)
++    _fill(stored,value,_cfg0,_opts0,ns,_proto)
++  elif isinstance(value,BoxList):
++    value.box_options.update(_child_options(_opts0,ns))
++    stored = value
++  elif isinstance(value,list):
++    stored = _make_list(value,_cfg0,_opts0,ns,_proto)
++  else:
++    stored = value
++  if key.__class__ is str:
++    sk = _safe_str.get(key)
++    if sk is None:
++      sk = _safe_str[key] = _proto._safe_attr(key)
++  else:
++    ck = (key.__class__,key)
++    sk = _safe_cache.get(ck)
++    if sk is None:
++      sk = _safe_cache[ck] = _proto._safe_attr(key)
++  b._box_config['__safe_keys'][sk] = key
++  dict.__setitem__(b,key,stored)
++
++def set_item(b: Box, key: typing.Any, value: typing.Any) -> None:
++  """
++  SKYFORGE-SPECIFIC: same result as b[key] = value (python-box re-creates a dictionary value as a Box, keeps a BoxList
++  and updates its options, makes a plain list a BoxList), without python-box's per-key conversion.
++  """
++  if not enabled() or type(b) is not Box or (isinstance(key,str) and ('.' in key or '[' in key)) or not _is_standard(b):
++    b[key] = value
++    return
++  try:
++    _set_item_fast(b,key,value)
++  except _Slow:
++    b[key] = value
++
++def set_reference(b: Box, key: str, value: typing.Any) -> None:
++  """
++  SKYFORGE-SPECIFIC: store `value` under `key` WITHOUT python-box's conversion (b[key] = value would copy a dictionary).
++  Only for a Box that is about to be copied as a whole (append_box, set_item, copy_box): the copy re-creates the value
++  exactly as an assignment would have, so the end result is the same and one copy is saved.
++  """
++  if not enabled() or type(b) is not Box or not isinstance(key,str) or '.' in key or '[' in key or not _is_standard(b):
++    b[key] = value
++    return
++  sk = _safe_str.get(key)
++  if sk is None:
++    sk = _safe_str[key] = _proto._safe_attr(key)
++  b._box_config['__safe_keys'][sk] = key
++  dict.__setitem__(b,key,value)
++
++def set_list(b: Box, key: typing.Any, value: list) -> None:
++  """
++  SKYFORGE-SPECIFIC: same result as b[key] = value for a plain list (python-box makes it a BoxList and re-creates every
++  dictionary in it), without python-box's per-item conversion. Anything unusual goes through python-box.
++  """
++  if not enabled() or type(b) is not Box or type(value) is not list or not isinstance(key,str) or '.' in key or '[' in key \
++     or not _is_standard(b):
++    b[key] = value
++    return
++  try:
++    bl = _make_list(value,_cfg0,_opts0,b._box_config['box_namespace'] + (key,),_proto)
++  except _Slow:
++    b[key] = value
++    return
++  sk = _safe_str.get(key)
++  if sk is None:
++    sk = _safe_str[key] = _proto._safe_attr(key)
++  b._box_config['__safe_keys'][sk] = key
++  dict.__setitem__(b,key,bl)
++  if VERIFY:
++    check = Box(**_OPTS)
++    object.__setattr__(check,'_box_config',dict(b._box_config,__safe_keys=dict(b._box_config['__safe_keys'])))
++    check[key] = value
++    if not same_structure(dict.__getitem__(b,key),dict.__getitem__(check,key),check_config=True):
++      from ..utils import log
++      log.fatal('netlab fastbox: set_list differs from python-box')
++
++def append_box(bl: BoxList, item: typing.Any) -> None:
++  """
++  SKYFORGE-SPECIFIC: same result as bl.append(item) (python-box re-creates a dictionary item as a Box configured by
++  the list's options), without python-box's per-key conversion. Anything unusual goes through python-box.
++  """
++  if not enabled() or type(bl) is not BoxList or type(item) not in (dict,Box):
++    bl.append(item)
++    return
++  _ensure_proto()
++  opts = bl.box_options
++  ns = opts.get('box_namespace',())
++  if opts.get('box_class',None) is not Box or not isinstance(ns,tuple) or \
++     {k:v for k,v in opts.items() if k != 'box_namespace'} != {k:v for k,v in _opts0.items() if k != 'box_namespace'}:
++    bl.append(item)
++    return
++  try:
++    child = _new_box(_cfg0,ns)
++    _fill(child,item,_cfg0,_opts0,ns,_proto)
++  except _Slow:
++    bl.append(item)
++    return
++  list.append(bl,child)
++  if VERIFY:
++    check = BoxList(**opts)
++    check.append(item)
++    if not same_structure(child,check[0],check_config=True):
++      from ..utils import log
++      log.fatal('netlab fastbox: append_box differs from python-box')
++
++def shallow(src: Box) -> Box:
++  """
++  A new top-level Box with the configuration and keys of `src` whose VALUES ARE THE SAME OBJECTS (no conversion).
++  Only for copy-on-write use: the caller must replace a value before modifying anything under it.
++  """
++  result = dict.__new__(Box)
++  cfg = dict(src._box_config)
++  cfg['__safe_keys'] = dict(src._box_config['__safe_keys'])
++  cfg['box_namespace'] = ()
++  object.__setattr__(result,'_box_config',cfg)
++  dict.update(result,src)
++  return result
++
++def same_structure(a: typing.Any, b: typing.Any, check_config: bool = False, _depth: int = 0) -> bool:
++  """Equal values, equal container types at every level, and (check_config) equal python-box bookkeeping"""
++  if a.__class__ is not b.__class__:
++    return False
++  if isinstance(a,dict):
++    if list(a.keys()) != list(b.keys()):
++      return False
++    if check_config and isinstance(a,Box) and a._box_config != b._box_config:
++      return False
++    return all(same_structure(dict.__getitem__(a,k),dict.__getitem__(b,k),check_config,_depth + 1) for k in a.keys())
++  if isinstance(a,list):
++    if len(a) != len(b):
++      return False
++    if check_config and isinstance(a,BoxList) and a.box_options != b.box_options:
++      return False
++    return all(same_structure(x,y,check_config,_depth + 1) for x,y in zip(a,b))
++  return bool(a == b)
++
++
++#
++# SELF-TEST. The fast paths reproduce python-box's own algorithms, and python-box ships in more than one build: the
++# runtime image has Debian's Cython-compiled 7.3.2 on python 3.13, developers pip's pure-python 7.4.1 (whose
++# merge_update grew an argument 7.3.2 does not have -- the first version of this module used it and every compile
++# in the image died). Before the first use, every fast path is compared with the installed python-box on a structure
++# that exercises what a compile produces; any difference or exception switches the module off for this process, so
++# the result is python-box's own, only slower.
++#
++_self_test_state: typing.Optional[bool] = None
++
++def _sample() -> dict:
++  import ipaddress
++  return {
++    'a': 1, 'b': 'x', 'c': None, 'd': [1, {'e': [2, {'f': 'g'}]}, [3, [4]]], 'h': {'i': {'j': {}}, 'k': []},
++    1: {2: 'int keys'}, 'with-dash': {'class': True}, 'ip': ipaddress.ip_network('10.0.0.0/24'), 't': (1, 2),
++    'flag': False, 'f': 1.5,
++  }
++
++def _run_self_test() -> bool:
++  try:
++    if not same_structure(_from_plain_fast(_sample()),Box(_sample(),**_OPTS),check_config=True):
++      return False
++    b = Box(_sample(),**_OPTS)
++    if not same_structure(_to_dict(b),b.to_dict()):
++      return False
++    b1, b2 = Box(_sample(),**_OPTS), Box(_sample(),**_OPTS)
++    if not same_structure(_from_plain_fast(b1),Box(b2,**_OPTS),check_config=True):
++      return False
++    b1, b2 = Box(_sample(),**_OPTS), Box(_sample(),**_OPTS)
++    if not same_structure(_copy_fast(b1),b2.copy(),check_config=True):
++      return False
++    other = {'h': {'i': {'z': 1}, 'k': [9]}, 'n': [5], 'a': {'x': 1}}
++    b1, b2 = Box(_sample(),**_OPTS), Box(_sample(),**_OPTS)
++    fast_add = _copy_fast(b1)
++    fast_add.merge_update(Box(other,**_OPTS))
++    if not same_structure(fast_add,b2 + Box(other,**_OPTS),check_config=True):
++      return False
++    b1, b2 = Box(_sample(),**_OPTS), Box(_sample(),**_OPTS)
++    if not same_structure(_deep_copy_fast(b1),Box(b2.to_dict(),**_OPTS),check_config=True):
++      return False
++    b1, b2 = Box(_sample(),**_OPTS), Box(_sample(),**_OPTS)
++    items = [{'node': 'x', 'ifname': 'e1', 'l': [1, {'z': 2}]}, Box({'node': 'y', 'n': {'m': [3]}},**_OPTS), 'str', [4]]
++    target1, target2 = b1.h, b2.h
++    bl = _make_list(list(items),_cfg0,_opts0,target1._box_config['box_namespace'] + ('nb',),_proto)
++    target2['nb'] = list(items)
++    if not same_structure(bl,dict.__getitem__(target2,'nb'),check_config=True):
++      return False
++    target1, target2 = Box(_sample(),**_OPTS), Box(_sample(),**_OPTS)
++    target1.nl = []
++    target2.nl = []
++    for it in ({'name': 'n1', 'x': {'y': [1]}}, Box({'name': 'n2', 'l': [{'a': 1}]},**_OPTS)):
++      child = _new_box(_cfg0,target1.nl.box_options['box_namespace'])
++      _fill(child,it,_cfg0,_opts0,target1.nl.box_options['box_namespace'],_proto)
++      list.append(target1.nl,child)
++      target2.nl.append(it)
++    if not same_structure(target1.nl,target2.nl,check_config=True) or not same_structure(target1,target2,check_config=True):
++      return False
++    t1, t2 = Box(_sample(),**_OPTS), Box(_sample(),**_OPTS)
++    src = Box(_sample(),**_OPTS)
++    for k, v in (('v1', src.h), ('v2', [src.d, {'q': src.h}]), ('v3', 7), ('v4', src.d), (5, {'w': [src.d]}), ('v5', None)):
++      _set_item_fast(t1,k,v)
++      t2[k] = v
++    if not same_structure(t1,t2,check_config=True) or t1._box_config['__safe_keys'] != t2._box_config['__safe_keys']:
++      return False
++    sh = shallow(Box(_sample(),**_OPTS))
++    if not same_structure(sh,Box(_sample(),**_OPTS)):
++      return False
++  except Exception:
++    return False
++  return True
++
++def enabled() -> bool:
++  global _self_test_state
++  if not ENABLED:
++    return False
++  if _self_test_state is None:
++    _self_test_state = False                            # no fast path while the self-test itself runs
++    _self_test_state = _run_self_test()
++    if not _self_test_state:
++      import sys
++      print('netlab fastbox: self-test against the installed python-box failed, fast paths disabled',file=sys.stderr)
++  return _self_test_state
+diff --git a/netsim/data/memo.py b/netsim/data/memo.py
+new file mode 100644
+index 0000000..a63c610
+--- /dev/null
++++ b/netsim/data/memo.py
+@@ -0,0 +1,96 @@
++"""
++SKYFORGE-SPECIFIC compile-time memoisation of lookups that are rebuilt for every node and link.
++
++Why: python-box rebuilds (deep-copies) a whole Box on every `a + b`. netlab does that for the same device-type
++feature tables and the same attribute-definition tables once per node, interface and attribute -- tens of thousands
++of times for a 512-node lab -- and the cost grows faster than linearly with the node count.
++
++The caches are CONSERVATIVE:
++
++* an entry is only a hit when the SOURCE OBJECTS it was built from are the same Python objects (identity, not
++  equality), so replacing a table is a miss;
++* for the device tables, which plugins and hooks may edit in place, an entry is also a miss when the content of the
++  sources no longer equals the snapshot taken when the entry was built;
++* every cache is dropped (`invalidate`) around each plugin hook, module hook, provider hook and output module;
++* a cached device table is never handed out itself: callers get a copy of their own, as they always did (python-box
++  creates a key when a missing one is read, and that must not leak from one caller to the next);
++* `SKYFORGE_NETLAB_COMPILE_MEMO=0` switches the whole thing off (no caching, original behaviour);
++* `SKYFORGE_NETLAB_COMPILE_MEMO_VERIFY=1` recomputes on EVERY hit and aborts if the cached value differs. The test
++  corpus is run that way. (The switches are not NETLAB_*: netlab turns every NETLAB_* variable into a defaults entry.)
++"""
++
++import atexit
++import copy
++import os
++import typing
++
++from box import Box
++
++from ..utils import log
++
++DISABLED = os.environ.get('SKYFORGE_NETLAB_COMPILE_MEMO','1') == '0'
++VERIFY = os.environ.get('SKYFORGE_NETLAB_COMPILE_MEMO_VERIFY','0') == '1'
++STATS = os.environ.get('SKYFORGE_NETLAB_COMPILE_MEMO_STATS','0') == '1'
++
++# name -> key -> (refs, value, compute, snapshots of the watched objects)
++_caches: typing.Dict[str, typing.Dict[typing.Any, tuple]] = {}
++stats: typing.Dict[str, typing.List[int]] = {}
++
++def invalidate() -> None:
++  _caches.clear()
++
++def _same(a: typing.Any, b: typing.Any) -> bool:
++  return a == b
++
++def _snapshot(obj: typing.Any) -> typing.Any:
++  from . import fastbox
++  return fastbox.to_dict(obj) if isinstance(obj,Box) else copy.deepcopy(obj)
++
++def memo(
++      name: str,
++      key: typing.Hashable,
++      refs: tuple,
++      compute: typing.Callable[[], typing.Any],
++      watch: tuple = ()) -> typing.Any:
++  """
++  Return compute() once per (name,key) while the objects in `refs` stay the same objects and the objects in `watch`
++  still have the content they had when the value was computed (a plugin or hook that edits one of them in place gets a
++  fresh computation, not a stale answer). The returned object is SHARED between callers: callers must not modify it
++  (verify mode enforces that).
++  """
++  if DISABLED:
++    return compute()
++
++  cache = _caches.setdefault(name,{})
++  stat = stats.setdefault(name,[0,0])
++  entry = cache.get(key)
++  if entry is not None and len(entry[0]) == len(refs) and all(a is b for a,b in zip(entry[0],refs)) \
++      and all(w == snap for w,snap in zip(watch,entry[3])):
++    stat[0] += 1
++    if VERIFY:
++      fresh = compute()
++      if not _same(fresh,entry[1]):
++        log.fatal(f'netlab memo: cached {name} {key!r} differs from a fresh computation (stale entry or a caller modified a shared result)')
++    return entry[1]
++
++  stat[1] += 1
++  value = compute()
++  cache[key] = (refs,value,compute,tuple(_snapshot(w) for w in watch))
++  return value
++
++def verify_all(where: str) -> None:
++  """Recompute every cached entry and abort if any differs from what callers have been handed."""
++  if DISABLED:
++    return
++  for name,cache in _caches.items():
++    for key,(refs,value,compute,_snaps) in cache.items():
++      if not _same(compute(),value):
++        log.fatal(f'netlab memo: cached {name} {key!r} differs from a fresh computation at {where} (stale entry or a caller modified a shared result)')
++
++def report() -> None:
++  if STATS:
++    for name,(hit,miss) in sorted(stats.items()):
++      print(f'memo {name}: hits={hit} misses={miss}')
++
++if STATS:
++  atexit.register(report)
+diff --git a/netsim/data/validate.py b/netsim/data/validate.py
+index 226cb62..1a216d9 100644
+--- a/netsim/data/validate.py
++++ b/netsim/data/validate.py
+@@ -4,11 +4,12 @@
+ 
+ import ast
+ import typing
++import weakref
+ 
+ from box import Box
+ 
+ from ..utils import log, strings
+-from . import append_to_list, get_a_list, get_box, get_empty_box
++from . import append_to_list, fastbox, get_a_list, get_box, get_empty_box, memo
+ 
+ # We also need to import the whole data.types module to be able to do validation function lookup
+ from . import types as _tv
+@@ -104,13 +105,12 @@ def get_valid_attributes(
+     no_propagate = f'{atlist}_no_propagate'                 # No-propagate list excluded only for non-first attribute category
+     if idx:                                                 # Special handling for secondary namespaces
+       if no_propagate in attributes:                        # Build a reduced dictionary if the secondary namespace has no_propagate list
+-        add_attr = { k:v for k,v in add_attr.items() if not k in attributes[no_propagate] }
++        add_attr = strip_secondary_namespace(attributes,atlist)
+       else:                                                 # Other create a copy of the secondary attributes
+-        add_attr = add_attr + {}
++        add_attr = fastbox.add(add_attr,{})
++        remove_required_flag(add_attr)                      # Remove required flags from the secondary namespace attributes
+ 
+-      remove_required_flag(add_attr)                        # Remove required flags from the secondary namespace attributes
+-
+-    valid = add_attr + valid                                # ... nope, merge with existing list and move on
++    valid = fastbox.add(add_attr,valid)                     # ... nope, merge with existing list and move on
+ 
+     internal_atlist = f'{atlist}_internal'                  # Internal object attributes (used by links)
+     if internal_atlist in attributes:                       # Add internal attributes if they exist
+@@ -710,6 +710,109 @@ def validate_item(
+ 
+   return OK
+ 
++_private_tables: typing.Dict[int,typing.Any] = {}         # id -> (weakref, copied namespaces) of the tables handed out
++
++def cow_namespace(attributes: Box, atlist: str) -> typing.Any:
++  """
++  SKYFORGE-SPECIFIC copy-on-write. A validation gets its own top-level attribute table whose namespaces are shared
++  with the cached merged table (see resolve_attributes). The only change validation ever makes to that table is
++  stripping the _required flags of a secondary namespace (strip_secondary_namespace); copy that namespace into the
++  table first, so the validation sees exactly what a full private copy would show and the shared namespaces stay
++  untouched.
++  """
++  entry = _private_tables.get(id(attributes))
++  if entry is None or entry[0]() is not attributes or atlist in entry[1]:
++    return attributes[atlist]
++  entry[1].add(atlist)
++  shared = dict.__getitem__(attributes,atlist)
++  if isinstance(shared,Box):
++    dict.__setitem__(attributes,atlist,fastbox.copy_subtree(shared,(atlist,)))
++  return attributes[atlist]
++
++def strip_secondary_namespace(attributes: Box, atlist: str) -> dict:
++  """
++  What get_valid_attributes does with a secondary namespace that has a no_propagate list: take the attributes not in
++  that list and strip their _required flags -- in place, so the table it was given keeps the stripped flags
++  (the uncached code behaves that way, and later validations with the same table depend on it)
++  """
++  add_attr = cow_namespace(attributes,atlist)               # SKYFORGE-SPECIFIC: about to be modified, see cow_namespace
++  add_attr = { k:v for k,v in add_attr.items() if not k in attributes[f'{atlist}_no_propagate'] }
++  remove_required_flag(add_attr)
++  return add_attr
++
++def resolve_private(attributes: Box, entry: tuple, attr_list: typing.List[str]) -> tuple:
++  """
++  SKYFORGE-SPECIFIC: resolve_attributes for a table handed out by resolve_attributes (a recursive validation reuses
++  the merged table of its caller). The table is fully determined by the cached table it was made from and the set of
++  namespaces it has copied and stripped so far, so the namespaces and the valid-attribute table computed for it can
++  be remembered on exactly that key. A computation strips more namespaces in the table as a side effect; on a hit
++  the same namespaces are stripped again here, so the table ends up exactly as the computation would leave it.
++  """
++  _ref,stripped,base = entry
++
++  def compute() -> tuple:
++    before = set(stripped)
++    ns = get_attribute_namespaces(attributes,attr_list)
++    valid = get_valid_attributes(attributes,ns)
++    return (ns,valid,frozenset(stripped - before))
++
++  ns,valid,side_effects = memo.memo(
++    'validate_private',
++    (id(base),frozenset(stripped),tuple(attr_list)),
++    (base,),
++    compute)
++  for atlist in side_effects:                               # replay (a no-op when compute just ran)
++    if atlist not in stripped:
++      strip_secondary_namespace(attributes,atlist)
++  return (attributes,ns,valid)
++
++def resolve_attributes(
++      attributes: Box,
++      extra_attributes: typing.Optional[Box],
++      attr_list: typing.List[str]) -> tuple:
++  """
++  resolve_attributes: merge extra attributes into the attribute definitions, expand the attribute namespaces
++  and build the valid-attribute table. Returns (attributes, namespaces, valid).
++
++  The merge (and the build of the valid-attribute table, which strips the _required flags from the nested tables
++  it shares with the merged copy) is the expensive part and depends only on the shared attribute definitions, so
++  it is done once per (attribute table, extra attributes, namespace list) -- see netsim.data.memo for the rules.
++  Every caller still gets a merged copy of its own (pristine apart from that stripping, exactly what the
++  uncached code handed out), because the recursive validation below modifies it.
++  """
++  def compute() -> tuple:
++    a = fastbox.add(attributes,extra_attributes) if extra_attributes else attributes
++    if not isinstance(a,Box):
++      return (a,None,None)                                  # The caller reports the error
++    ns = get_attribute_namespaces(a,attr_list)
++    return (a,ns,get_valid_attributes(a,ns))
++
++  if not extra_attributes:
++    # No copy is made: the caller's own table is used (and modified) in place, exactly as before. A table that this
++    # function handed out is private to one validation and different every time, so it is computed in place. A shared
++    # table (the module attribute definitions) is stripped only the first time, so the answer can be remembered.
++    entry = _private_tables.get(id(attributes))
++    if entry is not None and entry[0]() is attributes:
++      return resolve_private(attributes,entry,attr_list)
++    return memo.memo(
++      'validate_attributes_shared',
++      (id(attributes),tuple(attr_list)),
++      (attributes,),
++      compute,
++      watch=(attributes,))
++
++  a,ns,valid = memo.memo(
++    'validate_attributes',
++    (id(attributes),id(extra_attributes),tuple(attr_list)),
++    (attributes,extra_attributes),
++    compute,
++    watch=(attributes,extra_attributes))
++  if not isinstance(a,Box):
++    return (a,ns,valid)
++  private = fastbox.shallow(a)                              # copy-on-write: see cow_namespace
++  _private_tables[id(private)] = (weakref.ref(private,lambda r,i=id(private): _private_tables.pop(i,None)),set(),a)
++  return (private,ns,valid)
++
+ """
+ validate_attributes -- validate object attributes
+ 
+@@ -743,8 +846,10 @@ def validate_attributes(
+   if attributes is None:
+     attributes = topology.defaults.attributes
+ 
+-  if extra_attributes:
+-    attributes = attributes + extra_attributes
++  # SKYFORGE-SPECIFIC: the merged attribute table, the namespace list and the valid-attribute table depend only on
++  # the (shared) attribute definitions and the attribute namespaces, not on the object being validated
++  resolved = resolve_attributes(attributes,extra_attributes,attr_list)
++  attributes = resolved[0]
+ 
+   if not ignored:
+     ignored = ['_']
+@@ -765,8 +870,8 @@ def validate_attributes(
+   # It could be that the list of attributes tells us data should be of certain type
+   # Deal with that as well (although in an awkward way that should be improved)
+   #
+-  attr_list = get_attribute_namespaces(attributes,attr_list)
+-  valid = get_valid_attributes(attributes,attr_list)
++  attr_list = list(resolved[1])
++  valid = resolved[2]
+   if isinstance(valid,str):                   # Validate data that is not a dictionary
+     validate_value(                           # Use standalone value validator
+       value=data,
+diff --git a/netsim/modules/__init__.py b/netsim/modules/__init__.py
+index 587df64..523ce40 100644
+--- a/netsim/modules/__init__.py
++++ b/netsim/modules/__init__.py
+@@ -10,6 +10,7 @@ from box import Box
+ 
+ # Related modules
+ from .. import data
++from ..data import memo
+ from ..augment import devices
+ from ..data.types import must_be_list
+ from ..utils import log
+@@ -504,11 +505,13 @@ def call_module_hook(module: str, method: str, topology: Box, **kwargs: typing.A
+   mod_load[module].call(method,topology=topology,**kwargs)
+ 
+ def execute_module_hooks(method: str, topology: Box) -> None:
++  memo.invalidate()                                                       # SKYFORGE-SPECIFIC: hooks may edit shared tables
+   for m in list_of_modules(topology):
+     if method in topology.defaults[m].get('hooks',[]):
+       call_module_hook(m,f'module_{method}',topology)
+ 
+ def module_transform(method: str, topology: Box) -> None:
++  memo.invalidate()                                                       # SKYFORGE-SPECIFIC: hooks may edit shared tables
+   if log.debug_active('modules'):
+     print(f'Processing module_{method} hooks')
+ 
+diff --git a/netsim/modules/bgp.py b/netsim/modules/bgp.py
+index 5ccb6e3..ca5af27 100644
+--- a/netsim/modules/bgp.py
++++ b/netsim/modules/bgp.py
+@@ -8,7 +8,7 @@ from box import Box
+ 
+ from .. import data
+ from ..augment import devices, groups
+-from ..data import global_vars
++from ..data import fastbox, global_vars
+ from ..data.types import must_be_asn, must_be_list
+ from ..data.validate import validate_item
+ from ..utils import log
+@@ -82,15 +82,97 @@ def validate_bgp_sessions(node: Box, sessions: Box, attribute: str) -> bool:
+ 
+   return OK
+ 
++"""
++SKYFORGE-SPECIFIC (patch 62): AS index. find_bgp_rr and build_ibgp_sessions looked at every node for every BGP node
++(N * N reads: 13 s of a 3,972-node compile). The index is built once, in module_post_transform, from the state the
++scans would see: bgp.as and bgp.rr are final by then (node_pre_transform sets rr, module_post_transform sets router IDs
++and RR clusters from it), and the one place that sets an AS later (vrf: a fake bgp.as for inter-VRF route leaking, in
++vrf's node_post_transform) needs node.vrfs, so any node with vrfs switches the index off.
++
++It answers only what the scans answered and for the shapes they handled the same way: every node whose bgp is not a
++dictionary with an 'as' (the original expression creates keys on those, through python-box) sends find_bgp_rr back
++to the scan; an AS value that cannot be a dictionary key sends both back to the scan. The index is dropped in
++module_cleanup and ignored for any other topology object or node count.
++"""
++class _AsIndex:
++  def __init__(self, topology: Box):
++    self.topology = topology
++    self.count = len(topology.nodes)
++    self.members: typing.Dict[typing.Any,typing.List[Box]] = {}   # AS -> nodes with that bgp.as, in node order
++    rr: typing.Optional[typing.Dict[typing.Any,typing.List[Box]]] = {}
++    for n in topology.nodes.values():
++      if 'vrfs' in n:
++        raise ValueError('vrfs')
++      bgp = dict.get(n,'bgp',_NO_BGP)
++      asn = _bgp_as(n)
++      if asn is not None:
++        self.members.setdefault(asn,[]).append(n)
++      if bgp is _NO_BGP:
++        continue
++      if not (isinstance(bgp,dict) and 'as' in bgp):
++        rr = None                                 # a shape the scan treats through python-box: leave it to the scan
++      elif rr is not None and bgp.get('rr',None):
++        rr.setdefault(dict.__getitem__(bgp,'as'),[]).append(n)
++    self.rr = rr
++
++_as_index: typing.Optional[_AsIndex] = None
++
++def _index_for(topology: Box) -> typing.Optional[_AsIndex]:
++  idx = _as_index
++  if idx is None or idx.topology is not topology or idx.count != len(topology.nodes):
++    return None
++  return idx
++
++def _index_rr(bgp_as: typing.Any, topology: Box) -> typing.Optional[typing.List[Box]]:
++  idx = _index_for(topology)
++  if idx is None or idx.rr is None:
++    return None
++  try:
++    return list(idx.rr.get(bgp_as,()))
++  except TypeError:                               # an AS that cannot be a key: the scan decides
++    return None
++
++def _index_members(node_as: typing.Any, topology: Box) -> typing.Optional[typing.List[Box]]:
++  idx = _index_for(topology)
++  if idx is None:
++    return None
++  try:
++    return idx.members.get(node_as,[])
++  except TypeError:
++    return None
++
++def build_as_index(topology: Box) -> None:
++  global _as_index
++  _as_index = None
++  try:
++    _as_index = _AsIndex(topology)
++  except Exception:                               # whatever the index could not read, the scans will read (and report)
++    _as_index = None
++
+ """
+ find_bgp_rr: find route reflectors in the specified autonomous system
+ 
+ Given an autonomous system and lab topology, return a list of node names that are route reflectors in that AS
+ """
++_NO_BGP = object()
++
+ def find_bgp_rr(bgp_as: int, topology: Box) -> typing.List[Box]:
+-  return [ n 
+-    for n in topology.nodes.values() 
+-      if 'bgp' in n and n.bgp["as"] == bgp_as and n.bgp.get("rr",None) ]
++  rr = _index_rr(bgp_as,topology)                 # SKYFORGE-SPECIFIC (patch 62): looked up in the index, if there is one
++  if rr is not None:
++    return rr
++  # SKYFORGE-SPECIFIC: every BGP node scans every node; read the usual shape (bgp is a dictionary with an 'as') at
++  # dictionary level and leave anything else to the original expression (which, through python-box, may create keys)
++  result = []
++  for n in topology.nodes.values():
++    bgp = dict.get(n,'bgp',_NO_BGP)
++    if bgp is _NO_BGP:
++      continue
++    if isinstance(bgp,dict) and 'as' in bgp:
++      if dict.__getitem__(bgp,'as') == bgp_as and bgp.get('rr',None):
++        result.append(n)
++    elif 'bgp' in n and n.bgp["as"] == bgp_as and n.bgp.get("rr",None):
++      result.append(n)
++  return result
+ 
+ """
+ bgp_neighbor: Create BGP neighbor data structure
+@@ -151,6 +233,35 @@ build_ibgp_sessions: create IBGP session data structure
+ * BGP route reflectors need IBGP session with all other nodes in the same AS
+ * Other nodes need IBGP sessions with all RRs in the same AS
+ """
++def _ibgp_neighbor_plain(n: Box, intf: Box, sessions: Box, extra_data: typing.Optional[dict] = None) -> typing.Optional[dict]:
++  """
++  SKYFORGE-SPECIFIC: bgp_neighbor(n,intf,'ibgp',sessions,extra_data) as a PLAIN dict with the same keys in the same
++  order. build_ibgp_sessions appends it to a BoxList, which converts it once; bgp_neighbor's Box was converted key by
++  key and then copied again by the append. Same appended result, one conversion per session instead of two.
++  """
++  ngb = dict(extra_data or {})
++  ngb['name'] = n.name
++  ngb['as'] = n.bgp.get('as')
++  ngb['type'] = 'ibgp'
++  af_count = 0
++  for af in ['ipv4','ipv6']:
++    if 'ibgp' in sessions.get(af,[]):
++      if af in intf:
++        af_count = af_count + 1
++        if isinstance(intf[af],bool):
++          ngb[af] = intf[af]
++        else:
++          ngb[af] = _rp_utils.get_intf_address(intf[af])
++
++  return ngb if af_count > 0 else None
++
++def _bgp_as(n: Box) -> typing.Any:
++  """SKYFORGE-SPECIFIC: n.get('bgp.as',None) without python-box's dotted-key machinery for the usual shape"""
++  bgp = dict.get(n,'bgp',None)
++  if isinstance(bgp,dict):
++    return dict.get(bgp,'as',None)
++  return n.get('bgp.as',None)
++
+ def build_ibgp_sessions(node: Box, sessions: Box, topology: Box) -> None:
+   node_as  = node.bgp['as']                       # Set up variables that will come handy, starting with node AS
+   is_rr    = node.bgp.get("rr",None)              # Is this node an RR?
+@@ -159,10 +270,11 @@ def build_ibgp_sessions(node: Box, sessions: Box, topology: Box) -> None:
+   rrlist = [] if is_rr else find_bgp_rr(node_as,topology)
+   rr_mesh  = node.bgp.get("rr_mesh",True)         # Do we want to have a mesh between RRs (default: Yes)?
+   if is_rr or not rrlist:                         # If the current node is RR or we have a full mesh
++    as_members = _index_members(node_as,topology)   # SKYFORGE-SPECIFIC (patch 62): the nodes in this AS, from the index
+     ibgp_ngb_list = [                             # ... we need IBGP sessions to all nodes in the AS
+-      ngb for ngb in topology.nodes.values()      # ... but while building the node list
+-        if ngb.name != node.name and              # ... skip current node
+-           ngb.get('bgp.as',None) == node_as]     # ... and everyone not in the current AS (or not running BGP)
++      ngb for ngb in (topology.nodes.values() if as_members is None else as_members)   # ... but while building the node list
++        if (as_members is not None or _bgp_as(ngb) == node_as) and   # ... skip everyone not in the current AS (or not running BGP)
++           ngb.name != node.name]                 # ... and the current node
+     if is_rr and not rr_mesh:                     # Are we a RR and the user hates inter-RR sessions?
+       ibgp_ngb_list = [                           # ... Let's exclude other RRs from neighbor list
+         ngb for ngb in ibgp_ngb_list              # Iterate over IBGP neighbors we found so far
+@@ -173,15 +285,17 @@ def build_ibgp_sessions(node: Box, sessions: Box, topology: Box) -> None:
+ 
+   for n in ibgp_ngb_list:
+     n_intf = get_remote_ibgp_endpoint(n)
+-    neighbor_data = bgp_neighbor(n,n_intf,'ibgp',sessions,get_neighbor_rr(n))
++    neighbor_data = _ibgp_neighbor_plain(n,n_intf,sessions,get_neighbor_rr(n))
+     if not neighbor_data is None:
+       if 'loopback' in node:
+-        neighbor_data._source_intf = node.loopback
++        # SKYFORGE-SPECIFIC: store the loopback as it is; append_box below re-creates it in the appended neighbor (the
++        # assignment copied it once more, and that copy was thrown away by the append that copied it again)
++        neighbor_data['_source_intf'] = node.loopback
+       if bgp_nhs:
+-        neighbor_data.next_hop_self = 'ebgp'
++        neighbor_data['next_hop_self'] = 'ebgp'
+       if is_rr and not 'rr' in neighbor_data:
+-        neighbor_data.rr_client = True
+-      node.bgp.neighbors.append(neighbor_data)
++        neighbor_data['rr_client'] = True
++      fastbox.append_box(node.bgp.neighbors,neighbor_data)   # SKYFORGE-SPECIFIC: converted once, here (same result)
+       has_ibgp = True
+ 
+   if not has_ibgp:
+@@ -1017,9 +1131,14 @@ class BGP(_Module):
+       if 'bgp' in n:
+         _routing.router_id(n,'bgp',topology.pools)
+ 
++    build_as_index(topology)                      # SKYFORGE-SPECIFIC (patch 62)
+     build_bgp_rr_clusters(topology)
+     check_confederation_data(topology)
+ 
++  def module_cleanup(self, topology: Box) -> None:
++    global _as_index                              # SKYFORGE-SPECIFIC (patch 62)
++    _as_index = None
++
+   #
+   # Execute the rest of node post-transform code, including setting up the BGP session table
+   #
+diff --git a/netsim/modules/vlan.py b/netsim/modules/vlan.py
+index 350ccf8..dc978c2 100644
+--- a/netsim/modules/vlan.py
++++ b/netsim/modules/vlan.py
+@@ -7,7 +7,7 @@ from box import Box
+ 
+ from .. import data
+ from ..augment import addressing, devices, groups, links
+-from ..data import get_box, get_empty_box, get_global_parameter
++from ..data import fastbox, get_box, get_empty_box, get_global_parameter
+ from ..utils import log, strings
+ from . import _dataplane, _Module, get_effective_module_attribute
+ 
+@@ -971,7 +971,7 @@ def set_svi_neighbor_list(node: Box, topology: Box) -> None:
+         if len(vlan_data.neighbors) == vlan_data.host_count +1:             # ... and there's exactly one non-host attached to the VLAN
+           ifdata.role = 'stub'                                              # ... then we have a stub link, mark it for IGP modules
+ 
+-      ifdata.neighbors = [ n for n in vlan_data.neighbors if n.node != node.name ]
++      fastbox.set_list(ifdata,'neighbors',[ n for n in vlan_data.neighbors if n.node != node.name ])   # SKYFORGE-SPECIFIC: same as =, faster
+       if ifdata.neighbors:
+         if ' -> ' in ifdata.name:
+           ifdata.name = ifdata.name.split(' -> ')[0]
+diff --git a/netsim/outputs/common.py b/netsim/outputs/common.py
+index be156fc..00eaf05 100644
+--- a/netsim/outputs/common.py
++++ b/netsim/outputs/common.py
+@@ -7,7 +7,7 @@ import typing
+ from box import Box
+ 
+ from ..augment import devices
+-from ..data import append_to_list, get_box, get_empty_box, global_vars
++from ..data import append_to_list, fastbox, get_box, get_empty_box, global_vars
+ 
+ """
+ Copy provider-specific inventory settings into node data. Used primarily to set up port forwarding
+@@ -39,12 +39,12 @@ def add_group_vars(
+   if provider_only:
+     group_vars = devices.get_provider_data(node,defaults).get('group_vars',{})
+   else:
+-    group_vars = devices.get_device_attribute(node,'group_vars',defaults)
++    group_vars = devices.get_device_attribute_readonly(node,'group_vars',defaults)    # SKYFORGE-SPECIFIC: read only
+ 
+   if isinstance(group_vars,dict):
+     for k,v in group_vars.items():
+       if k not in host:
+-        host[k] = v
++        fastbox.set_item(host,k,v)              # SKYFORGE-SPECIFIC: same as host[k] = v, faster
+ 
+   return group_vars
+ 
+@@ -68,7 +68,7 @@ def adjust_inventory_host(
+     # for provider group_vars on nodes with non-default provider, as they might have (for example)
+     # different ansible_connection
+     #
+-    g_vars = devices.get_device_attribute(node,'group_vars',defaults)
++    g_vars = devices.get_device_attribute_readonly(node,'group_vars',defaults)       # SKYFORGE-SPECIFIC: read only
+     if n_provider != defaults.provider:
+       add_group_vars(host,node,defaults,provider_only=True)
+ 
+@@ -80,8 +80,8 @@ def adjust_inventory_host(
+     node.inventory_hostname = node.name
+     node.netlab_device_type = host.get('netlab_device_type',host.get('ansible_network_os','none'))
+     node.node_provider = n_provider
+-    node.netlab_interfaces = ([ node.get('loopback')] if 'loopback' in node else []) + \
+-                             node.get('interfaces',[])
++    fastbox.set_item(node,'netlab_interfaces',                  # SKYFORGE-SPECIFIC: same as node.netlab_interfaces = ...
++                     ([ node.get('loopback')] if 'loopback' in node else []) + node.get('interfaces',[]))
+ 
+   # For Docker nodes, do not use mgmt.X attributes (to set ansible_host)
+   # Everywhere else, 'mgmt.ipv4' will overwrite 'hostname' (set by clab)
+@@ -96,11 +96,11 @@ def adjust_inventory_host(
+   for (node_key,inv_key) in translate.items():
+     value = node.get(node_key,None)
+     if value is not None:
+-      host[inv_key] = value
++      fastbox.set_item(host,inv_key,value)        # SKYFORGE-SPECIFIC: same as host[inv_key] = value, faster
+ 
+   for (k,v) in node.items():
+     if not k in ignore:
+-      host[k] = v
++      fastbox.set_item(host,k,v)                  # SKYFORGE-SPECIFIC: same as host[k] = v, faster
+ 
+   # KNE uses the compile-time provider contract for apply, not any source
+   # provider label that may still be present on imported clab topologies.
+@@ -115,15 +115,31 @@ def adjust_inventory_host(
+ def create_adjusted_topology(
+       topology: Box,
+       ignore: typing.Optional[list] = ['name'],
+-      template_vars: bool = False) -> Box:
+-  topo_copy = get_box(topology.to_dict())
++      template_vars: bool = False,
++      share: bool = False) -> Box:
++  if share:
++    # SKYFORGE-SPECIFIC (patch 61): the caller only READS what it gets back (config templates). Everything but the
++    # nodes is the topology's own data; each node is copied one level because template_vars writes four keys on it
++    # and adjust_inventory_host builds a new host from it. Not for callers that modify the result.
++    topo_copy = fastbox.shallow(topology)
++    new_nodes = fastbox.shallow(topology.nodes)
++    for node in list(new_nodes.keys()):
++      fastbox.set_reference(new_nodes,node,adjust_inventory_host(
++                              node=fastbox.shallow(topology.nodes[node]),
++                              defaults=topology.defaults,
++                              ignore=ignore,
++                              group_vars=True,
++                              template_vars=template_vars))
++    fastbox.set_reference(topo_copy,'nodes',new_nodes)
++    return topo_copy
++  topo_copy = fastbox.deep_copy(topology)                         # SKYFORGE-SPECIFIC: same result as get_box(topology.to_dict()), one pass
+   for node in list(topo_copy.nodes.keys()):
+-    topo_copy.nodes[node] = adjust_inventory_host(
++    fastbox.set_item(topo_copy.nodes,node,adjust_inventory_host(     # SKYFORGE-SPECIFIC: same as topo_copy.nodes[node] = ...
+                               node=topo_copy.nodes[node],
+                               defaults=topology.defaults,
+                               ignore=ignore,
+                               group_vars=True,
+-                              template_vars=template_vars)
++                              template_vars=template_vars))
+   return topo_copy
+ 
+ """
+diff --git a/netsim/outputs/config.py b/netsim/outputs/config.py
+index 23c5d9e..ae494d4 100644
+--- a/netsim/outputs/config.py
++++ b/netsim/outputs/config.py
+@@ -11,6 +11,7 @@ from ..augment import devices, groups, nodes
+ from ..providers import SHARED_PREFIX, SHARED_SUFFIX, get_provider_module
+ from ..utils import log, strings, templates
+ from . import _TopologyOutput, check_writeable
++from . import parallel_config
+ from . import common as output_common
+ 
+ 
+@@ -18,18 +19,25 @@ class ConfigurationFiles(_TopologyOutput):
+ 
+   DESCRIPTION :str = 'Create device configuration files'
+ 
+-  def write(self, topology: Box) -> None:
++  @staticmethod
++  def _shared_sources(n_data: Box, topology: Box) -> list:
++    """SKYFORGE-SPECIFIC (patch 57): the shared config templates one_node() would reach for this node, in order.
++
++    Mirrors the shared-template branch of the node loop exactly, so a parallel run can hand every node the
++    shared_list the sequential loop would have had when it got to that node."""
++    n_provider = devices.get_provider(n_data,topology.defaults)
++    skip_config = n_data.get('skip_config',[])
++    out = []
++    for cfg_item in n_data.get(f'{n_provider}.config_templates',[]):
++      cfg_source = cfg_item if isinstance(cfg_item,str) else cfg_item.get('source',getattr(cfg_item,'source',None))
++      cfg_mode = '' if isinstance(cfg_item,str) else cfg_item.get('mode','')
++      if not cfg_source or cfg_source in skip_config:
++        continue
++      if cfg_mode == SHARED_SUFFIX:
++        out.append(cfg_source)
++    return out
+ 
+-    def do_config(t_name: str, f_name: str, cfg_mode: str) -> bool:
+-      return templates.create_config_file(
+-        node=n_data,
+-        node_dict=node_dict,
+-        topology=topology,
+-        module=t_name,
+-        provider_path=provider_path,
+-        output_path=node_files,
+-        output_file=f_name,
+-        config_mode=cfg_mode)
++  def write(self, topology: Box) -> None:
+ 
+     check_writeable('device configuration files')
+ 
+@@ -46,19 +54,42 @@ class ConfigurationFiles(_TopologyOutput):
+ 
+     # Creates a "ghost clean" topology after transformation
+     # (AKA, remove unmanaged devices)
+-    topology = output_common.create_adjusted_topology(nodes.ghost_buster(topology),ignore=[],template_vars=True)
++    # SKYFORGE-SPECIFIC (patch 61): when the nodes are rendered in forked workers (parallel_config), the templates read
++    # the topology in the workers, so it is shared instead of deep-copied: python-box's default_box creates a key on
++    # a read of a missing one, and that must not reach this process (the pickle output runs here, after this one).
++    share = parallel_config.usable(topology)
++    real_topology = topology
++    topology = output_common.create_adjusted_topology(nodes.ghost_buster(topology,copy=not share),ignore=[],template_vars=True,share=share)
++
++    def unshare() -> Box:
++      # parallel_config renders every node in THIS process when a worker logged something: do that on a private deep
++      # copy, as the original loop did, not on the shared one
++      nonlocal topology
++      topology = output_common.create_adjusted_topology(nodes.ghost_buster(real_topology),ignore=[],template_vars=True)
++      return topology
+     shared_list = []
+     if 'unprovisioned' in topology.groups:
+       unprovisioned = groups.group_members(topology,'unprovisioned')
+     else:
+       unprovisioned = []
+ 
+-    for n_name,n_data in topology.nodes.items():
++    def one_node(n_name: str, n_data: Box, shared_list: list) -> None:
+       n_provider = devices.get_provider(n_data,topology.defaults)
+       p = get_provider_module(topology,n_provider)
+       provider_path = p.get_full_template_path()
+       node_dict = templates.template_node_data(n_data,topology)       # The dictionary used in templates
+ 
++      def do_config(t_name: str, f_name: str, cfg_mode: str) -> bool:
++        return templates.create_config_file(
++          node=n_data,
++          node_dict=node_dict,
++          topology=topology,
++          module=t_name,
++          provider_path=provider_path,
++          output_path=node_files,
++          output_file=f_name,
++          config_mode=cfg_mode)
++
+       create_list = []
+       skip_config = n_data.get('skip_config',[])
+       for cfg_item in n_data.get(f'{n_provider}.config_templates',[]):
+@@ -85,7 +116,7 @@ class ConfigurationFiles(_TopologyOutput):
+             (node_files / cfg_path).chmod(0o755)
+ 
+       if n_name in unprovisioned:
+-        continue
++        return
+ 
+       mod_list = ['initial']
+       if devices.get_device_attribute(n_data,'features.initial.normalize',topology.defaults):
+@@ -109,3 +140,11 @@ class ConfigurationFiles(_TopologyOutput):
+       if not log.VERBOSE and create_list:
+         strings.print_colored_text(strings.pad_err_code('CONFIG',10),'green')
+         print(f"{n_name}: {','.join(create_list)}")
++
++    # SKYFORGE-SPECIFIC (patch 57): render the nodes in forked workers when the lab is big enough (exact same files,
++    # same console lines in the same order); otherwise the original loop.
++    if parallel_config.usable(topology):
++      parallel_config.run(topology,one_node,lambda n_data: self._shared_sources(n_data,topology),unshare if share else None)
++    else:
++      for n_name,n_data in topology.nodes.items():
++        one_node(n_name,n_data,shared_list)
+diff --git a/netsim/outputs/parallel_config.py b/netsim/outputs/parallel_config.py
+new file mode 100644
+index 0000000..577f8b6
+--- /dev/null
++++ b/netsim/outputs/parallel_config.py
+@@ -0,0 +1,78 @@
++#
++# SKYFORGE-SPECIFIC (patch 57): render node configuration files in forked workers.
++#
++# The node loop in outputs/config.py is independent per node except for one piece of shared state: the list of
++# "shared" config templates already written. The parent computes, for every node, exactly the shared_list the
++# sequential loop would have had on reaching that node, then hands contiguous chunks of nodes to workers. Each worker
++# writes its nodes' files; its console lines, errors and warnings are replayed in chunk order (utils/forkrun.py), so
++# the files, the CONFIG lines and the exit status are the same as the sequential loop.
++#
++# Used only when the lab has at least SKYFORGE_NETLAB_PARALLEL_CONFIG_MIN nodes (default 64), forking is safe, and
++# SKYFORGE_NETLAB_PARALLEL_OUTPUTS is not 0. Workers: SKYFORGE_NETLAB_CONFIG_WORKERS (default min(8, CPUs)).
++#
++import os
++import shutil
++import tempfile
++import typing
++
++from box import Box
++
++from ..utils import forkrun
++
++
++def _workers() -> int:
++  try:
++    want = int(os.environ.get('SKYFORGE_NETLAB_CONFIG_WORKERS', '0'))
++  except ValueError:
++    want = 0
++  cpus = len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else (os.cpu_count() or 1)
++  return max(1, want if want > 0 else min(8, cpus))
++
++
++def usable(topology: Box) -> bool:
++  if os.environ.get('SKYFORGE_NETLAB_PARALLEL_OUTPUTS', '1') == '0' or not forkrun.fork_ok():
++    return False
++  try:
++    min_nodes = int(os.environ.get('SKYFORGE_NETLAB_PARALLEL_CONFIG_MIN', '64'))
++  except ValueError:
++    min_nodes = 64
++  return len(topology.nodes) >= min_nodes and _workers() > 1
++
++
++def run(topology: Box, one_node: typing.Callable, shared_sources: typing.Callable, unshare: typing.Optional[typing.Callable] = None) -> None:
++  names = list(topology.nodes.keys())
++  shared: list = []                             # simulate the sequential loop's shared_list
++  start_state = {}
++  for n_name in names:
++    start_state[n_name] = list(shared)
++    for src in shared_sources(topology.nodes[n_name]):
++      if src not in shared:
++        shared.append(src)
++
++  w = min(_workers(), len(names))
++  size = -(-len(names) // w)
++  chunks = [ names[i:i + size] for i in range(0, len(names), size) ]
++
++  def chunk_fn(chunk: list) -> typing.Callable[[], None]:
++    def fn() -> None:
++      for n_name in chunk:
++        one_node(n_name, topology.nodes[n_name], list(start_state[n_name]))
++    return fn
++
++  with tempfile.TemporaryDirectory(prefix='netlab-config-') as tmpdir:
++    pids = [ forkrun.start(chunk_fn(c), tmpdir, f'c{i}') for i, c in enumerate(chunks) ]
++    results = [ forkrun.collect(pid, tmpdir, f'c{i}', 'config worker') for i, pid in enumerate(pids) ]
++    if all(forkrun.clean(r) for r in results):
++      for r in results:
++        forkrun.replay(r, exit_on_error=False)  # the output loop checks errors after the module, as before
++      return
++
++  # A worker logged something (an error, a warning, a hint). What netlab prints once per process can only be printed
++  # right by this process: start the node files again and render every node here, exactly as the original loop does.
++  if os.path.exists('node_files'):
++    shutil.rmtree('node_files')
++  if unshare is not None:                       # SKYFORGE-SPECIFIC (patch 61): the topology was shared with the caller's
++    topology = unshare()                        # ... own, and the original loop rendered a private copy
++  shared_list: list = []
++  for n_name in names:
++    one_node(n_name, topology.nodes[n_name], shared_list)
+diff --git a/netsim/outputs/pickle.py b/netsim/outputs/pickle.py
+index 0c85268..5bf027d 100644
+--- a/netsim/outputs/pickle.py
++++ b/netsim/outputs/pickle.py
+@@ -7,6 +7,7 @@ from box import Box
+ 
+ from .. import __version__
+ from ..augment import topology
++from ..data import fastbox
+ from .. import providers
+ from ..utils import log
+ from . import _TopologyOutput
+@@ -24,7 +25,7 @@ class YAML(_TopologyOutput):
+     if outfile == '-':
+       log.fatal('Cannot write pickled data to stdout',module='pickle')
+ 
+-    topodict = topology.cleanup_topology(topo).to_dict()
++    topodict = fastbox.to_dict(topology.cleanup_topology(topo))   # SKYFORGE-SPECIFIC: same result as .to_dict(), faster
+     provider_name = str(getattr(topo,'provider','') or '').strip()
+     if provider_name:
+       try:
+diff --git a/netsim/outputs/provider.py b/netsim/outputs/provider.py
+index f5d7efa..25175c1 100644
+--- a/netsim/outputs/provider.py
++++ b/netsim/outputs/provider.py
+@@ -28,7 +28,7 @@ class ProviderConfiguration(_TopologyOutput):
+ 
+     # Creates a "ghost clean" topology after transformation
+     # (AKA, remove unmanaged devices)
+-    topology = output_common.create_adjusted_topology(nodes.ghost_buster(topology),ignore=[],template_vars=True)
++    topology = output_common.create_adjusted_topology(nodes.ghost_buster(topology,copy=False),ignore=[],template_vars=True)
+     p_module = providers.get_provider_module(topology,topology.provider)
+     providers.mark_providers(topology)
+     p_module.call('pre_output_transform',topology)
+diff --git a/netsim/providers/__init__.py b/netsim/providers/__init__.py
+index a29540c..42ae083 100644
+--- a/netsim/providers/__init__.py
++++ b/netsim/providers/__init__.py
+@@ -16,7 +16,7 @@ import typing
+ from box import Box
+ 
+ from ..augment import devices, links
+-from ..data import append_to_list, filemaps, get_box, get_empty_box
++from ..data import append_to_list, fastbox, filemaps, get_box, get_empty_box, memo
+ from ..outputs.ansible import get_host_addresses
+ from ..utils import files as _files
+ from ..utils import log, strings, templates
+@@ -116,7 +116,7 @@ class _Provider(Callback):
+     try:
+       search_path = _files.get_search_path(self.provider,pkg_path_component=self.get_template_path(),topology=topology)
+       r_text = templates.render_template(
+-        data=topology.to_dict(),
++        data=fastbox.to_dict(topology),                   # SKYFORGE-SPECIFIC: same result as topology.to_dict()
+         j2_file=tname,
+         extra_path=search_path)
+     except Exception as ex:
+@@ -266,6 +266,7 @@ def get_provider_module(topology: Box, pname: str) -> _Provider:
+ Execute a topology-wide provider hook
+ """
+ def execute(hook: str, topology: Box) -> None:
++  memo.invalidate()                                           # SKYFORGE-SPECIFIC: provider hooks may edit shared tables
+   p_module = get_provider_module(topology,topology.provider)
+   p_module.call(hook,topology)
+ 
+diff --git a/netsim/providers/kne.py b/netsim/providers/kne.py
+index 7830cb6..3859b94 100644
+--- a/netsim/providers/kne.py
++++ b/netsim/providers/kne.py
+@@ -21,7 +21,7 @@ from ..augment import devices
+ from ..augment import links as augment_links
+ from ..augment import topology as topology_cleanup
+ from ..cli import external_commands, is_dry_run
+-from ..data import append_to_list, filemaps, get_box
++from ..data import append_to_list, fastbox, filemaps, get_box
+ from ..utils import files as _files
+ from ..utils import log, strings, templates
+ from . import _Provider, validate_mgmt_ip
+@@ -635,7 +635,7 @@ def get_node_config_mode(node: Box, topology: Box) -> str:
+       return 'none'
+     return cfg_mode
+ 
+-  features = devices.get_device_features(node,topology.defaults)
++  features = devices.get_device_features_readonly(node,topology.defaults)   # SKYFORGE-SPECIFIC: read only
+   supported = features.get('initial.config_mode',[])
+   if len(supported) == 1 and supported[0] in ('sh','cp_sh'):
+     return supported[0]
+@@ -2460,7 +2460,7 @@ def kne_device_initial_features(node: Box, topology: Box) -> Box:
+   and raises on an absent one, so ask only when there is a name to ask about.'''
+   if not node.get('device',None):
+     return Box({},default_box=True)
+-  return devices.get_device_features(node,topology.defaults).get('initial',Box({},default_box=True))
++  return devices.get_device_features_readonly(node,topology.defaults).get('initial',Box({},default_box=True))   # SKYFORGE-SPECIFIC: read only
+ 
+ def kne_device_mtu_ceiling(node: Box, topology: Box, device_caps: dict) -> int | None:
+   '''The largest interface MTU this node's NOS will actually accept.
+@@ -2902,7 +2902,7 @@ def build_kne_render_node_data(node: Box, topology: Box, node_interfaces: list)
+   if isinstance(node.get('kne',None),Box) and 'config_templates' in node.kne:
+     return build_kne_node_data(node,topology,node_interfaces)
+ 
+-  render_node = get_box(node.to_dict())
++  render_node = fastbox.deep_copy(node)                             # SKYFORGE-SPECIFIC: same result as get_box(node.to_dict()), one pass
+   render_node.kne = Box(default_box=True,box_dots=True)
+   render_node.kne.config_templates = Box(default_box=True,box_dots=True)
+   add_default_config_mode(render_node,topology)
+@@ -2927,7 +2927,7 @@ def normalize_interface_mtu(value: object) -> int | None:
+ 
+ def render_kne_topology_textproto(topology: Box) -> str:
+   search_path = _files.get_search_path('kne',pkg_path_component='templates/provider/kne')
+-  topo_data = get_box(topology.to_dict())
++  topo_data = fastbox.deep_copy(topology)                           # SKYFORGE-SPECIFIC: same result as get_box(topology.to_dict()), one pass
+   topo_data.kne_name = str(topo_data.get('kne_name',get_kne_topology_name(topology)) or get_kne_topology_name(topology))
+   topo_data.kne_links = [
+     get_box(link) if not isinstance(link,Box) else link
+@@ -2988,7 +2988,7 @@ def save_runtime_snapshot(topology: Box) -> None:
+   if not snapshot_file.exists():
+     return
+ 
+-  topodict = topology_cleanup.cleanup_topology(topology).to_dict()
++  topodict = fastbox.to_dict(topology_cleanup.cleanup_topology(topology))
+   topodict['kne'] = build_kne_snapshot_metadata(topology)
+   topodict['_netlab_version'] = __version__
+   try:
+diff --git a/netsim/utils/forkrun.py b/netsim/utils/forkrun.py
+new file mode 100644
+index 0000000..5197afe
+--- /dev/null
++++ b/netsim/utils/forkrun.py
+@@ -0,0 +1,128 @@
++#
++# SKYFORGE-SPECIFIC (patch 57): run pieces of 'netlab create' in forked workers while keeping the console output,
++# the error/warning logs and the exit behaviour exactly as if they had run one after the other in this process.
++#
++# A task is a zero-argument callable. Each one runs with fd 1/2 redirected to files; what it printed, the errors and
++# warnings it logged and any exception it raised are collected, then replay() feeds them back IN TASK ORDER.
++#
++import gc
++import os
++import pickle
++import sys
++import threading
++import typing
++
++from . import log
++
++
++def fork_ok() -> bool:
++  """Forking is only safe from a single-threaded process."""
++  return hasattr(os, 'fork') and threading.active_count() == 1
++
++
++def run_captured(fn: typing.Callable[[], None], tmpdir: str, tag: str) -> dict:
++  out_path, err_path = os.path.join(tmpdir, f'{tag}.out'), os.path.join(tmpdir, f'{tag}.err')
++  n_err, n_warn = len(log._ERROR_LOG), len(log._WARNING_LOG)
++  header = log._error_header_printed
++  sys.stdout.flush()
++  sys.stderr.flush()
++  saved = (os.dup(1), os.dup(2))
++  saved_streams = (sys.stdout, sys.stderr)
++  result: dict = {'exc': None}
++  with open(out_path, 'wb') as fo, open(err_path, 'wb') as fe:
++    os.dup2(fo.fileno(), 1)
++    os.dup2(fe.fileno(), 2)
++    # The python-level streams too: something (a test harness, a wrapper) may have pointed sys.stdout at a file
++    # object that does not go through fd 1, and output written there would bypass the capture and lose its order.
++    sys.stdout = open(1, 'w', encoding=getattr(saved_streams[0], 'encoding', None) or 'utf-8', closefd=False)
++    sys.stderr = open(2, 'w', encoding=getattr(saved_streams[1], 'encoding', None) or 'utf-8', closefd=False)
++    try:
++      fn()
++    except BaseException as ex:                   # SystemExit from log.fatal, ErrorAbort under RAISE_ON_ERROR, bugs
++      result['exc'] = ex
++    finally:
++      sys.stdout.flush()
++      sys.stderr.flush()
++      sys.stdout, sys.stderr = saved_streams
++      os.dup2(saved[0], 1)
++      os.dup2(saved[1], 2)
++      os.close(saved[0])
++      os.close(saved[1])
++  result['errors'] = log._ERROR_LOG[n_err:]
++  result['warnings'] = log._WARNING_LOG[n_warn:]
++  result['header'] = log._error_header_printed and not header
++  result['out'], result['err'] = out_path, err_path
++  # Taken back out: the caller re-adds them at this task's place in the order (replay)
++  del log._ERROR_LOG[n_err:]
++  del log._WARNING_LOG[n_warn:]
++  log._error_header_printed = header
++  return result
++
++
++def start(fn: typing.Callable[[], None], tmpdir: str, tag: str) -> int:
++  """Fork a worker that runs fn captured and writes its result file. Returns the pid."""
++  sys.stdout.flush()
++  sys.stderr.flush()
++  gc.freeze()                                   # the child's collector must not walk (and so copy) the parent's pages
++  pid = os.fork()
++  if pid:
++    return pid
++  gc.disable()                                  # short-lived worker: no cyclic collection of the inherited heap
++  code = 0
++  try:
++    result = run_captured(fn, tmpdir, tag)
++    exc = result['exc']
++    if exc is not None:
++      try:
++        pickle.dumps(exc)
++      except Exception:
++        result['exc'] = RuntimeError(f'{type(exc).__name__}: {exc}')
++    with open(os.path.join(tmpdir, f'{tag}.result'), 'wb') as f:
++      pickle.dump(result, f)
++  except BaseException:
++    code = 70
++  finally:
++    os._exit(code)
++
++
++def collect(pid: int, tmpdir: str, tag: str, what: str) -> dict:
++  _, status = os.waitpid(pid, 0)
++  gc.unfreeze()
++  rpath = os.path.join(tmpdir, f'{tag}.result')
++  if not os.path.exists(rpath):
++    log.fatal(f'{what}: worker died (wait status {status})', module='create')
++  with open(rpath, 'rb') as f:
++    return pickle.load(f)
++
++
++def clean(result: dict) -> bool:
++  """A task that logged nothing, wrote nothing to stderr and raised nothing.
++
++  Only a clean task's captured output can be replayed as is: netlab prints some things once per process (the
++  'Errors encountered' header, documentation hints, repeated warnings), and a worker that started from a copy of this
++  process cannot know whether an earlier task printed them. Callers re-run an unclean task in this process instead."""
++  if result.get('exc') is not None or result['errors'] or result['warnings'] or result['header']:
++    return False
++  return os.path.getsize(result['err']) == 0
++
++
++def replay(result: dict, exit_on_error: bool = True) -> None:
++  """Print what the task printed, re-add its errors/warnings, re-raise its exception, then check for errors."""
++  for path, stream in ((result['out'], sys.stdout), (result['err'], sys.stderr)):
++    with open(path, 'rb') as f:
++      data = f.read()
++    if data:
++      stream.flush()
++      if hasattr(stream, 'buffer'):
++        stream.buffer.write(data)
++      else:
++        stream.write(data.decode(getattr(stream, 'encoding', None) or 'utf-8', errors='replace'))
++      stream.flush()
++  log._ERROR_LOG.extend(result['errors'])
++  log._WARNING_LOG.extend(result['warnings'])
++  if result['header']:
++    log._error_header_printed = True
++  if result.get('exc') is not None:
++    raise result['exc']
++  if exit_on_error:
++    log.exit_on_error()
+diff --git a/netsim/utils/routing.py b/netsim/utils/routing.py
+index 952b149..c96e6d7 100644
+--- a/netsim/utils/routing.py
++++ b/netsim/utils/routing.py
+@@ -17,8 +17,21 @@ from . import log
+ def get_ipv4_address(addr: typing.Union[str,int]) -> str:
+   return str(ipaddress.IPv4Interface(addr).ip)
+ 
++_intf_address_cache: typing.Dict[typing.Any,str] = {}
++
+ def get_intf_address(addr: typing.Union[str,int]) -> str:
+-  return str(ipaddress.ip_interface(addr).ip)
++  # SKYFORGE-SPECIFIC: a pure function of its argument, asked for the same loopback once per BGP session (tens of
++  # thousands of times in a large lab); remember the answers. Errors are not cached: they are raised every time.
++  key = (addr.__class__,addr)
++  try:
++    return _intf_address_cache[key]
++  except KeyError:
++    pass
++  except TypeError:                     # unhashable argument: compute it every time, as before
++    return str(ipaddress.ip_interface(addr).ip)
++  result = str(ipaddress.ip_interface(addr).ip)
++  _intf_address_cache[key] = result
++  return result
+ 
+ def get_address(addr: str) -> str:
+   return str(ipaddress.ip_address(addr))
+diff --git a/netsim/utils/templates.py b/netsim/utils/templates.py
+index 9e993d0..62bb67a 100644
+--- a/netsim/utils/templates.py
++++ b/netsim/utils/templates.py
+@@ -11,6 +11,7 @@ from box import Box
+ from jinja2 import Environment, FileSystemLoader
+ 
+ from ..augment import devices
++from ..data import fastbox
+ from ..outputs import common as outputs_common
+ from . import filters, log
+ from . import strings as _strings
+@@ -285,12 +286,12 @@ def template_shared_data(topology: Box) -> dict:
+       TEMPLATE_SHARED_DATA = None
+ 
+   if TEMPLATE_SHARED_DATA is None:
+-    host_addrs = outputs_common.get_host_addresses(topology).to_dict()
++    host_addrs = fastbox.to_dict(outputs_common.get_host_addresses(topology))
+     TEMPLATE_SHARED_DATA = {                      # Create the shared data we need for config templates
+-      'hostvars': topology.nodes.to_dict(),
++      'hostvars': fastbox.to_dict(topology.nodes),
+       'hosts': host_addrs,                        # Deprecated value
+       'host_addrs': host_addrs,                   # New value that does not clash with Ansible
+-      'addressing': topology.addressing.to_dict(),
++      'addressing': fastbox.to_dict(topology.addressing),
+       '_timestamp': topology.defaults._cache.timestamp
+     }
+ 
+@@ -300,11 +301,11 @@ def template_shared_data(topology: Box) -> dict:
+ template_node_data: node data with extra Ansible-like attributes used in config templates or template paths
+ """
+ def template_node_data(n_data: Box, topology: Box) -> dict:
+-  node_data = outputs_common.adjust_inventory_host(         # Add group variables to node data
++  node_data = fastbox.to_dict(outputs_common.adjust_inventory_host(   # Add group variables to node data
+                             node=n_data,
+                             defaults=topology.defaults,
+                             group_vars=True,
+-                            template_vars=True).to_dict()
++                            template_vars=True))
+   shared_data = template_shared_data(topology)
+   for k,v in shared_data.items():                           # ...copy shared data
+     node_data[k] = v
+diff --git a/tests/test_compile_speed.py b/tests/test_compile_speed.py
+new file mode 100644
+index 0000000..716805e
+--- /dev/null
++++ b/tests/test_compile_speed.py
+@@ -0,0 +1,786 @@
++#!/usr/bin/env python3
++"""
++Compile-speed patch (SKYFORGE-SPECIFIC, patch 50): the caches and the fast box conversions must change how long a
++compile takes, never what it produces.
++
++The tests are written from that requirement, not from the implementation: every one of them compares a result
++computed with the speed-ups ON against the same result computed with them OFF (python-box / uncached netlab).
++"""
++
++import copy
++import ipaddress
++import textwrap
++from pathlib import Path
++
++import pytest
++import yaml
++from box import Box, BoxList
++
++from netsim.augment import devices
++from netsim.cli import create
++from netsim.data import fastbox, get_box, memo
++from netsim.utils import log
++
++_OPTS = dict(default_box=True, default_box_none_transform=False, box_dots=True)
++
++
++def _init_log() -> None:
++  log.init_log_system(header=False)
++  log.set_flag(quiet=True, raise_error=False, warning=False, logging=False, verbose=0)
++
++
++def _same(a, b, path='') -> None:
++  """Independent comparator: values, container TYPES, key order, and python-box's own bookkeeping."""
++  assert type(a) is type(b), f'{path}: {type(a).__name__} != {type(b).__name__}'
++  if isinstance(a, dict):
++    assert list(a.keys()) == list(b.keys()), f'{path}: keys differ'
++    if isinstance(a, Box):
++      assert a._box_config == b._box_config, f'{path}: _box_config differs'
++    for k in a.keys():
++      _same(dict.__getitem__(a, k), dict.__getitem__(b, k), f'{path}.{k}')
++  elif isinstance(a, list):
++    assert len(a) == len(b), f'{path}: length differs'
++    if isinstance(a, BoxList):
++      assert a.box_options == b.box_options, f'{path}: box_options differ'
++    for i, (x, y) in enumerate(zip(a, b)):
++      _same(x, y, f'{path}[{i}]')
++  else:
++    assert a == b, f'{path}: {a!r} != {b!r}'
++
++
++_STRUCTURES = {
++  'scalars': {'a': 1, 'b': 'x', 'c': 2.5, 'd': True, 'e': None, 'f': b'raw', 'g': {1, 2}, 'h': (1, 2)},
++  'nested': {'a': {'b': {'c': [1, {'d': [2, [3, {'e': 'f'}]]}]}}},
++  'ip objects stay as they are': {'pfx': ipaddress.ip_network('10.0.0.0/24'), 'l': [ipaddress.ip_address('10.0.0.1')]},
++  'int and tuple keys': {1: 'one', (1, 2): 'pair', 'x': {2: {3: 4}}},
++  'keys that are not attribute names': {'a-b': 1, 'class': 2, '1x': 3, 'ü': 4},
++  'empty containers': {'a': {}, 'b': [], 'c': [[], {}]},
++  'dotted key splits into nested boxes': {'a.b': 1, 'c': {'d.e': {'f': 2}}},
++  'bracket key': {'a[0]': 1},
++  'list of lists of dicts': {'a': [[{'x': 1}], [{'y': [{'z': 2}]}]]},
++  'self reference': None,    # built below
++}
++
++
++def _self_ref() -> dict:
++  d: dict = {'a': 1}
++  d['me'] = d
++  return d
++
++
++@pytest.mark.parametrize('name', [n for n in _STRUCTURES if n != 'self reference'])
++def test_from_plain_equals_python_box(name: str) -> None:
++  expected = Box(copy.deepcopy(_STRUCTURES[name]), **_OPTS)
++  got = fastbox.from_plain(copy.deepcopy(_STRUCTURES[name]))
++  _same(got, expected)
++  # and the usual Box behaviour on top of it: attribute access, defaults, dotted access
++  if name == 'nested':
++    assert got.a.b.c[1].d[1][1].e == 'f'
++    assert got.missing.deep.value == {}              # default_box
++  if name == 'dotted key splits into nested boxes':
++    assert got.a.b == 1 and got.c.d.e.f == 2
++
++
++def test_from_plain_hands_a_self_referencing_dictionary_to_python_box() -> None:
++  got = fastbox.from_plain(_self_ref())
++  expected = Box(_self_ref(), **_OPTS)
++  _same(got, expected)
++
++
++def test_from_plain_is_a_true_copy() -> None:
++  src = {'a': {'b': [1, {'c': 2}]}}
++  box = fastbox.from_plain(src)
++  box.a.b[1].c = 99
++  box.a.b.append(3)
++  assert src == {'a': {'b': [1, {'c': 2}]}}
++
++
++def test_get_box_of_a_box_keeps_python_box_semantics() -> None:
++  """get_box(Box) must not take the fast path: python-box re-uses the BoxList objects of its source."""
++  src = get_box({'l': [{'a': 1}], 'd': {'x': 1}})
++  copy_ = get_box(src)
++  assert copy_.d is not src.d                         # dictionaries are re-created
++  assert copy_.l is src.l                             # ... and lists are shared, exactly as python-box does it
++
++
++@pytest.mark.parametrize('name', [n for n in _STRUCTURES if n != 'self reference'])
++def test_to_dict_equals_python_box(name: str) -> None:
++  box = Box(copy.deepcopy(_STRUCTURES[name]), **_OPTS)
++  got, expected = fastbox.to_dict(box), box.to_dict()
++  _same(got, expected)
++  assert type(got) is dict
++
++
++@pytest.mark.parametrize('name', [n for n in _STRUCTURES if n != 'self reference'])
++def test_copy_box_equals_python_box_copy(name: str) -> None:
++  src = get_box(copy.deepcopy(_STRUCTURES[name]))
++  _same(fastbox.copy_box(src), src.copy())
++
++
++def test_copy_box_shares_lists_exactly_like_python_box() -> None:
++  src = get_box({'l': [{'a': 1}], 'd': {'x': 1}})
++  for c in (fastbox.copy_box(src), src.copy()):
++    assert c.d is not src.d
++    assert c.l is src.l
++
++
++def test_get_box_of_a_box_equals_python_box() -> None:
++  src = get_box({'l': [{'a': 1}], 'd': {'x': [1, {'y': 2}]}, 'e': {}})
++  _same(get_box(src), Box(src, **_OPTS))
++
++
++def test_speedups_can_be_switched_off(monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.setattr(fastbox, 'ENABLED', False)
++  monkeypatch.setattr(memo, 'DISABLED', True)
++  _same(fastbox.from_plain({'a': {'b': [1]}}), Box({'a': {'b': [1]}}, **_OPTS))
++  calls = []
++  assert memo.memo('t', 1, (), lambda: calls.append(1) or 'v') == 'v'
++  assert memo.memo('t', 1, (), lambda: calls.append(1) or 'v') == 'v'
++  assert len(calls) == 2                              # nothing cached
++
++
++#
++# memo: a hit needs the SAME source objects; everything else recomputes
++#
++
++def test_memo_recomputes_when_the_source_object_is_replaced() -> None:
++  memo.invalidate()
++  t1, t2 = Box({'v': 1}), Box({'v': 1})
++  n = []
++  assert memo.memo('t', 'k', (t1,), lambda: n.append(1) or 'a') == 'a'
++  assert memo.memo('t', 'k', (t1,), lambda: n.append(1) or 'b') == 'a' and len(n) == 1          # hit
++  assert memo.memo('t', 'k', (t2,), lambda: n.append(1) or 'c') == 'c' and len(n) == 2          # equal but not the same object
++  memo.invalidate()
++  assert memo.memo('t', 'k', (t2,), lambda: n.append(1) or 'd') == 'd' and len(n) == 3          # invalidated
++
++
++def test_memo_verify_mode_aborts_on_a_stale_entry(monkeypatch: pytest.MonkeyPatch) -> None:
++  _init_log()
++  memo.invalidate()
++  monkeypatch.setattr(memo, 'VERIFY', True)
++  src = Box({'v': 1})
++  state = {'v': 'old'}
++  memo.memo('t', 'k', (src,), lambda: state['v'])
++  state['v'] = 'new'                                  # the table was edited in place behind the cache's back
++  with pytest.raises(SystemExit):
++    memo.memo('t', 'k', (src,), lambda: state['v'])
++  memo.invalidate()
++
++
++def test_verify_all_catches_a_caller_that_modified_a_shared_result() -> None:
++  _init_log()
++  memo.invalidate()
++  src = Box({'v': 1})
++  shared = memo.memo('t', 'k', (src,), lambda: Box({'x': {'y': 1}}))
++  memo.verify_all('before')                           # untouched: fine
++  shared.x.y = 2                                      # a caller edits the shared object
++  with pytest.raises(SystemExit):
++    memo.verify_all('after')
++  memo.invalidate()
++
++
++#
++# device lookups: cached == uncached for every device, provider and attribute
++#
++
++_TOPOLOGY = """
++provider: kne
++module: [ ospf, bgp, vxlan, evpn, vlan ]
++bgp.as: 65000
++addressing:
++  loopback: { ipv4: 10.0.0.0/16, prefix: 32 }
++  mgmt: { ipv4: 10.200.0.0/14 }
++vlans:
++  tenant0: { id: 100, mode: bridge, prefix: 10.100.0.0/24 }
++  tenant1: { id: 101, mode: bridge, prefix: 10.104.0.0/24 }
++defaults.device: eos
++nodes:
++  s1: { bgp.rr: true }
++  s2: { bgp.rr: true }
++  l1: { vlans: { tenant0: {}, tenant1: {} } }
++  l2: { vlans: { tenant0: {}, tenant1: {} } }
++  h1: { device: linux }
++  h2: { device: linux }
++  h3: { device: linux }
++links:
++- { s1: , l1: }
++- { s1: , l2: }
++- { s2: , l1: }
++- { s2: , l2: }
++- { l1: , h1: , vlan.access: tenant0 }
++- { l1: , h2: , vlan.access: tenant1 }
++- { l2: , h3: , vlan.access: tenant0 }
++"""
++
++_ATTRS = ['features', 'group_vars', 'interface_name', 'ifindex_offset', 'role', 'mgmt_if', 'daemon',
++          'features.initial.normalize', 'features.vlan', 'features.bgp', 'features.routing', 'clab', 'kne']
++
++
++def _compile(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, fast: bool) -> tuple:
++  lab = tmp_path / name / 'lab'
++  lab.mkdir(parents=True)
++  monkeypatch.chdir(lab)
++  monkeypatch.setattr(memo, 'DISABLED', not fast)
++  monkeypatch.setattr(fastbox, 'ENABLED', fast)
++  memo.invalidate()
++  (lab / 'topology.yml').write_text(textwrap.dedent(_TOPOLOGY).strip() + '\n')
++  _init_log()
++  topology = create.run(['-o', 'config', '-o', 'provider', '-o', 'ansible:dir', '-o', 'pickle', str(lab / 'topology.yml')])
++  return lab, topology
++
++
++def _warm_up(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  """netlab caches the parsed defaults on first use and the key order of a cold and a warm start differ: compare warm starts."""
++  _compile(tmp_path, monkeypatch, 'warmup', fast=False)
++
++
++def _tree(lab: Path, root: Path) -> dict:
++  out = {}
++  for p in sorted(lab.rglob('*')):
++    if p.is_file() and '__pycache__' not in p.parts:
++      rel = str(p.relative_to(lab))
++      raw = p.read_bytes()
++      if rel.endswith('.pickle'):
++        import pickle
++        data = pickle.loads(raw)
++        data.get('defaults', {}).get('_cache', {}).pop('timestamp', None)
++        raw = repr(data).encode()
++      out[rel] = raw.replace(str(root).encode(), b'<ROOT>')
++  return out
++
++
++def test_compile_output_is_identical_with_and_without_the_speedups(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  _warm_up(tmp_path, monkeypatch)
++  lab_off, _ = _compile(tmp_path, monkeypatch, 'off', fast=False)
++  off = _tree(lab_off, tmp_path / 'off')
++  lab_on, _ = _compile(tmp_path, monkeypatch, 'on', fast=True)
++  on = _tree(lab_on, tmp_path / 'on')
++  assert set(on) == set(off) and len(on) > 20
++  assert [k for k in on if on[k] != off[k]] == []
++
++
++@pytest.mark.parametrize('provider', [None, 'clab', 'kne'])
++def test_device_lookups_return_what_the_uncached_code_returns(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: str) -> None:
++  _, topology = _compile(tmp_path, monkeypatch, 'dev', fast=True)
++  defaults = topology.defaults
++  checked = 0
++  for dev in defaults.devices.keys():
++    node = Box({'device': dev, 'name': 'x'} | ({'provider': provider} if provider else {}), **_OPTS)
++    for attr in _ATTRS:
++      monkeypatch.setattr(memo, 'DISABLED', True)
++      expected = devices.get_device_attribute(node, attr, defaults)
++      monkeypatch.setattr(memo, 'DISABLED', False)
++      memo.invalidate()
++      first = devices.get_device_attribute(node, attr, defaults)
++      second = devices.get_device_attribute(node, attr, defaults)                # served from the cache
++      assert first == expected and second == expected, f'{dev}/{provider}/{attr}'
++      checked += 1
++    monkeypatch.setattr(memo, 'DISABLED', True)
++    expected = devices.get_device_features(node, defaults)
++    monkeypatch.setattr(memo, 'DISABLED', False)
++    assert devices.get_device_features(node, defaults) == expected
++    assert devices.get_device_features(node, defaults) == expected
++    # a node with its own features must never be handed the shared table
++    node2 = Box(dict(node) | {'_features': {'x_test_only': True}}, **_OPTS)
++    got = devices.get_device_features(node2, defaults)
++    assert got.get('x_test_only') is True
++    assert 'x_test_only' not in devices.get_device_features(node, defaults)
++  assert checked > 500
++
++
++def test_features_returned_to_a_caller_are_private_copies(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  """python-box creates a key when a missing one is read; that must never leak from one caller to the next."""
++  _, topology = _compile(tmp_path, monkeypatch, 'sh', fast=True)
++  node = Box({'device': 'eos', 'name': 'x'}, **_OPTS)
++  first = devices.get_device_features(node, topology.defaults)
++  assert 'x_never_defined' not in first
++  _ = first.x_never_defined.deeper                    # default_box: reading creates the key in THIS copy
++  first.bfd = 'scribble'
++  assert 'x_never_defined' in first
++  second = devices.get_device_features(node, topology.defaults)
++  assert 'x_never_defined' not in second and second.bfd != 'scribble'
++  assert topology.defaults.devices.eos.features.get('bfd') != 'scribble'
++
++
++def test_merged_device_attributes_are_private_copies(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  _, topology = _compile(tmp_path, monkeypatch, 'sh2', fast=True)
++  node = Box({'device': 'eos', 'name': 'x', 'provider': 'kne'}, **_OPTS)
++  first = devices.get_device_attribute(node, 'group_vars', topology.defaults)
++  first.ansible_user = 'scribble'
++  _ = first.x_never_defined.deeper
++  second = devices.get_device_attribute(node, 'group_vars', topology.defaults)
++  assert second.ansible_user != 'scribble' and 'x_never_defined' not in second
++
++
++#
++# a plugin that edits a device table in place between two lookups
++#
++
++_EDIT_PLUGIN = '''
++def pre_node_transform(topology):
++  # the features of every eos node have been looked up (and cached) by now; change the table in place
++  topology.defaults.devices.eos.features.bfd = False
++  topology.defaults.devices.eos.features.bgp.multipath = False
++'''
++
++
++def _compile_with_plugin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, fast: bool) -> tuple:
++  lab = tmp_path / name / 'lab'
++  lab.mkdir(parents=True)
++  monkeypatch.chdir(lab)
++  monkeypatch.setattr(memo, 'DISABLED', not fast)
++  monkeypatch.setattr(fastbox, 'ENABLED', fast)
++  memo.invalidate()
++  (lab / 'edit_features.py').write_text(_EDIT_PLUGIN)
++  (lab / 'topology.yml').write_text('plugin: [ edit_features ]\n' + textwrap.dedent(_TOPOLOGY).strip() + '\n')
++  _init_log()
++  create.run(['-o', 'config', '-o', 'provider', '-o', 'ansible:dir', '-o', 'pickle', str(lab / 'topology.yml')])
++  return lab
++
++
++def test_a_plugin_editing_a_device_table_gives_the_same_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  _warm_up(tmp_path, monkeypatch)
++  off = _tree(_compile_with_plugin(tmp_path, monkeypatch, 'off', fast=False), tmp_path / 'off')
++  on = _tree(_compile_with_plugin(tmp_path, monkeypatch, 'on', fast=True), tmp_path / 'on')
++  assert set(on) == set(off) and [k for k in on if on[k] != off[k]] == []
++
++
++def test_without_the_guards_the_same_plugin_is_caught_by_verify_mode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  """Positive control: break the invalidation AND the content guard on purpose; the stale cache must be reported."""
++  real = memo.memo
++  monkeypatch.setattr(memo, 'invalidate', lambda: None)
++  monkeypatch.setattr(memo, 'memo', lambda name, key, refs, compute, watch=(): real(name, key, refs, compute))
++  monkeypatch.setattr(memo, 'VERIFY', True)
++  with pytest.raises(SystemExit):
++    _compile_with_plugin(tmp_path, monkeypatch, 'broken', fast=True)
++
++
++def test_the_content_guard_alone_keeps_the_plugin_case_correct(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  """Invalidation off, content guard on: an in-place edit is still noticed (verify mode would abort otherwise)."""
++  _warm_up(tmp_path, monkeypatch)
++  monkeypatch.setattr(memo, 'invalidate', lambda: None)
++  monkeypatch.setattr(memo, 'VERIFY', True)
++  off = _tree(_compile_with_plugin(tmp_path, monkeypatch, 'off', fast=False), tmp_path / 'off')
++  monkeypatch.setattr(memo, 'DISABLED', False)
++  on = _tree(_compile_with_plugin(tmp_path, monkeypatch, 'on', fast=True), tmp_path / 'on')
++  assert [k for k in on if on[k] != off[k]] == []
++
++
++#
++# validate_attributes: the merged attribute table is modified while it validates (get_valid_attributes strips the
++# _required flags from tables it shares with the copy); the NEXT validation must start from an untouched table
++#
++
++def test_every_validation_starts_from_its_own_merged_attribute_table(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  from netsim.data import validate
++  _, topology = _compile(tmp_path, monkeypatch, 'val', fast=True)
++  attrs = topology.defaults.attributes
++  extra = validate.get_object_attributes(['providers', 'outputs'], topology)
++  memo.invalidate()
++  first = validate.resolve_attributes(attrs, extra, ['node'])
++  second = validate.resolve_attributes(attrs, extra, ['node'])
++  assert first[0] is not second[0]                    # a table of its own for every call
++  # what a validation does to its own table: recursive calls without extra attributes strip the required flags
++  for ns in validate.get_attribute_namespaces(first[0], ['node']):
++    validate.get_valid_attributes(first[0], [ns])
++  validate.resolve_attributes(first[0], None, ['link'])
++  third = validate.resolve_attributes(attrs, extra, ['node'])
++  monkeypatch.setattr(memo, 'DISABLED', True)
++  expected = validate.resolve_attributes(attrs, extra, ['node'])
++  assert third[0] == expected[0] and third[1] == expected[1] and third[2] == expected[2]
++
++
++#
++# the fast paths check themselves against the INSTALLED python-box before first use (the runtime image ships a
++# different build than developers have; the first version of this patch killed every compile in the image)
++#
++
++def test_a_fast_path_that_disagrees_with_python_box_switches_the_module_off(monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.setattr(fastbox, '_self_test_state', None)
++  monkeypatch.setattr(fastbox, '_copy_fast', lambda src, ns=(): Box({'wrong': 1}, **_OPTS))
++  assert fastbox.enabled() is False
++  src = get_box({'a': {'b': [1]}})
++  _same(fastbox.copy_box(src), src.copy())             # python-box's own result
++  _same(fastbox.add(src, {'c': 1}), src + {'c': 1})
++
++
++def test_a_fast_path_that_raises_switches_the_module_off(monkeypatch: pytest.MonkeyPatch) -> None:
++  def boom(*a, **k):
++    raise TypeError('merge_update expected at most 1 argument, got 2')
++  monkeypatch.setattr(fastbox, '_self_test_state', None)
++  monkeypatch.setattr(fastbox, '_from_plain_fast', boom)
++  assert fastbox.enabled() is False
++  _same(fastbox.from_plain({'a': [{'b': 1}]}), Box({'a': [{'b': 1}]}, **_OPTS))
++
++
++def test_the_installed_python_box_passes_the_self_test() -> None:
++  """If this fails, the compile still works (python-box's slow path) but the speed-up is gone on this build."""
++  assert fastbox._run_self_test() is True
++
++
++def test_add_equals_python_box_add_for_nested_merges() -> None:
++  a = get_box({'x': {'y': {'z': 1}, 'l': [1]}, 'k': 'v'})
++  b = {'x': {'y': {'w': 2}, 'l': [2]}, 'n': {'m': [3]}}
++  _same(fastbox.add(a, b), a + b)
++
++
++def test_stripping_a_secondary_namespace_never_reaches_the_next_validation(monkeypatch: pytest.MonkeyPatch) -> None:
++  """
++  get_valid_attributes strips the _required flags of a secondary namespace that has a no_propagate list IN the table
++  it is given. With the speed-ups that table shares namespaces with the cache, so the strip must land on a copy.
++  Compared against the same sequence with the speed-ups off.
++  """
++  from netsim.data import validate
++  _init_log()
++  attrs = get_box({
++    'node': {'name': 'str', 'mode': {'type': 'str', '_required': True}},
++    'link': {'mtu': 'int', 'tunnel': {'type': 'dict', '_keys': {'mode': {'type': 'str', '_required': True}}},
++             'bw': {'type': 'int', '_required': True}},
++    'link_no_propagate': ['bw'],
++    'interface': {'ifindex': 'int'},
++  })
++  extra = get_box({'node': {'clab': None}, 'link': {'clab': None}})
++
++  def sequence() -> tuple:
++    memo.invalidate()
++    first = validate.resolve_attributes(attrs, extra, ['node'])         # resolving 'node' leaves 'link' untouched
++    validate.get_valid_attributes(first[0], ['interface', 'link'])      # strips link.* _required in first[0]
++    second = validate.resolve_attributes(attrs, extra, ['node'])
++    return fastbox.to_dict(first[0]), fastbox.to_dict(second[0])
++
++  fast_first, fast_second = sequence()
++  monkeypatch.setattr(memo, 'DISABLED', True)
++  monkeypatch.setattr(fastbox, 'ENABLED', False)
++  slow_first, slow_second = sequence()
++  assert slow_first != slow_second                     # the test is only meaningful if something was stripped
++  assert fast_first == slow_first                      # the strip happened in the validation's own table ...
++  assert fast_second == slow_second                    # ... and not in the next one
++  assert attrs.link.tunnel._keys.mode._required is True
++
++
++def test_recursive_validation_on_a_private_table_matches_the_uncached_code(monkeypatch: pytest.MonkeyPatch) -> None:
++  """
++  A recursive validation reuses its caller's merged table; with the speed-ups its namespaces and valid-attribute
++  table come from a cache keyed by the table's origin and stripped namespaces, and the strip is replayed on a hit.
++  Every result and the table itself must equal the uncached sequence, on the first call and on cache hits.
++  """
++  from netsim.data import validate
++  _init_log()
++  attrs = get_box({
++    'node': {'name': 'str', 'mode': {'type': 'str', '_required': True}},
++    'interface': {'ifindex': 'int', '_namespace': ['link']},
++    'link': {'mtu': {'type': 'int', '_required': True}, 'bw': {'type': 'int', '_required': True}},
++    'link_no_propagate': ['bw'],
++  })
++  extra = get_box({'node': {'clab': None}})
++
++  def sequence() -> list:
++    memo.invalidate()
++    out = []
++    for _ in range(3):                                 # first call fills the cache, the others hit it
++      table = validate.resolve_attributes(attrs, extra, ['node'])[0]
++      for attr_list in (['interface'], ['node'], ['interface']):
++        _t, ns, valid = validate.resolve_attributes(table, None, attr_list)
++        out.append((list(ns), fastbox.to_dict(valid) if isinstance(valid, Box) else valid, fastbox.to_dict(table)))
++    return out
++
++  fast = sequence()
++  monkeypatch.setattr(memo, 'DISABLED', True)
++  monkeypatch.setattr(fastbox, 'ENABLED', False)
++  slow = sequence()
++  assert fast == slow
++  assert slow[0][2] != fastbox.to_dict(attrs + extra)  # the strip happened (the test exercises the side effect)
++
++
++#
++# patch 60: BGP scans and neighbour build, consolidated device data
++#
++
++def _reference_find_bgp_rr(bgp_as, topology):
++  return [ n for n in topology.nodes.values() if 'bgp' in n and n.bgp["as"] == bgp_as and n.bgp.get("rr",None) ]
++
++
++def test_find_bgp_rr_matches_the_original_expression_including_odd_shapes() -> None:
++  from netsim.modules import bgp
++  def topo():
++    return get_box({'nodes': {
++      'a': {'name': 'a', 'bgp': {'as': 1, 'rr': True}}, 'b': {'name': 'b', 'bgp': {'as': 1}},
++      'c': {'name': 'c'}, 'd': {'name': 'd', 'bgp': {'as': 2, 'rr': True}},
++      'e': {'name': 'e', 'bgp': {'rr': True}},           # no 'as': python-box creates one on read
++    }})
++  t1, t2 = topo(), topo()
++  for asn in (1, 2, 3):
++    assert [n.name for n in bgp.find_bgp_rr(asn, t1)] == [n.name for n in _reference_find_bgp_rr(asn, t2)]
++  _same(t1, t2)                                      # the same side effects, too
++  t3, t4 = topo(), topo()
++  t3.nodes.f = get_box({'name': 'f'}); dict.__setitem__(t3.nodes.f, 'bgp', None)
++  t4.nodes.f = get_box({'name': 'f'}); dict.__setitem__(t4.nodes.f, 'bgp', None)
++  with pytest.raises(TypeError):
++    _reference_find_bgp_rr(1, t4)
++  with pytest.raises(TypeError):                     # bgp: null fails exactly as before
++    bgp.find_bgp_rr(1, t3)
++
++
++@pytest.mark.parametrize('extra', [None, {}, {'rr': True}, {'rr': '10.0.0.1'}])
++@pytest.mark.parametrize('intf', [{'ipv4': '10.0.0.1/32'}, {'ipv4': '10.0.0.1/32', 'ipv6': '2001:db8::1/128'}, {'ipv4': True}, {}])
++def test_plain_ibgp_neighbor_appends_exactly_like_bgp_neighbor(extra, intf) -> None:
++  from netsim.modules import bgp
++  n = get_box({'name': 'peer', 'bgp': {'as': 65000}})
++  sessions = get_box({'ipv4': ['ibgp', 'ebgp'], 'ipv6': ['ibgp']})
++  boxed = bgp.bgp_neighbor(n, get_box(intf), 'ibgp', sessions, extra)
++  plain = bgp._ibgp_neighbor_plain(n, get_box(intf), sessions, extra)
++  assert (boxed is None) == (plain is None)
++  if boxed is None:
++    return
++  host = get_box({'bgp': {'neighbors': []}})
++  l1, l2 = host.bgp.neighbors, get_box({'bgp': {'neighbors': []}}).bgp.neighbors
++  l1.append(boxed)
++  fastbox.append_box(l2, plain)
++  _same(l1[0], l2[0])
++
++
++def test_readonly_consolidated_device_data_equals_the_original(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  _, topology = _compile(tmp_path, monkeypatch, 'cons', fast=True)
++  memo.invalidate()
++  for dev in topology.defaults.devices.keys():
++    for provider in (None, 'clab', 'kne', 'libvirt'):
++      node = Box({'device': dev, 'name': 'x'} | ({'provider': provider} if provider else {}), **_OPTS)
++      assert devices.get_consolidated_device_data_readonly(node, topology.defaults) == \
++             devices.get_consolidated_device_data(node, topology.defaults), f'{dev}/{provider}'
++
++
++#
++# patch 61: the outputs stop deep-copying the topology
++#
++
++def _bgp_lab_topology() -> str:
++  return textwrap.dedent("""
++    defaults.device: eos
++    module: [ bgp, ospf ]
++    bgp.as_list:
++      65000: { members: [ s1, s2, l1, l2, x1 ], rr: [ s1, s2 ] }
++      65001: { members: [ m1, m2, m3 ] }
++    nodes:
++      s1:
++      s2:
++      l1:
++      l2:
++      x1: { module: [ bgp ] }
++      m1:
++      m2:
++      m3:
++      h1: { device: linux, module: [] }
++    links:
++    - s1-l1
++    - s1-l2
++    - s2-l1
++    - s2-l2
++    - s1-x1
++    - l1-m1
++    - m1-m2
++    - m2-m3
++    - m3-m1
++    - l2-h1
++    """).strip() + '\n'
++
++
++def _compile_text(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, text: str, outputs=('config', 'provider', 'ansible:dir', 'pickle')) -> Path:
++  lab = tmp_path / name / 'lab'
++  lab.mkdir(parents=True)
++  monkeypatch.chdir(lab)
++  memo.invalidate()
++  (lab / 'topology.yml').write_text(text)
++  _init_log()
++  args = []
++  for o in outputs:
++    args += ['-o', o]
++  create.run(args + [str(lab / 'topology.yml')])
++  return lab
++
++
++def _unmanaged_topology() -> Box:
++  return get_box({
++    'name': 'lab', 'defaults': {}, 'nodes': {'a': {'name': 'a'}, 'g': {'name': 'g', 'unmanaged': True}, 'b': {'name': 'b'}},
++    'links': [{'node_count': 2, 'type': 'p2p', 'linkindex': 1, 'interfaces': [{'node': 'a'}, {'node': 'b'}]},
++              {'node_count': 2, 'type': 'p2p', 'linkindex': 2, 'interfaces': [{'node': 'a'}, {'node': 'g'}]},
++              {'node_count': 2, 'type': 'p2p', 'linkindex': 3, 'interfaces': [{'node': 'g'}, {'node': 'g'}]}]})
++
++
++def test_ghost_buster_without_copy_returns_the_topology_only_when_nothing_is_unmanaged() -> None:
++  from netsim.augment import nodes
++  _init_log()
++  clean = get_box({'name': 'lab', 'nodes': {'a': {'name': 'a'}, 'b': {'name': 'b'}}, 'links': []})
++  assert nodes.ghost_buster(clean, copy=False) is clean
++  assert nodes.ghost_buster(clean) is not clean                       # the default is still a copy
++  _same(nodes.ghost_buster(clean), clean)
++
++  topo = _unmanaged_topology()
++  for kw in ({}, {'copy': False}):                                      # an unmanaged node: always the full copy
++    out = nodes.ghost_buster(topo, **kw)
++    assert out is not topo and list(out.nodes) == ['a', 'b']
++    assert [[i.node for i in l.interfaces] for l in out.links] == [['a', 'b'], ['a']]
++    topo = _unmanaged_topology()                                        # (this copy shares its links with the source: as it always did)
++
++
++def _snap(topology: Box) -> dict:
++  d = fastbox.to_dict(topology)
++  d.pop('_Providers', None)                                             # provider instances compare by identity
++  return d
++
++
++def test_shared_adjusted_topology_equals_the_deep_copied_one_and_leaves_the_source_alone(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  from netsim.outputs import common
++  _, topology = _compile(tmp_path, monkeypatch, 'adj', fast=True)
++  memo.invalidate()
++  before = copy.deepcopy(_snap(topology))
++  for tv in (True, False):
++    for ignore in ([], ['name']):
++      deep = common.create_adjusted_topology(topology, ignore=ignore, template_vars=tv)
++      shared = common.create_adjusted_topology(topology, ignore=ignore, template_vars=tv, share=True)
++      assert _snap(deep) == _snap(shared)
++      assert list(deep.nodes) == list(shared.nodes) and list(deep.keys()) == list(shared.keys())
++      assert _snap(topology) == before                        # nothing written to the source (template_vars adds keys)
++  # positive control: the check above can fail. Adjusting the REAL node, without the one-level copy, does write to it.
++  name = next(iter(topology.nodes))
++  common.adjust_inventory_host(node=topology.nodes[name], defaults=topology.defaults, ignore=[], group_vars=True, template_vars=True)
++  assert _snap(topology) != before
++  # the shared result is what a deep copy would be for everything but the nodes: same objects, by design
++  assert shared.defaults is topology.defaults and shared.nodes is not topology.nodes
++
++
++@pytest.mark.parametrize('lab_text', ['tiny', 'bgp'])
++def test_output_is_identical_when_the_config_output_shares_the_topology(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lab_text: str) -> None:
++  """Requirement: sharing is invisible in every file. Forced on (workers from 2 nodes) against forced off."""
++  from netsim.outputs import common
++  text = _bgp_lab_topology() if lab_text == 'bgp' else textwrap.dedent(_TOPOLOGY).strip() + '\n'
++  calls = []
++  real = common.create_adjusted_topology
++  def spy(*a, **kw):
++    calls.append(kw.get('share', False))
++    return real(*a, **kw)
++  monkeypatch.setattr(common, 'create_adjusted_topology', spy)
++  _compile_text(tmp_path, monkeypatch, 'warm', text)
++  monkeypatch.setenv('SKYFORGE_NETLAB_PARALLEL_CONFIG_MIN', '100000')
++  calls.clear()
++  off = _tree(_compile_text(tmp_path, monkeypatch, 'off', text), tmp_path / 'off')
++  assert True not in calls
++  monkeypatch.setenv('SKYFORGE_NETLAB_PARALLEL_CONFIG_MIN', '2')
++  calls.clear()
++  on = _tree(_compile_text(tmp_path, monkeypatch, 'on', text), tmp_path / 'on')
++  assert True in calls, 'the shared path did not run: this comparison proves nothing'
++  assert set(on) == set(off) and len(on) > 10
++  assert [k for k in on if on[k] != off[k]] == []
++
++
++def test_when_a_config_worker_logs_something_the_parent_renders_a_private_copy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  """parallel_config falls back to rendering every node in the parent; that must not touch the shared topology."""
++  from netsim.outputs import common, parallel_config
++  text = _bgp_lab_topology()
++  calls = []
++  real = common.create_adjusted_topology
++  def spy(*a, **kw):
++    calls.append(kw.get('share', False))
++    return real(*a, **kw)
++  monkeypatch.setattr(common, 'create_adjusted_topology', spy)
++  _compile_text(tmp_path, monkeypatch, 'warm', text)
++  monkeypatch.setenv('SKYFORGE_NETLAB_PARALLEL_CONFIG_MIN', '100000')
++  off = _tree(_compile_text(tmp_path, monkeypatch, 'off', text), tmp_path / 'off')
++  monkeypatch.setenv('SKYFORGE_NETLAB_PARALLEL_CONFIG_MIN', '2')
++  monkeypatch.setattr(parallel_config.forkrun, 'clean', lambda result: False)    # every worker "logged something"
++  calls.clear()
++  on = _tree(_compile_text(tmp_path, monkeypatch, 'on', text, outputs=('config',)), tmp_path / 'on')
++  assert calls == [True, False], f'expected a shared topology and then a private one, got {calls}'
++  assert [k for k in on if on[k] != off.get(k)] == [] and any(k.startswith('node_files/') for k in on)
++
++
++#
++# patch 62: AS index for the BGP scans, include prefixes for link names
++#
++
++def test_include_prefixes_and_nodename_validity_do_not_depend_on_who_built_the_list() -> None:
++  from netsim.augment import links
++  nodes = get_box({'a': {}, 'comp': {'include': 'x'}, 'other': {'include': 'y'}, 'plain': {'device': 'eos'}})
++  pfx = links.include_prefixes(nodes)
++  assert sorted(pfx) == ['comp_', 'other_']
++  for n in ('a', 'comp', 'comp_leaf', 'other_x', 'plain_x', 'zzz', 'comp-leaf', 'compx', ''):
++    expected = n in nodes or any(n.startswith(p) for p in ('comp_', 'other_'))
++    assert links.is_nodename_valid(n, nodes) is expected
++    assert links.is_nodename_valid(n, nodes, pfx) is expected
++  nodes_plain = get_box({'a': {}, 'b': {}})                              # no 'include': a non-string key is a plain miss
++  assert links.is_nodename_valid(5, nodes_plain) is False and links.is_nodename_valid(5, nodes_plain, ()) is False
++
++
++def _as_topology() -> Box:
++  return get_box({'nodes': {
++    'a': {'name': 'a', 'bgp': {'as': 1, 'rr': True}}, 'b': {'name': 'b', 'bgp': {'as': 1}},
++    'c': {'name': 'c'}, 'd': {'name': 'd', 'bgp': {'as': 2, 'rr': True}}, 'e': {'name': 'e', 'bgp': {'as': 1, 'rr': True}},
++    'f': {'name': 'f', 'bgp': {'as': '1'}}}})
++
++
++def test_the_as_index_answers_what_the_scans_answered() -> None:
++  from netsim.modules import bgp
++  topo = _as_topology()
++  ref = _as_topology()
++  try:
++    bgp.build_as_index(topo)
++    assert bgp._index_for(topo) is not None
++    for asn in (1, 2, 3, '1', 1.0, True, None):
++      got = bgp.find_bgp_rr(asn, topo)
++      assert [n.name for n in got] == [n.name for n in _reference_find_bgp_rr(asn, ref)]
++      assert all(a is b for a, b in zip(got, [n for n in topo.nodes.values() if n.name in [m.name for m in got]]))
++    got = bgp.find_bgp_rr(1, topo)
++    got.clear()                                                          # callers get their own list
++    assert len(bgp.find_bgp_rr(1, topo)) == 2
++    assert [n.name for n in bgp._index_members(1, topo)] == ['a', 'b', 'e'] and [n.name for n in bgp._index_members('1', topo)] == ['f']
++    _same(topo, ref)
++  finally:
++    bgp._as_index = None
++
++
++def test_the_as_index_steps_aside_for_anything_it_cannot_answer_exactly() -> None:
++  from netsim.modules import bgp
++  try:
++    topo = _as_topology()
++    bgp.build_as_index(topo)
++    assert bgp._index_for(_as_topology()) is None                        # another topology object
++    topo.nodes.z = get_box({'name': 'z'})
++    assert bgp._index_for(topo) is None                                  # the node set changed
++    assert bgp._index_rr(1, topo) is None and bgp._index_members(1, topo) is None
++    topo = _as_topology(); topo.nodes.c.vrfs = {'v': {}}                 # vrf can set a fake bgp.as later: no index at all
++    bgp.build_as_index(topo)
++    assert bgp._as_index is None
++    topo = _as_topology(); topo.nodes.e.bgp = {'rr': True}               # a shape the scan handles through python-box
++    bgp.build_as_index(topo)
++    assert bgp._index_rr(1, topo) is None and bgp._index_members(1, topo) is not None
++    topo = _as_topology(); topo.nodes.e.bgp = {'as': [1], 'rr': True}    # an AS that cannot be a dictionary key
++    bgp.build_as_index(topo)
++    assert bgp._as_index is None
++    topo = _as_topology()
++    bgp.build_as_index(topo)
++    assert bgp._index_rr([1], topo) is None and bgp._index_members({}, topo) is None
++    bgp.BGP({}).module_cleanup(topo)
++    assert bgp._as_index is None
++  finally:
++    bgp._as_index = None
++
++
++def test_compile_output_is_identical_with_and_without_the_as_index(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  """Route reflectors, an iBGP full mesh, EBGP between the ASes: sessions must not change."""
++  from netsim.modules import bgp
++  text = _bgp_lab_topology()
++  built = []
++  real = bgp.build_as_index
++  def spy(topology):
++    real(topology)
++    built.append(bgp._as_index is not None)
++  monkeypatch.setattr(bgp, 'build_as_index', spy)
++  _compile_text(tmp_path, monkeypatch, 'warm', text)
++  built.clear()
++  on = _tree(_compile_text(tmp_path, monkeypatch, 'on', text), tmp_path / 'on')
++  assert built == [True], 'the index was not built (or not usable): this comparison proves nothing'
++  monkeypatch.setattr(bgp, 'build_as_index', lambda topology: None)       # the original scans
++  off = _tree(_compile_text(tmp_path, monkeypatch, 'off', text), tmp_path / 'off')
++  assert set(on) == set(off) and len(on) > 10
++  assert [k for k in on if on[k] != off[k]] == []
++  neighbors = [v for k, v in on.items() if k.startswith('host_vars/') and b'neighbors' in v]
++  assert neighbors, 'no BGP neighbours in the output'
+diff --git a/tests/test_parallel_outputs.py b/tests/test_parallel_outputs.py
+new file mode 100644
+index 0000000..bcc3558
+--- /dev/null
++++ b/tests/test_parallel_outputs.py
+@@ -0,0 +1,329 @@
++#!/usr/bin/env python3
++"""
++Parallel outputs (SKYFORGE-SPECIFIC, patch 57): running the output modules (and the per-node config rendering) in
++forked workers must change how long 'netlab create' takes, never what it produces: not the files, not the console
++output, not the topology create.run() returns, not the exit behaviour on an error.
++
++Every test compares a run with the parallel paths ON against the same run with them OFF
++(SKYFORGE_NETLAB_PARALLEL_OUTPUTS=0, the original sequential loop).
++"""
++
++import pickle
++import textwrap
++import threading
++from pathlib import Path
++
++import pytest
++
++from netsim.cli import create, parallel_outputs
++from netsim.data import memo
++from netsim.outputs import parallel_config
++from netsim.utils import forkrun, log
++
++_TOPOLOGY = """
++provider: kne
++module: [ ospf, bgp, vxlan, evpn, vlan ]
++bgp.as: 65000
++addressing:
++  loopback: { ipv4: 10.0.0.0/16, prefix: 32 }
++  mgmt: { ipv4: 10.200.0.0/14 }
++vlans:
++  tenant0: { id: 100, mode: bridge, prefix: 10.100.0.0/24 }
++  tenant1: { id: 101, mode: bridge, prefix: 10.104.0.0/24 }
++defaults.device: eos
++nodes:
++  s1: { bgp.rr: true }
++  s2: { bgp.rr: true }
++  l1: { vlans: { tenant0: {}, tenant1: {} } }
++  l2: { vlans: { tenant0: {}, tenant1: {} } }
++  h1: { device: linux }
++  h2: { device: linux }
++  h3: { device: linux }
++links:
++- { s1: , l1: }
++- { s1: , l2: }
++- { s2: , l1: }
++- { s2: , l2: }
++- { l1: , h1: , vlan.access: tenant0 }
++- { l1: , h2: , vlan.access: tenant1 }
++- { l2: , h3: , vlan.access: tenant0 }
++"""
++
++
++def _init_log() -> None:
++  log.init_log_system(header=False)
++  log.set_flag(quiet=False, raise_error=False, warning=False, logging=False, verbose=0)
++
++
++def _compile(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture, name: str,
++             parallel: bool, topology_text: str = _TOPOLOGY) -> tuple:
++  lab = tmp_path / name / 'lab'
++  lab.mkdir(parents=True)
++  monkeypatch.chdir(lab)
++  monkeypatch.setenv('SKYFORGE_NETLAB_PARALLEL_OUTPUTS', '1' if parallel else '0')
++  monkeypatch.setenv('SKYFORGE_NETLAB_PARALLEL_CONFIG_MIN', '1')    # exercise the per-node workers on a small lab
++  monkeypatch.setenv('SKYFORGE_NETLAB_CONFIG_WORKERS', '3')
++  memo.invalidate()
++  (lab / 'topology.yml').write_text(textwrap.dedent(topology_text).strip() + '\n')
++  _init_log()
++  capfd.readouterr()
++  topology = create.run([str(lab / 'topology.yml')])              # default outputs: config, provider, pickle, tools, ansible
++  out, err = capfd.readouterr()
++  return lab, topology, out.replace(str(tmp_path / name), '<ROOT>'), err.replace(str(tmp_path / name), '<ROOT>')
++
++
++def _tree(lab: Path, root: Path) -> dict:
++  out = {}
++  for p in sorted(lab.rglob('*')):
++    if p.is_file() and '__pycache__' not in p.parts:
++      rel = str(p.relative_to(lab))
++      raw = p.read_bytes()
++      if rel.endswith('.pickle'):
++        data = pickle.loads(raw)
++        data.get('defaults', {}).get('_cache', {}).pop('timestamp', None)
++        raw = repr(data).encode()
++      out[rel] = (raw.replace(str(root).encode(), b'<ROOT>'), p.stat().st_mode)
++  return out
++
++
++def _plain(topology) -> dict:
++  d = topology.to_dict()
++  providers = d.pop('_Providers', {})
++  d['_Providers'] = sorted(providers)                              # provider objects: compare which, not identity
++  d.get('defaults', {}).get('_cache', {}).pop('timestamp', None)   # wall-clock time of the run
++  return d
++
++
++@pytest.fixture
++def warm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture) -> None:
++  """netlab caches the parsed defaults on first use and the key order of a cold and a warm start differ: compare warm starts."""
++  _compile(tmp_path, monkeypatch, capfd, 'warmup', parallel=False)
++
++
++def test_parallel_outputs_are_used_for_a_default_create(warm, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
++                                                        capfd: pytest.CaptureFixture) -> None:
++  """Positive control for the equality tests below: the parallel paths really run."""
++  calls = {'outputs': 0, 'config': 0}
++  real_out, real_cfg = parallel_outputs.run, parallel_config.run
++  monkeypatch.setattr(parallel_outputs, 'run', lambda *a: (calls.__setitem__('outputs', calls['outputs'] + 1), real_out(*a)))
++  monkeypatch.setattr(parallel_config, 'run', lambda *a: (calls.__setitem__('config', calls['config'] + 1), real_cfg(*a)))
++  _compile(tmp_path, monkeypatch, capfd, 'on', parallel=True)
++  assert calls == {'outputs': 1, 'config': 1}
++
++
++def test_files_console_and_returned_topology_are_identical(warm, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
++                                                           capfd: pytest.CaptureFixture) -> None:
++  lab_off, topo_off, out_off, err_off = _compile(tmp_path, monkeypatch, capfd, 'off', parallel=False)
++  lab_on, topo_on, out_on, err_on = _compile(tmp_path, monkeypatch, capfd, 'on', parallel=True)
++  off, on = _tree(lab_off, tmp_path / 'off'), _tree(lab_on, tmp_path / 'on')
++  assert set(on) == set(off) and len(on) > 20
++  assert [k for k in on if on[k] != off[k]] == []
++  assert out_on == out_off and 'CONFIG' in out_on
++  assert err_on == err_off
++  assert repr(_plain(topo_on)).replace(str(tmp_path / 'on'), '<ROOT>') == \
++         repr(_plain(topo_off)).replace(str(tmp_path / 'off'), '<ROOT>')
++
++
++def test_provider_output_reads_the_files_config_writes(warm, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
++                                                       capfd: pytest.CaptureFixture) -> None:
++  """Why 'config' is a barrier: the KNE provider builds each startup-config from the node_files 'config' writes, so
++  'provider' without 'config' first writes different files."""
++  lab_full, _, _, _ = _compile(tmp_path, monkeypatch, capfd, 'full', parallel=False)
++  lab = tmp_path / 'provider-only' / 'lab'
++  lab.mkdir(parents=True)
++  monkeypatch.chdir(lab)
++  memo.invalidate()
++  (lab / 'topology.yml').write_text(textwrap.dedent(_TOPOLOGY).strip() + '\n')
++  _init_log()
++  create.run(['-o', 'provider', str(lab / 'topology.yml')])
++  full, alone = _tree(lab_full, tmp_path / 'full'), _tree(lab, tmp_path / 'provider-only')
++  startup = [ k for k in full if k.endswith('/startup-config') ]
++  assert startup and all(full[k][0] for k in startup)
++  assert [ k for k in startup if alone.get(k) != full[k] ] == startup
++
++
++def test_provider_starts_only_after_config_has_finished(warm, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
++                                                        capfd: pytest.CaptureFixture) -> None:
++  """The barrier itself, independent of timing luck: a slow 'config' must have finished before 'provider' starts."""
++  import time
++  from netsim.outputs import config as config_output, provider as provider_output
++  events = tmp_path / 'events'
++
++  def traced(cls, name, delay=0.0):
++    real = cls.write
++    def write(self, topology) -> None:
++      with open(events, 'a') as f: f.write(f'{name} start\n')
++      time.sleep(delay)
++      real(self, topology)
++      with open(events, 'a') as f: f.write(f'{name} end\n')
++    monkeypatch.setattr(cls, 'write', write)
++
++  traced(config_output.ConfigurationFiles, 'config', delay=1.0)
++  traced(provider_output.ProviderConfiguration, 'provider')
++  _compile(tmp_path, monkeypatch, capfd, 'on', parallel=True)
++  order = events.read_text().split('\n')
++  assert order.index('config end') < order.index('provider start')
++
++
++def test_pickle_runs_in_process_so_the_returned_topology_matches(warm, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
++                                                                 capfd: pytest.CaptureFixture) -> None:
++  """'pickle' changes the topology it writes (provider cache back into _Providers); in a worker that change would be
++  lost and create.run() would return a different topology."""
++  _, topo_off, _, _ = _compile(tmp_path, monkeypatch, capfd, 'off', parallel=False)
++  monkeypatch.setattr(parallel_outputs, 'IN_PROCESS', set())
++  _, topo_on, _, _ = _compile(tmp_path, monkeypatch, capfd, 'on', parallel=True)
++  assert repr(_plain(topo_on)).replace(str(tmp_path / 'on'), '<ROOT>') != \
++         repr(_plain(topo_off)).replace(str(tmp_path / 'off'), '<ROOT>')
++
++
++def test_an_error_in_a_worker_fails_the_run_like_the_sequential_loop(warm, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
++                                                                     capfd: pytest.CaptureFixture) -> None:
++  from netsim.outputs import ansible as ansible_output
++
++  def broken(self, topology) -> None:
++    log.error('ansible output broke on purpose', log.IncorrectValue, 'ansible')
++
++  monkeypatch.setattr(ansible_output.AnsibleInventory, 'write', broken)
++  results = {}
++  for name, parallel in (('off', False), ('on', True)):
++    with pytest.raises(SystemExit) as ex:
++      _compile(tmp_path, monkeypatch, capfd, name, parallel=parallel)
++    results[name] = (ex.value.code, capfd.readouterr())
++  assert results['on'][0] == results['off'][0] != 0
++  err = { k: v[1].err.replace(str(tmp_path / k), '<ROOT>') for k, v in results.items() }
++  assert err['on'] == err['off'] and 'broke on purpose' in err['on']
++
++
++def test_once_only_messages_are_printed_once(warm, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
++                                             capfd: pytest.CaptureFixture) -> None:
++  """netlab prints the 'Errors encountered' header and each documentation hint once per process. Two config workers
++  that each hit a missing template must not print them twice (found on the blueprint corpus: demo-lab/full)."""
++  broken = _TOPOLOGY.replace('  s1: { bgp.rr: true }', '  s1: { bgp.rr: true, config: [ no_such_template ] }') \
++                    .replace('  h3: { device: linux }', '  h3: { device: linux, config: [ no_such_template ] }')
++  assert broken != _TOPOLOGY
++  results = {}
++  for name, parallel in (('off', False), ('on', True)):
++    with pytest.raises(SystemExit):
++      _compile(tmp_path, monkeypatch, capfd, name, parallel=parallel, topology_text=broken)
++    results[name] = capfd.readouterr()
++  err = { k: v.err.replace(str(tmp_path / k), '<ROOT>') for k, v in results.items() }
++  assert err['off'].count("--debug template") == 1 and 'no_such_template' in err['off']
++  assert err['on'] == err['off']
++  assert results['on'].out.replace(str(tmp_path / 'on'), '<ROOT>') == results['off'].out.replace(str(tmp_path / 'off'), '<ROOT>')
++
++
++def test_once_only_messages_across_output_modules(warm, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
++                                                  capfd: pytest.CaptureFixture) -> None:
++  """Same as above across two output-module workers: the first one warns, the second one fails. The header and the
++  hint must appear once, in the sequential order."""
++  from netsim.outputs import ansible as ansible_output, provider as provider_output
++  real_provider = provider_output.ProviderConfiguration.write
++
++  hint = 'a hint netlab prints once per process'
++
++  def warn_then_write(self, topology) -> None:
++    log.warning(text='provider output warns on purpose', module='provider', more_hints=[hint])
++    real_provider(self, topology)
++
++  def broken(self, topology) -> None:
++    log.error('ansible output broke on purpose', log.IncorrectValue, 'ansible', more_hints=[hint])
++
++  monkeypatch.setattr(provider_output.ProviderConfiguration, 'write', warn_then_write)
++  monkeypatch.setattr(ansible_output.AnsibleInventory, 'write', broken)
++  results = {}
++  for name, parallel in (('off', False), ('on', True)):
++    with pytest.raises(SystemExit):
++      _compile(tmp_path, monkeypatch, capfd, name, parallel=parallel)
++    results[name] = capfd.readouterr()
++  err = { k: v.err.replace(str(tmp_path / k), '<ROOT>') for k, v in results.items() }
++  assert 'warns on purpose' in err['off'] and 'broke on purpose' in err['off'] and err['off'].count(hint) == 1
++  assert err['on'] == err['off']
++
++
++def test_shared_templates_see_the_sequential_shared_list() -> None:
++  """The per-node workers must hand each node exactly the shared_list the sequential loop had on reaching it."""
++
++  class Topo(dict):
++    pass
++
++  nodes = {f'n{i}': {'shared': src} for i, src in
++           enumerate([['a'], [], ['a', 'b'], ['b'], ['c', 'a', 'c'], [], ['d'], ['a', 'd', 'e']])}
++  topo = Topo(nodes=nodes)
++  topo.nodes = nodes
++
++  def run_sequential() -> dict:
++    seen, shared = {}, []
++    for name, data in nodes.items():
++      seen[name] = list(shared)
++      for src in data['shared']:
++        if src not in shared:
++          shared.append(src)
++    return seen
++
++  seen: dict = {}
++
++  def one_node(name, data, shared_list) -> None:
++    seen[name] = list(shared_list)
++
++  # run the parallel planner in-process (no fork) by replacing the worker start with a direct call
++  results = []
++
++  def start(fn, tmpdir, tag):
++    fn()
++    results.append(tag)
++    return len(results)
++
++  orig = (forkrun.start, forkrun.collect, forkrun.replay, forkrun.clean)
++  try:
++    forkrun.start = start
++    forkrun.collect = lambda pid, tmpdir, tag, what: {}
++    forkrun.replay = lambda r, exit_on_error=True: None
++    forkrun.clean = lambda r: True
++    parallel_config.run(topo, one_node, lambda d: d['shared'])
++  finally:
++    forkrun.start, forkrun.collect, forkrun.replay, forkrun.clean = orig
++  assert seen == run_sequential()
++
++
++def test_no_fork_while_threads_are_running() -> None:
++  stop = threading.Event()
++  t = threading.Thread(target=stop.wait)
++  t.start()
++  try:
++    assert forkrun.fork_ok() is False
++  finally:
++    stop.set()
++    t.join()
++  assert forkrun.fork_ok() is True
++
++
++def test_explicit_outputs_keep_the_sequential_loop() -> None:
++  from box import Box
++
++  class Args:
++    devices = None
++
++  args = Args()
++  args.output = Box({'config': None, 'provider': None, 'pickle': None, 'tools': None, 'ansible': None})
++  assert parallel_outputs.usable(args, Box()) is True               # the defaults, as netlab create uses them
++  args.output = ['config', 'provider', 'pickle', 'ansible']          # the same modules, named with -o
++  assert parallel_outputs.usable(args, Box()) is False
++  args.output = Box({'config': None, 'provider': None, 'ansible': 'dir'})   # an output with an option
++  assert parallel_outputs.usable(args, Box()) is False
++  args.output = Box({'config': None, 'provider': None, 'no_such_output': None})
++  assert parallel_outputs.usable(args, Box()) is False
++  args.output = Box({'config': None, 'provider': None, 'pickle': None, 'tools': None, 'ansible': None})
++  args.devices = ['r1']
++  assert parallel_outputs.usable(args, Box()) is False
++
++
++def test_a_worker_sees_the_keys_earlier_module_loads_added(warm, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
++                                                          capfd: pytest.CaptureFixture) -> None:
++  """Loading an output module can add an empty defaults.outputs.<name> entry to the topology, and the pickle written
++  after it records that. Modules must therefore be loaded in this process, in order: loading them all up front made
++  the pickle differ on every blueprint (found on the corpus run)."""
++  lab_off, _, _, _ = _compile(tmp_path, monkeypatch, capfd, 'off', parallel=False)
++  lab_on, _, _, _ = _compile(tmp_path, monkeypatch, capfd, 'on', parallel=True)
++  off = pickle.loads((lab_off / 'netlab.snapshot.pickle').read_bytes())
++  on = pickle.loads((lab_on / 'netlab.snapshot.pickle').read_bytes())
++  assert list(on['defaults']['outputs'].keys()) == list(off['defaults']['outputs'].keys())
+-- 
+2.56.0
+
