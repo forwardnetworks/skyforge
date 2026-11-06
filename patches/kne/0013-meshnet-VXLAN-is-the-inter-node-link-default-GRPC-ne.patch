@@ -192,7 +192,7 @@ index 0000000..21bc48a
 +// value is an error, so a typo such as "grpc" cannot silently pick VXLAN or
 +// GRPC without the operator asking for it.
 +//
-+// Upstream's own default was GRPC. Skyforge runs VXLAN (MTU 1450 on a 1500
++// Upstream's own default was GRPC. The platform runs VXLAN (MTU 1450 on a 1500
 +// underlay; see the KNE rebase plan R4), and the manifests set it explicitly.
 +func ResolveInterNodeLinkType(value string) (string, error) {
 +	v := strings.TrimSpace(value)

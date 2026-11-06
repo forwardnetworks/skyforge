@@ -4,8 +4,6 @@ Date: Wed, 4 Nov 2026 13:40:30 -0600
 Subject: [PATCH] meshnet: propagate link admin state across VXLAN links
  (carrier follows the peer)
 
-SKYFORGE-SPECIFIC: platform behaviour; not for upstream.
-
 ---
 diff --git a/third_party/meshnet/README.md b/third_party/meshnet/README.md
 index 76fc85a..7e6c2c3 100644

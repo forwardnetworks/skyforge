@@ -4,8 +4,6 @@ Date: Mon, 2 Nov 2026 09:50:05 -0600
 Subject: [PATCH] service: the per-node lab Service is ClusterIP, not
  LoadBalancer
 
-SKYFORGE-SPECIFIC: platform behaviour; not for upstream.
-
 ---
 diff --git a/topo/node/node.go b/topo/node/node.go
 index 4ebe83b..0a78bbc 100644
@@ -16,7 +14,7 @@ index 4ebe83b..0a78bbc 100644
  }
  
 +// nodeServiceType is the Kubernetes type of the per-node service-<node> Service: the group that
-+// k8sServiceType maps to LoadBalancer (an unset type or LOAD_BALANCER). SKYFORGE-SPECIFIC: see CreateService.
++// k8sServiceType maps to LoadBalancer (an unset type or LOAD_BALANCER). PLATFORM-SPECIFIC: see CreateService.
 +const nodeServiceType = corev1.ServiceTypeClusterIP
 +
  func serviceNameForType(nodeName string, svcType corev1.ServiceType) string {
@@ -32,9 +30,9 @@ index 4ebe83b..0a78bbc 100644
 -			// supported in default clusters.
 -			// https://kubernetes.io/docs/concepts/services-networking/service/#load-balancer-nodeport-allocation
 -			s.Spec.AllocateLoadBalancerNodePorts = pointer.Bool(false)
-+			// SKYFORGE-SPECIFIC: the per-node service-<node> Service is ClusterIP, not LoadBalancer.
++			// PLATFORM-SPECIFIC: the per-node service-<node> Service is ClusterIP, not LoadBalancer.
 +			// Lab nodes are reached only from inside the cluster (the netlab runtime, napalm/scrapligo,
-+			// the the collector collector over management, the portal proxies), always as
++			// the collector over management, the portal proxies), always as
 +			// service-<node>.<ns>.svc or its ClusterIP; jump servers cover reach from outside. No
 +			// LoadBalancer IP pool matches lab Services, so a LoadBalancer here never got an address
 +			// (cilium.io/IPAMRequestSatisfied=False no_pool on every lab Service, measured 2026-11-02),
@@ -96,7 +94,7 @@ index ff3f53d..3216d21 100644
  			},
  		}},
 +	}, {
-+		// SKYFORGE-SPECIFIC: an explicit LOAD_BALANCER still yields the ClusterIP service-<node>; labs
++		// PLATFORM-SPECIFIC: an explicit LOAD_BALANCER still yields the ClusterIP service-<node>; labs
 +		// get no external load balancer on this platform.
 +		desc: "explicit load balancer type is the ClusterIP node service",
 +		node: &topopb.Node{
@@ -133,7 +131,7 @@ index ff3f53d..3216d21 100644
 +			},
 +		}},
 +	}, {
-+		// SKYFORGE-SPECIFIC: a ClusterIP Service cannot carry a nodePort (the API server rejects it), so a
++		// PLATFORM-SPECIFIC: a ClusterIP Service cannot carry a nodePort (the API server rejects it), so a
 +		// node_port on an untyped service is dropped instead of failing the node's create.
 +		desc: "untyped service with a node port is ClusterIP without it",
 +		node: &topopb.Node{
@@ -191,7 +189,7 @@ index d5371c0..16a1c69 100644
 +	"k8s.io/client-go/rest"
  )
  
-+// SKYFORGE-SPECIFIC: the per-node Service that CreateService builds must count as ready without a
++// PLATFORM-SPECIFIC: the per-node Service that CreateService builds must count as ready without a
 +// LoadBalancer ingress. No IP pool serves lab Services on this platform, so while it was a LoadBalancer,
 +// checkServiceStatus could never see it ready and held kne create for the rest of its timeout.
 +func TestCreatedNodeServiceIsReadyWithoutLoadBalancerIngress(t *testing.T) {

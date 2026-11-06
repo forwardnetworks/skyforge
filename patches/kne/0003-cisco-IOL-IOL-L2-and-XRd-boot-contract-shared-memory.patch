@@ -1196,7 +1196,7 @@ index 3c63f20..2b75145 100644
 +		env[item.Name] = item.Value
 +	}
 +	if got := env["IOL_SNMP_COMMUNITY"]; got != "skyforge" {
-+		t.Fatalf("expected IOL SNMP community to match Skyforge the collector credential, got %q", got)
++		t.Fatalf("expected IOL SNMP community to match the collector credential, got %q", got)
 +	}
 +	if got := env["IOL_SNMP_HOSTNAME"]; got != "iol1" {
 +		t.Fatalf("expected IOL SNMP hostname to be set from node name, got %q", got)

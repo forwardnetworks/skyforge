@@ -1601,14 +1601,14 @@ index 619bad8..a09abb0 100644
 +"""
 +sha512crypt a value for a Junos-style `encrypted-password` directive.
 +
-+Skyforge-specific: this renderer registers only a hand-picked filter set (see
++Platform-specific: this renderer registers only a hand-picked filter set (see
 +BUILTIN_FILTERS below), not ansible-playbook's full filter_plugins path, so
 +Ansible's own `password_hash` filter is NOT available here even though
 +passlib is installed in the runtime image. vSRX day-0
 +(initial/vsrx.j2) needs one: that image boots into Junos FIPS mode
 +unconditionally, and FIPS-mode Junos accepts `plain-text-password-value` at
 +commit but never produces a working login from it -- proven live and
-+reproduced on a bare factory image outside Skyforge entirely. rounds
++reproduced on a bare factory image outside the platform entirely. rounds
 +defaults to 5000 (glibc's traditional sha512crypt count) so passlib omits
 +the `$6$rounds=N$` segment, matching the exact wire shape verified working;
 +raising rounds changes the shape and would need its own verification.
@@ -1698,7 +1698,7 @@ index 0000000..1c88f81
 +#!/usr/bin/env python3
 +"""sort_extra_config() must not depend on Python's per-process string-hash seed.
 +
-+Found 2026-10-02 by the Skyforge render oracle: rendering the same commit twice through the same
++Found 2026-10-02 by the platform render oracle: rendering the same commit twice through the same
 +image reordered group_vars netlab_custom_config, because the function collected the names in a
 +set(). The seed is fixed at interpreter start, so each case runs in a subprocess.
 +"""

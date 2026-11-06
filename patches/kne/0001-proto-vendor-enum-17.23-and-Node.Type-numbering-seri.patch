@@ -44,7 +44,7 @@ index 4ff6115..352272c 100644
    IN_CLUSTER_PROXY = 14;
    SONIC = 15;
    CIENA = 16;
-+  // Skyforge vendor surface (0002), renumbered: 15 and 16 are taken upstream by SONIC and CIENA.
++  // The platform vendor surface (0002), renumbered: 15 and 16 are taken upstream by SONIC and CIENA.
 +  A10 = 17;
 +  ARUBA = 18;
 +  DELL = 19;
@@ -89,7 +89,7 @@ index deb41a4..90901f3 100644
  	Vendor_IN_CLUSTER_PROXY Vendor = 14
  	Vendor_SONIC            Vendor = 15
  	Vendor_CIENA            Vendor = 16
-+	// Skyforge vendor surface (0002), renumbered: 15 and 16 are taken upstream by SONIC and CIENA.
++	// The platform vendor surface (0002), renumbered: 15 and 16 are taken upstream by SONIC and CIENA.
 +	Vendor_A10      Vendor = 17
 +	Vendor_ARUBA    Vendor = 18
 +	Vendor_DELL     Vendor = 19
@@ -1466,7 +1466,7 @@ index 0000000..71ac5ed
 +
 +// The Vendor and Node_Type numbers are a wire contract (kne_cli, the server and
 +// the meshnet images read them by number). These values are the approved
-+// 2026-10-20 numbering: SONIC and CIENA keep upstream's 15 and 16, Skyforge
++// 2026-10-20 numbering: SONIC and CIENA keep upstream's 15 and 16, the platform
 +// vendors take 17..23, and Node.Type IN_CLUSTER_PROXY matches upstream's 15.
 +// The test pins the NAMES to the NUMBERS, so a renumbering that is not also
 +// approved fails here rather than on a live lab.

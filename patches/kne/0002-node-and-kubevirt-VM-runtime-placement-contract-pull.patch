@@ -4165,7 +4165,7 @@ index 0000000..36fb9f0
 +}
 +
 +// kubeVirtMeshnetFabricMTU reads the fabric MTU the platform resolved for this
-+// deployment. Skyforge sets MESHNET_FABRIC_MTU on the runtime from the same
++// deployment. The platform sets MESHNET_FABRIC_MTU on the runtime from the same
 +// value it refuses to assume elsewhere (it will not default to 1450, because
 +// doing so silently pins every lab to one node), so the VM path and the
 +// container path end up reading ONE number from ONE source.
@@ -4939,7 +4939,7 @@ index 0000000..f2e6978
 +	return corev1.PullPolicy(policy)
 +}
 +
-+// kubeVirtViptelaInjectorNodeIdentityLabels are the labels Skyforge uses to map a
++// kubeVirtViptelaInjectorNodeIdentityLabels are the labels the platform uses to map a
 +// pod back to a TOPOLOGY NODE (see kubeTopologyNodeNameForPod in the server's
 +// taskengine). A companion pod must carry NONE of them.
 +//
@@ -7838,7 +7838,7 @@ index bd36f49..4ebe83b 100644
 +	return corev1.ProtocolTCP
 +}
 +
-+// unexposedServiceNames are the vendor-default service ports no Skyforge consumer reads. The platform reaches a
++// unexposedServiceNames are the vendor-default service ports no platform consumer reads. The platform reaches a
 +// node through its Service ClusterIP (ssh, snmp, gnmi) and nothing uses gRIBI or P4Runtime, but every port in the
 +// Service costs one cluster NodePort per node, and the NodePort range (30000-32767) is shared by every lab.
 +// Measured 2026-10-07: the range was 2766/2768 allocated and a 41-node lab stalled with "failed to allocate a
@@ -9814,7 +9814,7 @@ index 5e6e868..ff3f53d 100644
 +		t.Fatalf("TFTP bootstrap pod should require KubeVirt schedulable nodes, got %#v", required)
 +	}
 +	if required["skyforge.example.com/labs"] != "true" {
-+		t.Fatalf("TFTP bootstrap pod should require Skyforge lab nodes, got %#v", required)
++		t.Fatalf("TFTP bootstrap pod should require the platform lab nodes, got %#v", required)
 +	}
 +}
 +
