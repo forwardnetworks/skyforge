@@ -40,7 +40,7 @@ index 6f1b212..acbbcb1 100644
 +## SNMP agent
 +
 +```{note}
-+SNMP is a **Skyforge extension**. Upstream *netlab* lists SNMP as planned for a
++SNMP is a **platform extension**. Upstream *netlab* lists SNMP as planned for a
 +future release; this fork implements the agent half now. Changes belong in
 +`patches/netlab/`.
 +```
@@ -390,7 +390,7 @@ index 2850663..1e50990 100644
 +{% endif %}
 +{% if services.syslog._server_list is defined and services.syslog._mgmt|default(False) %}
 +{#
-+  Skyforge: `transport_vrf: mgmt` (see services.py). The collector is reached
++  The platform: `transport_vrf: mgmt` (see services.py). The collector is reached
 +  over management, so logs are sourced from the management interface.
 +#}
 +logging source-interface {{ mgmt_if|default('Management0') }}
@@ -514,7 +514,7 @@ index d89d16a..7eba15d 100644
 +{% endif %}
 +{% if services.syslog._server_list is defined and services.syslog._mgmt|default(False) %}
 +{#
-+  Skyforge: `transport_vrf: mgmt` (see services.py). The collector is reached
++  The platform: `transport_vrf: mgmt` (see services.py). The collector is reached
 +  over management, so logs are sourced from the management interface.
 +#}
 +logging source-interface {{ mgmt_if|default(mgmt.ifname|default('Ethernet0/0')) }}{%
@@ -775,7 +775,7 @@ index 0000000..0aae39b
 +snmp {
 +  {#
 +      The management interface (fxp0) lives in the mgmt_junos routing
-+      instance -- Skyforge's initial/vjunos-*.j2 sets management-instance so
++      instance -- the platform's initial/vjunos-*.j2 sets management-instance so
 +      out-of-band default route cannot leak into the data plane. snmpd binds
 +      *:161 in the DEFAULT instance and, without this statement, silently
 +      drops every request that arrives on fxp0. Measured 2026-09-07 on
@@ -830,7 +830,7 @@ index 0000000..0aae39b
 +  datagrams leave from the forwarding plane. `show sflow collector` on any
 +  vJunos is the evidence.
 +
-+  NO agent-id OR source-ip, for the same reason Skyforge never sets a syslog
++  NO agent-id OR source-ip, for the same reason the platform never sets a syslog
 +  source-address: netlab's mgmt.ipv4 is not the address this device has.
 +
 +  PHYSICAL INTERFACES, DE-DUPLICATED. netlab hands us unit names (ge-0/0/1.0);
@@ -903,7 +903,7 @@ index 0000000..f573cc2
 +snmp {
 +  {#
 +      The management interface (fxp0) lives in the mgmt_junos routing
-+      instance -- Skyforge's initial/vjunos-*.j2 sets management-instance so
++      instance -- the platform's initial/vjunos-*.j2 sets management-instance so
 +      out-of-band default route cannot leak into the data plane. snmpd binds
 +      *:161 in the DEFAULT instance and, without this statement, silently
 +      drops every request that arrives on fxp0. Measured 2026-09-07 on
@@ -958,7 +958,7 @@ index 0000000..f573cc2
 +  datagrams leave from the forwarding plane. `show sflow collector` on any
 +  vJunos is the evidence.
 +
-+  NO agent-id OR source-ip, for the same reason Skyforge never sets a syslog
++  NO agent-id OR source-ip, for the same reason the platform never sets a syslog
 +  source-address: netlab's mgmt.ipv4 is not the address this device has.
 +
 +  PHYSICAL INTERFACES, DE-DUPLICATED. netlab hands us unit names (ge-0/0/1.0);
@@ -1031,7 +1031,7 @@ index 0000000..1b78a20
 +snmp {
 +  {#
 +      The management interface (fxp0) lives in the mgmt_junos routing
-+      instance -- Skyforge's initial/vjunos-*.j2 sets management-instance so
++      instance -- the platform's initial/vjunos-*.j2 sets management-instance so
 +      out-of-band default route cannot leak into the data plane. snmpd binds
 +      *:161 in the DEFAULT instance and, without this statement, silently
 +      drops every request that arrives on fxp0. Measured 2026-09-07 on
@@ -1076,7 +1076,7 @@ index 0000000..1b78a20
 +snmp {
 +  {#
 +      The management interface (fxp0) lives in the mgmt_junos routing
-+      instance -- Skyforge's initial/vjunos-*.j2 sets management-instance so
++      instance -- the platform's initial/vjunos-*.j2 sets management-instance so
 +      out-of-band default route cannot leak into the data plane. snmpd binds
 +      *:161 in the DEFAULT instance and, without this statement, silently
 +      drops every request that arrives on fxp0. Measured 2026-09-07 on
@@ -1121,7 +1121,7 @@ index 0000000..1b78a20
 +snmp {
 +  {#
 +      The management interface (fxp0) lives in the mgmt_junos routing
-+      instance -- Skyforge's initial/vjunos-*.j2 sets management-instance so
++      instance -- the platform's initial/vjunos-*.j2 sets management-instance so
 +      out-of-band default route cannot leak into the data plane. snmpd binds
 +      *:161 in the DEFAULT instance and, without this statement, silently
 +      drops every request that arrives on fxp0. Measured 2026-09-07 on
@@ -1169,7 +1169,7 @@ index 98fe629..9c8670c 100644
  features:
    services:
 +    # SYSLOG + NSEL CLIENT. Both dial a collector and neither was declared here,
-+    # so Skyforge's syslog receiver had nothing from a firewall and neither ASA
++    # so the platform's syslog receiver had nothing from a firewall and neither ASA
 +    # in demo-lab exported a record. MEASURED 2026-09-11 on the live cdg-fw01
 +    # (ASA 9.24(1)), with `show flarble wibble` as the negative control so an
 +    # empty answer could not be read as an absent feature: `show logging
@@ -1199,7 +1199,7 @@ index 2410040..e4c87d9 100644
  features:
    services:
 +    # SYSLOG + FLOW CLIENT. Both dial a collector; both were declared nowhere on
-+    # this platform, so Skyforge's syslog receiver had nothing sending to it and
++    # this platform, so the platform's syslog receiver had nothing sending to it and
 +    # no IOS device exported a flow record. MEASURED 2026-09-11 on a live IOL:
 +    # `show flow record` lists the full built-in Flexible NetFlow set and
 +    # `show flow exporter` answers empty rather than erroring, while
@@ -1347,7 +1347,7 @@ index 03fb86e..a169e79 100644
  features:
    services:
 +    # SYSLOG + FLOW CLIENT. Both dial a collector; both were declared nowhere on
-+    # this platform, so Skyforge's syslog receiver had nothing sending to it and
++    # this platform, so the platform's syslog receiver had nothing sending to it and
 +    # no IOS device exported a flow record. MEASURED 2026-09-11 on a live IOL:
 +    # `show flow record` lists the full built-in Flexible NetFlow set and
 +    # `show flow exporter` answers empty rather than erroring, while
@@ -1431,7 +1431,7 @@ index 74f17ea..27e95f5 100644
  features:
    services:
 +    # SYSLOG + FLOW CLIENT. Both dial a collector; both were declared nowhere on
-+    # this platform, so Skyforge's syslog receiver had nothing sending to it and
++    # this platform, so the platform's syslog receiver had nothing sending to it and
 +    # no IOS device exported a flow record. MEASURED 2026-09-11 on a live IOL:
 +    # `show flow record` lists the full built-in Flexible NetFlow set and
 +    # `show flow exporter` answers empty rather than erroring, while
@@ -1529,7 +1529,7 @@ index 8ee4026..cd0b051 100644
    services:
 +    # SYSLOG + sFLOW CLIENT. Neither was declared on any Juniper device in this
 +    # tree, so the syslog block services/junos.j2 has carried upstream all along
-+    # could never render and Skyforge's receiver saw nothing from Junos.
++    # could never render and the platform's receiver saw nothing from Junos.
 +    #
 +    # sflow AND NOT ipfix, and the reason is measured rather than documented.
 +    # Patch 0042 recorded the usual Juniper split -- sFlow on the switch, inline
@@ -1573,7 +1573,7 @@ index 55f1966..6f463a1 100644
    services:
 +    # SYSLOG + sFLOW CLIENT. Neither was declared on any Juniper device in this
 +    # tree, so the syslog block services/junos.j2 has carried upstream all along
-+    # could never render and Skyforge's receiver saw nothing from Junos.
++    # could never render and the platform's receiver saw nothing from Junos.
 +    #
 +    # sflow AND NOT ipfix, and the reason is measured rather than documented.
 +    # Patch 0042 recorded the usual Juniper split -- sFlow on the switch, inline
@@ -1778,9 +1778,9 @@ index e2f2d7b..d6945e0 100644
          category=log.MissingDependency,
          module='services')
  
-+# MANAGEMENT-VRF TRANSPORT (Skyforge extension). Upstream `transport_vrf` must
++# MANAGEMENT-VRF TRANSPORT (the platform extension). Upstream `transport_vrf` must
 +# name a LAB VRF -- check_vrf() refuses anything else -- but a collector that
-+# lives outside the lab (Skyforge's syslog and flow receivers) is reached over
++# lives outside the lab (the platform's syslog and flow receivers) is reached over
 +# the MANAGEMENT interface, whose VRF is a device property (the netlab_mgmt_vrf
 +# group variable), not a lab VRF, and differs per device across one fleet.
 +# `transport_vrf: mgmt` therefore means "whatever this device calls its
@@ -1925,7 +1925,7 @@ index 5d2ffce..e605491 100644
        ignore: []
        must_have: [ server, ipv4, ipv6 ]
        check_when: [ _server_list ]
-+    flow:                                         # Skyforge: flow export (NetFlow/IPFIX/sFlow) client
++    flow:                                         # the platform: flow export (NetFlow/IPFIX/sFlow) client
 +      ignore: []
 +      must_have: [ server, ipv4, ipv6 ]
 +      check_when: [ _server_list ]

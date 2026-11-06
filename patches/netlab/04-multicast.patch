@@ -14,7 +14,7 @@ index 0000000..632235b
 +
 +## Summary
 +
-+Add IPv4 multicast support to the vendored netlab tree for Skyforge, scoped to Cisco IOL and Arista EOS. The goal is configuration parity with multicast behavior the collector already parses: PIM, static RP, IGMP receiver joins, VRF multicast, static multicast RPF routes, and EOS bidirectional PIM.
++Add IPv4 multicast support to the vendored netlab tree for the platform, scoped to Cisco IOL and Arista EOS. The goal is configuration parity with multicast behavior the collector already parses: PIM, static RP, IGMP receiver joins, VRF multicast, static multicast RPF routes, and EOS bidirectional PIM.
 +
 +## Implementation
 +

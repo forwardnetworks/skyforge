@@ -9,7 +9,7 @@ diff --git a/controllers/ceoslabdevice_controller.go b/controllers/ceoslabdevice
 index 0e6ea06..432e306 100644
 --- a/controllers/ceoslabdevice_controller.go
 +++ b/controllers/ceoslabdevice_controller.go
-@@ -1192,6 +1192,127 @@ func getSkyforgePlacement(env map[string]string) (map[string]string, []corev1.To
+@@ -1192,6 +1192,127 @@ func getPlatformPlacement(env map[string]string) (map[string]string, []corev1.To
  	return selector, tolerations, strings.TrimSpace(env["SKYFORGE_KNE_PRIORITY_CLASS_NAME"]), nil
  }
  
@@ -29,7 +29,7 @@ index 0e6ea06..432e306 100644
 +	softPlacementWeight = 100
 +)
 +
-+// getSkyforgeSoftPlacement gives a cEOS pod the SAME two soft placement terms
++// getPlatformSoftPlacement gives a cEOS pod the SAME two soft placement terms
 +// KNE gives every other container-backed lab pod (generic CreatePod plus the
 +// cisco/juniper/forward/alpine copies). MEASURED 2026-09-23 on demo-lab
 +// (user-alice-demo-lab): every one of its 63 cEOS pods,
@@ -61,7 +61,7 @@ index 0e6ea06..432e306 100644
 +// FAILS OPEN on the node half: an unset, empty, `{}` or unparseable policy
 +// yields no node affinity (the anti-affinity is unconditional, as in KNE).
 +// The policy is read from the device's envvars first -- the path every other
-+// placement input in getSkyforgePlacement takes (kne 0024 forwards them from
++// placement input in getPlatformPlacement takes (kne 0024 forwards them from
 +// the kne_cli env in arista.CreateCRD) -- and then from the operator's own
 +// process env, so either wiring works and a per-device value is authoritative.
 +//
@@ -69,7 +69,7 @@ index 0e6ea06..432e306 100644
 +// immutable on a scheduled pod anyway), so rolling an operator that carries
 +// this recreates nothing: a running lab keeps its placement until its pods are
 +// recreated for some other reason (stop/start, redeploy, a real drift).
-+func getSkyforgeSoftPlacement(podLabels map[string]string, env map[string]string) *corev1.Affinity {
++func getPlatformSoftPlacement(podLabels map[string]string, env map[string]string) *corev1.Affinity {
 +	affinity := &corev1.Affinity{NodeAffinity: getIOHeavyAvoidNodeAffinity(env)}
 +	if topo := podLabels[kneTopoLabel]; topo != "" {
 +		affinity.PodAntiAffinity = &corev1.PodAntiAffinity{
@@ -143,7 +143,7 @@ index 0e6ea06..432e306 100644
  		Volumes:            volumes,
 +		// Soft placement parity with KNE's container pods. Preferred only, and
 +		// not in the drift checks, so only newly created pods get it.
-+		Affinity: getSkyforgeSoftPlacement(labels, envVarsMap),
++		Affinity: getPlatformSoftPlacement(labels, envVarsMap),
  	}
  	return nil
  }

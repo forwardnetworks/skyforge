@@ -71,7 +71,7 @@ index 0000000..824b66e
 +
 +This plugin adds a vendor-neutral security-policy data model and renders it as device configuration.
 +
-+`firewall.policy` is a **Skyforge plugin**, not stock *netlab* — it was added here alongside `nat` and `loadbalancer` for blueprint-import parity. Changes belong in `patches/netlab/`.
++`firewall.policy` is a **platform plugin**, not stock *netlab* — it was added here alongside `nat` and `loadbalancer` for blueprint-import parity. Changes belong in `patches/netlab/`.
 +
 +## Supported Platforms
 +
@@ -254,7 +254,7 @@ index 0000000..dd2e926
 @@ -0,0 +1,98 @@
 +# Load Balancer Plugin
 +
-+The **loadbalancer** plugin preserves and renders load-balancing metadata discovered by the the collector importer.
++The **loadbalancer** plugin preserves and renders load-balancing metadata discovered by the collector importer.
 +
 +```yaml
 +plugin: [ loadbalancer ]
@@ -361,7 +361,7 @@ index 0000000..196226f
 +
 +This plugin adds a generic NAT data model to supported firewall and router operating systems, and renders vendor configuration for the platforms marked below.
 +
-+`nat` is a **Skyforge plugin**, not stock *netlab* — it is maintained in this fork alongside `firewall.policy` and `loadbalancer`. Changes to it belong in `patches/netlab/`.
++`nat` is a **platform plugin**, not stock *netlab* — it is maintained in this fork alongside `firewall.policy` and `loadbalancer`. Changes to it belong in `patches/netlab/`.
 +
 +## Supported Platforms
 +
@@ -1482,7 +1482,7 @@ index 0000000..0782777
 +#
 +---
 +devices:
-+  # asav: added by Skyforge. The ASA has no App-ID, so it deliberately does NOT
++  # asav: added by the platform. The ASA has no App-ID, so it deliberately does NOT
 +  # get firewall.policy_app_id -- see the comment on panos below.
 +  asav:
 +    features.firewall.policy: True
@@ -3757,7 +3757,7 @@ index 0000000..2cdbe8f
 +#
 +---
 +devices:
-+  # eos: added by Skyforge (patches/netlab/0026). Arista is INTERFACE-based, so
++  # eos: added by the platform (patches/netlab/0026). Arista is INTERFACE-based, so
 +  # eos.j2 renders NAT under the interfaces carrying nat.role: outside.
 +  #
 +  # ⚠️ THIS LIST IS NOT "PLATFORMS WHERE NAT WORKS". Check for a template before

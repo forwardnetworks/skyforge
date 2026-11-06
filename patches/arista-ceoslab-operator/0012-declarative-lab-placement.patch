@@ -227,7 +227,7 @@ index 9e75aa7..cf989a4 100644
  	return strings.Join(lines, "\n") + "\n"
  }
  
-+func getSkyforgePlacement(env map[string]string) (map[string]string, []corev1.Toleration, string, error) {
++func getPlatformPlacement(env map[string]string) (map[string]string, []corev1.Toleration, string, error) {
 +	selector := map[string]string{}
 +	if raw := strings.TrimSpace(env["SKYFORGE_KNE_NODE_SELECTOR_JSON"]); raw != "" {
 +		if err := json.Unmarshal([]byte(raw), &selector); err != nil {
@@ -262,7 +262,7 @@ index 9e75aa7..cf989a4 100644
  func getPod(pod *corev1.Pod, device *ceoslabv1alpha1.CEosLabDevice, secretsAndConfigMaps map[string]client.Object, useStartupPersistence bool) error {
  	labels := getLabels(device)
  	envVarsMap := getEnvVarsMap(device)
-+	nodeSelector, tolerations, priorityClassName, err := getSkyforgePlacement(envVarsMap)
++	nodeSelector, tolerations, priorityClassName, err := getPlatformPlacement(envVarsMap)
 +	if err != nil {
 +		return err
 +	}
@@ -295,7 +295,7 @@ index eddaf8a..767477b 100644
  	}
  }
  
-+func TestGetPodSkyforgePlacement(t *testing.T) {
++func TestGetPodPlatformPlacement(t *testing.T) {
 +	device := &ceoslabv1alpha1.CEosLabDevice{
 +		Spec: ceoslabv1alpha1.CEosLabDeviceSpec{EnvVar: map[string]string{
 +			"SKYFORGE_KNE_NODE_SELECTOR_JSON":  `{"skyforge.example.com/meshnet-fabric-mtu":"8950"}`,

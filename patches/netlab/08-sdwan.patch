@@ -15,7 +15,7 @@ index 0000000..fcdf939
 +
 +The SD-WAN module describes an SD-WAN fabric — roles, site identity, transport colours and service VPNs — and exports it as inventory for downstream consumers.
 +
-+`sdwan` is a **Skyforge module**, not stock *netlab*. Changes belong in `patches/netlab/`.
++`sdwan` is a **platform module**, not stock *netlab*. Changes belong in `patches/netlab/`.
 +
 +## It configures nothing, on purpose
 +
@@ -45,7 +45,7 @@ index 0000000..fcdf939
 +| Device | Roles |
 +| --- | --- |
 +| `cisco_sdwan-manager` | manager |
-+| `cisco_sdwan-controller` | controller, validator (validator added by the Skyforge runtime defaults, not the vendor device file) |
++| `cisco_sdwan-controller` | controller, validator (validator added by the platform runtime defaults, not the vendor device file) |
 +| `cisco_sdwan-validator` | validator (declared only -- no image is published, so a topology cannot deploy one; run the validator as a `cisco_sdwan-controller`) |
 +| `cat8000v` | controller (managed; the fabric role `edge` is derived) |
 +| `versa-director` | controller |
@@ -871,7 +871,7 @@ index 0000000..ce454c3
 +
 +REPORTING, NOT DECIDING. Prints one JSON document and always exits 0. The lane
 +decides what a NOT_PROVEN edge means (today: it is reported, never hidden, and
-+the runtime persists it for Skyforge to gate the collector's device typing on). A
++the runtime persists it for the platform to gate the collector's device typing on). A
 +reader that can itself fail is a second thing to debug at the moment the fabric
 +is the first.
 +
@@ -2827,7 +2827,7 @@ index 0000000..d210340
 +    include_tasks: sdwan_service_vpns.yml
 +
 +  # PERSISTED FOR THE RUNTIME. netlab.py reads this file after the play and
-+  # carries it into the onboarding results ConfigMap, which is what Skyforge
++  # carries it into the onboarding results ConfigMap, which is what the platform
 +  # gates the collector's edge device typing on. The path is a contract with
 +  # components/server/netlab/runtime/netlab.py. The `service` half of each
 +  # entry is carried in the file, and so are two ADDITIVE top-level keys a
@@ -6499,7 +6499,7 @@ index 0000000..9bc3652
 +  ansible_user: admin
 +  # CONTAINERLAB DEFAULT. admin/admin is what containerlab/vrnetlab ships for
 +  # this device and what every other consumer expects; this file follows it
-+  # rather than inventing a Skyforge-specific literal, which is unupstreamable
++  # rather than inventing a Platform-specific literal, which is unupstreamable
 +  # and drifts from the rest of the fleet.
 +  #
 +  # NOTE: vManage 20.7.1 was observed refusing to KEEP the factory value

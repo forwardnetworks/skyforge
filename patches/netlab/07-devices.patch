@@ -157,7 +157,7 @@ index 0000000..cb6d8df
 +    default: 180
 +    type: int
 +author:
-+  - Skyforge
++  - The platform
 +'''
 +
 +
@@ -525,7 +525,7 @@ index 0000000..444f528
 +    default: 300
 +    type: int
 +author:
-+  - Skyforge
++  - The platform
 +'''
 +
 +PROMPT_BYTES = 4096
@@ -2544,7 +2544,7 @@ index 0000000..b82f8c6
 @@ -0,0 +1,82 @@
 +"""A device that reports "still loading" in its CLI prompt is waited for, not configured early.
 +
-+SKYFORGE-SPECIFIC: A10 vThunder answers `hostname <name>` with "Unrecognized command" while its
++PLATFORM-SPECIFIC: A10 vThunder answers `hostname <name>` with "Unrecognized command" while its
 +prompt reads `vThunder(LOADING)#`.
 +"""
 +import pytest

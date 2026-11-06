@@ -17,7 +17,7 @@ index acbbcb1..aaeb711 100644
 +(services-bmp)=
 +## BMP Monitoring Station (EOS and Junos)
 +
-+**services.bmp** (global/node dictionary, Skyforge extension) renders a passive BGP Monitoring Protocol station on the device, as day-0 configuration. It is rendered only on a node that runs the **bgp** module on a device declaring `services.bmp` (EOS, and the Junos devices except vSRX); on any other node the block is removed from the node data. There is no iBGP fallback.
++**services.bmp** (global/node dictionary, the platform extension) renders a passive BGP Monitoring Protocol station on the device, as day-0 configuration. It is rendered only on a node that runs the **bgp** module on a device declaring `services.bmp` (EOS, and the Junos devices except vSRX); on any other node the block is removed from the node data. There is no iBGP fallback.
 +
 +* **station** (string, required): DNS name or address of the BMP station, written to the device verbatim (no resolution by netlab).
 +* **port** (int, default 50001): the TCP port the device listens on.
@@ -35,10 +35,10 @@ index 3cf9856..7fdb9c8 100644
  fi
 +
 +{#
-+  SKYFORGE-SPECIFIC (patch 40): a KNE pod never runs the image entrypoint (KNE replaces the command with `sleep`), so the
++  PLATFORM-SPECIFIC (patch 40): a KNE pod never runs the image entrypoint (KNE replaces the command with `sleep`), so the
 +  services the skyforge-linux-host image offers (Caldera agent launcher, opt-in listeners, iperf3, LLDP) are started from here,
 +  the only script that runs in a KNE lab. The helper is idempotent (a warm reconfigure re-runs this script) and fails open; an
-+  image without it (any non-Skyforge linux image) is skipped. It reads its switches from the pod environment that patches 36
++  image without it (any non-platform linux image) is skipped. It reads its switches from the pod environment that patches 36
 +  and 38 render, which `kubectl exec` inherits.
 +#}
 +if [ -x /usr/local/bin/skyforge-host-services.sh ]; then
@@ -105,11 +105,11 @@ index 32a2b67..3af375a 100644
 @@ -1,2 +1,40 @@
  #!/bin/sh
 +{#
-+  SKYFORGE-SPECIFIC (patch 39): the SNMP agent of a linux host, delivered like the services of every other NOS.
++  PLATFORM-SPECIFIC (patch 39): the SNMP agent of a linux host, delivered like the services of every other NOS.
 +
 +  `services.server.snmp` is set on every node by the platform defaults (community `skyforge`, the community
 +  the collector's collectors poll with), so a linux host answers SNMP exactly like a cEOS does. A node opts out with
-+  `services.server.snmp: false`. A linux image without net-snmp (any non-Skyforge image) is skipped with a note,
++  `services.server.snmp: false`. A linux image without net-snmp (any non-platform image) is skipped with a note,
 +  never an error: the services script must not fail a lab over a missing optional daemon.
 +
 +  The script runs inside the pod (the linux namespace-exec lane) at day 0 AND again on every warm reconfigure,
@@ -176,7 +176,7 @@ index 683b849..fda0c1b 100644
    services:
      dns:
        transport_vrf: false
-+    server.snmp: True              # Skyforge: patch 39, services/linux.j2 (net-snmp in the skyforge-linux-host image)
++    server.snmp: True              # the platform: patch 39, services/linux.j2 (net-snmp in the skyforge-linux-host image)
  libvirt:
    image: bento/ubuntu-24.04
    create_image: netlab/linux
@@ -401,7 +401,7 @@ index 06096c8..7830cb6 100644
 +  '''
 +  Is this node one the platform asked to run the Caldera agent?
 +
-+  NETLAB_KNE_CALDERA_AGENT_NODES is a comma-separated list of node names the Skyforge server puts on the
++  NETLAB_KNE_CALDERA_AGENT_NODES is a comma-separated list of node names the platform server puts on the
 +  runtime Job together with NETLAB_KNE_CALDERA_AGENT_SERVER. ABSENT (or empty) means every linux node of the
 +  deployment, which is the default scope of the deployment setting; PRESENT means exactly those nodes.
 +  '''
@@ -410,12 +410,12 @@ index 06096c8..7830cb6 100644
 +
 +def linux_services_env(node: Box) -> dict:
    '''
--  SKYFORGE-SPECIFIC: the Caldera (Sandcat) agent is OPT-IN PER LAB, and this is the only door.
+-  PLATFORM-SPECIFIC: the Caldera (Sandcat) agent is OPT-IN PER LAB, and this is the only door.
 +  The pod env for the node's DECLARED listeners (services.listen).
  
 -  The skyforge-linux-host image starts its Sandcat launcher only when the pod carries
 -  SKYFORGE_CALDERA_AGENT_ENABLED=1 and SKYFORGE_CALDERA_SERVER. Both come from ONE per-run fact,
--  NETLAB_KNE_CALDERA_AGENT_SERVER, which the Skyforge server puts on the runtime Job only when the
+-  NETLAB_KNE_CALDERA_AGENT_SERVER, which the platform server puts on the runtime Job only when the
 -  deployment's owner switched Caldera on for that deployment (default off, audited). Unset -> the pod
 -  gets neither variable and the image runs no agent.
 +  SKYFORGE_SERVICES is the "<proto>:<port>,..." list the skyforge-linux-host image's strict parser reads
@@ -439,12 +439,12 @@ index 06096c8..7830cb6 100644
 -  this keeps the pod spec honest about it).
 +def adjust_linux_node_data(kne_data: Box, node: Box) -> None:
 +  '''
-+  SKYFORGE-SPECIFIC: the pod env of a linux host comes from the platform and the declaration, not from raw env.
++  PLATFORM-SPECIFIC: the pod env of a linux host comes from the platform and the declaration, not from raw env.
 +
 +  1. Caldera (Sandcat) agent -- OPT-IN, PLATFORM-AUTHORISED, PER DEPLOYMENT AND PER NODE SCOPE. The
 +     skyforge-linux-host image starts its launcher only when the pod carries SKYFORGE_CALDERA_AGENT_ENABLED=1 and
 +     SKYFORGE_CALDERA_SERVER. Both come from ONE per-run fact, NETLAB_KNE_CALDERA_AGENT_SERVER, which the
-+     Skyforge server puts on the runtime Job only when the deployment's owner switched Caldera on (default off,
++     The platform server puts on the runtime Job only when the deployment's owner switched Caldera on (default off,
 +     audited); the optional NETLAB_KNE_CALDERA_AGENT_NODES narrows it to the nodes the owner selected. Nothing in
 +     the topology can ask for the agent: a topology author's own `kne.env.SKYFORGE_CALDERA_*` is DISCARDED either
 +     way (the lab file is user input; the Caldera NetworkPolicy is the second lock).

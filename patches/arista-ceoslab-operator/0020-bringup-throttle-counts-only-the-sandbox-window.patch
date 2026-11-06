@@ -4,8 +4,6 @@ Date: Mon, 12 Oct 2026 07:32:58 -0500
 Subject: [PATCH] bringup throttle: count only pods in the sandbox window, so
  labs larger than the ceiling converge
 
-SKYFORGE-SPECIFIC: platform behaviour; not for upstream.
-
 ---
 diff --git a/controllers/ceoslabdevice_bringup_topology_test.go b/controllers/ceoslabdevice_bringup_topology_test.go
 new file mode 100644
@@ -15,7 +13,7 @@ index 0000000..d5c9f8f
 @@ -0,0 +1,286 @@
 +package controllers
 +
-+// SKYFORGE-SPECIFIC (scale ladder 2026-10-12): the bringup throttle must let a lab of ANY
++// PLATFORM-SPECIFIC (scale ladder 2026-10-12): the bringup throttle must let a lab of ANY
 +// size converge when cEOS pods wait in Init for their meshnet link peers.
 +//
 +// Live failure this guards: a 96-cEOS EVPN Clos (4 pods x [4 spines + 20 leaves]) with
@@ -320,7 +318,7 @@ index 432e306..8ab12e5 100644
 +// slot: it is Pending AND no container has started, i.e. it is still in the CNI-ADD /
 +// sandbox-creation window this throttle exists to pace (task#40/#47).
 +//
-+// SKYFORGE-SPECIFIC (scale ladder 2026-10-12): a Pending pod whose sandbox HAS started is
++// PLATFORM-SPECIFIC (scale ladder 2026-10-12): a Pending pod whose sandbox HAS started is
 +// NOT in that window. A cEOS pod sits Pending in Init (the interface wait) until meshnet has
 +// wired every link, and a link is only wired once BOTH ends exist. Counting those pods made
 +// the throttle a deadlock for any lab larger than the ceiling: in a Clos, a spine waits for

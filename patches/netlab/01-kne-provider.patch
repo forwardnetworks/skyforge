@@ -1179,7 +1179,7 @@ index 69c1775..953848a 100644
  
 +def get_captured_output() -> typing.Tuple[str,str]:
 +  """
-+  SKYFORGE-SPECIFIC (patch 01): (stdout, stderr) captured by the last run_command call in the current thread.
++  PLATFORM-SPECIFIC (patch 01): (stdout, stderr) captured by the last run_command call in the current thread.
 +  Upstream keeps these in a thread-local (ff52463be9); the KNE provider needs them apart, not merged.
 +  """
 +  return (getattr(_CAPTURED,'stdout',''),getattr(_CAPTURED,'stderr',''))
@@ -2011,7 +2011,7 @@ index 9518c3a..a29540c 100644
      pass
  
 +  def augment_runtime_snapshot(self, topology: Box, snapshot: dict) -> None:
-+    """Skyforge: let a provider add its own runtime facts to the snapshot.
++    """the platform: let a provider add its own runtime facts to the snapshot.
 +
 +    KNE records pod/namespace state the generic snapshot has no concept of.
 +    A no-op here, so no other provider is affected.
@@ -3565,7 +3565,7 @@ index 0000000..81ad405
 +# startup-config nodes whose defaults declare netlab_reconfigure_mode (see
 +# get_node_reconfigure_mode): their boot payload cannot carry a change to a
 +# running device, so a reconfigure render delivers it post-boot instead. The
-+# Skyforge runtime sets it in its config (reconfigure) mode only, next to
++# The platform runtime sets it in its config (reconfigure) mode only, next to
 +# NETLAB_KNE_NAMESPACE.
 +def kne_reconfigure_render() -> bool:
 +  return str(os.environ.get('NETLAB_KNE_RECONFIGURE','') or '').strip().lower() in ('1','true','yes')
@@ -5457,7 +5457,7 @@ index 0000000..1227e59
 @@ -0,0 +1,57 @@
 +#!/bin/bash
 +#
-+# Skyforge XRd config wrapper: vendor netlab-config.sh + an XR BOOT-READINESS
++# The platform XRd config wrapper: vendor netlab-config.sh + an XR BOOT-READINESS
 +# GATE in front of the first apply.
 +#
 +# This is netsim/templates/provider/kne/iosxr/netlab-config.j2 as carried by

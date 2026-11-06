@@ -1220,7 +1220,7 @@ index 17c0cfa..be7ef76 100644
 -	}
 -	wg.Wait()
 -	return firstErr
-+// heavyEarlyCreateEnv is the SKYFORGE-SPECIFIC switch for WHEN the heavy lane (KubeVirt VMs such as PAN-OS) is
++// heavyEarlyCreateEnv is the PLATFORM-SPECIFIC switch for WHEN the heavy lane (KubeVirt VMs such as PAN-OS) is
 +// created relative to the regular nodes. Unset, empty or any unrecognised value keeps the historical gate: wait for
 +// the sandbox stability of EVERY regular node, then create the heavy lane. "linked-peers" (also "true" or "1")
 +// waits only for the sandbox stability of the regular nodes that are LINK PEERS of a heavy node, so a PAN-OS VM

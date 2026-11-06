@@ -333,7 +333,7 @@ index 6d58b94..c1722c8 100644
    modules.post_link_transform(topology)
  
  def post_transform(topology: Box) -> None:
-+  augment.nodes.check_lldp_support(topology)          # SKYFORGE-SPECIFIC (patch 55): lldp is limited to devices with the lldp feature
++  augment.nodes.check_lldp_support(topology)          # PLATFORM-SPECIFIC (patch 55): lldp is limited to devices with the lldp feature
 +  log.exit_on_error()
    augment.validate.process_validation(topology)
    modules.post_transform(topology)                    # Call module post-transform routines
@@ -356,7 +356,7 @@ index 937a790..be6cf32 100644
  are not used by a module, a plugin (based on "config" data) or a device itself
  '''
 +"""
-+SKYFORGE-SPECIFIC (patch 55): the 'lldp' node/interface attribute exists only on devices that declare the 'lldp' feature
++PLATFORM-SPECIFIC (patch 55): the 'lldp' node/interface attribute exists only on devices that declare the 'lldp' feature
 +(today: linux with the kne provider). netlab's usual rule for a device that lacks an optional feature applies: the
 +topology is rejected with "Device <device> does not support lldp used in <path>". That includes a link-level 'lldp' that
 +propagates onto the interface of a node that cannot do it, and an explicit 'lldp: false' (the attribute is not accepted at all).
@@ -390,7 +390,7 @@ index f8084c8..65635f9 100644
      )
  
 +"""
-+SKYFORGE-SPECIFIC: overlap the Ansible lane with the internal (kubectl exec) fan-out.
++PLATFORM-SPECIFIC: overlap the Ansible lane with the internal (kubectl exec) fan-out.
 +
 +Upstream runs deploy_internal_config (a thread pool that execs shell/cEOS fragments into pods) to completion and
 +only then starts the Ansible playbook for the nodes that need it (PAN-OS and the other VM NOS). The two lanes touch
@@ -482,7 +482,7 @@ index 6aaab20..c636f88 100644
    bandwidth: int
    bridge: id
    disable: bool
-+  lldp: bool                # SKYFORGE-SPECIFIC (patch 55): LLDP on this interface, linux hosts only (see devices/linux.yml)
++  lldp: bool                # PLATFORM-SPECIFIC (patch 55): LLDP on this interface, linux hosts only (see devices/linux.yml)
    shutdown: bool            # Shut down then interface during the initial configuration
    name: str
    linkid: id
@@ -490,7 +490,7 @@ index 6aaab20..c636f88 100644
    cpu:
    memory: int
    unmanaged: bool
-+  lldp: bool                # SKYFORGE-SPECIFIC (patch 55): run LLDP on this linux host (default off); devices without the lldp feature reject it
++  lldp: bool                # PLATFORM-SPECIFIC (patch 55): run LLDP on this linux host (default off); devices without the lldp feature reject it
  
  loopback:
    ipv4: { type: ipv4, use: host_prefix, _alt_types: [ bool ] }
@@ -614,7 +614,7 @@ index fda0c1b..dde2d6c 100644
    # kne" (user report, 2026-09-12). Same declaration as clab, because the KNE
    # linux pod is the same vanilla distro reached over its network namespace.
    features:
-+    # SKYFORGE-SPECIFIC (patch 55): the `lldp` node/interface attribute is supported here only (the kne provider renders it
++    # PLATFORM-SPECIFIC (patch 55): the `lldp` node/interface attribute is supported here only (the kne provider renders it
 +    # into the pod env). Devices without this feature reject the attribute (augment/nodes.py check_lldp_support).
 +    lldp: true
      initial:
@@ -748,7 +748,7 @@ index 3859b94..2f53bfc 100644
 +
 +def adjust_linux_node_data(kne_data: Box, node: Box, topology: Box) -> None:
    '''
-   SKYFORGE-SPECIFIC: the pod env of a linux host comes from the platform and the declaration, not from raw env.
+   PLATFORM-SPECIFIC: the pod env of a linux host comes from the platform and the declaration, not from raw env.
  
 @@ -2683,12 +2693,19 @@ def adjust_linux_node_data(kne_data: Box, node: Box) -> None:
    2. Listeners -- `services.listen` (node or group level) is rendered into SKYFORGE_SERVICES /
@@ -856,7 +856,7 @@ index 0000000..31cd8f8
 --- /dev/null
 +++ b/tests/test_initial_overlap_lanes.py
 @@ -0,0 +1,161 @@
-+"""netlab initial: SKYFORGE_NETLAB_OVERLAP_ANSIBLE_LANE (SKYFORGE-SPECIFIC).
++"""netlab initial: SKYFORGE_NETLAB_OVERLAP_ANSIBLE_LANE (PLATFORM-SPECIFIC).
 +
 +The requirement: with the switch on, the Ansible lane (PAN-OS and the other VM NOS) runs CONCURRENTLY with the
 +internal kubectl-exec fan-out instead of after it; with it off or unrecognised, the order is today's (internal, then

@@ -57,7 +57,7 @@ index 352ed0c..69f05c7 100644
 +}
 +# cEOS enforces an EOS control-plane firewall: the iptables INPUT policy is DROP
 +# and the EOS_INPUT chain starts empty, so every inbound management packet from
-+# the Kubernetes pod / Service network (where the the collector collector pod and the
++# the Kubernetes pod / Service network (where the collector pod and the
 +# per-device Services it dials both live) is dropped before EOS processes it. The
 +# return routes above only correct the reply *path*; they do not lift this
 +# ingress filter (a route to the source CIDR does not create a permit). Without

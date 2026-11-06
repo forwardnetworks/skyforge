@@ -1,9 +1,9 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 00:00:00 +0000
-Subject: [PATCH] kne: Skyforge platform defaults, day-0 shims, Caldera agent
- env, config-exec bulkhead, boot-config mode, ixia-c entrypoint and engine
- pinning, netmiko parameters as device features
+Subject: [PATCH] kne: platform defaults, day-0 shims, Caldera agent env,
+ config-exec bulkhead, boot-config mode, ixia-c entrypoint and engine pinning,
+ netmiko parameters as device features
 
 ---
 diff --git a/netsim/ansible/templates/initial/asa.j2 b/netsim/ansible/templates/initial/asa.j2
@@ -443,7 +443,7 @@ index 0000000..a6abec0
 +    `fipsd` started, every boot, config or no config) -- proven both on the
 +    live KubeVirt VM and on a bare, factory, Juniper-downloaded
 +    junos-vsrx3-x86-64-21.3R1.9.qcow2 booted locally under plain QEMU/KVM,
-+    completely outside Skyforge. In FIPS mode `plain-text-password-value`
++    completely outside the platform. In FIPS mode `plain-text-password-value`
 +    commits cleanly (mgd: commit complete, no warning anywhere) but the
 +    account it produces never authenticates -- console, SSH and NETCONF all
 +    reject the exact password just configured. Switching to a pre-computed
@@ -672,7 +672,7 @@ index 85cb93a..9c95a0f 100644
    netlab_check_delay: 10
 +  # vThunder can accept SSH before config submodes leave LOADING state.
 +  # The vendor readiness probe must wait for enable-mode success before
-+  # config apply, instead of mutating topology or adding Skyforge-side
++  # config apply, instead of mutating topology or adding platform-side
 +  # retry behavior.
 +  a10_config_retries: 30
 +  a10_config_delay: 20
@@ -695,7 +695,7 @@ index 85cb93a..9c95a0f 100644
      ipv4: true
    routing:
      static: true
-+    static_pool_routes: false   # SKYFORGE-SPECIFIC: role host, but OSPF-learned (seed has no 'ip route')
++    static_pool_routes: false   # PLATFORM-SPECIFIC: role host, but OSPF-learned (seed has no 'ip route')
  
  kne:
    interface.name: eth{ifindex}
@@ -723,7 +723,7 @@ index 7a5be2c..23b7427 100644
 -  netlab_check_retries: 50
 +  # ASAv first boot on Kubernetes can take several minutes and may include
 +  # internal restart phases before management SSH is reachable. Keep the
-+  # public Skyforge device key as asav.
++  # public the platform device key as asav.
 +  #
 +  # 360x5s = 1800s, ALIGNED WITH THE VM-NOS DEPLOY BUDGET. These two numbers
 +  # are the same claim about the same device and must not disagree:
@@ -1785,7 +1785,7 @@ index 81ad405..06096c8 100644
  KNE_CONFIG_EXEC_PARALLELISM = int(os.environ.get('SKYFORGE_KNE_CONFIG_EXEC_PARALLELISM','12') or 0)
  _kne_config_exec_semaphore = threading.Semaphore(KNE_CONFIG_EXEC_PARALLELISM) if KNE_CONFIG_EXEC_PARALLELISM > 0 else None
  
-+# SKYFORGE-SPECIFIC: TWO bulkhead lanes instead of one.
++# PLATFORM-SPECIFIC: TWO bulkhead lanes instead of one.
 +#
 +# The 12 above was set for CONSOLE-attach devices (IOL: one exclusive attach chain per node, orphans that hold the
 +# lock). The fragments it also throttles for cEOS and linux hosts are plain `kubectl exec`, with no per-node lock
@@ -1976,11 +1976,11 @@ index 81ad405..06096c8 100644
 +
 +def adjust_linux_node_data(kne_data: Box, node: Box) -> None:
 +  '''
-+  SKYFORGE-SPECIFIC: the Caldera (Sandcat) agent is OPT-IN PER LAB, and this is the only door.
++  PLATFORM-SPECIFIC: the Caldera (Sandcat) agent is OPT-IN PER LAB, and this is the only door.
 +
 +  The skyforge-linux-host image starts its Sandcat launcher only when the pod carries
 +  SKYFORGE_CALDERA_AGENT_ENABLED=1 and SKYFORGE_CALDERA_SERVER. Both come from ONE per-run fact,
-+  NETLAB_KNE_CALDERA_AGENT_SERVER, which the Skyforge server puts on the runtime Job only when the
++  NETLAB_KNE_CALDERA_AGENT_SERVER, which the platform server puts on the runtime Job only when the
 +  deployment's owner switched Caldera on for that deployment (default off, audited). Unset -> the pod
 +  gets neither variable and the image runs no agent.
 +
@@ -2104,7 +2104,7 @@ index 42a61cb..6fcd80c 100644
 +#   + margin) = 1450 - 60 = 1390.
 +# If you change link_mtu, update this value with it (same contract as
 +# overlay_mtu_headroom). netlab has no native MSS knob, so the clamp is
-+# emitted by Skyforge's own per-NOS templates (templates/eos/initial.j2,
++# emitted by the platform's own per-NOS templates (templates/eos/initial.j2,
 +# templates/initial/<nos>.j2); a new NOS adds one clamp line referencing
 +# {{ tcp_mss_clamp }}, which reaches the template via that NOS's group_vars.
 +tcp_mss_clamp: &tcp_mss_clamp 1390
@@ -2116,7 +2116,7 @@ index 4ffc6f2..7349bc5 100644
      if n_data.get('routing.static',None):         # Host already has static routes, move on
        continue
  
-+    # SKYFORGE-SPECIFIC: a 'host'-role device that runs OSPF (A10 vThunder in demo-lab)
++    # PLATFORM-SPECIFIC: a 'host'-role device that runs OSPF (A10 vThunder in demo-lab)
 +    # learns its routes dynamically; pool-prefix static routes via the first gateway
 +    # would override that and loop against the neighbouring firewall. Skip only when the
 +    # device opts out AND the node actually has the ospf module; an A10 with no IGP keeps
@@ -2233,7 +2233,7 @@ index 0000000..9a72508
 --- /dev/null
 +++ b/tests/test_kne_config_exec_lanes.py
 @@ -0,0 +1,148 @@
-+"""KNE config-exec bulkhead lanes (SKYFORGE-SPECIFIC).
++"""KNE config-exec bulkhead lanes (PLATFORM-SPECIFIC).
 +
 +Requirement: cEOS and linux fragments (plain `kubectl exec`) get a higher, BOUNDED concurrency limit than the
 +console-bound lane (default 12, unchanged); the limit is configurable; a stuck console lane cannot starve the plain

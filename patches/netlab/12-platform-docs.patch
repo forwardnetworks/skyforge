@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 00:00:00 +0000
-Subject: [PATCH] docs: Skyforge topology blocks, plans and roadmap
+Subject: [PATCH] docs: topology blocks, plans and roadmap
 
 ---
 diff --git a/docs/roadmap/index.md b/docs/roadmap/index.md
@@ -23,11 +23,11 @@ index 0000000..5f43765
 +(topology-otg)=
 +# Declared Traffic Flows (`otg:`)
 +
-+`otg:` is a **Skyforge-only, topology-level block**. Its schema lives in Skyforge's patched netlab defaults (`attributes.global.otg` in `netsim/defaults/attributes.yml`), not in upstream *netlab*. Nothing goes in `module:` or `plugin:`, and no device configuration is rendered from it.
++`otg:` is a **platform-only, topology-level block**. Its schema lives in the platform's patched netlab defaults (`attributes.global.otg` in `netsim/defaults/attributes.yml`), not in upstream *netlab*. Nothing goes in `module:` or `plugin:`, and no device configuration is rendered from it.
 +
 +It declares the traffic flows a Keysight ixia-c generator (OTG, the Open Traffic Generator API) should run between its ports in this lab. Flows are declared in the topology because a flow is a statement about specific nodes and links and should version with them. That declaration is worth nothing until something pushes it: a lab that comes up with a generator configured with NOTHING, while its blueprint plainly declares three flows, is the kind of gap that reads as "the traffic generator is broken". So the declaration is parsed out of the topology at deploy time, carried on the deployment record, and pushed when the lab's pods report ready.
 +
-+**Why it is not rendered as config.** The ixia-c controller takes no generated configuration at all -- its device definition says so and sets `netlab_initial: never`, because it is driven over the OTG API after boot. *netlab*'s job here is to CARRY and VALIDATE the declaration; Skyforge reads it out of the compiled topology and pushes it to the controller's API, which is also how flows can be changed on a lab that is already up.
++**Why it is not rendered as config.** The ixia-c controller takes no generated configuration at all -- its device definition says so and sets `netlab_initial: never`, because it is driven over the OTG API after boot. *netlab*'s job here is to CARRY and VALIDATE the declaration; the platform reads it out of the compiled topology and pushes it to the controller's API, which is also how flows can be changed on a lab that is already up.
 +
 +**Raw data, no verdict.** A flow says what to send and where; what came back is counters, reported as counters. Nothing here expresses a pass/fail -- that judgement is a separate concern and belongs to whatever consumes the measurement, not to the thing that takes it.
 +
@@ -44,16 +44,16 @@ index 0000000..5f43765
 +
 +An ixia-c generator is two *netlab* device types, and a KNE node is a single-container pod, so the API and each port are separate NODES:
 +
-+* `keysight_ixia-c-controller` -- the API surface. Exactly one per lab. **No data links**: Skyforge drives flows through this node, and the engines are reached through it rather than directly.
++* `keysight_ixia-c-controller` -- the API surface. Exactly one per lab. **No data links**: the platform drives flows through this node, and the engines are reached through it rather than directly.
 +* `keysight_ixia-c-traffic-engine` -- one per generator PORT, owning its one data interface. Wire each one to the device under test with an ordinary link.
 +
 +The combined `ixia-c-one` image cannot be used here: measured 2026-09-05, it is docker-in-docker, reaches Running, fails with "could not wait for docker daemon" and listens on nothing. The component images are ordinary containers.
 +
-+Skyforge finds both by device KIND, not by name -- `otgctl`, `otg1` are the author's choice.
++The platform finds both by device KIND, not by name -- `otgctl`, `otg1` are the author's choice.
 +
 +## Attributes
 +
-+Every key below is the schema in `attributes.global.otg`. *netlab* refuses a key that is not listed here (`Incorrect global attribute ...`). *netlab* marks nothing as required; the "Required" column is what the Skyforge reader (`internal/otgflows`) demands, and a flow that fails it is **dropped at deploy time without a compile error**.
++Every key below is the schema in `attributes.global.otg`. *netlab* refuses a key that is not listed here (`Incorrect global attribute ...`). *netlab* marks nothing as required; the "Required" column is what the platform reader (`internal/otgflows`) demands, and a flow that fails it is **dropped at deploy time without a compile error**.
 +
 +| Attribute | Type | Required | Meaning |
 +| --- | --- | :-: | --- |
@@ -65,7 +65,7 @@ index 0000000..5f43765
 +| Attribute | Type | Required | Meaning |
 +| --- | --- | :-: | --- |
 +| `name` | string | yes | Names the flow in every metric row that comes back, so it has to survive round-tripping through the OTG API unchanged. Must be unique: metric rows are keyed by name, so two flows sharing one are indistinguishable in the result, and the whole set is refused. |
-+| `tx` | string | yes | The traffic-engine NODE that transmits. A **node name** (`otg1`), not an address or an interface. Ports rather than addresses, because a port is what the generator owns; Skyforge resolves each to its interface address when it builds the config. |
++| `tx` | string | yes | The traffic-engine NODE that transmits. A **node name** (`otg1`), not an address or an interface. Ports rather than addresses, because a port is what the generator owns; the platform resolves each to its interface address when it builds the config. |
 +| `rx` | string | yes | The traffic-engine NODE that receives. Same rules as `tx`. |
 +| `src` | ipv4 address | no | Override the source address derived from the `tx` port. Needed when the flow should carry an address the generator does not own -- testing a route rather than the adjacency it sits on. A bare address (`10.1.0.1`), no mask, and not in a reserved range (0/8, 127/8, 224/4, 240/4). |
 +| `dst` | ipv4 address | no | Override the destination address derived from the `rx` port. Same rules as `src`. |
@@ -76,7 +76,7 @@ index 0000000..5f43765
 +| `src_port` | int 1..65535 | no | Transport source port. Only applied with `protocol: udp` or `tcp`; silently unused otherwise. |
 +| `dst_port` | int 1..65535 | no | Transport destination port. Same rule as `src_port`. |
 +
-+Flow metrics are always enabled when Skyforge builds the configuration. Metrics are OFF by default in OTG, and a flow configured without them transmits and reports nothing, which looks exactly like a flow that transmitted and was lost.
++Flow metrics are always enabled when the platform builds the configuration. Metrics are OFF by default in OTG, and a flow configured without them transmits and reports nothing, which looks exactly like a flow that transmitted and was lost.
 +
 +The Flows API also speaks `src_mac` / `dst_mac`. They are **not** in the topology schema -- writing them under `otg.flows[]` fails the compile -- so a flow that needs them is set through the API after boot, not declared here.
 +
@@ -129,7 +129,7 @@ index 0000000..5f43765
 +
 +## Pitfalls
 +
-+* **`tx` and `rx` are traffic-engine node names.** Not IP addresses, not interface names, not the router's name. Skyforge checks every `tx`/`rx` against the lab's `keysight_ixia-c-traffic-engine` nodes and refuses the WHOLE flow set when one is wrong: `flow "x": node "r1" is not a traffic-engine port in this deployment`. The schema types them as `str`, so *netlab* cannot catch a typo at compile time.
++* **`tx` and `rx` are traffic-engine node names.** Not IP addresses, not interface names, not the router's name. The platform checks every `tx`/`rx` against the lab's `keysight_ixia-c-traffic-engine` nodes and refuses the WHOLE flow set when one is wrong: `flow "x": node "r1" is not a traffic-engine port in this deployment`. The schema types them as `str`, so *netlab* cannot catch a typo at compile time.
 +* **Face the two ports at each other and the flow proves nothing.** The same flow passes while proving only that the generator can talk to itself. Put the device under test between `tx` and `rx`.
 +* **The controller gets no data links.** The smoke blueprint wires none: the controller node is the API and the traffic engines own the ports. A link on the controller is not a generator port and cannot be named in `tx`/`rx`.
 +* **`otg:` renders no device config.** If the generator holds nothing after bring-up, the questions are: did the deploy record the flows (a missing `name`/`tx`/`rx` drops the flow silently), did the lab have a controller node, and did the generator already hold flows from a previous edit. Not "did netlab render the flows" -- it never does.
@@ -154,7 +154,7 @@ index a0a446d..6aaab20 100644
 +    # WHY NOT RENDERED AS CONFIG. The ixia-c controller takes no generated
 +    # configuration at all -- its device definition says so and sets
 +    # `netlab_initial: never`, because it is driven over the OTG API after boot.
-+    # netlab's job here is to CARRY and VALIDATE the declaration; Skyforge reads
++    # netlab's job here is to CARRY and VALIDATE the declaration; the platform reads
 +    # it out of the compiled topology and pushes it to the controller's API,
 +    # which is also how flows can be changed on a lab that is already up.
 +    #
@@ -175,7 +175,7 @@ index a0a446d..6aaab20 100644
 +          # survive round-tripping through the OTG API unchanged.
 +          name: { type: str }
 +          # The traffic-engine NODES this flow runs between. Ports rather than
-+          # addresses, because a port is what the generator owns; Skyforge
++          # addresses, because a port is what the generator owns; the platform
 +          # resolves each to its interface address when it builds the config.
 +          tx: { type: str }
 +          rx: { type: str }

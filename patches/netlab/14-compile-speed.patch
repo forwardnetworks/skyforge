@@ -25,7 +25,7 @@ index a5d61a7..065cd46 100644
 -def get_device_attribute(node: Box, attr: str, defaults: Box) -> typing.Optional[typing.Any]:
 +def _device_attribute(node: Box, attr: str, defaults: Box) -> typing.Tuple[typing.Any,bool]:
 +  """
-+  SKYFORGE-SPECIFIC: get_device_attribute, returning (value, shared). shared=True means the value is the CACHED merged
++  PLATFORM-SPECIFIC: get_device_attribute, returning (value, shared). shared=True means the value is the CACHED merged
 +  table (see netsim.data.memo): nobody may modify it, and get_device_attribute hands out a copy of it instead.
 +  """
    devtype  = node.device
@@ -53,7 +53,7 @@ index a5d61a7..065cd46 100644
    value = devdata.get(attr,None)         # Non-specific device data
    if isinstance(value,Box) and isinstance(pvalue,Box):
 -    return value+pvalue                  # Return merged dictionaries
-+    # SKYFORGE-SPECIFIC: the merged table is the same for every node of this device type and provider
++    # PLATFORM-SPECIFIC: the merged table is the same for every node of this device type and provider
 +    return (memo.memo('device_attr',(id(defaults),devtype,provider,attr),(defaults,value,pvalue),lambda: value+pvalue,watch=(value,pvalue)),True)
  
    if provider in devdata and attr in devdata[provider]:          # Do we have a provider-specific value?
@@ -68,13 +68,13 @@ index a5d61a7..065cd46 100644
 -  return value                           # Return whatever the device value is
 +def get_device_attribute(node: Box, attr: str, defaults: Box) -> typing.Optional[typing.Any]:
 +  value,shared = _device_attribute(node,attr,defaults)
-+  # SKYFORGE-SPECIFIC: every caller still gets a merged table of its own, as it always did (python-box creates keys
++  # PLATFORM-SPECIFIC: every caller still gets a merged table of its own, as it always did (python-box creates keys
 +  # when a missing one is read, and callers may modify what they get)
 +  return fastbox.copy_box(value) if shared else value
 +
 +def get_device_attribute_readonly(node: Box, attr: str, defaults: Box) -> typing.Optional[typing.Any]:
 +  """
-+  SKYFORGE-SPECIFIC: get_device_attribute for callers that only READ the result with .get() and `in`. The value may
++  PLATFORM-SPECIFIC: get_device_attribute for callers that only READ the result with .get() and `in`. The value may
 +  be shared with every other node of the device type: never modify it, and never read a missing key with attribute
 +  or [] access (python-box would create it). Saves a copy of the table per call.
 +  """
@@ -96,14 +96,14 @@ index a5d61a7..065cd46 100644
      return data.get_empty_box()
  
 -  return features + n_features
-+  if not n_features:                     # SKYFORGE-SPECIFIC: nothing to merge, so this is just features.copy() (one copy
++  if not n_features:                     # PLATFORM-SPECIFIC: nothing to merge, so this is just features.copy() (one copy
 +    return fastbox.copy_box(features)    # ... where the uncached code made two: the merge, then the copy; same result)
 +
 +  return fastbox.add(features,n_features)
 +
 +def get_device_features_readonly(node: Box, defaults: Box) -> Box:
 +  """
-+  SKYFORGE-SPECIFIC: get_device_features for callers that only READ the result with .get() and `in` (see
++  PLATFORM-SPECIFIC: get_device_features for callers that only READ the result with .get() and `in` (see
 +  get_device_attribute_readonly). Falls back to get_device_features whenever the node has its own features.
 +  """
 +  if node.get('_features',None):
@@ -121,7 +121,7 @@ index a5d61a7..065cd46 100644
  
 +def get_consolidated_device_data_readonly(node: Box, defaults: Box) -> Box:
 +  """
-+  SKYFORGE-SPECIFIC: get_consolidated_device_data for a caller that only READS the result (.get(), `in`, existing
++  PLATFORM-SPECIFIC: get_consolidated_device_data for a caller that only READS the result (.get(), `in`, existing
 +  keys). The merged device definition is the same for every node of a device type and provider, so it is built once
 +  (netsim.data.memo: same source objects and unchanged content, dropped around every hook) and shared: never modify
 +  it, never read a missing key with attribute or [] access.
@@ -146,7 +146,7 @@ index a5d61a7..065cd46 100644
      return node.get(g_var)
    else:                                           # Not set, get default device value for the node provider
 -    group_vars = get_device_attribute(node,'group_vars',defaults)
-+    group_vars,shared = _device_attribute(node,'group_vars',defaults)    # SKYFORGE-SPECIFIC: no copy of the whole table
++    group_vars,shared = _device_attribute(node,'group_vars',defaults)    # PLATFORM-SPECIFIC: no copy of the whole table
      if isinstance(group_vars,Box):
 -      return group_vars.get(g_var,None)
 +      value = group_vars.get(g_var,None)
@@ -167,7 +167,7 @@ index 0e068de..113d12b 100644
 -def is_nodename_valid(n: str, nodes: Box) -> bool:
 +def include_prefixes(nodes: Box) -> tuple:
 +  '''
-+  SKYFORGE-SPECIFIC (patch 62): the name prefixes of the nodes with 'include' requests (was rebuilt on every miss of
++  PLATFORM-SPECIFIC (patch 62): the name prefixes of the nodes with 'include' requests (was rebuilt on every miss of
 +  is_nodename_valid: every non-node key of every dictionary-style link, a scan of all nodes each)
 +  '''
 +  return tuple( x+"_" for x,d in nodes.items() if 'include' in d )
@@ -258,7 +258,7 @@ index 0e068de..113d12b 100644
 +      linkname_format: str = 'links[{link_cnt}]',
 +      c_pfx: typing.Optional[tuple] = None) -> list:
    link_list: list = []
-+  if c_pfx is None:                       # SKYFORGE-SPECIFIC (patch 62): one list for the whole link list
++  if c_pfx is None:                       # PLATFORM-SPECIFIC (patch 62): one list for the whole link list
 +    c_pfx = include_prefixes(nodes)
  
    if not(links):
@@ -290,7 +290,7 @@ index 0e068de..113d12b 100644
    # the device features include initial.generate_mac
    #
 -  features = devices.get_device_features(node,defaults)
-+  features = devices.get_device_features_readonly(node,defaults)        # SKYFORGE-SPECIFIC: read only
++  features = devices.get_device_features_readonly(node,defaults)        # PLATFORM-SPECIFIC: read only
    if 'ethernet' in features.get('initial.generate_mac',[]) and ifdata.get('type','') != 'vlan_member':
      ifdata.mac_address = generate_interface_mac(node,ifdata,defaults)
  
@@ -303,7 +303,7 @@ index 16a49c6..937a790 100644
    defaults = topology.defaults
    node_attr = defaults.attributes.get('node',[])
 -  dev_data  = devices.get_consolidated_device_data(n,defaults)
-+  dev_data  = devices.get_consolidated_device_data_readonly(n,defaults)     # SKYFORGE-SPECIFIC: read only, see devices.py
++  dev_data  = devices.get_consolidated_device_data_readonly(n,defaults)     # PLATFORM-SPECIFIC: read only, see devices.py
  
    for attr in node_attr:                      # Copy known node attributes from device+provider data into node data
      if attr in dev_data and not attr in n:
@@ -312,7 +312,7 @@ index 16a49c6..937a790 100644
  '''
  Return a copy of the topology (leaving original topology unchanged) with unmanaged devices removed
 +
-+SKYFORGE-SPECIFIC (patch 61): copy=False lets a caller that never changes what it gets back (or copies what it
++PLATFORM-SPECIFIC (patch 61): copy=False lets a caller that never changes what it gets back (or copies what it
 +changes itself) receive the topology ITSELF when there is nothing to remove. With an unmanaged node it is the
 +same full copy as always.
  '''
@@ -341,7 +341,7 @@ index c5268af..09c10dc 100644
      func = getattr(plugin,action)                           # ... yes, fetch the function to call
      if log.debug_active('plugin'):                          # ... do some logging to help the poor debugging souls
        print(f'plug {action}: {plugin}')
-+    memo.invalidate()                                       # SKYFORGE-SPECIFIC: a plugin may edit device/attribute tables in place
++    memo.invalidate()                                       # PLATFORM-SPECIFIC: a plugin may edit device/attribute tables in place
      func(topology)                                          # ... and execute the plugin function
 +    memo.invalidate()
  
@@ -351,7 +351,7 @@ index c5268af..09c10dc 100644
    if not 'Plugin' in topology:                                # No plugins, no worries
      return
  
-+  memo.invalidate()                                           # SKYFORGE-SPECIFIC: plugins edit device/attribute tables in place
++  memo.invalidate()                                           # PLATFORM-SPECIFIC: plugins edit device/attribute tables in place
 +
    if log.debug_active('plugin'):
      print(f'plug hook: {action}')
@@ -388,7 +388,7 @@ index 9e6c6b6..b5f56ec 100644
 -      log.exit_on_error()
 -    else:
 -      log.error('Unknown output format %s' % output_format,log.IncorrectValue,'create')
-+  if parallel_outputs.usable(args,topology):     # SKYFORGE-SPECIFIC (patch 57): independent outputs run concurrently
++  if parallel_outputs.usable(args,topology):     # PLATFORM-SPECIFIC (patch 57): independent outputs run concurrently
 +    parallel_outputs.run(args,topology)
 +  else:
 +    for output_format in args.output:
@@ -397,7 +397,7 @@ index 9e6c6b6..b5f56ec 100644
 +        continue
 +      output_module = _TopologyOutput.load(output_param,topology.defaults.outputs[output_param.split(':')[0]])
 +      if output_module:
-+        memo.invalidate()                       # SKYFORGE-SPECIFIC: outputs work on copies of the topology, don't keep them alive
++        memo.invalidate()                       # PLATFORM-SPECIFIC: outputs work on copies of the topology, don't keep them alive
 +        output_module.write(topology)
 +        memo.invalidate()
 +        log.exit_on_error()
@@ -413,7 +413,7 @@ index 0000000..e9a2e2f
 +++ b/netsim/cli/parallel_outputs.py
 @@ -0,0 +1,109 @@
 +#
-+# SKYFORGE-SPECIFIC (patch 57): run the 'netlab create' output modules concurrently.
++# PLATFORM-SPECIFIC (patch 57): run the 'netlab create' output modules concurrently.
 +#
 +# WHY. On a large lab the output modules are about a third of the compile (measured at 512 nodes in the runtime
 +# image, patches 1-55: config 17.4%, provider 7.8%, pickle 5.2%, ansible 2.9%) and most of them only read the
@@ -535,7 +535,7 @@ index 9973f00..f33aa13 100644
  # I had enough -- here's a function that returns a box with proper default settings
  
  def get_box(init: dict) -> Box:
-+  if type(init) is dict or type(init) is Box:   # SKYFORGE-SPECIFIC: these take the fast path (same result, see fastbox.py)
++  if type(init) is dict or type(init) is Box:   # PLATFORM-SPECIFIC: these take the fast path (same result, see fastbox.py)
 +    return fastbox.from_plain(init)
    return Box(init,default_box=True,default_box_none_transform=False,box_dots=True)
  
@@ -544,7 +544,7 @@ index 9973f00..f33aa13 100644
  
  def get_new_box(b: Box) -> Box:
 -  return get_box(b.to_dict())
-+  return fastbox.deep_copy(b) if type(b) is Box else get_box(b.to_dict())   # SKYFORGE-SPECIFIC: same result, one pass
++  return fastbox.deep_copy(b) if type(b) is Box else get_box(b.to_dict())   # PLATFORM-SPECIFIC: same result, one pass
  
  #
  # Another thingy we need all the time: make something a list
@@ -555,7 +555,7 @@ index 0000000..2550f96
 +++ b/netsim/data/fastbox.py
 @@ -0,0 +1,548 @@
 +"""
-+SKYFORGE-SPECIFIC fast paths for the two whole-topology conversions the output modules do: Box -> plain dict
++PLATFORM-SPECIFIC fast paths for the two whole-topology conversions the output modules do: Box -> plain dict
 +(`Box.to_dict()`) and plain dict -> Box (`get_box(dict)`).
 +
 +Why: python-box converts one value at a time through `__getitem__`, `__setitem__` and a configuration dictionary it
@@ -581,7 +581,7 @@ index 0000000..2550f96
 +import box as _box
 +from box import Box, BoxList
 +
-+# python-box versions this was written and tested against: the one the Skyforge runtime image ships, and the newest one
++# python-box versions this was written and tested against: the one the platform runtime image ships, and the newest one
 +# the developers use. Any other version keeps the slow, original path.
 +KNOWN_VERSIONS = ('7.3.2','7.4.1')
 +ENABLED = os.environ.get('SKYFORGE_NETLAB_COMPILE_FASTBOX','1') != '0' and getattr(_box,'__version__','') in KNOWN_VERSIONS
@@ -857,7 +857,7 @@ index 0000000..2550f96
 +
 +def deep_copy(src: Box) -> Box:
 +  """
-+  SKYFORGE-SPECIFIC: same result as get_box(src.to_dict()) -- a completely independent copy -- in one pass,
++  PLATFORM-SPECIFIC: same result as get_box(src.to_dict()) -- a completely independent copy -- in one pass,
 +  without building the intermediate plain dictionary.
 +  """
 +  if not enabled() or type(src) is not Box:
@@ -906,7 +906,7 @@ index 0000000..2550f96
 +
 +def set_item(b: Box, key: typing.Any, value: typing.Any) -> None:
 +  """
-+  SKYFORGE-SPECIFIC: same result as b[key] = value (python-box re-creates a dictionary value as a Box, keeps a BoxList
++  PLATFORM-SPECIFIC: same result as b[key] = value (python-box re-creates a dictionary value as a Box, keeps a BoxList
 +  and updates its options, makes a plain list a BoxList), without python-box's per-key conversion.
 +  """
 +  if not enabled() or type(b) is not Box or (isinstance(key,str) and ('.' in key or '[' in key)) or not _is_standard(b):
@@ -919,7 +919,7 @@ index 0000000..2550f96
 +
 +def set_reference(b: Box, key: str, value: typing.Any) -> None:
 +  """
-+  SKYFORGE-SPECIFIC: store `value` under `key` WITHOUT python-box's conversion (b[key] = value would copy a dictionary).
++  PLATFORM-SPECIFIC: store `value` under `key` WITHOUT python-box's conversion (b[key] = value would copy a dictionary).
 +  Only for a Box that is about to be copied as a whole (append_box, set_item, copy_box): the copy re-creates the value
 +  exactly as an assignment would have, so the end result is the same and one copy is saved.
 +  """
@@ -934,7 +934,7 @@ index 0000000..2550f96
 +
 +def set_list(b: Box, key: typing.Any, value: list) -> None:
 +  """
-+  SKYFORGE-SPECIFIC: same result as b[key] = value for a plain list (python-box makes it a BoxList and re-creates every
++  PLATFORM-SPECIFIC: same result as b[key] = value for a plain list (python-box makes it a BoxList and re-creates every
 +  dictionary in it), without python-box's per-item conversion. Anything unusual goes through python-box.
 +  """
 +  if not enabled() or type(b) is not Box or type(value) is not list or not isinstance(key,str) or '.' in key or '[' in key \
@@ -961,7 +961,7 @@ index 0000000..2550f96
 +
 +def append_box(bl: BoxList, item: typing.Any) -> None:
 +  """
-+  SKYFORGE-SPECIFIC: same result as bl.append(item) (python-box re-creates a dictionary item as a Box configured by
++  PLATFORM-SPECIFIC: same result as bl.append(item) (python-box re-creates a dictionary item as a Box configured by
 +  the list's options), without python-box's per-key conversion. Anything unusual goes through python-box.
 +  """
 +  if not enabled() or type(bl) is not BoxList or type(item) not in (dict,Box):
@@ -1109,7 +1109,7 @@ index 0000000..a63c610
 +++ b/netsim/data/memo.py
 @@ -0,0 +1,96 @@
 +"""
-+SKYFORGE-SPECIFIC compile-time memoisation of lookups that are rebuilt for every node and link.
++PLATFORM-SPECIFIC compile-time memoisation of lookups that are rebuilt for every node and link.
 +
 +Why: python-box rebuilds (deep-copies) a whole Box on every `a + b`. netlab does that for the same device-type
 +feature tables and the same attribute-definition tables once per node, interface and attribute -- tens of thousands
@@ -1248,7 +1248,7 @@ index 226cb62..1a216d9 100644
 +
 +def cow_namespace(attributes: Box, atlist: str) -> typing.Any:
 +  """
-+  SKYFORGE-SPECIFIC copy-on-write. A validation gets its own top-level attribute table whose namespaces are shared
++  PLATFORM-SPECIFIC copy-on-write. A validation gets its own top-level attribute table whose namespaces are shared
 +  with the cached merged table (see resolve_attributes). The only change validation ever makes to that table is
 +  stripping the _required flags of a secondary namespace (strip_secondary_namespace); copy that namespace into the
 +  table first, so the validation sees exactly what a full private copy would show and the shared namespaces stay
@@ -1269,14 +1269,14 @@ index 226cb62..1a216d9 100644
 +  that list and strip their _required flags -- in place, so the table it was given keeps the stripped flags
 +  (the uncached code behaves that way, and later validations with the same table depend on it)
 +  """
-+  add_attr = cow_namespace(attributes,atlist)               # SKYFORGE-SPECIFIC: about to be modified, see cow_namespace
++  add_attr = cow_namespace(attributes,atlist)               # PLATFORM-SPECIFIC: about to be modified, see cow_namespace
 +  add_attr = { k:v for k,v in add_attr.items() if not k in attributes[f'{atlist}_no_propagate'] }
 +  remove_required_flag(add_attr)
 +  return add_attr
 +
 +def resolve_private(attributes: Box, entry: tuple, attr_list: typing.List[str]) -> tuple:
 +  """
-+  SKYFORGE-SPECIFIC: resolve_attributes for a table handed out by resolve_attributes (a recursive validation reuses
++  PLATFORM-SPECIFIC: resolve_attributes for a table handed out by resolve_attributes (a recursive validation reuses
 +  the merged table of its caller). The table is fully determined by the cached table it was made from and the set of
 +  namespaces it has copied and stripped so far, so the namespaces and the valid-attribute table computed for it can
 +  be remembered on exactly that key. A computation strips more namespaces in the table as a side effect; on a hit
@@ -1356,7 +1356,7 @@ index 226cb62..1a216d9 100644
  
 -  if extra_attributes:
 -    attributes = attributes + extra_attributes
-+  # SKYFORGE-SPECIFIC: the merged attribute table, the namespace list and the valid-attribute table depend only on
++  # PLATFORM-SPECIFIC: the merged attribute table, the namespace list and the valid-attribute table depend only on
 +  # the (shared) attribute definitions and the attribute namespaces, not on the object being validated
 +  resolved = resolve_attributes(attributes,extra_attributes,attr_list)
 +  attributes = resolved[0]
@@ -1390,13 +1390,13 @@ index 587df64..523ce40 100644
    mod_load[module].call(method,topology=topology,**kwargs)
  
  def execute_module_hooks(method: str, topology: Box) -> None:
-+  memo.invalidate()                                                       # SKYFORGE-SPECIFIC: hooks may edit shared tables
++  memo.invalidate()                                                       # PLATFORM-SPECIFIC: hooks may edit shared tables
    for m in list_of_modules(topology):
      if method in topology.defaults[m].get('hooks',[]):
        call_module_hook(m,f'module_{method}',topology)
  
  def module_transform(method: str, topology: Box) -> None:
-+  memo.invalidate()                                                       # SKYFORGE-SPECIFIC: hooks may edit shared tables
++  memo.invalidate()                                                       # PLATFORM-SPECIFIC: hooks may edit shared tables
    if log.debug_active('modules'):
      print(f'Processing module_{method} hooks')
  
@@ -1418,7 +1418,7 @@ index 5ccb6e3..ca5af27 100644
    return OK
  
 +"""
-+SKYFORGE-SPECIFIC (patch 62): AS index. find_bgp_rr and build_ibgp_sessions looked at every node for every BGP node
++PLATFORM-SPECIFIC (patch 62): AS index. find_bgp_rr and build_ibgp_sessions looked at every node for every BGP node
 +(N * N reads: 13 s of a 3,972-node compile). The index is built once, in module_post_transform, from the state the
 +scans would see: bgp.as and bgp.rr are final by then (node_pre_transform sets rr, module_post_transform sets router IDs
 +and RR clusters from it), and the one place that sets an AS later (vrf: a fake bgp.as for inter-VRF route leaking, in
@@ -1495,10 +1495,10 @@ index 5ccb6e3..ca5af27 100644
 -  return [ n 
 -    for n in topology.nodes.values() 
 -      if 'bgp' in n and n.bgp["as"] == bgp_as and n.bgp.get("rr",None) ]
-+  rr = _index_rr(bgp_as,topology)                 # SKYFORGE-SPECIFIC (patch 62): looked up in the index, if there is one
++  rr = _index_rr(bgp_as,topology)                 # PLATFORM-SPECIFIC (patch 62): looked up in the index, if there is one
 +  if rr is not None:
 +    return rr
-+  # SKYFORGE-SPECIFIC: every BGP node scans every node; read the usual shape (bgp is a dictionary with an 'as') at
++  # PLATFORM-SPECIFIC: every BGP node scans every node; read the usual shape (bgp is a dictionary with an 'as') at
 +  # dictionary level and leave anything else to the original expression (which, through python-box, may create keys)
 +  result = []
 +  for n in topology.nodes.values():
@@ -1520,7 +1520,7 @@ index 5ccb6e3..ca5af27 100644
  """
 +def _ibgp_neighbor_plain(n: Box, intf: Box, sessions: Box, extra_data: typing.Optional[dict] = None) -> typing.Optional[dict]:
 +  """
-+  SKYFORGE-SPECIFIC: bgp_neighbor(n,intf,'ibgp',sessions,extra_data) as a PLAIN dict with the same keys in the same
++  PLATFORM-SPECIFIC: bgp_neighbor(n,intf,'ibgp',sessions,extra_data) as a PLAIN dict with the same keys in the same
 +  order. build_ibgp_sessions appends it to a BoxList, which converts it once; bgp_neighbor's Box was converted key by
 +  key and then copied again by the append. Same appended result, one conversion per session instead of two.
 +  """
@@ -1541,7 +1541,7 @@ index 5ccb6e3..ca5af27 100644
 +  return ngb if af_count > 0 else None
 +
 +def _bgp_as(n: Box) -> typing.Any:
-+  """SKYFORGE-SPECIFIC: n.get('bgp.as',None) without python-box's dotted-key machinery for the usual shape"""
++  """PLATFORM-SPECIFIC: n.get('bgp.as',None) without python-box's dotted-key machinery for the usual shape"""
 +  bgp = dict.get(n,'bgp',None)
 +  if isinstance(bgp,dict):
 +    return dict.get(bgp,'as',None)
@@ -1554,7 +1554,7 @@ index 5ccb6e3..ca5af27 100644
    rrlist = [] if is_rr else find_bgp_rr(node_as,topology)
    rr_mesh  = node.bgp.get("rr_mesh",True)         # Do we want to have a mesh between RRs (default: Yes)?
    if is_rr or not rrlist:                         # If the current node is RR or we have a full mesh
-+    as_members = _index_members(node_as,topology)   # SKYFORGE-SPECIFIC (patch 62): the nodes in this AS, from the index
++    as_members = _index_members(node_as,topology)   # PLATFORM-SPECIFIC (patch 62): the nodes in this AS, from the index
      ibgp_ngb_list = [                             # ... we need IBGP sessions to all nodes in the AS
 -      ngb for ngb in topology.nodes.values()      # ... but while building the node list
 -        if ngb.name != node.name and              # ... skip current node
@@ -1574,7 +1574,7 @@ index 5ccb6e3..ca5af27 100644
      if not neighbor_data is None:
        if 'loopback' in node:
 -        neighbor_data._source_intf = node.loopback
-+        # SKYFORGE-SPECIFIC: store the loopback as it is; append_box below re-creates it in the appended neighbor (the
++        # PLATFORM-SPECIFIC: store the loopback as it is; append_box below re-creates it in the appended neighbor (the
 +        # assignment copied it once more, and that copy was thrown away by the append that copied it again)
 +        neighbor_data['_source_intf'] = node.loopback
        if bgp_nhs:
@@ -1584,7 +1584,7 @@ index 5ccb6e3..ca5af27 100644
 -        neighbor_data.rr_client = True
 -      node.bgp.neighbors.append(neighbor_data)
 +        neighbor_data['rr_client'] = True
-+      fastbox.append_box(node.bgp.neighbors,neighbor_data)   # SKYFORGE-SPECIFIC: converted once, here (same result)
++      fastbox.append_box(node.bgp.neighbors,neighbor_data)   # PLATFORM-SPECIFIC: converted once, here (same result)
        has_ibgp = True
  
    if not has_ibgp:
@@ -1592,12 +1592,12 @@ index 5ccb6e3..ca5af27 100644
        if 'bgp' in n:
          _routing.router_id(n,'bgp',topology.pools)
  
-+    build_as_index(topology)                      # SKYFORGE-SPECIFIC (patch 62)
++    build_as_index(topology)                      # PLATFORM-SPECIFIC (patch 62)
      build_bgp_rr_clusters(topology)
      check_confederation_data(topology)
  
 +  def module_cleanup(self, topology: Box) -> None:
-+    global _as_index                              # SKYFORGE-SPECIFIC (patch 62)
++    global _as_index                              # PLATFORM-SPECIFIC (patch 62)
 +    _as_index = None
 +
    #
@@ -1621,7 +1621,7 @@ index 350ccf8..dc978c2 100644
            ifdata.role = 'stub'                                              # ... then we have a stub link, mark it for IGP modules
  
 -      ifdata.neighbors = [ n for n in vlan_data.neighbors if n.node != node.name ]
-+      fastbox.set_list(ifdata,'neighbors',[ n for n in vlan_data.neighbors if n.node != node.name ])   # SKYFORGE-SPECIFIC: same as =, faster
++      fastbox.set_list(ifdata,'neighbors',[ n for n in vlan_data.neighbors if n.node != node.name ])   # PLATFORM-SPECIFIC: same as =, faster
        if ifdata.neighbors:
          if ' -> ' in ifdata.name:
            ifdata.name = ifdata.name.split(' -> ')[0]
@@ -1643,13 +1643,13 @@ index be156fc..00eaf05 100644
      group_vars = devices.get_provider_data(node,defaults).get('group_vars',{})
    else:
 -    group_vars = devices.get_device_attribute(node,'group_vars',defaults)
-+    group_vars = devices.get_device_attribute_readonly(node,'group_vars',defaults)    # SKYFORGE-SPECIFIC: read only
++    group_vars = devices.get_device_attribute_readonly(node,'group_vars',defaults)    # PLATFORM-SPECIFIC: read only
  
    if isinstance(group_vars,dict):
      for k,v in group_vars.items():
        if k not in host:
 -        host[k] = v
-+        fastbox.set_item(host,k,v)              # SKYFORGE-SPECIFIC: same as host[k] = v, faster
++        fastbox.set_item(host,k,v)              # PLATFORM-SPECIFIC: same as host[k] = v, faster
  
    return group_vars
  
@@ -1658,7 +1658,7 @@ index be156fc..00eaf05 100644
      # different ansible_connection
      #
 -    g_vars = devices.get_device_attribute(node,'group_vars',defaults)
-+    g_vars = devices.get_device_attribute_readonly(node,'group_vars',defaults)       # SKYFORGE-SPECIFIC: read only
++    g_vars = devices.get_device_attribute_readonly(node,'group_vars',defaults)       # PLATFORM-SPECIFIC: read only
      if n_provider != defaults.provider:
        add_group_vars(host,node,defaults,provider_only=True)
  
@@ -1668,7 +1668,7 @@ index be156fc..00eaf05 100644
      node.node_provider = n_provider
 -    node.netlab_interfaces = ([ node.get('loopback')] if 'loopback' in node else []) + \
 -                             node.get('interfaces',[])
-+    fastbox.set_item(node,'netlab_interfaces',                  # SKYFORGE-SPECIFIC: same as node.netlab_interfaces = ...
++    fastbox.set_item(node,'netlab_interfaces',                  # PLATFORM-SPECIFIC: same as node.netlab_interfaces = ...
 +                     ([ node.get('loopback')] if 'loopback' in node else []) + node.get('interfaces',[]))
  
    # For Docker nodes, do not use mgmt.X attributes (to set ansible_host)
@@ -1678,12 +1678,12 @@ index be156fc..00eaf05 100644
      value = node.get(node_key,None)
      if value is not None:
 -      host[inv_key] = value
-+      fastbox.set_item(host,inv_key,value)        # SKYFORGE-SPECIFIC: same as host[inv_key] = value, faster
++      fastbox.set_item(host,inv_key,value)        # PLATFORM-SPECIFIC: same as host[inv_key] = value, faster
  
    for (k,v) in node.items():
      if not k in ignore:
 -      host[k] = v
-+      fastbox.set_item(host,k,v)                  # SKYFORGE-SPECIFIC: same as host[k] = v, faster
++      fastbox.set_item(host,k,v)                  # PLATFORM-SPECIFIC: same as host[k] = v, faster
  
    # KNE uses the compile-time provider contract for apply, not any source
    # provider label that may still be present on imported clab topologies.
@@ -1696,7 +1696,7 @@ index be156fc..00eaf05 100644
 +      template_vars: bool = False,
 +      share: bool = False) -> Box:
 +  if share:
-+    # SKYFORGE-SPECIFIC (patch 61): the caller only READS what it gets back (config templates). Everything but the
++    # PLATFORM-SPECIFIC (patch 61): the caller only READS what it gets back (config templates). Everything but the
 +    # nodes is the topology's own data; each node is copied one level because template_vars writes four keys on it
 +    # and adjust_inventory_host builds a new host from it. Not for callers that modify the result.
 +    topo_copy = fastbox.shallow(topology)
@@ -1710,10 +1710,10 @@ index be156fc..00eaf05 100644
 +                              template_vars=template_vars))
 +    fastbox.set_reference(topo_copy,'nodes',new_nodes)
 +    return topo_copy
-+  topo_copy = fastbox.deep_copy(topology)                         # SKYFORGE-SPECIFIC: same result as get_box(topology.to_dict()), one pass
++  topo_copy = fastbox.deep_copy(topology)                         # PLATFORM-SPECIFIC: same result as get_box(topology.to_dict()), one pass
    for node in list(topo_copy.nodes.keys()):
 -    topo_copy.nodes[node] = adjust_inventory_host(
-+    fastbox.set_item(topo_copy.nodes,node,adjust_inventory_host(     # SKYFORGE-SPECIFIC: same as topo_copy.nodes[node] = ...
++    fastbox.set_item(topo_copy.nodes,node,adjust_inventory_host(     # PLATFORM-SPECIFIC: same as topo_copy.nodes[node] = ...
                                node=topo_copy.nodes[node],
                                defaults=topology.defaults,
                                ignore=ignore,
@@ -1742,7 +1742,7 @@ index 23c5d9e..ae494d4 100644
 -  def write(self, topology: Box) -> None:
 +  @staticmethod
 +  def _shared_sources(n_data: Box, topology: Box) -> list:
-+    """SKYFORGE-SPECIFIC (patch 57): the shared config templates one_node() would reach for this node, in order.
++    """PLATFORM-SPECIFIC (patch 57): the shared config templates one_node() would reach for this node, in order.
 +
 +    Mirrors the shared-template branch of the node loop exactly, so a parallel run can hand every node the
 +    shared_list the sequential loop would have had when it got to that node."""
@@ -1777,7 +1777,7 @@ index 23c5d9e..ae494d4 100644
      # Creates a "ghost clean" topology after transformation
      # (AKA, remove unmanaged devices)
 -    topology = output_common.create_adjusted_topology(nodes.ghost_buster(topology),ignore=[],template_vars=True)
-+    # SKYFORGE-SPECIFIC (patch 61): when the nodes are rendered in forked workers (parallel_config), the templates read
++    # PLATFORM-SPECIFIC (patch 61): when the nodes are rendered in forked workers (parallel_config), the templates read
 +    # the topology in the workers, so it is shared instead of deep-copied: python-box's default_box creates a key on
 +    # a read of a missing one, and that must not reach this process (the pickle output runs here, after this one).
 +    share = parallel_config.usable(topology)
@@ -1831,7 +1831,7 @@ index 23c5d9e..ae494d4 100644
          strings.print_colored_text(strings.pad_err_code('CONFIG',10),'green')
          print(f"{n_name}: {','.join(create_list)}")
 +
-+    # SKYFORGE-SPECIFIC (patch 57): render the nodes in forked workers when the lab is big enough (exact same files,
++    # PLATFORM-SPECIFIC (patch 57): render the nodes in forked workers when the lab is big enough (exact same files,
 +    # same console lines in the same order); otherwise the original loop.
 +    if parallel_config.usable(topology):
 +      parallel_config.run(topology,one_node,lambda n_data: self._shared_sources(n_data,topology),unshare if share else None)
@@ -1845,7 +1845,7 @@ index 0000000..577f8b6
 +++ b/netsim/outputs/parallel_config.py
 @@ -0,0 +1,78 @@
 +#
-+# SKYFORGE-SPECIFIC (patch 57): render node configuration files in forked workers.
++# PLATFORM-SPECIFIC (patch 57): render node configuration files in forked workers.
 +#
 +# The node loop in outputs/config.py is independent per node except for one piece of shared state: the list of
 +# "shared" config templates already written. The parent computes, for every node, exactly the shared_list the
@@ -1917,7 +1917,7 @@ index 0000000..577f8b6
 +  # right by this process: start the node files again and render every node here, exactly as the original loop does.
 +  if os.path.exists('node_files'):
 +    shutil.rmtree('node_files')
-+  if unshare is not None:                       # SKYFORGE-SPECIFIC (patch 61): the topology was shared with the caller's
++  if unshare is not None:                       # PLATFORM-SPECIFIC (patch 61): the topology was shared with the caller's
 +    topology = unshare()                        # ... own, and the original loop rendered a private copy
 +  shared_list: list = []
 +  for n_name in names:
@@ -1939,7 +1939,7 @@ index 0c85268..5bf027d 100644
        log.fatal('Cannot write pickled data to stdout',module='pickle')
  
 -    topodict = topology.cleanup_topology(topo).to_dict()
-+    topodict = fastbox.to_dict(topology.cleanup_topology(topo))   # SKYFORGE-SPECIFIC: same result as .to_dict(), faster
++    topodict = fastbox.to_dict(topology.cleanup_topology(topo))   # PLATFORM-SPECIFIC: same result as .to_dict(), faster
      provider_name = str(getattr(topo,'provider','') or '').strip()
      if provider_name:
        try:
@@ -1974,7 +1974,7 @@ index a29540c..42ae083 100644
        search_path = _files.get_search_path(self.provider,pkg_path_component=self.get_template_path(),topology=topology)
        r_text = templates.render_template(
 -        data=topology.to_dict(),
-+        data=fastbox.to_dict(topology),                   # SKYFORGE-SPECIFIC: same result as topology.to_dict()
++        data=fastbox.to_dict(topology),                   # PLATFORM-SPECIFIC: same result as topology.to_dict()
          j2_file=tname,
          extra_path=search_path)
      except Exception as ex:
@@ -1982,7 +1982,7 @@ index a29540c..42ae083 100644
  Execute a topology-wide provider hook
  """
  def execute(hook: str, topology: Box) -> None:
-+  memo.invalidate()                                           # SKYFORGE-SPECIFIC: provider hooks may edit shared tables
++  memo.invalidate()                                           # PLATFORM-SPECIFIC: provider hooks may edit shared tables
    p_module = get_provider_module(topology,topology.provider)
    p_module.call(hook,topology)
  
@@ -2004,7 +2004,7 @@ index 7830cb6..3859b94 100644
      return cfg_mode
  
 -  features = devices.get_device_features(node,topology.defaults)
-+  features = devices.get_device_features_readonly(node,topology.defaults)   # SKYFORGE-SPECIFIC: read only
++  features = devices.get_device_features_readonly(node,topology.defaults)   # PLATFORM-SPECIFIC: read only
    supported = features.get('initial.config_mode',[])
    if len(supported) == 1 and supported[0] in ('sh','cp_sh'):
      return supported[0]
@@ -2013,7 +2013,7 @@ index 7830cb6..3859b94 100644
    if not node.get('device',None):
      return Box({},default_box=True)
 -  return devices.get_device_features(node,topology.defaults).get('initial',Box({},default_box=True))
-+  return devices.get_device_features_readonly(node,topology.defaults).get('initial',Box({},default_box=True))   # SKYFORGE-SPECIFIC: read only
++  return devices.get_device_features_readonly(node,topology.defaults).get('initial',Box({},default_box=True))   # PLATFORM-SPECIFIC: read only
  
  def kne_device_mtu_ceiling(node: Box, topology: Box, device_caps: dict) -> int | None:
    '''The largest interface MTU this node's NOS will actually accept.
@@ -2022,7 +2022,7 @@ index 7830cb6..3859b94 100644
      return build_kne_node_data(node,topology,node_interfaces)
  
 -  render_node = get_box(node.to_dict())
-+  render_node = fastbox.deep_copy(node)                             # SKYFORGE-SPECIFIC: same result as get_box(node.to_dict()), one pass
++  render_node = fastbox.deep_copy(node)                             # PLATFORM-SPECIFIC: same result as get_box(node.to_dict()), one pass
    render_node.kne = Box(default_box=True,box_dots=True)
    render_node.kne.config_templates = Box(default_box=True,box_dots=True)
    add_default_config_mode(render_node,topology)
@@ -2031,7 +2031,7 @@ index 7830cb6..3859b94 100644
  def render_kne_topology_textproto(topology: Box) -> str:
    search_path = _files.get_search_path('kne',pkg_path_component='templates/provider/kne')
 -  topo_data = get_box(topology.to_dict())
-+  topo_data = fastbox.deep_copy(topology)                           # SKYFORGE-SPECIFIC: same result as get_box(topology.to_dict()), one pass
++  topo_data = fastbox.deep_copy(topology)                           # PLATFORM-SPECIFIC: same result as get_box(topology.to_dict()), one pass
    topo_data.kne_name = str(topo_data.get('kne_name',get_kne_topology_name(topology)) or get_kne_topology_name(topology))
    topo_data.kne_links = [
      get_box(link) if not isinstance(link,Box) else link
@@ -2051,7 +2051,7 @@ index 0000000..5197afe
 +++ b/netsim/utils/forkrun.py
 @@ -0,0 +1,128 @@
 +#
-+# SKYFORGE-SPECIFIC (patch 57): run pieces of 'netlab create' in forked workers while keeping the console output,
++# PLATFORM-SPECIFIC (patch 57): run pieces of 'netlab create' in forked workers while keeping the console output,
 +# the error/warning logs and the exit behaviour exactly as if they had run one after the other in this process.
 +#
 +# A task is a zero-argument callable. Each one runs with fd 1/2 redirected to files; what it printed, the errors and
@@ -2190,7 +2190,7 @@ index 952b149..c96e6d7 100644
 +
  def get_intf_address(addr: typing.Union[str,int]) -> str:
 -  return str(ipaddress.ip_interface(addr).ip)
-+  # SKYFORGE-SPECIFIC: a pure function of its argument, asked for the same loopback once per BGP session (tens of
++  # PLATFORM-SPECIFIC: a pure function of its argument, asked for the same loopback once per BGP session (tens of
 +  # thousands of times in a large lab); remember the answers. Errors are not cached: they are raised every time.
 +  key = (addr.__class__,addr)
 +  try:
@@ -2255,7 +2255,7 @@ index 0000000..716805e
 @@ -0,0 +1,786 @@
 +#!/usr/bin/env python3
 +"""
-+Compile-speed patch (SKYFORGE-SPECIFIC, patch 50): the caches and the fast box conversions must change how long a
++Compile-speed patch (PLATFORM-SPECIFIC, patch 50): the caches and the fast box conversions must change how long a
 +compile takes, never what it produces.
 +
 +The tests are written from that requirement, not from the implementation: every one of them compares a result
@@ -3047,7 +3047,7 @@ index 0000000..bcc3558
 @@ -0,0 +1,329 @@
 +#!/usr/bin/env python3
 +"""
-+Parallel outputs (SKYFORGE-SPECIFIC, patch 57): running the output modules (and the per-node config rendering) in
++Parallel outputs (PLATFORM-SPECIFIC, patch 57): running the output modules (and the per-node config rendering) in
 +forked workers must change how long 'netlab create' takes, never what it produces: not the files, not the console
 +output, not the topology create.run() returns, not the exit behaviour on an error.
 +
