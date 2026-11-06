@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
-Date: Sun, 27 Sep 2026 12:00:00 +0000
-Subject: [PATCH] multicast: new module (PIM sparse/bidir, IGMP, static RP) for
- EOS and IOS
+Date: Thu, 19 Nov 2026 00:00:00 +0000
+Subject: [PATCH] multicast: PIM sparse/bidir, IGMP, static RP
 
 ---
 diff --git a/docs/netlab-multicast-plan.md b/docs/netlab-multicast-plan.md

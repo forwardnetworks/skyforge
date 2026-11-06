@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 00:00:00 +0000
-Subject: [PATCH] SKYFORGE-SPECIFIC: SKYFORGE_PANOS_SINGLE_COMMIT stages every
- PAN-OS lane and commits once (default: a commit per lane)
+Subject: [PATCH] devices: archive stanza for timed revert on IOS-family,
+ PAN-OS password promotion and single commit, Junos day-0 normalising commit
 
 ---
 diff --git a/netsim/ansible/initial-config.ansible b/netsim/ansible/initial-config.ansible
@@ -47,6 +47,270 @@ index a8725c9..53b4ced 100755
 +    args:
 +      apply:
 +        tags: [ always ]
+diff --git a/netsim/ansible/library/panos_admpwd_kne.py b/netsim/ansible/library/panos_admpwd_kne.py
+index cb6d8df..9d0988b 100644
+--- a/netsim/ansible/library/panos_admpwd_kne.py
++++ b/netsim/ansible/library/panos_admpwd_kne.py
+@@ -1,6 +1,7 @@
+ #!/usr/bin/python
+ from __future__ import annotations
+ 
++import datetime
+ import os
+ import pty
+ import re
+@@ -50,6 +51,14 @@ options:
+     required: false
+     default: 180
+     type: int
++  attempt_log:
++    description:
++      - File the module appends ONE LINE per phase boundary to (UTC timestamp, attempt number, phase C(probe) or
++        C(promote), event C(start) or C(end), elapsed seconds, time to the first byte the device sent, and why the
++        phase ended). Default C(/tmp/skyforge-panos-promotion-<host>-<port>.log). A failure to write it never fails
++        the module. The same text is returned as C(attempt_log) so a failed run still carries it.
++    required: false
++    type: str
+ author:
+   - Skyforge
+ '''
+@@ -58,6 +67,68 @@ author:
+ PROMPT_BYTES = 4096
+ 
+ 
++def _utc_stamp(epoch: float) -> str:
++  moment = datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc)
++  return moment.strftime('%Y-%m-%dT%H:%M:%S.') + f'{moment.microsecond // 1000:03d}Z'
++
++
++def attempt_log_path(module: AnsibleModule) -> str:
++  explicit = str(module.params.get('attempt_log') or '').strip()
++  if explicit:
++    return explicit
++  where = re.sub(r'[^A-Za-z0-9_.-]+', '-', f"{module.params['host']}-{module.params['port']}")
++  return f'/tmp/skyforge-panos-promotion-{where}.log'
++
++
++class AttemptLog:
++  """Per-attempt record of the password promotion, so the NEXT boot shows when the guest actually became ready.
++
++  WHY. The retry loop in tasks/panos/initial.yml (timeout 45s, delay 10s) produced two data points on fleet40
++  2026-10-10 -- first RETRYING line 91 s after the SSH port opened, success 64 s later -- and neither could say when
++  the guest started answering, because Ansible prints nothing about an attempt until it ends and the module said
++  nothing about how it spent its time. One attempt is TWO phases, each with its own budget: the already-promoted
++  PROBE (up to min(timeout, 60) s) and then the PROMOTION (up to timeout s), so a single "45 s" attempt can really
++  take ~90 s. This logs both, with timestamps, and never changes what the module does.
++  """
++
++  def __init__(self, path: str):
++    self.path = path
++    self.lines: list = []
++    prior = []
++    try:
++      with open(path, encoding='utf-8') as handle:
++        prior = handle.read().splitlines()
++    except OSError:
++      prior = []
++    self.attempt = sum(1 for line in prior if ' phase=probe event=start' in line) + 1
++    self.first_epoch = None
++    for line in prior:
++      match = re.search(r' epoch=([0-9.]+)', line)
++      if match:
++        self.first_epoch = float(match.group(1))
++        break
++
++  def write(self, phase: str, event: str, **fields) -> None:
++    now = time.time()
++    if self.first_epoch is None:
++      self.first_epoch = now
++    parts = [
++      _utc_stamp(now), 'promotion', f'attempt={self.attempt}', f'phase={phase}', f'event={event}',
++      f'since_first_s={now - self.first_epoch:.1f}', f'epoch={now:.3f}',
++    ]
++    parts += [f'{key}={value}' for key, value in fields.items()]
++    line = ' '.join(parts)
++    self.lines.append(line)
++    try:
++      with open(self.path, 'a', encoding='utf-8') as handle:
++        handle.write(line + '\n')
++    except OSError:
++      pass  # a log that cannot be written must never fail a promotion
++
++  def text(self) -> str:
++    return '\n'.join(self.lines)
++
++
+ def scrub(text: str, *secrets: str) -> str:
+   for secret in secrets:
+     if secret:
+@@ -94,7 +165,7 @@ def ssh_argv(module: AnsibleModule) -> list:
+   return cmd
+ 
+ 
+-def already_promoted(module: AnsibleModule) -> tuple:
++def already_promoted(module: AnsibleModule, attempt_log: 'AttemptLog | None' = None) -> tuple:
+   """Is the admin password ALREADY the configured one?
+ 
+   THIS IS WHAT MAKES THE MODULE IDEMPOTENT, and its absence is why refreshing
+@@ -130,11 +201,17 @@ def already_promoted(module: AnsibleModule) -> tuple:
+   transcript = ''
+   sent_login = False
+   promoted = False
+-  deadline = time.time() + timeout
++  started = time.time()
++  first_output = None
++  why = 'deadline'
++  if attempt_log:
++    attempt_log.write('probe', 'start', budget_s=timeout)
++  deadline = started + timeout
+   try:
+     while time.time() < deadline:
+       wait_pid, _ = os.waitpid(pid, os.WNOHANG)
+       if wait_pid == pid:
++        why = 'ssh-exited'
+         break
+       ready, _, _ = select.select([master], [], [], 0.25)
+       if not ready:
+@@ -142,9 +219,12 @@ def already_promoted(module: AnsibleModule) -> tuple:
+       try:
+         chunk = os.read(master, PROMPT_BYTES).decode(errors='replace')
+       except OSError:
++        why = 'ssh-closed'
+         break
+       if not chunk:
+         continue
++      if first_output is None:
++        first_output = time.time() - started
+       transcript += chunk
+       tail = transcript[-2048:]
+ 
+@@ -157,6 +237,7 @@ def already_promoted(module: AnsibleModule) -> tuple:
+       # A forced-change dialog means we are still on the factory password.
+       # Answer nothing and leave: the promotion path owns that conversation.
+       if re.search(r'(?:Enter old password|Current password)\s*:', tail, re.I):
++        why = 'factory-password-prompt'
+         break
+       if not sent_login and re.search(r'password\s*:', tail, re.I):
+         send(master, new_password)
+@@ -164,11 +245,17 @@ def already_promoted(module: AnsibleModule) -> tuple:
+         continue
+       if sent_login and re.search(r'(?m)[>#]\s*$', tail):
+         promoted = True
++        why = 'cli-prompt'
+         send(master, 'exit')
+         break
+       if re.search(r'(?i)permission denied|authentication fail', tail):
++        why = 'auth-refused'
+         break
+   finally:
++    if attempt_log:
++      attempt_log.write(
++        'probe', 'end', elapsed_s=f'{time.time() - started:.1f}', already_promoted=promoted, why=why,
++        first_output_s='none' if first_output is None else f'{first_output:.1f}', bytes=len(transcript))
+     try:
+       os.close(master)
+     except OSError:
+@@ -185,32 +272,13 @@ def already_promoted(module: AnsibleModule) -> tuple:
+   return promoted, scrub(transcript, module.params['old_password'], new_password)
+ 
+ 
+-def promote_password(module: AnsibleModule) -> tuple[bool,str]:
+-  host = module.params['host']
+-  port = int(module.params['port'])
++def promote_password(module: AnsibleModule, attempt_log: 'AttemptLog | None' = None) -> tuple[bool,str]:
+   username = module.params['username']
+   old_password = module.params['old_password']
+   new_password = module.params['new_password']
+-  key_filename = str(module.params.get('key_filename') or '').strip()
+   timeout = int(module.params['timeout'])
+-  preferred_auth = 'publickey,keyboard-interactive,password' if key_filename else 'keyboard-interactive,password'
+-
+-  cmd = [
+-    'ssh',
+-    '-tt',
+-    '-p', str(port),
+-    '-o', f'PreferredAuthentications={preferred_auth}',
+-    '-o', 'KbdInteractiveAuthentication=yes',
+-    '-o', 'NumberOfPasswordPrompts=3',
+-    '-o', f'PubkeyAuthentication={"yes" if key_filename else "no"}',
+-    '-o', 'StrictHostKeyChecking=no',
+-    '-o', 'UserKnownHostsFile=/dev/null',
+-    '-o', 'HostKeyAlgorithms=+ssh-rsa',
+-    '-o', 'LogLevel=ERROR',
+-  ]
+-  if key_filename:
+-    cmd += ['-o', 'IdentitiesOnly=yes', '-i', key_filename]
+-  cmd.append(f'{username}@{host}')
++  # ONE ssh invocation for the probe and the promotion (ssh_argv) -- the options were duplicated here verbatim.
++  cmd = ssh_argv(module)
+ 
+   pid, master = pty.fork()
+   if pid == 0:
+@@ -223,7 +291,11 @@ def promote_password(module: AnsibleModule) -> tuple[bool,str]:
+   sent_confirm = False
+   changed = False
+   exited = False
+-  deadline = time.time() + timeout
++  started = time.time()
++  first_output = None
++  if attempt_log:
++    attempt_log.write('promote', 'start', budget_s=timeout)
++  deadline = started + timeout
+ 
+   try:
+     while time.time() < deadline:
+@@ -242,6 +314,8 @@ def promote_password(module: AnsibleModule) -> tuple[bool,str]:
+       if not chunk:
+         continue
+ 
++      if first_output is None:
++        first_output = time.time() - started
+       transcript += chunk
+       tail = transcript[-2048:]
+ 
+@@ -289,10 +363,16 @@ def promote_password(module: AnsibleModule) -> tuple[bool,str]:
+           pass
+         break
+ 
++    if attempt_log:
++      attempt_log.write(
++        'promote', 'end', elapsed_s=f'{time.time() - started:.1f}', changed=changed,
++        saw_old_prompt=sent_old, saw_new_prompt=sent_new, saw_confirm_prompt=sent_confirm,
++        first_output_s='none' if first_output is None else f'{first_output:.1f}', bytes=len(transcript))
+     if not changed:
+       module.fail_json(
+         msg='PAN-OS password promotion did not observe the Password changed signal',
+-        transcript=scrub(transcript,old_password,new_password))
++        transcript=scrub(transcript,old_password,new_password),
++        attempt_log=attempt_log.text() if attempt_log else '')
+ 
+     return True,scrub(transcript,old_password,new_password)
+   finally:
+@@ -331,18 +411,21 @@ def main() -> None:
+       'new_password': { 'required': True, 'type': 'str', 'no_log': True },
+       'key_filename': { 'required': False, 'type': 'str' },
+       'timeout': { 'required': False, 'type': 'int', 'default': 180 },
++      'attempt_log': { 'required': False, 'type': 'str' },
+     },
+     supports_check_mode=False)
+ 
+-  promoted, probe_transcript = already_promoted(module)
++  attempt_log = AttemptLog(attempt_log_path(module))
++  promoted, probe_transcript = already_promoted(module, attempt_log)
+   if promoted:
+     module.exit_json(
+       changed=False,
+       transcript=probe_transcript,
++      attempt_log=attempt_log.text(),
+       msg='PAN-OS admin password is already the configured one; nothing to promote')
+ 
+-  changed,transcript = promote_password(module)
+-  module.exit_json(changed=changed, transcript=transcript)
++  changed,transcript = promote_password(module, attempt_log)
++  module.exit_json(changed=changed, transcript=transcript, attempt_log=attempt_log.text())
+ 
+ 
+ if __name__ == '__main__':
 diff --git a/netsim/ansible/library/panos_cli_config_kne.py b/netsim/ansible/library/panos_cli_config_kne.py
 index 444f528..df573ed 100644
 --- a/netsim/ansible/library/panos_cli_config_kne.py
@@ -218,10 +482,45 @@ index 0000000..2549604
 +        SKYFORGE_PANOS_SINGLE_COMMIT to get a commit (and a failure) per lane. Device transcript tail:
 +        {{ (ansible_failed_result.transcript | default(''))[-1500:] }}
 diff --git a/netsim/ansible/tasks/panos/initial.yml b/netsim/ansible/tasks/panos/initial.yml
-index 9d1582d..109d2fd 100644
+index 0aef208..109d2fd 100644
 --- a/netsim/ansible/tasks/panos/initial.yml
 +++ b/netsim/ansible/tasks/panos/initial.yml
-@@ -245,5 +245,15 @@
+@@ -30,6 +30,15 @@
+       password promotion has no endpoint to reach. Check the node's KNE
+       services in topology.pb.txt.
+ 
++# PER-ATTEMPT LOG OF THE PROMOTION (SKYFORGE-SPECIFIC, instrumentation only).
++# panos_admpwd_kne appends one line per probe/promote phase boundary to this file (UTC time, attempt number,
++# elapsed, time to first byte, why the phase ended) and the report task below prints it, so the next boot shows
++# when the guest actually started answering. Fresh file per play so a reconfigure does not inherit old attempts.
++- name: Reset the PAN-OS promotion attempt log
++  ansible.builtin.file:
++    path: "/tmp/skyforge-panos-promotion-{{ inventory_hostname }}.log"
++    state: absent
++
+ - name: Wait for the PAN-OS SSH endpoint to accept connections
+   ansible.builtin.wait_for:
+     host: "{{ ansible_host }}"
+@@ -75,6 +84,7 @@
+     old_password: admin
+     new_password: "{{ ansible_password }}"
+     key_filename: "{{ ansible_ssh_private_key_file | default(omit) }}"
++    attempt_log: "/tmp/skyforge-panos-promotion-{{ inventory_hostname }}.log"
+     # POLL FINELY, DO NOT WAIT COARSELY. timeout is the budget for ONE attempt,
+     # and a device that is not up yet burns ALL of it before failing -- so at
+     # 300s + 30s delay each retry cost 5.5 MINUTES and the ceiling was 55.
+@@ -96,6 +106,10 @@
+   retries: 50
+   delay: 10
+ 
++- name: Report the PAN-OS promotion attempts (when did the guest start answering?)
++  ansible.builtin.debug:
++    msg: "{{ lookup('file', '/tmp/skyforge-panos-promotion-' ~ inventory_hostname ~ '.log', errors='ignore') | default('no attempt log was written', true) }}"
++
+ # THE AUTOCOMMIT GATE, OVER THE SAME SSH SESSION EVERYTHING ELSE USES.
+ #
+ # A cold PAN-OS refuses every user commit until its first-boot AutoCom job
+@@ -231,5 +245,15 @@
      username: "{{ ansible_user }}"
      password: "{{ ansible_password }}"
      lines: "{{ panos_initial_config.splitlines() }}"
@@ -259,6 +558,100 @@ index f98b314..b6615eb 100644
 +  ansible.builtin.set_fact:
 +    panos_commit_pending: true
 +    panos_pending_lanes: "{{ (panos_pending_lanes | default([])) + [netsim_action | default('routing')] }}"
+diff --git a/netsim/ansible/templates/initial/ios.j2 b/netsim/ansible/templates/initial/ios.j2
+index e8d8ff0..a489216 100644
+--- a/netsim/ansible/templates/initial/ios.j2
++++ b/netsim/ansible/templates/initial/ios.j2
+@@ -20,6 +20,28 @@ ip ssh authentication-retries 3
+ {{ enable_debugging(ios.debug,prefix='do debug') }}
+ !
+ {% endif %}
++{% if netlab_device_type in ['iol','ioll2'] %}
++{#
++    SKYFORGE-SPECIFIC. Arms the device-side revert timer for change control. napalm's commit_config(revert_in=N) on
++    IOS is `configure replace ... revert timer N`, which refuses to run without an `archive` stanza. IOL has no
++    flash:, nvram: or bootflash: for it: `path unix:` is the only path the image accepts (measured 2026-10-09 on
++    demo-lab, IOL 17.18.2). Config backups land under the lab's own filesystem and die with the lab.
++#}
++archive
++ path unix:skyforge-archive
++!
++{% endif %}
++{% if netlab_device_type == 'cat8000v' %}
++{#
++    SKYFORGE-SPECIFIC. Same revert-timer prerequisite as the iol block above, on IOS-XE. A Rollback Confirmed Change is
++    refused until `archive` carries a path ("%Turn config archive on before using Rollback Confirmed Change", cat8000v
++    17.18.03a, 2026-10-24). The device's own file system here is bootflash: (unix: is IOL's). Rendered at day 0 so the
++    stanza is part of the approved baseline, not written by the change applier.
++#}
++archive
++ path bootflash:skyforge-archive
++!
++{% endif %}
+ lldp run
+ {#
+   CDP is OFF by default, as upstream has it (#3807). netlab_cdp_enable -- a
+diff --git a/netsim/ansible/templates/initial/junos/skyforge-day0-commit.j2 b/netsim/ansible/templates/initial/junos/skyforge-day0-commit.j2
+new file mode 100644
+index 0000000..32ed7b0
+--- /dev/null
++++ b/netsim/ansible/templates/initial/junos/skyforge-day0-commit.j2
+@@ -0,0 +1,37 @@
++{#
++    SKYFORGE-SPECIFIC. A NORMALISING COMMIT AT THE END OF DAY-0.
++
++    The KubeVirt Junos images (vjunos-router, vjunos-switch, vsrx) boot this file as their whole
++    configuration: the device loads it at boot ("by root via other") and that load is rollback 0. Its
++    STORED text is not what `show configuration` renders afterwards (no version line, no assigned uid,
++    password hashes as the load produced them). So the first held change after boot has a rollback 1
++    that never digests as the running config, and the config-push executor refuses to revert it from
++    the platform (live 2026-11-01, run 1b51663c on cp-vjrouter-r1: "junos rollback 1 is not the
++    pre-change config"); only the device's own commit-confirmed timer could undo it.
++
++    This event policy makes the device commit ONCE, about a minute after boot, from its own running
++    configuration. The commit removes the policy itself, so the running config is the netlab config
++    and nothing else, and rollback 0 is then a rendering of that config: the next change's rollback 1
++    digests exactly as the pre-change running config, and the platform revert works from the first change.
++    No change of configuration content is made by this commit other than deleting the policy.
++
++    NO commit-options log. A log line is printed under the entry in `show system commit`, and the
++    config-push executor reads that list fail-closed: live 2026-11-01 (run 7a7099e8) it refused the
++    first change on "unexpected line" for exactly that text, before anything was committed.
++#}
++event-options {
++    generate-event {
++        skyforge-day0-commit time-interval 60;
++    }
++    policy skyforge-day0-commit {
++        events skyforge-day0-commit;
++        then {
++            change-configuration {
++                commands {
++                    "delete event-options policy skyforge-day0-commit";
++                    "delete event-options generate-event skyforge-day0-commit";
++                }
++            }
++        }
++    }
++}
+diff --git a/netsim/ansible/templates/initial/vjunos-router.j2 b/netsim/ansible/templates/initial/vjunos-router.j2
+index 966b3d6..564cafa 100644
+--- a/netsim/ansible/templates/initial/vjunos-router.j2
++++ b/netsim/ansible/templates/initial/vjunos-router.j2
+@@ -173,3 +173,4 @@ routing-instances {
+     }
+   }
+ }
++{% include 'initial/junos/skyforge-day0-commit.j2' %}
+diff --git a/netsim/ansible/templates/initial/vsrx.j2 b/netsim/ansible/templates/initial/vsrx.j2
+index a6abec0..4012b31 100644
+--- a/netsim/ansible/templates/initial/vsrx.j2
++++ b/netsim/ansible/templates/initial/vsrx.j2
+@@ -211,3 +211,4 @@ routing-instances {
+     }
+   }
+ }
++{% include 'initial/junos/skyforge-day0-commit.j2' %}
 diff --git a/tests/test_panos_initial_gates.py b/tests/test_panos_initial_gates.py
 index 56d3486..75f2b9e 100644
 --- a/tests/test_panos_initial_gates.py
@@ -283,6 +676,204 @@ index 56d3486..75f2b9e 100644
    when = str(deploy.get("when"))
    assert "trim" in when and "length" in when, "empty renders must deploy nothing"
  
+diff --git a/tests/test_panos_promotion_log.py b/tests/test_panos_promotion_log.py
+new file mode 100644
+index 0000000..07e3b1d
+--- /dev/null
++++ b/tests/test_panos_promotion_log.py
+@@ -0,0 +1,192 @@
++"""PAN-OS password promotion: the per-attempt log (SKYFORGE-SPECIFIC instrumentation).
++
++The requirement: after a boot, the attempt log must say WHEN the guest started answering, per attempt and per phase
++(the already-promoted probe and the promotion each have their own budget), without ever changing what the module does
++and without ever carrying a password. The subject is driven through its real pty/ssh transport; only the `ssh`
++program is replaced (the module exposes ssh_argv as the single source of the command) by a scripted endpoint.
++"""
++
++import importlib.util
++import re
++import sys
++import textwrap
++from pathlib import Path
++
++import pytest
++
++LIB = Path(__file__).parent.parent / "netsim" / "ansible" / "library" / "panos_admpwd_kne.py"
++
++NEW = "Admin@123"
++OLD = "admin"
++
++FAKE_SSH = textwrap.dedent(
++    r'''
++    import sys, time
++    mode = sys.argv[1]
++    def say(text):
++        sys.stdout.write(text); sys.stdout.flush()
++    if mode == "silent":
++        time.sleep(30)
++    elif mode == "promoted":
++        time.sleep(0.3)
++        say("Warning: Permanently added\nadmin@10.0.0.1's password: ")
++        sys.stdin.readline()
++        say("\nadmin@PA-VM> ")
++        sys.stdin.readline()
++    elif mode == "factory":
++        # ready device that still wants the factory credential: first the probe (new password) is answered with the
++        # forced-change dialog, then the promotion walks it.
++        say("admin@10.0.0.1's password: ")
++        sys.stdin.readline()
++        say("\nEnter old password : ")
++        sys.stdin.readline()
++        say("\nEnter new password : ")
++        sys.stdin.readline()
++        say("\nConfirm password   : ")
++        sys.stdin.readline()
++        say("\nPassword changed\nadmin@PA-VM> ")
++        time.sleep(1)
++    '''
++)
++
++
++@pytest.fixture()
++def lib(tmp_path):
++    spec = importlib.util.spec_from_file_location("panos_admpwd_kne_under_test", LIB)
++    mod = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(mod)
++    script = tmp_path / "fake_ssh.py"
++    script.write_text(FAKE_SSH)
++    mod._fake_script = str(script)
++    return mod
++
++
++class FailJson(Exception):
++    def __init__(self, kwargs):
++        super().__init__(kwargs.get("msg"))
++        self.kwargs = kwargs
++
++
++class FakeModule:
++    def __init__(self, tmp_path, timeout=20):
++        self.params = {
++            "host": "10.0.0.1", "port": 22, "username": "admin", "old_password": OLD, "new_password": NEW,
++            "key_filename": None, "timeout": timeout, "attempt_log": str(tmp_path / "promotion.log"),
++        }
++
++    def fail_json(self, **kwargs):
++        raise FailJson(kwargs)
++
++
++def point_at(lib, monkeypatch, mode):
++    monkeypatch.setattr(lib, "ssh_argv", lambda module: [sys.executable, "-u", lib._fake_script, mode])
++
++
++def lines_of(path):
++    return Path(path).read_text().splitlines()
++
++
++def field(line, key):
++    match = re.search(rf" {key}=(\S+)", line)
++    assert match, f"{key} missing from {line!r}"
++    return match.group(1)
++
++
++def test_probe_logs_start_end_elapsed_first_output_and_why(lib, monkeypatch, tmp_path):
++    point_at(lib, monkeypatch, "promoted")
++    module = FakeModule(tmp_path)
++    log = lib.AttemptLog(lib.attempt_log_path(module))
++    promoted, _ = lib.already_promoted(module, log)
++    assert promoted is True
++    start, end = lines_of(module.params["attempt_log"])
++    assert " phase=probe event=start" in start and field(start, "attempt") == "1"
++    assert " phase=probe event=end" in end
++    assert field(end, "already_promoted") == "True" and field(end, "why") == "cli-prompt"
++    assert float(field(end, "first_output_s")) >= 0.3, "time to first byte is what says the guest answered"
++    assert float(field(end, "elapsed_s")) >= float(field(end, "first_output_s"))
++    # RFC3339-ish UTC stamp with milliseconds leads every line
++    assert re.match(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z promotion ", start)
++
++
++def test_silent_endpoint_is_logged_as_no_output_and_deadline(lib, monkeypatch, tmp_path):
++    point_at(lib, monkeypatch, "silent")
++    module = FakeModule(tmp_path, timeout=2)
++    log = lib.AttemptLog(lib.attempt_log_path(module))
++    promoted, _ = lib.already_promoted(module, log)
++    assert promoted is False
++    end = lines_of(module.params["attempt_log"])[-1]
++    assert field(end, "why") == "deadline" and field(end, "first_output_s") == "none"
++    assert float(field(end, "elapsed_s")) >= 2.0
++
++
++def test_attempts_are_numbered_across_calls_and_the_clock_runs_from_the_first(lib, monkeypatch, tmp_path):
++    point_at(lib, monkeypatch, "promoted")
++    module = FakeModule(tmp_path)
++    for _ in range(3):
++        log = lib.AttemptLog(lib.attempt_log_path(module))
++        lib.already_promoted(module, log)
++    starts = [l for l in lines_of(module.params["attempt_log"]) if "event=start" in l]
++    assert [field(l, "attempt") for l in starts] == ["1", "2", "3"]
++    since = [float(field(l, "since_first_s")) for l in starts]
++    assert since[0] == 0.0 and since == sorted(since) and since[2] > 0
++
++
++def test_factory_device_logs_probe_refusal_then_a_successful_promotion(lib, monkeypatch, tmp_path):
++    point_at(lib, monkeypatch, "factory")
++    module = FakeModule(tmp_path)
++    log = lib.AttemptLog(lib.attempt_log_path(module))
++    promoted, _ = lib.already_promoted(module, log)
++    assert promoted is False
++    changed, _ = lib.promote_password(module, log)
++    assert changed is True
++    text = "\n".join(lines_of(module.params["attempt_log"]))
++    assert "phase=probe event=end" in text and "why=factory-password-prompt" in text
++    promote_end = [l for l in lines_of(module.params["attempt_log"]) if "phase=promote event=end" in l][0]
++    assert field(promote_end, "changed") == "True" and field(promote_end, "saw_old_prompt") == "True"
++    assert field(promote_end, "saw_confirm_prompt") == "True"
++
++
++def test_a_failed_promotion_carries_the_attempt_log_in_the_failure(lib, monkeypatch, tmp_path):
++    point_at(lib, monkeypatch, "silent")
++    module = FakeModule(tmp_path, timeout=2)
++    log = lib.AttemptLog(lib.attempt_log_path(module))
++    lib.already_promoted(module, log)
++    with pytest.raises(FailJson) as failure:
++        lib.promote_password(module, log)
++    carried = failure.value.kwargs["attempt_log"]
++    assert "phase=probe event=end" in carried and "phase=promote event=end" in carried
++    assert "changed=False" in carried
++
++
++def test_no_password_ever_reaches_the_log(lib, monkeypatch, tmp_path):
++    point_at(lib, monkeypatch, "factory")
++    module = FakeModule(tmp_path)
++    log = lib.AttemptLog(lib.attempt_log_path(module))
++    lib.already_promoted(module, log)
++    lib.promote_password(module, log)
++    blob = Path(module.params["attempt_log"]).read_text() + log.text()
++    assert NEW not in blob and "Enter old password" not in blob
++
++
++def test_an_unwritable_log_never_fails_the_promotion(lib, monkeypatch, tmp_path):
++    point_at(lib, monkeypatch, "promoted")
++    module = FakeModule(tmp_path)
++    module.params["attempt_log"] = str(tmp_path / "no-such-dir" / "x.log")
++    log = lib.AttemptLog(lib.attempt_log_path(module))
++    promoted, _ = lib.already_promoted(module, log)
++    assert promoted is True and log.text(), "the in-memory copy still serves the result"
++
++
++def test_default_log_path_is_per_endpoint(lib, tmp_path):
++    module = FakeModule(tmp_path)
++    module.params["attempt_log"] = None
++    assert lib.attempt_log_path(module) == "/tmp/skyforge-panos-promotion-10.0.0.1-22.log"
++
++
++def test_initial_yml_resets_passes_and_reports_the_log():
++    text = (Path(__file__).parent.parent / "netsim" / "ansible" / "tasks" / "panos" / "initial.yml").read_text()
++    assert "Reset the PAN-OS promotion attempt log" in text
++    assert text.index("Reset the PAN-OS promotion attempt log") < text.index("Wait for the PAN-OS SSH endpoint")
++    promo = text.index("Promote the PAN-OS admin password")
++    assert "attempt_log:" in text[promo : promo + 3500]
++    assert text.index("Report the PAN-OS promotion attempts") > promo
 diff --git a/tests/test_panos_single_commit.py b/tests/test_panos_single_commit.py
 new file mode 100644
 index 0000000..3405c1a

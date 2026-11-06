@@ -1,10 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
-Date: Sun, 4 Oct 2026 12:00:00 +0000
-Subject: [PATCH] asa: firewall.policy.mgmt_security_level sets Management0/0's
- security-level
-
-SKYFORGE-SPECIFIC: platform behaviour; not for upstream.
+Date: Thu, 19 Nov 2026 00:00:00 +0000
+Subject: [PATCH] asa: firewall.policy management security level and ACL names
+ from rules
 
 ---
 diff --git a/netsim/ansible/templates/initial/asa.j2 b/netsim/ansible/templates/initial/asa.j2
@@ -28,11 +26,30 @@ index 38dc225..1f435c1 100644
   ip address dhcp setroute
   no shutdown
  !
+diff --git a/netsim/extra/firewall/policy/asa.j2 b/netsim/extra/firewall/policy/asa.j2
+index 718a8a9..83f9752 100644
+--- a/netsim/extra/firewall/policy/asa.j2
++++ b/netsim/extra/firewall/policy/asa.j2
+@@ -81,7 +81,13 @@ same-security-traffic permit inter-interface
+ {%   endif %}
+ {% endfor %}
+ {% for zone in zones %}
+-{%   set aclname = (zone | upper) ~ '-IN' %}
++{#
++   firewall.policy.acl_name_from_rule: name the zone's ACL after its first rule (the source
++   ACL's own name, e.g. `routed_nets_to_internet`) instead of <ZONE>-IN. One ACL per
++   interface and direction, so a zone's rules are expected to share a name; the first one wins.
++#}
++{%   set _first = (firewall.policy.rules | default([]) | selectattr('from_zone', 'equalto', zone) | list | first) %}
++{%   set aclname = _first.name if (firewall.policy.acl_name_from_rule | default(false) and _first.name is defined) else (zone | upper) ~ '-IN' %}
+ {%   for policy in firewall.policy.rules | default([]) if policy.from_zone == zone %}
+ {%     for src in policy.src | default(['any']) %}
+ {%       for dst in policy.dst | default(['any']) %}
 diff --git a/netsim/extra/firewall/policy/defaults.yml b/netsim/extra/firewall/policy/defaults.yml
-index 0782777..bb670bc 100644
+index 0782777..7dfaba4 100644
 --- a/netsim/extra/firewall/policy/defaults.yml
 +++ b/netsim/extra/firewall/policy/defaults.yml
-@@ -56,6 +56,10 @@ attributes:
+@@ -56,6 +56,12 @@ attributes:
        # ASA only: interfaces at EQUAL security levels cannot talk without this.
        # It is a node-wide switch on the platform, not a per-rule one.
        same_security_traffic: bool
@@ -40,6 +57,8 @@ index 0782777..bb670bc 100644
 +      # implicit same/different-security-level deny entries are computed from every
 +      # nameif's level, the management one included.
 +      mgmt_security_level: { type: int, min_value: 0, max_value: 100 }
++      # ASA only: name each zone's ACL after its first rule (default: <ZONE>-IN).
++      acl_name_from_rule: bool
        # ASA only: protocol inspection engines enabled in the factory
        # global_policy / inspection_default class (MPF). `icmp` is what lets
        # echo-reply, time-exceeded and unreachable come back through a lower

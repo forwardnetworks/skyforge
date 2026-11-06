@@ -1,0 +1,2794 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 00:00:00 +0000
+Subject: [PATCH] routing: EIGRP VRF and redistribution, NX-OS vPC, OSPF
+ instances and distribute lists, BGP rr_group and prefix filters, eBGP
+ multihop, iBGP explicit source, DMVPN, fabric validation
+
+---
+diff --git a/docs/module/eigrp.md b/docs/module/eigrp.md
+index d20cfaa..8008434 100644
+--- a/docs/module/eigrp.md
++++ b/docs/module/eigrp.md
+@@ -10,6 +10,7 @@ Supported features:
+ * EIGRP AS number
+ * Unnumbered point-to-point interfaces (Cisco IOS-XE only)
+ * Passive interfaces
++* Route import (redistribution) from BGP
+ 
+ ## Global Parameters
+ 
+@@ -18,6 +19,32 @@ Supported features:
+ ## Node Parameters
+ 
+ * **eigrp.as** -- per-node EIGRP AS number (default: 1 -- inherited from global defaults)
++* **eigrp.import** -- routes to import into EIGRP. The source protocol is the
++  dictionary key; an optional **policy** selects a routing policy. Every import
++  must include an EIGRP composite **metric** with **bandwidth**, **delay**,
++  **reliability**, **load**, and **mtu** values.
++
++The following example redistributes BGP routes into EIGRP through a routing
++policy and redistributes EIGRP routes into BGP through another policy:
++
++```
++module: [ bgp, eigrp, routing ]
++bgp:
++  as: 65000
++  import:
++    eigrp: { policy: eigrp_to_bgp }
++eigrp:
++  as: 100
++  import:
++    bgp:
++      policy: bgp_to_eigrp
++      metric:
++        bandwidth: 100000
++        delay: 100
++        reliability: 255
++        load: 1
++        mtu: 1500
++```
+ 
+ ```{tip}
+ The EIGRP configuration module is automatically removed from a node that does not run EIGRP on any non-loopback interface. In that case, _netlab_ generates a warning that can be turned off by setting **‌defaults.eigrp.warnings.inactive** to **‌False**.
+@@ -215,4 +242,4 @@ links:
+ - r1
+ - r2
+ - s1
+-```
+\ No newline at end of file
++```
+diff --git a/docs/module/lag.md b/docs/module/lag.md
+index 89d072c..b5b0e88 100644
+--- a/docs/module/lag.md
++++ b/docs/module/lag.md
+@@ -12,6 +12,7 @@ LAG is currently supported on these platforms:
+ | Aruba AOS-CX [❗](caveats-aruba) | ✅ | ✅ | ✅ | ✅ |
+ | Cisco IOL L2[^iol2] | ✅ | ✅ | ✅ | ❌ |
+ | Cisco IOSV L2[^iol2]  | ✅ | ✅ | ✅ | ❌ |
++| Cisco Nexus OS        | ✅ | ✅ | ✅ | ✅ |
+ | Cumulus Linux 4.x     | ✅ | ✅ | ❌  | ❌ |
+ | Cumulus 5.x (NVUE)    | ✅ | ✅ | ❌  | ✅ |
+ | Dell OS10             | ✅ | ✅ | ✅  | ✅ |
+@@ -96,6 +97,11 @@ Node/interface level:
+ 
+ Link level:
+ * **lag.mlag.peergroup**: This parameter configures a unique peer group ID for the pair of MLAG switches. Can be set to *True* for auto-id generation or an integer (that must be globally unique)
++* **lag.mlag.peer_switch**: Use the same spanning-tree bridge identity on both MLAG peers (Cisco Nexus OS)
++* **lag.mlag.peer_gateway**: Allow a peer to forward packets addressed to the other peer's gateway MAC address (Cisco Nexus OS)
++* **lag.mlag.layer3_peer_router**: Allow routing-protocol adjacencies over a VLAN carried on the peer link (Cisco Nexus OS)
++
++_Netlab_ rejects the three domain options on platforms that do not advertise support for them.
+ 
+ A simple example:
+ ```
+@@ -120,6 +126,24 @@ links:
+     mlag.peergroup: True # (also) used to derive a unique MAC address for this group of MLAG peers
+ ```
+ 
++The following peer-link declaration creates Nexus vPC domain 10 with two
++physical peer-link members and the commonly used routing hardening options:
++
++```
++nodes:
++  s1: { device: nxos, module: [ lag ] }
++  s2: { device: nxos, module: [ lag ] }
++
++links:
++- lag:
++    members: [ s1-s2, s1-s2 ]
++    mlag:
++      peergroup: 10
++      peer_switch: true
++      peer_gateway: true
++      layer3_peer_router: true
++```
++
+ ### Advanced MLAG Parameters
+ 
+ The **lag.mlag.peer.backup_ip** _device feature_ specifies a property from the node data model that should be used to determine the MLAG peer's backup IP address (the IP address an MLAG node tries to reach when resolving a split-brain scenario). This parameter is part of the device features and can be changed only for a device type, not individual nodes.
+diff --git a/docs/module/routing-prefix.txt b/docs/module/routing-prefix.txt
+index 69a8771..0b7458a 100644
+--- a/docs/module/routing-prefix.txt
++++ b/docs/module/routing-prefix.txt
+@@ -39,6 +39,22 @@ routing.prefix:
+     prefix: [ pool.loopback, prefix.lb_c1, 2001:db8:cafe:2::/64 ]
+ ```
+ 
++(routing-prefix-name)=
++### Keeping the Declared Prefix-List Name
++
++_netlab_ appends the address family to every generated prefix list (`p1-ipv4`, see below). When the configured object must carry exactly the declared name -- for example, because a change-review workflow edits it by name -- specify the prefix filter as a dictionary with a **value** list and a **name**:
++
++```
++routing.prefix:
++  PARTNER-IN-V4:
++    name: PARTNER-IN-V4
++    value:
++    - prefix: 198.19.0.0/21
++    - { prefix: 0.0.0.0/0, max: 32, action: deny, sequence: 100 }
++```
++
++The **name** is used verbatim for every address family of that filter. It is accepted only on devices whose features declare `routing.prefix.name` (Cisco IOS/IOS XE: `ip prefix-list` and `ipv6 prefix-list` are separate namespaces); other devices report an error instead of silently generating the `-ipv4`/`-ipv6` names.
++
+ (routing-prefix-ds)=
+ ### Dual-Stack Prefix Lists
+ 
+diff --git a/docs/plugins/bgp.policy.md b/docs/plugins/bgp.policy.md
+index d4d5a8b..b6fc335 100644
+--- a/docs/plugins/bgp.policy.md
++++ b/docs/plugins/bgp.policy.md
+@@ -25,6 +25,7 @@ The plugin adds the following BGP link attributes:
+ * **bgp.locpref** is an integer attribute that sets default local preference when applied to a node, or sets local preference on BGP updates received from an EBGP neighbor.
+ * **bgp.med** is an integer attribute that sets the MED attribute on BGP updates sent to an EBGP neighbor.
+ * **bgp.policy** is a dictionary that applies [predefined routing policies](generic-routing-policies) to inbound (**in**) or outbound (**out**) BGP updates.
++* **bgp.prefix_filter** is a dictionary that applies [prefix filters](generic-routing-prefixes) directly to inbound (**in**) or outbound (**out**) BGP updates of an EBGP neighbor, without a route map (Cisco IOS/IOS XE `neighbor prefix-list`). Combine it with a [declared prefix-list name](routing-prefix-name) when the configured object must keep its declared name.
+ * **bgp.prepend** is a dictionary configuring outbound AS-path prepending. It can contain a **count** attribute (number of times the node AS is prepended) or a **path** attribute (the prepended AS-path as a string[^ASPS])
+ * **bgp.weight** is an integer attribute that sets per-neighbor weight.
+ * **bgp.role** -- the local BGP role for an EBGP session (RFC 9234). Specify a role name (**provider**, **customer**, **peer**, **rs-server**, **rs-client**) or a dictionary with **name** (same values) and optional **strict** set to _true_ for RFC 9234 strict mode.
+@@ -49,6 +50,7 @@ The following table describes where you could apply individual attributes:
+ | locpref    |  ✅  |    ✅     |  ❌  |
+ | med        |  ❌   |    ✅     |  ❌  |
+ | policy     |  ❌   |    ✅     |  ❌  |
++| prefix_filter |  ❌   |    ✅     |  ❌  |
+ | prepend    |  ❌   |    ✅     |  ❌  |
+ | role       |  ✅  |    ✅     |  ❌  |
+ | weight     |  ❌   |    ✅     |  ❌  |
+diff --git a/docs/plugins/ebgp.multihop.md b/docs/plugins/ebgp.multihop.md
+index 1ef94b8..b491fee 100644
+--- a/docs/plugins/ebgp.multihop.md
++++ b/docs/plugins/ebgp.multihop.md
+@@ -52,6 +52,24 @@ bgp.multihop.sessions:
+   r2:
+ ```
+ 
++## Session Address, TTL and One-Sided Sessions
++
++By default, a multihop session runs between the node loopbacks with the maximum TTL. Three optional attributes change that:
++
++* **multihop** (session attribute, integer): the TTL configured on the session (`ebgp-multihop <n>` on Cisco IOS). The default is 255.
++* **ipv4**/**ipv6** (endpoint attribute): the session address on that node, given as an address or a host prefix. The session is sourced from the interface that owns the address (or, when no interface does, from whatever the device picks). Without it, the node loopback is used.
++* **bgp: False** (endpoint attribute): a one-sided session. That node configures nothing; the other node gets a neighbor pointing at this endpoint's address. Use it to model a peer that has not configured its half of the session.
++
++```
++bgp.multihop.sessions:
++- sdwan-agg:
++    ipv4: 196.52.31.77
++  dc1-wan-1:
++    ipv4: 196.52.31.2
++    bgp: False
++  multihop: 2
++```
++
+ ## Integration with Other BGP Plugins
+ 
+ EBGP multihop plugin works together with **[bgp.session](bgp.session.md)** and **[bgp.policy](bgp.policy.md)** plugins, but has to be listed after them in the list of plugins:
+diff --git a/docs/plugins/tunnel.gre.md b/docs/plugins/tunnel.gre.md
+index 4e89830..d2f2200 100644
+--- a/docs/plugins/tunnel.gre.md
++++ b/docs/plugins/tunnel.gre.md
+@@ -19,6 +19,20 @@ The plugin includes Jinja2 templates for the following platforms:
+     'vrf' in tunnel.gre
+ ```
+ 
++
++| Operating system    | GRE over<br>IPv4 | GRE over<br>IPv6 | Transport<br>VRF |
++|--------------|:-:|:-:|:-:|
++| Arista EOS          | ✅ | ❌ | ✅ |
++| Cisco IOS/XE[^18v] |✅|✅|✅|
++| FRR                 |✅|✅|✅|
++| Juniper vJunos-switch[❗](caveats-junos) |✅|❌|✅|
++| Juniper vSRX[❗](caveats-junos) |✅|❌|✅|
++| Mikrotik RouterOS 7 |✅|✅|✅|
++| OpenBSD            |✅|❌|❌|
++| VyOS               |✅|✅|✅|
++
++[^18v]: Includes Cisco IOSv, Cisco IOSvL2, Cisco CSR 1000v, Cisco Catalyst 8000v, Cisco IOS-on-Linux (IOL), and IOL Layer-2 image.
++
+ ## Specifying Tunnel Parameters
+ 
+ The GRE tunnels are configured as [links](topo-links) with **tunnel.mode** attribute set to **gre**[^ATT].
+diff --git a/netsim/ansible/templates/eigrp/ios.j2 b/netsim/ansible/templates/eigrp/ios.j2
+index 089ba01..48dcec4 100644
+--- a/netsim/ansible/templates/eigrp/ios.j2
++++ b/netsim/ansible/templates/eigrp/ios.j2
+@@ -3,8 +3,21 @@
+ Configure IPv4 EIGRP
+ 
+ #}
+-{% if eigrp.af.ipv4 is defined %}
+-router eigrp {{ eigrp.as }}
++{% import "templates/routing/_redistribute.ios.j2" as redistribute with context %}
++{% set vrf_eigrp = (vrfs|default({})).items()|selectattr('1.eigrp','defined')|list %}
++{% set has_global = eigrp is defined and eigrp.af.ipv4 is defined %}
++{% if has_global or vrf_eigrp %}
++{#
++  A single `router eigrp <AS>` container holds both the global (no-VRF)
++  address-family and one `address-family ipv4 vrf <name> autonomous-system
++  <as>` block per VRF -- this is real Cisco IOS classic-mode EIGRP-in-VRF
++  syntax (verified against the seed's own capture: a csw NO-ENG box's
++  `router eigrp 100` / `address-family ipv4 vrf NO-ENG autonomous-system 100`
++  / network / passive-interface / `exit-address-family`), NOT a separate
++  `router eigrp <as> vrf <name>` per VRF the way `router ospf` works.
++#}
++router eigrp {{ eigrp.as if has_global else vrf_eigrp[0][1].eigrp.as }}
++{% if has_global %}
+ {% if eigrp.router_id is defined %}
+  eigrp router-id {{ eigrp.router_id }}
+ {% endif %}
+@@ -17,14 +30,37 @@ router eigrp {{ eigrp.as }}
+ {% if mgmt.ifname|default("") %}
+  passive-interface {{ mgmt.ifname }}
+ {% endif %}
++{% if eigrp.import is defined %}
++{{ redistribute.config(eigrp,af='ipv4',t_proto='eigrp') }}
++{% endif %}
++{% endif %}
++{% for vname,vdata in vrf_eigrp %}
++ !
++ address-family ipv4 vrf {{ vname }} autonomous-system {{ vdata.eigrp.as }}
++{% if vdata.eigrp.router_id is defined %}
++  eigrp router-id {{ vdata.eigrp.router_id }}
++{% endif %}
++{% for l in vdata.eigrp.interfaces|default([]) if 'ipv4' in l and l.ipv4 is string %}
++  network {{ l.ipv4|ansible.utils.ipaddr('address') }} 0.0.0.0
++{% endfor %}
++{% for l in vdata.eigrp.interfaces|default([]) if l.eigrp.passive|default(False) %}
++  passive-interface {{ l.ifname }}
++{% endfor %}
++{% if vdata.eigrp.import is defined %}
++{{ redistribute.config(vdata.eigrp,af='ipv4',t_proto='eigrp',vrf=vname) }}
++{% endif %}
++ exit-address-family
++{% endfor %}
+ !
+ {% endif %}
+ {#
+ 
+-Configure IPv6 EIGRP - totally separate configuration
++Configure IPv6 EIGRP - totally separate configuration. VRF-scoped IPv6 EIGRP
++is not modeled: no seed evidence for it in this blueprint, and inventing the
++syntax without a real capture to verify against would be a guess, not a fix.
+ 
+ #}
+-{% if eigrp.af.ipv6 is defined %}
++{% if eigrp is defined and eigrp.af.ipv6 is defined %}
+ ipv6 router eigrp {{ eigrp.as }}
+ {% if eigrp.router_id is defined %}
+  eigrp router-id {{ eigrp.router_id }}
+@@ -33,6 +69,9 @@ ipv6 router eigrp {{ eigrp.as }}
+ {% for l in netlab_interfaces|default([]) if 'eigrp' in l and l.eigrp.passive %}
+  passive-interface {{ l.ifname }}
+ {% endfor %}
++{% if eigrp.import is defined %}
++{{ redistribute.config(eigrp,af='ipv6',t_proto='eigrp') }}
++{% endif %}
+ !
+ {% for l in netlab_interfaces|default([]) if 'eigrp' in l and 'ipv6' in l %}
+ interface {{ l.ifname }}
+diff --git a/netsim/ansible/templates/eigrp/nxos.j2 b/netsim/ansible/templates/eigrp/nxos.j2
+index 1e8e61f..95dcbb3 100644
+--- a/netsim/ansible/templates/eigrp/nxos.j2
++++ b/netsim/ansible/templates/eigrp/nxos.j2
+@@ -1,11 +1,44 @@
++{% import "templates/routing/_route_map_ios.j2" as routemap with context %}
++{% macro metric(data) -%}
++{{ data.metric.bandwidth }} {{ data.metric.delay }} {{ data.metric.reliability }} {{ data.metric.load }} {{ data.metric.mtu }}
++{%- endmacro %}
++{% macro policy_name(source,data,af) -%}
++{{ data.policy|default('import-' ~ source) }}-eigrp-{{ af }}
++{%- endmacro %}
++{# NX-OS requires the EIGRP composite metric in the redistribution route-map #}
++{% for af in ['ipv4','ipv6'] if af in eigrp.af %}
++{%   for source,data in eigrp.import|default({})|dictsort %}
++{%     set pname = policy_name(source,data,af) %}
++{%     if data.policy is defined %}
++{%       call(p_entry,match_af) routemap.build_route_map(pname,routing.policy[data.policy],af) -%}
++{{         routemap.common_route_map_entry(p_entry,match_af) }}
++{%         if p_entry.action|default('permit') != 'deny' %}
++  set metric {{ metric(data) }}
++{%         endif %}
++{%-      endcall %}
++{%     else %}
++route-map {{ pname }} permit 10
++  set metric {{ metric(data) }}
++{%     endif %}
++{%   endfor %}
++{% endfor %}
++!
+ feature eigrp
+ !
+ router eigrp {{ eigrp.as }}
+ {% if eigrp.router_id is defined %}
+  router-id {{ eigrp.router_id }}
+ {% endif %}
++{% if 'ipv4' in eigrp.af %}
++{%   for source,data in eigrp.import|default({})|dictsort %}
++ redistribute {{ source }}{% if source == 'bgp' %} {{ bgp.as }}{% endif %} route-map {{ policy_name(source,data,'ipv4') }}
++{%   endfor %}
++{% endif %}
+ {% if 'ipv6' in eigrp.af %}
+  address-family ipv6 unicast
++{%   for source,data in eigrp.import|default({})|dictsort %}
++  redistribute {{ source }}{% if source == 'bgp' %} {{ bgp.as }}{% endif %} route-map {{ policy_name(source,data,'ipv6') }}
++{%   endfor %}
+ {% endif %}
+ !
+ {% for l in netlab_interfaces|default([]) if 'eigrp' in l %}
+diff --git a/netsim/ansible/templates/lag/nxos.j2 b/netsim/ansible/templates/lag/nxos.j2
+new file mode 100644
+index 0000000..b938dd4
+--- /dev/null
++++ b/netsim/ansible/templates/lag/nxos.j2
+@@ -0,0 +1,71 @@
++{% set vpc = namespace(enabled=false) %}
++{% for intf in interfaces if intf.lag.mlag.peergroup is defined %}
++{%   set vpc.enabled = true %}
++{% endfor %}
++feature lacp
++{% if vpc.enabled %}
++feature vpc
++{% endif %}
++!
++{# Provision the vPC domain and peer link #}
++{% for intf in interfaces if intf.lag.mlag.peergroup is defined %}
++vpc domain {{ intf.lag.mlag.peergroup }}
++{%   if intf.lag.mlag.peer_switch|default(false) %}
++ peer-switch
++{%   endif %}
++{%   if intf.lag.mlag.peer_gateway|default(false) %}
++ peer-gateway
++{%   endif %}
++{%   if intf.lag.mlag.layer3_peer_router|default(false) %}
++ layer3 peer-router
++{%   endif %}
++!
++interface port-channel{{ intf.lag.mlag.ifindex }}
++ description vPC peer-link
++ switchport mode trunk
++ spanning-tree port type network
++ vpc peer-link
++!
++{%   for ch in interfaces if ch==intf or ch.lag._peerlink|default(0) == intf.linkindex %}
++interface {{ ch.ifname }}
++ description {{ ch.name }} (vPC peer-link member)
++ switchport mode trunk
++ channel-group {{ intf.lag.mlag.ifindex }} mode active
++!
++{%   endfor %}
++{% endfor %}
++
++{# Regular port channels, including downstream vPCs #}
++{% for intf in interfaces if intf.type == 'lag' %}
++interface {{ intf.ifname }}
++{%   if '_mlag' in intf.lag %}
++ description {{ intf.name }} (vPC {{ intf.lag.ifindex }})
++{#   NX-OS interfaces default to L3 and 'vpc' is accepted only on an L2 port-channel #}
++ switchport
++ vpc {{ intf.lag.ifindex }}
++{%   else %}
++ description {{ intf.name }}
++{%     if 'ipv4' in intf or 'ipv6' in intf %}
++ no switchport
++{%     endif %}
++{%   endif %}
++!
++{%   for ch in interfaces if ch.lag._parentindex|default(None) == intf.lag.ifindex %}
++{%     set lag_mode =
++         'on' if intf.lag.lacp|default('') == 'off' else
++         'active' if intf.lag.lacp_mode|default('') == 'active' else
++         'passive' %}
++interface {{ ch.ifname }}
++ description {{ ch.name }} in channel-group {{ intf.lag.ifindex }}
++{%     if 'ipv4' in intf or 'ipv6' in intf %}
++ no switchport
++{%     elif '_mlag' in intf.lag %}
++ switchport
++{%     endif %}
++ channel-group {{ intf.lag.ifindex }} mode {{ lag_mode }}
++{%     if intf.lag.lacp|default('') == 'fast' %}
++ lacp rate fast
++{%     endif %}
++!
++{%   endfor %}
++{% endfor %}
+diff --git a/netsim/ansible/templates/ospf/ios.ospfv2.j2 b/netsim/ansible/templates/ospf/ios.ospfv2.j2
+index 4282f90..a958a3f 100644
+--- a/netsim/ansible/templates/ospf/ios.ospfv2.j2
++++ b/netsim/ansible/templates/ospf/ios.ospfv2.j2
+@@ -13,6 +13,12 @@ router ospf {{ ospf_pid }}
+ {% if ospf_data.reference_bandwidth is defined %}
+  auto-cost reference-bandwidth {{ ospf_data.reference_bandwidth }}
+ {% endif %}
++{% if ospf_data.distribute_list is defined %}
++{#  routing/acl.ios.j2 renders the ACL named by ospf.distribute_list as an
++    IPv4 standard ACL under its own unsuffixed name (not <name>_ipv4): IOS
++    rejects an OSPF distribute-list that names an extended ACL. #}
++ distribute-list {{ ospf_data.distribute_list }} in
++{% endif %}
+ {% for l in intf_data if l.ospf.passive|default(False) %}
+  passive-interface {{ l.ifname }}
+ {% endfor %}
+diff --git a/netsim/ansible/templates/routing/_prefix_list_ios.j2 b/netsim/ansible/templates/routing/_prefix_list_ios.j2
+index 651bdc9..ce202e8 100644
+--- a/netsim/ansible/templates/routing/_prefix_list_ios.j2
++++ b/netsim/ansible/templates/routing/_prefix_list_ios.j2
+@@ -2,12 +2,15 @@
+ {%-  if 'min' in p_entry %} ge {{ p_entry.min }}{% endif -%}
+ {%-  if 'max' in p_entry %} le {{ p_entry.max }}{% endif -%}
+ {%- endmacro -%}
++{# routing._prefix_name[af][name] is the device-visible list name ('<name>-<af>' unless the
++   filter declared a name and the device accepts it) -- built by netsim/modules/routing/prefix.py #}
++{% set pfx_names = routing._prefix_name|default({}) %}
+ {% for pf_af in af if pf_af in routing._prefix|default({}) %}
+ {%   for p_name,p_value in routing._prefix[pf_af].items() %}
+ !
+ {%     for p_entry in p_value %}
+-{{ 'ip' if pf_af == 'ipv4' else pf_af }} prefix-list {{ p_name
+-  }}-{{ pf_af }} seq {{ p_entry.sequence }} {{ p_entry.action
++{{ 'ip' if pf_af == 'ipv4' else pf_af }} prefix-list {{ pfx_names.get(pf_af,{}).get(p_name,p_name ~ '-' ~ pf_af)
++  }} seq {{ p_entry.sequence }} {{ p_entry.action
+   }} {{ p_entry[pf_af] }}{{ min_max(p_entry) }}
+ {%     endfor %}
+ {%   endfor %}
+diff --git a/netsim/ansible/templates/routing/_redistribute.nxos.j2 b/netsim/ansible/templates/routing/_redistribute.nxos.j2
+new file mode 100644
+index 0000000..15591ad
+--- /dev/null
++++ b/netsim/ansible/templates/routing/_redistribute.nxos.j2
+@@ -0,0 +1,12 @@
++{% macro policy(sp_data,af) -%}
++  {% if 'policy' in sp_data %} route-map {{ sp_data.policy }}-{{ af }}{% endif +%}
++{%- endmacro %}
++{% macro config(pdata,af='ipv4') -%}
++{%   for s_proto,s_data in pdata.import.items() %}
++{%     set sp_config = s_proto %}
++{%     if s_proto == 'eigrp' %}
++{%       set sp_config = sp_config + ' ' + eigrp.as|string %}
++{%     endif %}
++  redistribute {{ sp_config }}{{ policy(s_data,af) }}
++{%   endfor %}
++{%- endmacro %}
+diff --git a/netsim/ansible/templates/routing/_route_map_ios.j2 b/netsim/ansible/templates/routing/_route_map_ios.j2
+index 04a52d0..647a78c 100644
+--- a/netsim/ansible/templates/routing/_route_map_ios.j2
++++ b/netsim/ansible/templates/routing/_route_map_ios.j2
+@@ -53,7 +53,8 @@ that use "industry standard" CLI (IOS, IOS-XE, FRR, Cumulus, Arista)
+ {%   if 'match' in p_entry %}
+ {%     set ipkwd = 'ip' if match_af == 'ipv4' else 'ipv6' %}
+ {%     if 'prefix' in p_entry.match %}
+-  match {{ ipkwd }} address prefix-list {{ p_entry.match.prefix }}-{{ match_af }}
++{%       set pfx_names = routing._prefix_name|default({}) %}
++  match {{ ipkwd }} address prefix-list {{ pfx_names.get(match_af,{}).get(p_entry.match.prefix,p_entry.match.prefix ~ '-' ~ match_af) }}
+ {%     endif %}
+ {%     if 'aspath' in p_entry.match %}
+ {%       set acl_num = p_entry.match.aspath
+diff --git a/netsim/ansible/templates/routing/acl.ios.j2 b/netsim/ansible/templates/routing/acl.ios.j2
+index 89d73c4..99edcaf 100644
+--- a/netsim/ansible/templates/routing/acl.ios.j2
++++ b/netsim/ansible/templates/routing/acl.ios.j2
+@@ -12,9 +12,30 @@
+ {%- endif -%}
+ {% endmacro %}
+ 
++{#
++  ACLs referenced by ospf.distribute_list are rendered as IPv4 STANDARD ACLs
++  under their own (unsuffixed) name: IOS resolves `distribute-list <name> in`
++  under `router ospf` to a standard ACL and refuses the command ("ACL cannot be
++  created or an ACL with the same name but incompatible type already exists")
++  when <name> is an extended ACL. ospf.py has already verified the ACL only
++  uses standard-ACL match fields and is not also attached to an interface.
++#}
++{% set std_acl = [ ospf.distribute_list ] if ospf.distribute_list is defined else [] %}
+ {% if routing.acl is defined %}
+ {%  for acl_af, acl_data in routing._acl.items() %}
+ {%    for name, acl_list in acl_data.items() %}
++{%      if name in std_acl %}
++{%        if acl_af == 'ipv4' %}
++ip access-list standard {{ name }}
++{%          for e in acl_list %}
++{%            if e.description is defined %}
++ remark {{ e.description }}
++{%            else %}
++ {{ e.action }}{{ r_acl_addr(e.src, acl_af) }}{{ " log" if e.log is defined else "" }}
++{%            endif %}
++{%          endfor %}
++{%        endif %}
++{%      else %}
+ {%      set cmd = "ipv6" if acl_af == "ipv6" else "ip" %}
+ {%      set seqcmd = "sequence " if acl_af == "ipv6" else "" %}
+ {%      set ext = " extended" if acl_af == "ipv4" else "" %}
+@@ -35,6 +56,7 @@
+       r_acl_port(e.dst) }}{{ est }}{{ log }}
+ {%        endif %}
+ {%      endfor %}
++{%      endif %}
+ {%    endfor %}
+ {%  endfor %}
+ {% endif %}
+diff --git a/netsim/devices/asav.yml b/netsim/devices/asav.yml
+index 9c8670c..5ee4a97 100644
+--- a/netsim/devices/asav.yml
++++ b/netsim/devices/asav.yml
+@@ -71,6 +71,14 @@ features:
+       core: caveats-asav
+     unnumbered: false
+     import: [ bgp, connected, static, no_policy ]
++    # ospf.default (default-information originate) -- ospf/asa.ospfv2.j2
++    # already renders it (always/metric/metric-type). Only the feature flag
++    # was missing, so _routing.default_route_adjust rejected it upstream of
++    # the template ever running: "Device asav cannot originate ospf default
++    # route in global routing table". Needed for a dual-process ASA WAN edge
++    # (ospf.instances) where the ISP-facing process originates the default
++    # and the inside process never should.
++    default: true
+     password: true
+     priority: true
+     timers: true
+diff --git a/netsim/devices/ios.yml b/netsim/devices/ios.yml
+index f1811e1..fb9df2d 100644
+--- a/netsim/devices/ios.yml
++++ b/netsim/devices/ios.yml
+@@ -44,6 +44,7 @@ features:
+     local_as: true
+     vrf_local_as: true
+     local_as_ibgp: true
++    import: [ ospf, isis, eigrp, ripv2, connected, static, vrf ]
+     community:
+       standard: [ standard ]
+       extended: [ extended ]
+@@ -66,6 +67,7 @@ features:
+     timers: true
+     _default_locpref: true
+     aggregate: true
++    prefix_filter: true     # neighbor X prefix-list NAME in|out (bgp.policy)
+     bandwidth:
+       in: auto
+     multihop.vrf: true
+@@ -77,7 +79,8 @@ features:
+     relay: true
+     vrf: true
+     server: true
+-  eigrp: true
++  eigrp:
++    import: [ bgp, ospf, static, connected ]
+   initial:
+     ipv4:
+       unnumbered: [ tunnel ]
+@@ -117,8 +120,9 @@ features:
+       file_transfer: true
+   ospf:
+     unnumbered: true
+-    import: [ bgp, isis, ripv2, connected, static, vrf ]
++    import: [ bgp, isis, ripv2, connected, static, vrf, eigrp ]
+     default.policy: true
++    distribute_list: true
+     password: true
+     priority: true
+     timers: true
+@@ -151,6 +155,7 @@ features:
+         community:
+           standard: True
+     prefix.strict: True
++    prefix.name: True     # 'ip prefix-list' and 'ipv6 prefix-list' are separate namespaces: a declared name renders verbatim
+     aspath: True
+     community:
+       standard: True
+@@ -178,6 +183,10 @@ features:
+     server.gnmi: True
+   tunnel:
+     gre: [ vrf, ipv4, ipv6 ]
++    # DMVPN: multipoint GRE plus NHRP. Declared here rather than in the plugin so
++    # tunnel.check_feature can read it the way it reads every other capability.
++    # IOS-family only -- IOS-XR, EOS and NX-OS do not implement DMVPN.
++    dmvpn: [ vrf, ipv4 ]
+   vlan:
+     model: router
+     svi_interface_name: BVI{bvi}
+diff --git a/netsim/devices/nxos.yml b/netsim/devices/nxos.yml
+index 4abe353..6b70b16 100644
+--- a/netsim/devices/nxos.yml
++++ b/netsim/devices/nxos.yml
+@@ -6,6 +6,7 @@ support:
+ interface_name: Ethernet1/{ifindex}
+ mgmt_if: mgmt0
+ loopback_interface_name: loopback{ifindex}
++lag_interface_name: port-channel{lag.ifindex}
+ routing:
+   _rm_per_af: True
+ clab:
+@@ -56,6 +57,7 @@ features:
+   bfd: true
+   bgp:
+     advertise: true
++    import: [ eigrp ]
+     allowas_in: true
+     as_override: true
+     default_originate: true
+@@ -65,7 +67,8 @@ features:
+     remove_private_as:
+       valid: [ 'on', all, replace ]
+     timers: true
+-  eigrp: true
++  eigrp:
++    import: [ bgp ]
+   evpn:
+     irb: true
+     transport: [ vxlan ]
+@@ -76,6 +79,13 @@ features:
+     unnumbered:
+       ipv4: true
+       ipv6: true
++  lag:
++    reserved_ifindex_range: [ 4096 ]
++    mlag:
++      peer:
++        ifindex: 4096
++      domain: [ peer_switch, peer_gateway, layer3_peer_router ]
++    passive: true
+   netmiko:
+     device_type: cisco_nxos
+     error_regexp: [ "^%(?!INFO).*", "(?i:invalid|error).*" ]
+diff --git a/netsim/extra/bgp/policy/__init__.py b/netsim/extra/bgp/policy/__init__.py
+index 5b450d1..cdd8a96 100644
+--- a/netsim/extra/bgp/policy/__init__.py
++++ b/netsim/extra/bgp/policy/__init__.py
+@@ -6,7 +6,7 @@ from netsim import api, data
+ from netsim.augment import devices
+ from netsim.data import types
+ from netsim.modules import get_effective_module_attribute
+-from netsim.modules.routing.policy import check_routing_policy, import_routing_policy
++from netsim.modules.routing.policy import check_routing_policy, import_match_filters, import_routing_policy
+ from netsim.utils import log
+ from netsim.utils import routing as _bgp
+ 
+@@ -270,6 +270,33 @@ def apply_bgp_routing_policy(ndata: Box,ngb: Box,intf: Box,topology: Box) -> Non
+     ngb.policy[direction] = intf.bgp.policy[direction]      # Copy interface BGP routing policy into a neighbor
+     apply_config(ndata,ngb)                                 # Remember that we have to do extra configuration
+ 
++'''
++apply_bgp_prefix_filter: import the prefix filters that bgp.prefix_filter applies directly to a neighbor
++
++bgp.prefix_filter is one of the p_attr.direct attributes (applied to the neighbor as-is, no route
++map). Upstream reserved the name in defaults.yml but never gave it an attribute or a template; this
++makes it real: the interface attribute is validated ({ in: <prefix filter>, out: <prefix filter> }),
++the referenced global/node prefix filters are imported, normalized, checked and expanded into the
++node exactly like a route map's match.prefix (import_match_filters), and apply_policy_attributes
++then copies the attribute onto the neighbor and checks the device feature bgp.prefix_filter.
++'''
++def apply_bgp_prefix_filter(ndata: Box,ngb: Box,intf: Box,topology: Box) -> None:
++  pf = intf.get('bgp.prefix_filter',{})
++  if not pf:
++    return
++
++  if 'routing' not in ndata.get('module', []):
++    log.error(
++      f"You cannot use 'bgp.prefix_filter' interface attribute on a node that does not use 'routing' module",
++      more_data=[ f'node {ndata.name} neighbor {ngb.name}' ],
++      category=log.IncorrectType,
++      module='bgp.policy')
++    return
++
++  for direction in ['in','out']:
++    if direction in pf:
++      import_match_filters(filter=pf[direction],r_object='prefix',node=ndata,topology=topology)
++
+ '''
+ Process routing aggregation requests:
+ 
+@@ -347,6 +374,8 @@ def post_transform(topology: Box) -> None:
+         intf.bgp.role = role
+       if intf.get('bgp.policy',{}):
+         apply_bgp_routing_policy(ndata,ngb,intf,topology)
++      if intf.get('bgp.prefix_filter',{}):
++        apply_bgp_prefix_filter(ndata,ngb,intf,topology)
+       if apply_policy_attributes(ndata,ngb,intf,topology):  # If we applied at least some bgp.policy attribute to the neighbor
+         p_name = bgp_policy_name(intf,ngb,policy_idx)       # Get the routing policy name
+         create_routing_policy(ndata,ngb,p_name)             # and try to create the route map
+diff --git a/netsim/extra/bgp/policy/defaults.yml b/netsim/extra/bgp/policy/defaults.yml
+index 0a81fcf..fd135f0 100644
+--- a/netsim/extra/bgp/policy/defaults.yml
++++ b/netsim/extra/bgp/policy/defaults.yml
+@@ -57,6 +57,9 @@ bgp:
+       policy:
+         in: str
+         out: str
++      prefix_filter:            # Prefix filters applied directly to the neighbor (no route map)
++        in: id
++        out: id
+       bandwidth:
+         _alt_types: [ autobw ]
+         in: autobw
+diff --git a/netsim/extra/bgp/policy/ios.j2 b/netsim/extra/bgp/policy/ios.j2
+index 3469009..02e707d 100644
+--- a/netsim/extra/bgp/policy/ios.j2
++++ b/netsim/extra/bgp/policy/ios.j2
+@@ -6,6 +6,13 @@
+ {%   if 'bandwidth' in n %}
+     neighbor {{ n[af] }} dmzlink-bw
+ {%   endif %}
++{%   if 'prefix_filter' in n %}
++{#     the device-visible list name: '<name>-<af>' unless the filter declared a name (routing.prefix.name) #}
++{%     set pfx_names = routing._prefix_name|default({}) if routing is defined else {} %}
++{%     for direction in ['in','out'] if direction in n.prefix_filter %}
++    neighbor {{ n[af] }} prefix-list {{ pfx_names.get(af,{}).get(n.prefix_filter[direction],n.prefix_filter[direction] ~ '-' ~ af) }} {{ direction }}
++{%     endfor %}
++{%   endif %}
+ {{   routemap.apply_route_map(n,af,True) }}
+ {%- endmacro %}
+ !
+diff --git a/netsim/extra/bgp/rr_group/__init__.py b/netsim/extra/bgp/rr_group/__init__.py
+new file mode 100644
+index 0000000..d6324bf
+--- /dev/null
++++ b/netsim/extra/bgp/rr_group/__init__.py
+@@ -0,0 +1,94 @@
++from box import Box
++
++from netsim.utils import log
++
++_requires    = [ 'bgp' ]
++
++'''
++bgp.rr_group -- prune IBGP sessions down to shared peering scopes.
++
++bgp.domain gives a node ONE domain and drops every cross-domain IBGP session.
++That cannot describe a route reflector which peers with its regional pair in
++one scope and with the core in another, while never peering with the other
++region at all. Written for the CCIE SP practice lab, whose Section 3.1
++solution has exactly that shape:
++
++  R1  -> R3, BB, R21..R24        R2  -> R4, BB, R25..R28, Internet
++  R3  -> R1, BB, R21..R24        R4  -> R2, BB, R25..R28, Internet
++  R21 -> R1, R3 only             R25 -> R2, R4 only
++
++with no R1<->R2 session anywhere and BB as the single transit reflector
++carrying no clients. R1 and R3 share `spda_a` and `core_a`; R1 and BB share
++`core_a`; R1 and R2 share nothing.
++
++SEMANTICS
++
++  * `rr_group` is a LIST of scope names on a node.
++  * An IBGP session is kept when the two ends share at least one scope.
++  * A session is dropped ONLY when BOTH ends declare rr_group and the two
++    lists are disjoint.
++
++The last rule is deliberate and conservative. A node with no rr_group is
++UNSCOPED, not "in an empty scope": every session it has behaves exactly as it
++does without this plugin. That keeps the plugin additive -- loading it changes
++nothing until scopes are declared -- and it keeps other autonomous systems in
++the same topology untouched, which matters because the lab has 11 BGP nodes
++outside the SP AS that carry no scopes at all.
++
++EBGP is never touched. Scoping applies to IBGP only, matching bgp.domain.
++'''
++
++def post_transform(topology: Box) -> None:
++  rr_as: dict = {}                                          # AS numbers that use route reflectors
++  group_rr: dict = {}                                       # (as,scope) -> does that scope hold a reflector?
++  group_seen: dict = {}                                     # (as,scope) -> is that scope used at all?
++
++  for n, ndata in topology.nodes.items():
++    if 'bgp' not in ndata.get('module',[]):                 # Skip nodes not running BGP
++      continue
++
++    n_groups = set(ndata.get('bgp.rr_group',[]) or [])      # This node's scopes; empty means UNSCOPED
++    n_as     = str(ndata.get('bgp.as'))
++
++    if ndata.get('bgp.rr',False):                           # Remember which AS use reflectors...
++      rr_as[n_as] = True
++
++    for grp in n_groups:                                    # ... and which scopes hold one
++      key = f'{n_as}:{grp}'
++      group_seen[key] = True
++      if ndata.get('bgp.rr',False):
++        group_rr[key] = True
++
++    if not n_groups:                                        # UNSCOPED node: leave every session alone
++      continue
++
++    ngb_list = []
++    for ngb in ndata.bgp.neighbors:
++      if ngb.type != 'ibgp':                                # Keep every EBGP session
++        ngb_list.append(ngb)
++        continue
++
++      p_groups = set(topology.nodes[ngb.name].get('bgp.rr_group',[]) or [])
++      if not p_groups:                                      # Peer is UNSCOPED: keep the session
++        ngb_list.append(ngb)
++        continue
++
++      if n_groups & p_groups:                               # Shared scope: keep the session
++        ngb_list.append(ngb)
++
++    ndata.bgp.neighbors = ngb_list
++
++  # A scope that uses reflectors but contains none cannot propagate anything
++  # inside itself. Report it the way bgp.domain reports a domain with no RR,
++  # rather than letting the lab come up with silent black holes.
++  for key in sorted(group_seen):
++    (g_as,g_name) = key.split(':',1)
++    if g_as not in rr_as:                                   # This AS does not use reflectors at all
++      continue
++    if group_rr.get(key,False):                             # Scope has a reflector: fine
++      continue
++    log.error(
++      f'BGP AS {g_as} uses route reflectors, but scope {g_name} contains none.\n' + \
++      f'... Nodes whose only scope is {g_name} will have no IBGP route propagation\n' + \
++      f'... Give at least one router in scope {g_name} bgp.rr: True',
++      log.IncorrectValue,'bgp.rr_group')
+diff --git a/netsim/extra/bgp/rr_group/defaults.yml b/netsim/extra/bgp/rr_group/defaults.yml
+new file mode 100644
+index 0000000..906a828
+--- /dev/null
++++ b/netsim/extra/bgp/rr_group/defaults.yml
+@@ -0,0 +1,13 @@
++# bgp.rr_group attributes
++#
++# A node may belong to SEVERAL peering scopes. An IBGP session survives only if
++# the two ends share at least one. bgp.domain is the single-valued equivalent
++# and cannot express a reflector that peers with its regional pair in one scope
++# and with the core in another.
++---
++bgp:
++  attributes:
++    node:
++      rr_group:
++        type: list
++        _subtype: str
+diff --git a/netsim/extra/ebgp/multihop/__init__.py b/netsim/extra/ebgp/multihop/__init__.py
+index f5a3695..9da2351 100644
+--- a/netsim/extra/ebgp/multihop/__init__.py
++++ b/netsim/extra/ebgp/multihop/__init__.py
+@@ -1,4 +1,5 @@
+ import ipaddress
++import typing
+ 
+ from box import Box
+ 
+@@ -47,39 +48,82 @@ def pre_link_transform(topology: Box) -> None:
+       module_source='topology',
+       module='ebgp.multihop')                         # Validation is called from 'ebgp.multihop' plugin
+ 
++    # Session-level TTL: the link attribute `multihop: <int>` was always declared (defaults.yml,
++    # link: multihop: int) and the IOS template always rendered `ebgp-multihop <n>` for n < 255,
++    # but this loop overwrote it with 255 on every interface. Honour it.
++    session_ttl = s.bgp.get('multihop',255)
++
+     for intf in s.interfaces:
+       node = topology.nodes[intf.node]
++
++      # ONE-SIDED SESSION: `bgp: False` on a session endpoint is the interface flag the BGP module
++      # already understands ("do not build EBGP sessions over this interface", build_ebgp_sessions).
++      # The endpoint keeps its address so the OTHER node still gets a neighbor pointing at it, and
++      # this node configures nothing -- a lab can model a peer that has not (yet) configured its
++      # half, e.g. a change-review baseline whose later change adds it.
++      one_sided = intf.get('bgp',None) is False
++
++      # EXPLICIT ENDPOINT: `ipv4`/`ipv6` on a session endpoint is the session address on that node
++      # (an interface address, not necessarily the loopback). Without it, the loopback is used,
++      # exactly as before.
++      explicit = { af: intf[af] for af in ('ipv4','ipv6') if af in intf and isinstance(intf[af],str) }
++
+       for attr in list(intf.keys()):                  # Change interface attributes into BGP attributes
+-        if attr in ['node','bgp','vrf']:              # Skip internal attributes and attributes already in BGP/VRF namespace
++        if attr in ['node','bgp','vrf','ipv4','ipv6']:      # Skip internal attributes, addresses, and BGP/VRF namespaces
+           continue
++        if one_sided:
++          log.error(
++            f'A one-sided EBGP multihop endpoint (bgp: False) cannot have attribute {attr}: {s._linkname}.{intf.node}',
++            log.IncorrectAttr,'ebgp.multihop')
+         intf.bgp[attr] = intf[attr]                   # Turn an interface attribute into 'bgp.x' attribute
+         intf.pop(attr,None)
+ 
+-      validate_attributes(
+-        data=intf,                                    # Validate interface data
+-        topology=topology,
+-        data_path=f'{s._linkname}.{intf.node}',
+-        data_name=f'BGP neighbor',
+-        attr_list=['interface','link'],               # We're checking interface or link attributes
+-        modules=v_mods,                               # ... against BGP/VRF attributes
+-        module_source='topology',
+-        module='ebgp.multihop',                       # Function is called from 'ebgp.multihop' plugin
+-        apply_defaults=False)
+-
+-      if not 'loopback' in node:
+-        log.error(
+-          'Cannot establish EBGP multihop session from node {intf.name}: node has no loopback interface',
+-          log.IncorrectValue,'ebgp.multihop')
++      if not one_sided:
++        validate_attributes(
++          data=intf,                                  # Validate interface data
++          topology=topology,
++          data_path=f'{s._linkname}.{intf.node}',
++          data_name=f'BGP neighbor',
++          attr_list=['interface','link'],             # We're checking interface or link attributes
++          modules=v_mods,                             # ... against BGP/VRF attributes
++          module_source='topology',
++          module='ebgp.multihop',                     # Function is called from 'ebgp.multihop' plugin
++          apply_defaults=False)
++
++      if explicit:
++        for af,addr in explicit.items():
++          try:
++            addr_if = ipaddress.ip_interface(addr)    # Accept an address or a host prefix
++          except Exception:
++            log.error(
++              f'Invalid {af} session address {addr} on {s._linkname}.{intf.node}',
++              log.IncorrectValue,'ebgp.multihop')
++            continue
++          if (af == 'ipv4') != (addr_if.version == 4):
++            log.error(
++              f'{af} session address {addr} on {s._linkname}.{intf.node} is not an {af} address',
++              log.IncorrectValue,'ebgp.multihop')
++            continue
++          intf[af] = f'{addr_if.ip}/{addr_if.network.max_prefixlen}'
++        intf._mh_explicit = True                      # The session is sourced from this address, not the loopback
++      else:
++        if not 'loopback' in node:
++          log.error(
++            f'Cannot establish EBGP multihop session from node {intf.node}: node has no loopback interface',
++            log.IncorrectValue,'ebgp.multihop')
++          continue
++        for af in ['ipv4','ipv6']:
++          if af in node.loopback:
++            intf[af] = node.loopback[af]
++
++      intf._phantom_link = True
++      intf.ifname = f'_ebgp_multihop_{s.linkindex}'
++      if one_sided:                                   # Nothing else to prepare: no neighbor, no plugin config on this node
+         continue
+-      for af in ['ipv4','ipv6']:
+-        if af in node.loopback:
+-          intf[af] = node.loopback[af]
+-      intf.bgp.multihop = 255
++      intf.bgp.multihop = session_ttl
+       if 'vrf' in intf:
+         intf.bgp._vrf = intf.vrf
+       intf._mh_bgp_session = True
+-      intf._phantom_link = True
+-      intf.ifname = f'_ebgp_multihop_{s.linkindex}'
+ 
+   topology.links.extend(sessions)
+ 
+@@ -191,7 +235,38 @@ def fix_vrf_loopbacks(ndata: Box, topology: Box) -> None:
+       ngb._source_intf = lb
+ 
+     else:
+-      ngb._source_intf = ndata.loopback
++      src_intf = multihop_source_interface(ndata,ngb)
++      if src_intf is not None:
++        ngb._source_intf = src_intf
++      # An explicit session address that no interface owns: leave update-source alone
++
++'''
++multihop_source_interface -- the interface a multihop session is sourced from
++
++* Loopback (as always) for a session built from the node loopback
++* For an explicit session address, the node interface that owns that address
++  (or None if no interface does -- the device will pick its egress interface)
++'''
++def multihop_source_interface(ndata: Box, ngb: Box) -> typing.Optional[Box]:
++  phantom = [ intf for intf in ndata.interfaces if intf.get('ifindex',None) == ngb.get('ifindex',None) ]
++  if not phantom or not phantom[0].get('_mh_explicit',False):
++    return ndata.loopback
++
++  for af in ('ipv4','ipv6'):
++    if af not in phantom[0]:
++      continue
++    addr = ipaddress.ip_interface(phantom[0][af]).ip
++    for intf in ndata.interfaces:
++      if intf.get('_phantom_link',False) or not isinstance(intf.get(af,None),str):
++        continue
++      if ipaddress.ip_interface(intf[af]).ip == addr:
++        return intf
++  if 'loopback' in ndata:
++    for af in ('ipv4','ipv6'):
++      if af in phantom[0] and isinstance(ndata.loopback.get(af,None),str) and \
++         ipaddress.ip_interface(ndata.loopback[af]).ip == ipaddress.ip_interface(phantom[0][af]).ip:
++        return ndata.loopback
++  return None
+ 
+ '''
+ post_transform processing:
+@@ -204,8 +279,26 @@ def post_transform(topology: Box) -> None:
+   global _config_name
+   for ndata in topology.nodes.values():
+     if ebgp_multihop_sessions(ndata,topology):
++      set_local_multihop(ndata)
+       fix_vrf_loopbacks(ndata,topology)
+ 
++'''
++set_local_multihop -- a neighbor's TTL comes from the LOCAL session endpoint
++
++The BGP module copies the REMOTE endpoint's bgp.* interface attributes into the neighbor
++(build_ebgp_sessions: extra_data = ngb_ifdata.bgp + extra_data). For a two-sided session both
++endpoints carry the same bgp.multihop, so nobody noticed. A one-sided session's remote endpoint
++is `bgp: False` and carries nothing, so the local TTL has to come from the local phantom
++interface -- which is where this plugin put it.
++'''
++def set_local_multihop(ndata: Box) -> None:
++  for ngb in _bgp.neighbors(ndata,vrf=True,select=['ebgp','localas_ibgp']):
++    if 'multihop' in ngb:
++      continue
++    for intf in ndata.interfaces:
++      if intf.get('_mh_bgp_session',False) and intf.get('ifindex',None) == ngb.get('ifindex',None):
++        ngb.multihop = intf.bgp.multihop
++
+ '''
+ Cleanup: remove interfaces and links with _phantom_link flag
+ '''
+diff --git a/netsim/extra/fabric/__init__.py b/netsim/extra/fabric/__init__.py
+index cd93a36..b33cb97 100644
+--- a/netsim/extra/fabric/__init__.py
++++ b/netsim/extra/fabric/__init__.py
+@@ -4,7 +4,7 @@ from box import Box
+ 
+ from netsim import data
+ from netsim.augment.links import adjust_link_list
+-from netsim.utils import strings
++from netsim.utils import log, strings
+ 
+ _description = 'Build a leaf-and-spine fabric'
+ _config_name = 'fabric'
+@@ -193,6 +193,12 @@ def topology_expand(topology: Box) -> None:
+   l_cnt = topology.get('fabric.leafs',1)                    # Get number of leafs and spines
+   s_cnt = topology.get('fabric.spines',1)                   # Missing values ==> 1, validation code will complain in a minute ;)
+ 
++  for k,v in (('leafs',l_cnt),('spines',s_cnt)):           # fabric.leafs/spines are NUMBERS (the count), not dictionaries
++    if not isinstance(v,int) or isinstance(v,bool):
++      log.error(f'fabric.{k} must be an integer (number of {k}), found {type(v).__name__}. Use fabric.{k[:-1]} for per-{k[:-1]} parameters',
++        log.IncorrectType,'fabric')
++      return
++
+   # Create the fabric groups, nodes and links
+   (grp,nodes,links) = generate_fabric(topology,l_cnt,s_cnt)
+ 
+diff --git a/netsim/extra/ibgp/explicit_source/__init__.py b/netsim/extra/ibgp/explicit_source/__init__.py
+new file mode 100644
+index 0000000..dde242c
+--- /dev/null
++++ b/netsim/extra/ibgp/explicit_source/__init__.py
+@@ -0,0 +1,74 @@
++"""
++ibgp.explicit_source -- source a plain IBGP session from a directly-connected
++interface instead of the loopback.
++
++netlab's core build_ibgp_sessions (netsim/modules/bgp.py) always sources an
++IBGP session from the node loopback and always neighbors the peer's
++loopback (get_remote_ibgp_endpoint): campus routers peering directly over a
++link between them, with no reachable IGP to the loopback (e.g. the link's
++own OSPF is disabled), can never come up -- the loopback is simply
++unreachable, not a config error.
++
++Opt in per interface with `bgp.session_source: True` on BOTH ends of the
++link; the two nodes must already be IBGP peers (same AS, both already have
++`module: [ bgp ]`) via the normal full mesh netlab builds among same-AS
++nodes -- this plugin only overrides the two address fields on the neighbor
++entry netlab already built, in post_transform, after bgp.py has run. It
++does not create sessions, does not touch EBGP, and does not build a phantom
++link the way ebgp.multihop does: the link is real and already carries real
++addresses, only the loopback default needs replacing.
++"""
++import typing
++
++from box import Box
++
++from netsim.utils import log
++from netsim.utils import routing as _bgp
++
++_config_name = 'ibgp.explicit_source'
++_execute_after = ['bgp']
++_requires = ['bgp']
++
++
++def post_transform(topology: Box) -> None:
++  for name, node in topology.nodes.items():
++    if 'bgp' not in node:
++      continue
++    for intf in node.get('interfaces', []):
++      if not intf.get('bgp', {}).get('session_source', False):
++        continue
++      _apply_explicit_source(node, intf, topology)
++
++
++def _apply_explicit_source(node: Box, intf: Box, topology: Box) -> None:
++  neighbors = intf.get('neighbors', [])
++  if len(neighbors) != 1:
++    log.error(
++      f'ibgp.explicit_source: interface {intf.ifname} on {node.name} needs exactly one '
++      f'link neighbor to source an IBGP session from (found {len(neighbors)})',
++      log.IncorrectValue, _config_name)
++    return
++
++  peer = neighbors[0]
++  peer_name = peer.get('node', None)
++  if not peer_name:
++    return
++
++  matched = False
++  for ngb in _bgp.neighbors(node, vrf=False, select=['ibgp']):
++    if ngb.name != peer_name:
++      continue
++    matched = True
++    for af in ('ipv4', 'ipv6'):
++      addr = peer.get(af, None)
++      if isinstance(addr, str):
++        ngb[af] = _bgp.get_intf_address(addr)
++    ngb._source_intf = intf
++
++  if not matched:
++    log.error(
++      f'ibgp.explicit_source: {node.name}.{intf.ifname} has bgp.session_source set, but '
++      f'{node.name} has no IBGP session toward {peer_name} to source from it -- both nodes '
++      f'need the same bgp.as and IBGP session (a full mesh, or one of them an RR client of '
++      f'the other)',
++      log.IncorrectValue, _config_name)
+diff --git a/netsim/extra/ibgp/explicit_source/defaults.yml b/netsim/extra/ibgp/explicit_source/defaults.yml
+new file mode 100644
+index 0000000..ff653bf
+--- /dev/null
++++ b/netsim/extra/ibgp/explicit_source/defaults.yml
+@@ -0,0 +1,14 @@
++bgp:
++  attributes:
++    interface:
++      session_source:
++        type: bool
++        true_value: True
++    # warn_bgp_attributes (netsim/modules/bgp.py) checks the intra-AS
++    # opt-out under the LINK attribute namespace regardless of whether the
++    # attribute is actually link- or interface-scoped -- this entry exists
++    # only to suppress that warning for an attribute that is, by design,
++    # used exclusively on intra-AS (IBGP) links.
++    link:
++      session_source:
++        _intra_as: True
+diff --git a/netsim/extra/ospf/instances/__init__.py b/netsim/extra/ospf/instances/__init__.py
+new file mode 100644
+index 0000000..765f1c4
+--- /dev/null
++++ b/netsim/extra/ospf/instances/__init__.py
+@@ -0,0 +1,150 @@
++from box import Box
++
++from netsim import api
++from netsim.utils import log
++
++_requires    = [ 'ospf' ]
++_config_name = 'ospf.instances'
++
++'''
++ospf.instances -- more than one OSPF process per node.
++
++netlab's ospf module configures exactly ONE process in a node's global routing
++table. The CCIE SP workbook runs TWO: OSPF 100 across the SP core and
++distribution area, OSPF 200 across the customer areas and the internet hub,
++mutually redistributed on the four routers that carry both.
++
++  ospf:
++    process: 200                  # the PRIMARY process, handled by the module
++    area: 0.0.0.0
++    instances:
++      100: { area: 0.0.0.1 }      # an ADDITIONAL process
++    redistribute:
++      200: [ 100 ]                # into 200, redistribute 100
++      100: [ 200 ]                # into 100, redistribute 200
++
++An interface joins a non-primary instance by naming it:
++
++  - clc-r1:
++      ospf: { process: 100, area: 0.0.0.1 }
++
++HOW THE SPLIT IS DONE, AND WHY IT LOOKS LIKE THIS
++
++The base template renders every interface that still carries an `ospf`
++attribute into the primary process. So an interface belonging to another
++instance has to leave the base template's view entirely: this plugin REMOVES
++`ospf` from that interface and hands a COPY -- with `ospf` intact -- to the
++instance under `ospf._instances[pid]._interfaces`.
++
++The per-device template then calls the module's OWN macro for each extra
++instance, with that pid and that interface list. Rendering is therefore
++upstream's, not a second implementation of it, so anything the module learns
++to emit for a process is emitted for these too.
++'''
++
++def _norm_area(area: str) -> str:
++  return str(area)
++
++def post_transform(topology: Box) -> None:
++  for n, ndata in topology.nodes.items():
++    if 'ospf' not in ndata.get('module',[]):
++      continue
++
++    instances = ndata.get('ospf.instances',None)
++    primary   = ndata.get('ospf.process',1)
++
++    # Interfaces may name a process even on a node that declares no extra
++    # instances -- that is an error worth naming, because the interface would
++    # otherwise land silently in the primary process.
++    for intf in ndata.get('interfaces',[]):
++      i_pid = intf.get('ospf.process',None)
++      if i_pid is None or int(i_pid) == int(primary):
++        continue
++      if not instances or int(i_pid) not in [ int(k) for k in instances.keys() ]:
++        log.error(
++          f'Node {n} interface {intf.get("ifname","?")} asks for OSPF process {i_pid},\n' + \
++          f'... but the node declares no ospf.instances entry for it\n' + \
++          f'... Primary process is {primary}; declare {i_pid} under ospf.instances',
++          log.IncorrectValue,'ospf.instances')
++
++    if not instances:
++      continue
++
++    inst_data = Box({},default_box=True,box_dots=True)
++
++    for pid, idata in instances.items():
++      pid_i = int(pid)
++      entry = Box(idata or {},default_box=True,box_dots=True)
++      entry.process = pid_i
++      # Every instance needs an af so the device template knows to emit it.
++      entry.af.ipv4 = True
++      entry._interfaces = []
++      inst_data[str(pid_i)] = entry
++
++    # Move interfaces out of the primary process and into their instance.
++    keep = []
++    for intf in ndata.get('interfaces',[]):
++      i_pid = intf.get('ospf.process',None)
++      if i_pid is None or int(i_pid) == int(primary):
++        keep.append(intf)
++        continue
++
++      key = str(int(i_pid))
++      if key not in inst_data:                       # already reported above
++        keep.append(intf)
++        continue
++
++      moved = Box(intf,default_box=True,box_dots=True)
++      # An interface that does not name its own area inherits the instance's.
++      if 'area' not in moved.ospf and 'area' in inst_data[key]:
++        moved.ospf.area = inst_data[key].area
++      inst_data[key]._interfaces.append(moved)
++
++      # Remove it from the base template's view WITHOUT dropping the interface
++      # itself: the node still has the address, it just is not in the primary
++      # OSPF process any more.
++      stripped = Box(intf,default_box=True,box_dots=True)
++      stripped.pop('ospf',None)
++      keep.append(stripped)
++
++    ndata.interfaces = keep
++
++    # CROSS-PROCESS REDISTRIBUTION IS RENDERED BY THIS PLUGIN, NOT BY THE
++    # MODULE'S REDISTRIBUTE MACRO.
++    #
++    # templates/routing/_redistribute.<dev>.j2 keys `import` by PROTOCOL NAME and
++    # appends a single `ospf_pid` for an ospf source -- and ios.ospfv2.j2 does not
++    # pass that parameter at all, so it defaults to 1. There is no way to say
++    # "into process 200, redistribute process 100" through it: one key, one pid,
++    # and the pid it would use is wrong.
++    #
++    # Writing `import['ospf_100']` instead, as an earlier revision did, made the
++    # macro emit the KEY as the protocol: `redistribute ospf_100`, which is not a
++    # command on any of these platforms. It rendered, it looked plausible in
++    # node_files, and no device would have accepted it.
++    #
++    # So record the pairs and let the per-device template emit the real command.
++    redist = ndata.get('ospf.redistribute',None) or {}
++    xredist = []
++    for tgt, src_list in redist.items():
++      tgt_i = int(tgt)
++      if tgt_i != int(primary) and str(tgt_i) not in inst_data:
++        log.error(
++          f'Node {n} redistributes into OSPF process {tgt_i}, which is neither\n' + \
++          f'... the primary process ({primary}) nor a declared instance',
++          log.IncorrectValue,'ospf.instances')
++        continue
++      sources = [ src_list ] if not isinstance(src_list,list) else src_list
++      for src in sources:
++        src_i = int(src)
++        if src_i != int(primary) and str(src_i) not in inst_data:
++          log.error(
++            f'Node {n} redistributes OSPF process {src_i} into {tgt_i}, but {src_i}\n' + \
++            f'... is neither the primary process ({primary}) nor a declared instance',
++            log.IncorrectValue,'ospf.instances')
++          continue
++        xredist.append({ 'target': tgt_i, 'source': src_i })
++
++    ndata.ospf._xredist = xredist
++    ndata.ospf._instances = inst_data
++    api.node_config(ndata,_config_name)
+diff --git a/netsim/extra/ospf/instances/asa.j2 b/netsim/extra/ospf/instances/asa.j2
+new file mode 100644
+index 0000000..5aab3ef
+--- /dev/null
++++ b/netsim/extra/ospf/instances/asa.j2
+@@ -0,0 +1,71 @@
++{#
++  Extra OSPF processes on ASA, plus cross-process redistribution.
++
++  Same shape as ios.j2 in this directory (and for the same reason it renders
++  the process itself instead of calling ospf/asa.ospfv2.j2's macro: a plugin
++  template's Jinja search path cannot resolve that macro's nested imports).
++  ASA syntax follows asa.ospfv2.j2 exactly: `network <net> <mask> area <int>`
++  statements (not `ip ospf <pid> area` on the interface -- ASA has none), the
++  area converted from dotted-decimal to an integer the way the base template
++  does, per-interface knobs under `interface <nameif>` as `ospf <knob>`.
++  Verified against a real ASA capture running OSPF 100 and 200 side by side
++  (sjc-bldg1-fw01: `router ospf 200` / `network 101.19.0.16 255.255.255.252
++  area 0.0.0.0` / `default-information originate metric 1`).
++
++  ASA's `redistribute ospf <pid>` takes no `subnets` keyword (that is IOS).
++#}
++{% macro area_to_int(area) -%}
++{%- set parts = area|string %}
++{%- if '.' in parts %}
++{%- set p = parts.split('.') %}
++{{ (p[0]|int * 16777216) + (p[1]|int * 65536) + (p[2]|int * 256) + (p[3]|int) }}
++{%- else %}
++{{ parts }}
++{%- endif %}
++{%- endmacro %}
++{% for pid, idata in ospf._instances|default({})|dictsort %}
++!
++router ospf {{ idata.process }}
++{%   if idata.router_id is defined %}
++ router-id {{ idata.router_id }}
++{%   elif ospf.router_id is defined %}
++ router-id {{ ospf.router_id }}
++{%   endif %}
++{%   if idata.reference_bandwidth is defined %}
++ auto-cost reference-bandwidth {{ idata.reference_bandwidth }}
++{%   endif %}
++{%   if idata.default is defined %}
++{%     set dfd = idata.default %}
++ default-information originate{%
++     if dfd.always|default(False) %} always{% endif %}{%
++     if dfd.type|default('') %} metric-type {{ dfd.type.replace('e','') }}{% endif %}{%
++     if dfd.cost|default(0) %} metric {{ dfd.cost }}{% endif +%}
++{%   endif %}
++{%   for l in idata._interfaces|default([]) if 'ipv4' in l and l.ipv4 is string %}
++{%     if l.ospf.passive|default(False) %}
++ passive-interface {{ l.ifname }}
++{%     endif %}
++ network {{ l.ipv4|ansible.utils.ipaddr('network') }} {{ l.ipv4|ansible.utils.ipaddr('netmask') }} area {{ area_to_int(l.ospf.area) }}
++{%   endfor %}
++{%   for l in idata._interfaces|default([]) if 'ipv4' in l and (l.ospf.cost is defined or l.ospf.timers is defined or l.ospf.priority is defined) %}
++!
++interface {{ l.ifname }}
++{%     if l.ospf.cost is defined %}
++ ospf cost {{ l.ospf.cost }}
++{%     endif %}
++{%     if l.ospf.timers.hello is defined %}
++ ospf hello-interval {{ l.ospf.timers.hello }}
++{%     endif %}
++{%     if l.ospf.timers.dead is defined %}
++ ospf dead-interval {{ l.ospf.timers.dead }}
++{%     endif %}
++{%     if l.ospf.priority is defined %}
++ ospf priority {{ l.ospf.priority }}
++{%     endif %}
++{%   endfor %}
++{% endfor %}
++{% for r in ospf._xredist|default([]) %}
++!
++router ospf {{ r.target }}
++ redistribute ospf {{ r.source }}
++{% endfor %}
+diff --git a/netsim/extra/ospf/instances/defaults.yml b/netsim/extra/ospf/instances/defaults.yml
+new file mode 100644
+index 0000000..c38ac65
+--- /dev/null
++++ b/netsim/extra/ospf/instances/defaults.yml
+@@ -0,0 +1,39 @@
++# ospf.instances attributes
++#
++# netlab's ospf module gives a node exactly ONE process in the global routing
++# table. `instances` declares the additional ones, and an interface says which
++# instance it belongs to with its own `ospf.process`.
++---
++ospf:
++  no_propagate:
++    instances:
++  attributes:
++    node:
++      instances:
++        type: dict
++        _subtype:
++          type: dict
++          _keys:
++            area: { type: ipv4, use: id }
++            router_id: { type: ipv4, use: id }
++            reference_bandwidth: int
++            # An instance's own default-information originate -- e.g. the ISP
++            # side of a dual-process ASA WAN edge, where the default route
++            # belongs on process 200 but never on the inside process 100.
++            # Same shape as the base ospf module's own ospf.default attribute.
++            default:
++              _alt_types: [ bool ]
++              type: dict
++              _keys:
++                always: bool
++                policy: id
++                cost: int
++                type:
++                  type: str
++                  valid_values: [ e1, e2 ]
++      redistribute:
++        type: dict
++    interface:
++      process: int
++    link:
++      process: int
+diff --git a/netsim/extra/ospf/instances/eos.j2 b/netsim/extra/ospf/instances/eos.j2
+new file mode 100644
+index 0000000..5f50a0e
+--- /dev/null
++++ b/netsim/extra/ospf/instances/eos.j2
+@@ -0,0 +1,13 @@
++{#
++  Extra OSPF processes on EOS, plus cross-process redistribution.
++  EOS's macro takes the same (pid,vrf,data,interfaces) shape as IOS.
++#}
++{% import "ospf/eos.ospfv2.j2" as ospfv2 with context %}
++{% for pid, idata in ospf._instances|default({})|dictsort %}
++{{ ospfv2.config(idata.process,False,idata,idata._interfaces|default([])) }}
++{% endfor %}
++{% for r in ospf._xredist|default([]) %}
++!
++router ospf {{ r.target }}
++   redistribute ospf {{ r.source }}
++{% endfor %}
+diff --git a/netsim/extra/ospf/instances/ios.j2 b/netsim/extra/ospf/instances/ios.j2
+new file mode 100644
+index 0000000..0657640
+--- /dev/null
++++ b/netsim/extra/ospf/instances/ios.j2
+@@ -0,0 +1,68 @@
++{#
++  Extra OSPF processes on IOS/IOL, plus cross-process redistribution.
++
++  WHY THIS RENDERS THE PROCESS ITSELF INSTEAD OF CALLING ios.ospfv2.j2.
++
++  Calling the module's macro would be preferable -- one implementation of "how a
++  process is emitted" -- and it was tried. It does not work from a plugin: the
++  macro's own first line imports `templates/routing/_default.ios.j2`, which
++  resolves only when `netsim/ansible` is on the Jinja search path. A plugin
++  template's search path ends at `netsim/ansible/templates`, so the nested import
++  fails with the macro itself found. The path list belongs to the framework, not
++  to us, so the choice is a template that works or a macro call that cannot
++  resolve.
++
++  Kept deliberately narrow: what a second OSPF process needs and nothing more.
++  Interface OSPF settings (cost, network type, timers) stay on the PRIMARY
++  process where the ospf module already renders them -- an interface here has
++  been moved out of the primary process, so its per-interface knobs move with it
++  and are emitted below.
++
++  Redistribution is emitted here too. The module's redistribute macro keys
++  `import` by protocol name and appends one `ospf_pid` that ios.ospfv2.j2 never
++  passes, so it cannot express "into 200, redistribute 100" -- see __init__.py.
++#}
++{% for pid, idata in ospf._instances|default({})|dictsort %}
++!
++router ospf {{ idata.process }}
++{%   if idata.router_id is defined %}
++ router-id {{ idata.router_id }}
++{%   elif ospf.router_id is defined %}
++ router-id {{ ospf.router_id }}
++{%   endif %}
++{%   if idata.reference_bandwidth is defined %}
++ auto-cost reference-bandwidth {{ idata.reference_bandwidth }}
++{%   endif %}
++{%   for l in idata._interfaces|default([]) if l.ospf.passive|default(False) %}
++ passive-interface {{ l.ifname }}
++{%   endfor %}
++{%   for l in idata._interfaces|default([]) if 'ipv4' in l %}
++!
++interface {{ l.ifname }}
++! {{ l.name|default("") }}
++ ip ospf {{ idata.process }} area {{ l.ospf.area }}
++{%     if l.ospf.network_type is defined %}
++ ip ospf network {{ l.ospf.network_type }}
++{%     endif %}
++{%     if l.ospf.cost is defined %}
++ ip ospf cost {{ l.ospf.cost }}
++{%     endif %}
++{%     if l.ospf.bfd|default(False) %}
++ ip ospf bfd
++{%     endif %}
++{%     if l.ospf.timers.hello is defined %}
++ ip ospf hello-interval {{ l.ospf.timers.hello }}
++{%     endif %}
++{%     if l.ospf.timers.dead is defined %}
++ ip ospf dead-interval {{ l.ospf.timers.dead }}
++{%     endif %}
++{%     if l.ospf.priority is defined %}
++ ip ospf priority {{ l.ospf.priority }}
++{%     endif %}
++{%   endfor %}
++{% endfor %}
++{% for r in ospf._xredist|default([]) %}
++!
++router ospf {{ r.target }}
++ redistribute ospf {{ r.source }} match internal external subnets
++{% endfor %}
+diff --git a/netsim/extra/ospf/instances/iosxr.j2 b/netsim/extra/ospf/instances/iosxr.j2
+new file mode 100644
+index 0000000..bc4eae2
+--- /dev/null
++++ b/netsim/extra/ospf/instances/iosxr.j2
+@@ -0,0 +1,13 @@
++{#
++  Extra OSPF processes on IOS-XR, plus cross-process redistribution.
++  XR defines its macro inside ospf/iosxr.j2 rather than a separate file.
++#}
++{% import "ospf/iosxr.j2" as xrospf with context %}
++{% for pid, idata in ospf._instances|default({})|dictsort %}
++{{ xrospf.ospf_config('ipv4',idata.process,idata,idata._interfaces|default([])) }}
++{% endfor %}
++{% for r in ospf._xredist|default([]) %}
++!
++router ospf {{ r.target }}
++ redistribute ospf {{ r.source }} match internal external
++{% endfor %}
+diff --git a/netsim/extra/tunnel/dmvpn/__init__.py b/netsim/extra/tunnel/dmvpn/__init__.py
+new file mode 100644
+index 0000000..194fd5c
+--- /dev/null
++++ b/netsim/extra/tunnel/dmvpn/__init__.py
+@@ -0,0 +1,145 @@
++from box import Box
++
++from netsim import api
++from netsim.utils import log
++
++from ... import tunnel as _tunnel
++
++_config_name = 'tunnel.dmvpn'
++
++'''
++tunnel.dmvpn -- multipoint GRE with NHRP.
++
++extra/tunnel/gre is POINT-TO-POINT: it insists on exactly two nodes per link and
++gives each end a `tunnel destination`. A DMVPN cloud is neither. One link
++carries a hub (or several) and any number of spokes, and no interface has a
++tunnel destination at all -- NHRP resolves the far end at run time. So this
++plugin uses tunnel's shared source handling but not _p2p.
++
++  links:
++  - clc-r34: { ipv4: 10.10.10.1 }        # hub
++    clc-r29: { ipv4: 10.10.10.2 }        # spoke
++    clc-r32: { ipv4: 10.10.10.3 }        # spoke
++    prefix: { ipv4: 10.10.10.0/24 }
++    tunnel: { mode: dmvpn, hub: [ clc-r34 ] }
++
++Each interface is marked `_dmvpn_role` hub or spoke, and every spoke is given
++`_dmvpn_nhs`, the list of hub tunnel addresses plus the hubs' transport
++addresses, because `ip nhrp map` needs BOTH: the overlay address to map and the
++underlay address to send to.
++
++DEVICE SUPPORT IS IOS-FAMILY ONLY, AND THAT IS A VENDOR FACT, NOT A GAP HERE.
++DMVPN is NHRP plus mGRE as Cisco implements it; IOS-XR does not implement DMVPN
++and neither does EOS or NX-OS. A device that cannot do it is REPORTED, not
++silently skipped, so a topology that puts a DMVPN spoke on the wrong platform
++fails at compile instead of coming up with an overlay that never forms.
++'''
++
++def _hub_list(link: Box) -> list:
++  """
++  tunnel.hub as a LIST, whatever it arrived as.
++
++  A single-hub cloud is written `hub: [ clc-r34 ]` and can reach here as the
++  bare string 'clc-r34'. Iterating that yields its CHARACTERS, and the plugin
++  then reports one error per letter -- "names hub c", "names hub l" ... which
++  is what it did before this existed.
++  """
++  hubs = link.get('tunnel.hub',None)
++  if hubs is None:
++    return []
++  if isinstance(hubs,str):
++    return [ hubs ]
++  return list(hubs)
++
++def pre_transform(topology: Box) -> None:
++  _tunnel.set_tunnel_type(topology)
++  for link in _tunnel.links(topology,'dmvpn'):
++    if len(link.interfaces) < 2:
++      log.error(
++        f'A DMVPN cloud needs at least two nodes attached (link {link._linkname})',
++        category=log.IncorrectAttr,
++        module='tunnel.dmvpn')
++      continue
++
++    hubs = _hub_list(link)
++    if not hubs:
++      log.error(
++        f'DMVPN link {link._linkname} declares no tunnel.hub\n' + \
++        f'... Name at least one attached node as the NHRP next-hop server',
++        category=log.IncorrectAttr,
++        module='tunnel.dmvpn')
++      continue
++
++    attached = [ intf.node for intf in link.interfaces ]
++    for h in hubs:
++      if h not in attached:
++        log.error(
++          f'DMVPN link {link._linkname} names hub {h}, which is not attached to it\n' + \
++          f'... Attached nodes are: {", ".join(attached)}',
++          category=log.IncorrectAttr,
++          module='tunnel.dmvpn')
++
++def post_transform(topology: Box) -> None:
++  for link in _tunnel.links(topology,'dmvpn'):
++    hubs   = _hub_list(link)
++    lidx   = link.get('linkindex',None)
++    net_id = link.get('tunnel.nhrp_id',None) or lidx or 1
++    t_af   = link.get('tunnel.af','ipv4')
++    passwd = link.get('tunnel.password',None)
++
++    # MATCH ON THE LINK'S linkindex, NOT THE LINK-INTERFACE'S.
++    #
++    # A link's own `interfaces` entries carry linkindex None; it is the NODE's
++    # interface that carries the link's index. Comparing the two never matched,
++    # so roles were never assigned and the plugin's template was never
++    # registered -- the config simply did not appear, with no error to say so.
++    def node_tunnel_intf(node_name: str):
++      for ni in topology.nodes[node_name].get('interfaces',[]):
++        if ni.get('linkindex',None) == lidx and ni.get('tunnel',None):
++          return ni
++      return None
++
++    # PASS 1 -- resolve every tunnel source on this cloud first.
++    #
++    # A spoke's `ip nhrp map` needs the hub's NBMA (underlay) address, which is
++    # the address of the hub's tunnel SOURCE interface. That is only known once
++    # set_tunnel_source has run for the hub, so sources have to be resolved for
++    # the whole link before any map can be built.
++    on_link = []
++    for intf in link.interfaces:
++      ndata = topology.nodes[intf.node]
++      if not _tunnel.check_feature(ndata,topology,f_name='dmvpn',f_desc='DMVPN tunnels'):
++        continue
++      ni = node_tunnel_intf(intf.node)
++      if ni is None:
++        continue
++      u_iflist = _tunnel.get_tunnel_source(ndata,ni,topology)
++      if u_iflist:
++        _tunnel.set_tunnel_source(ni,u_iflist,ndata,topology)
++      on_link.append((intf.node,ndata,ni))
++
++    # The hubs' overlay + NBMA addresses, which every other node has to map.
++    hub_map = []
++    for h_name,h_ndata,h_ni in on_link:
++      if h_name not in hubs:
++        continue
++      overlay = h_ni.get(t_af,None)
++      nbma    = h_ni.get(f'tunnel._source.{t_af}',None)
++      if not overlay:
++        continue
++      hub_map.append({
++        'node':    h_name,
++        'overlay': str(overlay).split('/')[0],
++        'nbma':    str(nbma).split('/')[0] if nbma else None })
++
++    # PASS 2 -- roles and NHRP data.
++    for n_name,ndata,ni in on_link:
++      ni.tunnel._dmvpn_role  = 'hub' if n_name in hubs else 'spoke'
++      ni.tunnel._dmvpn_netid = net_id
++      # Every node maps every OTHER hub. On a cloud with two hubs that is what
++      # makes them point at each other, which is how the workbook has it.
++      ni.tunnel._dmvpn_nhs   = [ h for h in hub_map if h['node'] != n_name ]
++      if passwd:
++        ni.tunnel._dmvpn_password = passwd
++
++      api.node_config(ndata,_config_name)
+diff --git a/netsim/extra/tunnel/dmvpn/defaults.yml b/netsim/extra/tunnel/dmvpn/defaults.yml
+new file mode 100644
+index 0000000..ce78563
+--- /dev/null
++++ b/netsim/extra/tunnel/dmvpn/defaults.yml
+@@ -0,0 +1,39 @@
++# DMVPN (multipoint GRE + NHRP) tunnel attributes
++#
++# DMVPN is not point-to-point, so it does not use extra/tunnel/_p2p: a cloud has
++# one or more hubs and any number of spokes on ONE link, and there is no
++# `tunnel destination` at all -- NHRP resolves it.
++---
++providers:
++  clab:
++    kmods:
++      tunnel@dmvpn: [ ip_gre ]
++
++attributes:
++  link:
++    tunnel:
++      af:
++        { type: str, valid_values: [ ipv4, ipv6 ] }
++      mode:
++        _required: True
++        type: str
++        valid_values:
++          dmvpn:
++      hub:                    # Node name(s) acting as NHRP next-hop server.
++                              # A single hub may be written as a bare string.
++        type: list
++        _subtype: str
++        _alt_types: [ str ]
++      nhrp_id: int            # NHRP network-id; defaults to the link index
++      password: str           # NHRP authentication string
++      source:
++        type: dict
++        _keys:
++          ifindex: int
++          type:
++            { type: str, valid_values: [ loopback ] }
++          linkid: id
++          link:
++            name: str
++            role: id
++      vrf: str
+diff --git a/netsim/extra/tunnel/dmvpn/ios.j2 b/netsim/extra/tunnel/dmvpn/ios.j2
+new file mode 100644
+index 0000000..175a487
+--- /dev/null
++++ b/netsim/extra/tunnel/dmvpn/ios.j2
+@@ -0,0 +1,45 @@
++{#
++  DMVPN on IOS/IOL: multipoint GRE plus NHRP, in the workbook's own form.
++
++  Hub:   ip nhrp map multicast dynamic          (learn spokes as they register)
++  Spoke: ip nhrp map <hub-overlay> <hub-nbma>   (reach the hub before NHRP works)
++         ip nhrp map multicast <hub-nbma>       (carry routing multicast to it)
++         ip nhrp nhs <hub-overlay>              (register with it)
++
++  No `tunnel destination` -- that is the point of mGRE.
++#}
++{% for intf in netlab_interfaces if intf.tunnel.mode|default('') == 'dmvpn' %}
++!
++interface {{ intf.ifname }}
++ tunnel mode gre multipoint
++{%   if intf.tunnel.vrf is defined %}
++ tunnel vrf {{ intf.tunnel.vrf }}
++{%   endif %}
++ tunnel source {{ intf.tunnel._source.ifname }}
++ ip nhrp network-id {{ intf.tunnel._dmvpn_netid|default(1) }}
++{%   if intf.tunnel._dmvpn_password is defined %}
++ ip nhrp authentication {{ intf.tunnel._dmvpn_password }}
++{%   endif %}
++{%   if intf.tunnel._dmvpn_role|default('spoke') == 'hub' %}
++ ip nhrp map multicast dynamic
++{#
++  ONE MULTIPOINT INTERFACE CARRIES EVERY SPOKE, so EIGRP split horizon on the
++  hub stops spoke A ever hearing spoke B: the update learned on Tunnel0 is
++  never sent back out Tunnel0. The workbook's hub carries `no ip split-horizon
++  eigrp <as>` for exactly this reason, and the demo-lab source hub (which lacked
++  it) never got spoke-to-spoke routes. Emitted on the HUB only, and only when
++  the node runs EIGRP on this tunnel -- OSPF point-to-multipoint has no such
++  rule. Measured 2026-09-12: the rendered demo-lab hub had none of it until this.
++#}
++{%     if eigrp.as is defined and intf.eigrp is defined %}
++ no ip split-horizon eigrp {{ eigrp.as }}
++{%     endif %}
++{%   endif %}
++{%   for nhs in intf.tunnel._dmvpn_nhs|default([]) %}
++{%     if nhs.nbma %}
++ ip nhrp map {{ nhs.overlay }} {{ nhs.nbma }}
++ ip nhrp map multicast {{ nhs.nbma }}
++{%     endif %}
++ ip nhrp nhs {{ nhs.overlay }}
++{%   endfor %}
++{% endfor %}
+diff --git a/netsim/modules/eigrp.py b/netsim/modules/eigrp.py
+index c9b5828..0b49097 100644
+--- a/netsim/modules/eigrp.py
++++ b/netsim/modules/eigrp.py
+@@ -3,6 +3,7 @@
+ #
+ from box import Box
+ 
++from ..utils import log
+ from . import _Module, _routing
+ 
+ 
+@@ -14,4 +15,12 @@ class EIGRP(_Module):
+       if not _routing.external(intf,'eigrp'):
+         _routing.passive(intf,'eigrp',topology)
+ 
+-    _routing.igp_post_transform(node,topology,proto='eigrp',vrf_aware=False)
++    _routing.igp_post_transform(node,topology,proto='eigrp',vrf_aware=True)
++    for source,import_data in node.get('eigrp.import',{}).items():
++      if import_data.get('metric',None):
++        continue
++      log.error(
++        f'Route import from {source} into EIGRP on node {node.name} requires an EIGRP composite metric',
++        more_hints='Set eigrp.import.<protocol>.metric bandwidth, delay, reliability, load, and mtu',
++        category=log.MissingValue,
++        module='eigrp')
+diff --git a/netsim/modules/eigrp.yml b/netsim/modules/eigrp.yml
+index e74b07d..4e50704 100644
+--- a/netsim/modules/eigrp.yml
++++ b/netsim/modules/eigrp.yml
+@@ -17,7 +17,36 @@ attributes:
+   node:
+     af:
+     as:
++    import: eigrp_import
+   link:
+     passive: bool
++  vrf:
++    active: bool
++    af:
++      copy: global
++    as: asn
++    import: eigrp_import
++    passive: bool
++_top:
++  attributes:
++    eigrp_metric:
++      bandwidth: { type: int, min_value: 1, max_value: 4294967295, _required: True }
++      delay: { type: int, min_value: 0, max_value: 4294967295, _required: True }
++      reliability: { type: int, min_value: 0, max_value: 255, _required: True }
++      load: { type: int, min_value: 1, max_value: 255, _required: True }
++      mtu: { type: int, min_value: 1, max_value: 65535, _required: True }
++    eigrp_import:
++      _description: EIGRP route import specification
++      type: dict
++      _keytype: r_proto
++      _list_to_dict: True
++      _subtype:
++        _alt_types: [ NoneType, bool ]
++        policy:
++          type: id
++          _requires: [ routing ]
++        metric: eigrp_metric
++features:
++  import: Import routes from other routing protocols
+ warnings:
+   inactive: True
+diff --git a/netsim/modules/lag.py b/netsim/modules/lag.py
+index de74482..4d91255 100644
+--- a/netsim/modules/lag.py
++++ b/netsim/modules/lag.py
+@@ -13,6 +13,7 @@ ID_SET = 'lag_id'
+ PEERLINK_ID_SET = 'peerlink_id'
+ 
+ PEERLINK_ID_ATT = 'lag.mlag.peergroup'
++MLAG_DOMAIN_ATTR = [ 'peer_switch', 'peer_gateway', 'layer3_peer_router' ]
+ 
+ """
+ populate_lag_id_set -- Collect any user defined lag.ifindex values globally and initialize ID generator
+@@ -103,6 +104,19 @@ def check_mside_lag_support(node: str, linkname: str, topology: Box) -> bool:
+     return False
+   return True
+ 
++"""
++check_mlag_domain_support - check device support for optional MLAG domain settings
++"""
++def check_mlag_domain_support(node: Box, intf: Box, features: Box) -> None:
++  supported = features.get('lag.mlag.domain',[])
++  for attr in MLAG_DOMAIN_ATTR:
++    if not intf.get(f'lag.mlag.{attr}',False) or attr in supported:
++      continue
++    log.error(
++      f'Node {node.name} ({node.device}) does not support lag.mlag.{attr}',
++      category=log.IncorrectAttr,
++      module='lag')
++
+ """
+ normalized_members - builds a normalized list of lag member links. It also checks that:
+ 
+@@ -472,6 +486,7 @@ class LAG(_Module):
+     uses_esi_lag = False
+     for i in node.interfaces:
+       if i.get(PEERLINK_ID_ATT,None):          # Fill in peer loopback IP and vMAC for MLAG peer links
++        check_mlag_domain_support(node,i,features)
+         populate_mlag_peer(node,i,topology)
+         has_peerlink = True
+       elif i.type=='lag':
+diff --git a/netsim/modules/lag.yml b/netsim/modules/lag.yml
+index 09a2bbd..99f6fca 100644
+--- a/netsim/modules/lag.yml
++++ b/netsim/modules/lag.yml
+@@ -34,6 +34,9 @@ attributes:
+         min_value: 1
+         _alt_types: [ bool ]
+       mac: mac
++      peer_switch: bool         # Use the same STP bridge identity on both MLAG peers
++      peer_gateway: bool        # Allow forwarding through the peer's gateway MAC
++      layer3_peer_router: bool  # Allow routing-protocol peering across the peer link
+   interface:
+     lacp_system_id:
+       type: mac
+@@ -60,3 +63,7 @@ attributes:
+     _linkname:
+     name:
+     ifindex:
++
++features:
++  mlag:
++    domain: MLAG domain-level options
+diff --git a/netsim/modules/ospf.py b/netsim/modules/ospf.py
+index 6985b23..da767cd 100644
+--- a/netsim/modules/ospf.py
++++ b/netsim/modules/ospf.py
+@@ -161,6 +161,53 @@ def check_gr(node: Box, features: Box) -> None:
+           log.IncorrectValue,
+           'ospf')
+ 
++def check_standard_acl(node: Box, acl_name: str) -> None:
++  """
++  IOS renders the ACL referenced by ospf.distribute_list as an IPv4 standard
++  ACL (routing/acl.ios.j2), which can only match on the source prefix. Reject
++  entries that need an extended ACL, and reject attaching the same ACL to an
++  interface (the interface form references the extended <name>_ipv4 ACL,
++  which is not rendered for a distribute-list ACL).
++  """
++  def is_any(addr: Box) -> bool:
++    if not addr:
++      return True
++    if 'port' in addr:
++      return False
++    if addr.get('prefix',None) == ['any']:
++      return True
++    pfx = [ p for af in ('ipv4','ipv6') for p in addr.get(af,[]) ]
++    return bool(pfx) and all(str(p).endswith('/0') for p in pfx)   # 'any' expands to 0.0.0.0/0 + ::/0
++
++  for idx,entry in enumerate(node.routing.acl[acl_name],1):
++    reason = ''
++    if entry.get('protocol','ip') != 'ip':
++      reason = f'protocol {entry.protocol}'
++    elif entry.get('established',False):
++      reason = 'established'
++    elif 'port' in entry.get('src',{}):
++      reason = 'a source port'
++    elif not is_any(entry.get('dst',{})):
++      reason = 'a destination match'
++    if reason:
++      log.error(
++        text=f'{node.name} ospf.distribute_list ACL {acl_name} entry #{idx} uses {reason}; ' + \
++              'a distribute-list ACL is a standard ACL and can match only the source prefix',
++        category=log.IncorrectValue,
++        module='ospf')
++
++  for intf in node.get('interfaces',[]):
++    intf_acl = intf.get('routing.acl',{})
++    for acl_ref in intf_acl.values():
++      refs = [ acl_ref ] if isinstance(acl_ref,str) else list(acl_ref.values())
++      if acl_name in refs:
++        log.error(
++          text=f'{node.name} ACL {acl_name} is used by ospf.distribute_list and also attached to ' + \
++               f'interface {intf.ifname}; use a separate routing.acl entry for the interface filter',
++          category=log.IncorrectValue,
++          module='ospf')
++
++
+ class OSPF(_Module):
+ 
+   def node_post_transform(self, node: Box, topology: Box) -> None:
+@@ -205,6 +252,21 @@ class OSPF(_Module):
+     _routing.check_vrf_protocol_support(node,'ospf','ipv6','ospfv3',topology)
+     _routing.check_intf_support(node,'ospf',topology)
+     check_gr(node,features)
++    dlist = node.get('ospf.distribute_list',None)
++    if dlist is not None:
++      if not features.get('ospf.distribute_list',False):
++        log.error(
++          text=f'{node.name} (device {node.device}) does not support ospf.distribute_list',
++          category=log.IncorrectValue,
++          module='ospf')
++      elif dlist not in node.get('routing.acl',{}):
++        log.error(
++          text=f'{node.name} ospf.distribute_list references ACL {dlist}, which is not ' + \
++               f'declared in this node\'s routing.acl',
++          category=log.IncorrectValue,
++          module='ospf')
++      else:
++        check_standard_acl(node,dlist)
+ 
+     # Collect OSPF areas from interfaces (similar to ospf.areas plugin but without extra attributes)
+     collect_ospf_areas(node)
+diff --git a/netsim/modules/ospf.yml b/netsim/modules/ospf.yml
+index 73e5ed5..8fb2c61 100644
+--- a/netsim/modules/ospf.yml
++++ b/netsim/modules/ospf.yml
+@@ -39,6 +39,11 @@ attributes:
+         cost: int
+         type: { type: str, valid_values: [ e1, e2 ] }
+     digest: { type: dict }
++    # Global (not per-interface) inbound route filter: `router ospf <pid> /
++    # distribute-list <acl> in`. References the name of a `routing.acl` entry
++    # already declared on this node -- same `id` type interface.acl.in.ipv4
++    # uses for the same kind of reference.
++    distribute_list: id
+     gr:
+       _remove_when_false: True
+       _value_to_dict:
+diff --git a/netsim/modules/routing/__init__.py b/netsim/modules/routing/__init__.py
+index 8ee466d..7d63150 100644
+--- a/netsim/modules/routing/__init__.py
++++ b/netsim/modules/routing/__init__.py
+@@ -142,14 +142,17 @@ class Routing(_Module):
+   group data validation.
+   """
+   def module_normalize(self, topology: Box) -> None:
++    prefix.extract_prefix_names(topology,'topology')          # { name, value } prefix filters -> list + declared name
+     normalize_routing_data(topology,topo_object=True,o_name='topology')
+ 
+     for gname,gdata in topology.get('groups',{}).items():
+       if gname.startswith('_'):
+         continue
++      prefix.extract_prefix_names(gdata,f'groups.{gname}')
+       normalize_routing_data(gdata,o_name=f'groups.{gname}')
+ 
+     for node,ndata in topology.nodes.items():
++      prefix.extract_prefix_names(ndata,f'nodes.{node}')
+       normalize_routing_data(ndata,o_name=f'nodes.{node}')
+ 
+   """
+diff --git a/netsim/modules/routing/prefix.py b/netsim/modules/routing/prefix.py
+index 45f5ff9..56aa774 100644
+--- a/netsim/modules/routing/prefix.py
++++ b/netsim/modules/routing/prefix.py
+@@ -15,6 +15,66 @@ from ...data import append_to_list, get_empty_box
+ from ...utils import log
+ from . import utils as _utils
+ 
++"""
++extract_prefix_names:
++
++A prefix filter is normally a list of entries. It can also be a dictionary with a
++'value' list and a 'name' -- the exact object name the DEVICE gets (the same shape
++the community lists use for their 'type' + 'value'). The dictionary is folded back
++into the plain list before validation, and the declared name is kept in
++routing._pfxname[<key>] so expand_prefix_list can build the per-AF name map.
++
++Why: netlab appends the address family to every prefix-list name ('p1-ipv4') so
++platforms with one namespace for IPv4 and IPv6 prefix lists never collide. Some
++labs need the configured name to be exactly what was declared (a change-review
++demo edits the lists by name), and IOS keeps 'ip prefix-list' and 'ipv6
++prefix-list' in separate namespaces anyway.
++"""
++def extract_prefix_names(r_object: Box, o_name: str = 'topology') -> None:
++  pfx = r_object.get('routing.prefix',None)
++  if not isinstance(pfx,Box):
++    return
++
++  for key in list(pfx.keys()):
++    pdata = pfx[key]
++    if not isinstance(pdata,Box) or 'value' not in pdata:
++      continue
++    extra = [ k for k in pdata.keys() if k not in ('name','value') ]
++    if extra:
++      log.error(
++        f'Prefix filter {key} in {o_name} can have only "name" and "value" attributes, found {",".join(extra)}',
++        category=log.IncorrectAttr,
++        module='routing')
++    if 'name' in pdata:
++      if not isinstance(pdata.name,str) or not pdata.name:
++        log.error(
++          f'The "name" of prefix filter {key} in {o_name} must be a non-empty string',
++          category=log.IncorrectType,
++          module='routing')
++      else:
++        r_object.routing._pfxname[key] = pdata.name
++    pfx[key] = pdata.value
++
++"""
++declared_prefix_name: the declared device name of prefix filter <p_name>, or None
++
++* Without a declared 'name' the device configures '<p_name>-<af>' (unchanged behavior on every platform)
++* A declared 'name' is used verbatim when the device features declare routing.prefix.name
++  (the device keeps per-AF prefix lists in separate namespaces or the caller accepts the
++  collision); on any other device it is an error, not a silent fallback.
++"""
++def declared_prefix_name(p_name: str, node: Box, topology: Box, features: Box) -> typing.Optional[str]:
++  declared = node.get(f'routing._pfxname.{p_name}',None) or topology.get(f'routing._pfxname.{p_name}',None)
++  if not declared:
++    return None
++  if not features.get('routing.prefix.name',False):
++    log.error(
++      f'Device {node.device} (node {node.name}) cannot use the declared prefix-list name "{declared}" (prefix filter {p_name})',
++      more_hints=['The device configuration templates use netlab prefix list names (<name>-<af>)'],
++      category=log.IncorrectAttr,
++      module='routing')
++    return None
++  return declared
+ 
+ def expand_prefix_entry(p_entry: Box, path: str, topology: Box) -> Box:
+   """
+@@ -178,6 +238,7 @@ def expand_prefix_list(p_name: str,o_name: str,node: Box,topology: Box) -> typin
+   node.routing[o_name][p_name] = sorted(node.routing[o_name][p_name],key=lambda O: O.get('sequence',10))
+   features = a_devices.get_device_features(node,topology.defaults)
+   min_strict = features.get('routing.prefix.strict',False)
++  declared = declared_prefix_name(p_name,node,topology,features)
+   af_prefix: dict = {}                                      # Prepare dictionary of per-AF prefix lists
+   for af in ('ipv4','ipv6'):                                # Iterate over address families (sorry, no CLNS or IPX)
+     af_prefix[af] = []                                      # Start with an emtpy per-AF list
+@@ -197,5 +258,7 @@ def expand_prefix_list(p_name: str,o_name: str,node: Box,topology: Box) -> typin
+       node.routing['_'+o_name][af][p_name] = af_prefix[af]  # ... yes, save it
+     else:
+       node.routing['_'+o_name][af][p_name] = create_empty_prefix_list(af)      
++    # The name the device gets for this per-AF list ('<name>-<af>' unless a name was declared)
++    node.routing['_'+o_name+'_name'][af][p_name] = declared or f'{p_name}-{af}'
+ 
+   return None                                               # No need to do additional checks
+diff --git a/tests/errors/fabric-count-not-integer-spines.log b/tests/errors/fabric-count-not-integer-spines.log
+new file mode 100644
+index 0000000..b5b1973
+--- /dev/null
++++ b/tests/errors/fabric-count-not-integer-spines.log
+@@ -0,0 +1,2 @@
++IncorrectType in fabric: fabric.spines must be an integer (number of spines), found Box. Use fabric.spine for per-spine parameters
++Fatal error in netlab: Cannot proceed beyond this point due to errors, exiting
+diff --git a/tests/errors/fabric-count-not-integer-spines.yml b/tests/errors/fabric-count-not-integer-spines.yml
+new file mode 100644
+index 0000000..4d6224b
+--- /dev/null
++++ b/tests/errors/fabric-count-not-integer-spines.yml
+@@ -0,0 +1,8 @@
++---
++defaults.device: eos
++plugin: [ fabric ]
++
++fabric:
++  spines:
++    count: 2
++  leafs: 4
+diff --git a/tests/errors/fabric-count-not-integer.log b/tests/errors/fabric-count-not-integer.log
+new file mode 100644
+index 0000000..a2810e3
+--- /dev/null
++++ b/tests/errors/fabric-count-not-integer.log
+@@ -0,0 +1,2 @@
++IncorrectType in fabric: fabric.leafs must be an integer (number of leafs), found Box. Use fabric.leaf for per-leaf parameters
++Fatal error in netlab: Cannot proceed beyond this point due to errors, exiting
+diff --git a/tests/errors/fabric-count-not-integer.yml b/tests/errors/fabric-count-not-integer.yml
+new file mode 100644
+index 0000000..185cecc
+--- /dev/null
++++ b/tests/errors/fabric-count-not-integer.yml
+@@ -0,0 +1,10 @@
++---
++# fabric.leafs and fabric.spines are the NUMBER of leafs/spines; per-device parameters go into fabric.leaf / fabric.spine
++defaults.device: eos
++plugin: [ fabric ]
++
++fabric:
++  spines:
++    count: 2
++  leafs:
++    count: 4
+diff --git a/tests/errors/routing-prefix-name-attr.log b/tests/errors/routing-prefix-name-attr.log
+new file mode 100644
+index 0000000..b2bac8a
+--- /dev/null
++++ b/tests/errors/routing-prefix-name-attr.log
+@@ -0,0 +1,3 @@
++IncorrectAttr in routing: Prefix filter p_extra in topology can have only "name" and "value" attributes, found type
++IncorrectType in routing: The "name" of prefix filter p_badname in topology must be a non-empty string
++Fatal error in netlab: Cannot proceed beyond this point due to errors, exiting
+diff --git a/tests/errors/routing-prefix-name-attr.yml b/tests/errors/routing-prefix-name-attr.yml
+new file mode 100644
+index 0000000..7cc0315
+--- /dev/null
++++ b/tests/errors/routing-prefix-name-attr.yml
+@@ -0,0 +1,25 @@
++---
++message: |
++  The topology tests the attribute checks of prefix filters with a declared name
++
++module: [ routing ]
++provider: clab                # To make IOL work
++defaults.device: iol
++
++routing.prefix:
++  p_extra:                    # Only "name" and "value" are allowed
++    name: EXTRA
++    type: standard
++    value:
++    - prefix: 10.0.0.0/8
++  p_badname:                  # The name must be a non-empty string
++    name: 42
++    value:
++    - prefix: 10.0.0.0/8
++
++nodes:
++  r1:
++    box: none                 # To ensure idempotence when images change
++    routing.prefix:
++      p_extra:
++      p_badname:
+diff --git a/tests/errors/routing-prefix-name-device.log b/tests/errors/routing-prefix-name-device.log
+new file mode 100644
+index 0000000..10ac509
+--- /dev/null
++++ b/tests/errors/routing-prefix-name-device.log
+@@ -0,0 +1,3 @@
++IncorrectAttr in routing: Device frr (node r1) cannot use the declared prefix-list name "NAMED" (prefix filter p_named)
++... The device configuration templates use netlab prefix list names (<name>-<af>)
++Fatal error in netlab: Cannot proceed beyond this point due to errors, exiting
+diff --git a/tests/errors/routing-prefix-name-device.yml b/tests/errors/routing-prefix-name-device.yml
+new file mode 100644
+index 0000000..c19b877
+--- /dev/null
++++ b/tests/errors/routing-prefix-name-device.yml
+@@ -0,0 +1,22 @@
++---
++message: |
++  The topology tests a declared prefix-list name on a device that cannot keep it
++
++provider: clab                # To make IOL work
++module: [ routing ]
++
++routing.prefix:
++  p_named:
++    name: NAMED
++    value:
++    - prefix: 10.0.0.0/8
++
++nodes:
++  r1:
++    device: frr               # FRR does not declare routing.prefix.name
++    box: none                 # To ensure idempotence when images change
++    routing.prefix.p_named:
++  r2:
++    device: iol               # IOS keeps the declared name
++    box: none
++    routing.prefix.p_named:
+diff --git a/tests/test_eigrp_redistribution.py b/tests/test_eigrp_redistribution.py
+new file mode 100644
+index 0000000..65f99ed
+--- /dev/null
++++ b/tests/test_eigrp_redistribution.py
+@@ -0,0 +1,144 @@
++#!/usr/bin/env python3
++
++import textwrap
++from pathlib import Path
++
++import pytest
++
++from netsim import augment
++from netsim.cli import create
++from netsim.utils import log
++from netsim.utils import read as _read
++
++
++@pytest.fixture(autouse=True)
++def restore_log_state():
++  """Leave netlab's log module as this test found it.
++
++  init_log() sets process-wide flags (raise_error, quiet, ...) and the error tests leave entries in the
++  global error log. A later test module that calls log.exit_on_error() would then abort on errors it never
++  made, so snapshot the flags before each test, restore them after it, and clear the error log.
++  """
++  saved = log.set_flag()
++  yield
++  log.init_log_system(header=False)
++  log.set_flag(
++    debug=saved['debug'],
++    quiet=saved['quiet'],
++    verbose=saved['verbose'],
++    logging=saved['logging'],
++    warning=saved['warning'],
++    raise_error=saved['raise_on_error'])
++
++
++def init_log(raise_error: bool = False) -> None:
++  log.init_log_system(header=False)
++  log.set_flag(quiet=True,raise_error=raise_error,warning=False,logging=False,verbose=0)
++
++
++def write_topology(tmp_path: Path, topology: str) -> Path:
++  topo_file = tmp_path / 'topology.yml'
++  topo_file.write_text(textwrap.dedent(topology).strip() + '\n')
++  return topo_file
++
++
++@pytest.mark.parametrize('device',['iol','nxos'])
++def test_kne_renders_native_bgp_eigrp_redistribution(
++      tmp_path: Path,
++      monkeypatch: pytest.MonkeyPatch,
++      device: str) -> None:
++  monkeypatch.chdir(tmp_path)
++  topo_file = write_topology(tmp_path,f"""
++provider: kne
++
++routing:
++  prefix:
++    eigrp_to_bgp:
++    - {{ sequence: 10, action: permit, ipv4: 10.99.10.0/24 }}
++    - {{ sequence: 20, action: permit, ipv4: 10.99.20.0/24 }}
++    atm_cidrs:
++    - {{ sequence: 10, action: permit, ipv4: 10.99.10.0/24 }}
++    - {{ sequence: 20, action: permit, ipv4: 10.99.20.0/24 }}
++  policy:
++    eigrp_to_bgp:
++    - {{ sequence: 10, action: permit, match: {{ prefix: eigrp_to_bgp }} }}
++    atm_from_sdwan:
++    - {{ sequence: 10, action: permit, match: {{ prefix: atm_cidrs }} }}
++    - {{ sequence: 20, action: deny }}
++
++nodes:
++  core:
++    device: {device}
++    module: [ bgp, eigrp, routing ]
++    bgp:
++      as: 65010
++      import:
++        eigrp: {{ policy: eigrp_to_bgp }}
++    eigrp:
++      as: 100
++      import:
++        bgp:
++          policy: atm_from_sdwan
++          metric:
++            bandwidth: 100000
++            delay: 100
++            reliability: 255
++            load: 1
++            mtu: 1500
++  branch:
++    device: {device}
++    module: [ eigrp ]
++    eigrp.as: 100
++  edge:
++    device: {device}
++    module: [ bgp ]
++    bgp.as: 65100
++
++links:
++- core-branch
++- core-edge
++""")
++
++  init_log()
++  create.run(['-o','config','-o','provider',str(topo_file)])
++  startup = Path('node_files/core/startup-config').read_text()
++
++  assert 'ip prefix-list eigrp_to_bgp-ipv4 seq 100 permit 10.99.10.0/24' in startup
++  assert 'route-map eigrp_to_bgp-ipv4 permit 10' in startup
++  assert 'match ip address prefix-list eigrp_to_bgp-ipv4' in startup
++  assert 'redistribute eigrp 100 route-map eigrp_to_bgp-ipv4' in startup
++
++  if device == 'iol':
++    assert 'redistribute bgp 65010 metric 100000 100 255 1 1500 route-map atm_from_sdwan-ipv4' in startup
++  else:
++    assert 'route-map atm_from_sdwan-eigrp-ipv4 permit 10' in startup
++    assert 'set metric 100000 100 255 1 1500' in startup
++    assert 'redistribute bgp 65010 route-map atm_from_sdwan-eigrp-ipv4' in startup
++
++  provider_text = Path('topology.pb.txt').read_text()
++  assert f'model: "{device}"' in provider_text
++  assert 'file: "node_files/core/startup-config"' in provider_text
++
++
++def test_eigrp_import_requires_composite_metric(tmp_path: Path) -> None:
++  topo_file = write_topology(tmp_path,"""
++module: [ bgp, eigrp ]
++defaults.device: iol
++provider: kne
++bgp.as: 65000
++eigrp.as: 100
++nodes:
++  r1:
++    eigrp.import: [ bgp ]
++  r2:
++links: [ r1-r2 ]
++""")
++
++  init_log(raise_error=True)
++  topology = _read.load(str(topo_file),relative_topo_name=True,user_defaults=[])
++  try:
++    augment.main.transform(topology)
++  except log.ErrorAbort:
++    assert 'requires an EIGRP composite metric' in '\n'.join(log.get_error_log())
++  else:
++    raise AssertionError('EIGRP import without a composite metric was accepted')
+diff --git a/tests/test_nxos_vpc.py b/tests/test_nxos_vpc.py
+new file mode 100644
+index 0000000..6f6c318
+--- /dev/null
++++ b/tests/test_nxos_vpc.py
+@@ -0,0 +1,89 @@
++#!/usr/bin/env python3
++
++import textwrap
++from pathlib import Path
++
++import pytest
++
++from netsim import augment
++from netsim.cli import create
++from netsim.utils import log
++from netsim.utils import read as _read
++
++
++def init_log(raise_error: bool = False) -> None:
++  log.init_log_system(header=False)
++  log.set_flag(quiet=True,raise_error=raise_error,warning=False,logging=False,verbose=0)
++
++
++def write_topology(tmp_path: Path, topology: str) -> Path:
++  topo_file = tmp_path / 'topology.yml'
++  topo_file.write_text(textwrap.dedent(topology).strip() + '\n')
++  return topo_file
++
++
++def test_kne_renders_native_nxos_vpc(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.chdir(tmp_path)
++  topo_file = write_topology(tmp_path,"""
++provider: kne
++module: [ lag ]
++
++nodes:
++  s1: { device: nxos }
++  s2: { device: nxos }
++  c1: { device: ioll2 }
++
++links:
++- lag:
++    members:
++    - s1: { ifindex: 1 }
++      s2: { ifindex: 1 }
++    - s1: { ifindex: 2 }
++      s2: { ifindex: 2 }
++    mlag:
++      peergroup: 10
++      peer_switch: true
++      peer_gateway: true
++      layer3_peer_router: true
++- prefix: false
++  lag.members: [ c1-s1, c1-s2 ]
++""")
++
++  init_log()
++  create.run(['-o','config','-o','provider',str(topo_file)])
++
++  startup = Path('node_files/s1/startup-config').read_text()
++  assert 'feature lacp\nfeature vpc' in startup
++  assert 'vpc domain 10\n peer-switch\n peer-gateway\n layer3 peer-router' in startup
++  assert 'interface port-channel4096' in startup
++  assert ' spanning-tree port type network\n vpc peer-link' in startup
++  assert startup.count(' channel-group 4096 mode active') == 2
++  assert 'interface port-channel1\n description s1 -> [c1,s2] (vPC 1)\n switchport\n vpc 1' in startup
++  assert 'interface Ethernet1/3\n description s1 -> c1 in channel-group 1\n switchport\n channel-group 1 mode active' in startup
++
++  provider_text = Path('topology.pb.txt').read_text()
++  assert 'name: "s1"\n  vendor: CISCO\n  model: "nxos"' in provider_text
++  assert provider_text.count('links: {') == 4
++
++
++def test_mlag_domain_options_are_device_capabilities(tmp_path: Path) -> None:
++  topo_file = write_topology(tmp_path,"""
++module: [ lag ]
++defaults.device: eos
++nodes: [ s1, s2 ]
++links:
++- lag:
++    members: [ s1-s2 ]
++    mlag:
++      peergroup: 10
++      peer_gateway: true
++""")
++
++  init_log(raise_error=True)
++  topology = _read.load(str(topo_file),relative_topo_name=True,user_defaults=[])
++  try:
++    augment.main.transform(topology)
++  except log.ErrorAbort:
++    assert 'does not support lag.mlag.peer_gateway' in '\n'.join(log.get_error_log())
++  else:
++    raise AssertionError('unsupported MLAG domain option was accepted')
+diff --git a/tests/topology/expected/routing-prefix-name.yml b/tests/topology/expected/routing-prefix-name.yml
+new file mode 100644
+index 0000000..419c37c
+--- /dev/null
++++ b/tests/topology/expected/routing-prefix-name.yml
+@@ -0,0 +1,203 @@
++input:
++- topology/input/routing-prefix-name.yml
++- package:topology-defaults.yml
++module:
++- routing
++name: input
++nodes:
++  r1:
++    af:
++      ipv4: true
++      ipv6: true
++    box: vrnetlab/cisco_iol:17.16.01a
++    clab:
++      binds:
++      - source: node_files/r1/ifstate
++        target: /iol/ifstate.cfg
++      config_templates:
++      - source: ifstate
++        target: /iol/ifstate.cfg
++      kind: cisco_iol
++    device: iol
++    hostname: clab-input-r1
++    id: 1
++    interfaces: []
++    loopback:
++      ifindex: 0
++      ifname: Loopback0
++      ipv4: 10.0.0.1/32
++      ipv6: 2001:db8:cafe:1::1/64
++      neighbors: []
++      type: loopback
++      virtual_interface: true
++    mgmt:
++      ifname: Ethernet0/0
++      ipv4: 192.168.121.101
++      mac: ca:fe:00:01:00:00
++    module:
++    - routing
++    name: r1
++    role: router
++    routing:
++      _pfxname:
++        p_named: CUSTOMER-IN
++      _prefix:
++        ipv4:
++          p_named:
++          - action: permit
++            ipv4: 10.0.0.0/8
++            max: 24
++            sequence: 100
++          - action: permit
++            ipv4: 192.168.42.0/24
++            sequence: 110
++          p_plain:
++          - action: permit
++            ipv4: 172.16.0.0/12
++            sequence: 100
++        ipv6:
++          p_named:
++          - action: permit
++            ipv6: 2001:db8:cafe:42::/64
++            sequence: 100
++          p_plain:
++          - action: deny
++            ipv6: ::/0
++            sequence: 10
++      _prefix_name:
++        ipv4:
++          p_named: CUSTOMER-IN
++          p_plain: p_plain-ipv4
++        ipv6:
++          p_named: CUSTOMER-IN
++          p_plain: p_plain-ipv6
++      _rm_per_af: true
++      policy:
++        pol_named:
++        - action: permit
++          match:
++            prefix: p_named
++          sequence: 10
++        - action: permit
++          match:
++            prefix: p_plain
++          sequence: 20
++      prefix:
++        p_named:
++        - action: permit
++          ipv4:
++          - 10.0.0.0/8
++          max:
++            ipv4: 24
++          sequence: 10
++        - action: permit
++          ipv4:
++          - 192.168.42.0/24
++          ipv6:
++          - 2001:db8:cafe:42::/64
++          sequence: 20
++        p_plain:
++        - action: permit
++          ipv4:
++          - 172.16.0.0/12
++          sequence: 10
++  r2:
++    af:
++      ipv4: true
++      ipv6: true
++    box: vrnetlab/cisco_iol:17.16.01a
++    clab:
++      binds:
++      - source: node_files/r2/ifstate
++        target: /iol/ifstate.cfg
++      config_templates:
++      - source: ifstate
++        target: /iol/ifstate.cfg
++      kind: cisco_iol
++    device: iol
++    hostname: clab-input-r2
++    id: 2
++    interfaces: []
++    loopback:
++      ifindex: 0
++      ifname: Loopback0
++      ipv4: 10.0.0.2/32
++      ipv6: 2001:db8:cafe:2::1/64
++      neighbors: []
++      type: loopback
++      virtual_interface: true
++    mgmt:
++      ifname: Ethernet0/0
++      ipv4: 192.168.121.102
++      mac: ca:fe:00:02:00:00
++    module:
++    - routing
++    name: r2
++    role: router
++    routing:
++      _pfxname:
++        p_local: LOCAL-OUT
++        p_named: CUSTOMER-IN
++      _prefix:
++        ipv4:
++          p_local:
++          - action: permit
++            ipv4: 192.0.2.0/24
++            sequence: 100
++        ipv6:
++          p_local:
++          - action: deny
++            ipv6: ::/0
++            sequence: 10
++      _prefix_name:
++        ipv4:
++          p_local: LOCAL-OUT
++        ipv6:
++          p_local: LOCAL-OUT
++      _rm_per_af: true
++      prefix:
++        p_local:
++        - action: permit
++          ipv4:
++          - 192.0.2.0/24
++          sequence: 10
++prefix:
++  any:
++    ipv4: 0.0.0.0/0
++    ipv6: ::/0
++  lan_ds:
++    ipv4: 192.168.42.0/24
++    ipv6: 2001:db8:cafe:42::/64
++provider: clab
++routing:
++  _pfxname:
++    p_named: CUSTOMER-IN
++  policy:
++    pol_named:
++    - action: permit
++      match:
++        prefix: p_named
++      sequence: 10
++    - action: permit
++      match:
++        prefix: p_plain
++      sequence: 20
++  prefix:
++    p_named:
++    - action: permit
++      ipv4:
++      - 10.0.0.0/8
++      max:
++        ipv4: 24
++      sequence: 10
++    - action: permit
++      ipv4:
++      - 192.168.42.0/24
++      ipv6:
++      - 2001:db8:cafe:42::/64
++      sequence: 20
++    p_plain:
++    - action: permit
++      ipv4:
++      - 172.16.0.0/12
++      sequence: 10
+diff --git a/tests/topology/expected/rp-prefix-expansion.yml b/tests/topology/expected/rp-prefix-expansion.yml
+index 2bdae62..0509480 100644
+--- a/tests/topology/expected/rp-prefix-expansion.yml
++++ b/tests/topology/expected/rp-prefix-expansion.yml
+@@ -57,6 +57,13 @@ nodes:
+           - action: deny
+             ipv6: ::/0
+             sequence: 10
++      _prefix_name:
++        ipv4:
++          p1: p1-ipv4
++          p2: p2-ipv4
++        ipv6:
++          p1: p1-ipv6
++          p2: p2-ipv6
+       prefix:
+         p1:
+         - action: permit
+@@ -175,6 +182,15 @@ nodes:
+           - action: permit
+             ipv6: 2001:db8:dead:beef::/64
+             sequence: 110
++      _prefix_name:
++        ipv4:
++          p1: p1-ipv4
++          p3: p3-ipv4
++          p4: p4-ipv4
++        ipv6:
++          p1: p1-ipv6
++          p3: p3-ipv6
++          p4: p4-ipv6
+       prefix:
+         p1:
+         - action: permit
+diff --git a/tests/topology/input/routing-prefix-name.yml b/tests/topology/input/routing-prefix-name.yml
+new file mode 100644
+index 0000000..3c816b5
+--- /dev/null
++++ b/tests/topology/input/routing-prefix-name.yml
+@@ -0,0 +1,37 @@
++# Test prefix filters that keep a declared device list name
++#
++addressing.loopback.ipv6: 2001:db8:cafe::/48
++module: [ routing ]
++provider: clab                # To make IOL work
++defaults.device: iol
++
++prefix:
++  lan_ds:
++    ipv4: 192.168.42.0/24
++    ipv6: 2001:db8:cafe:42::/64
++
++routing.prefix:
++  p_named:                    # Global filter with a declared name
++    name: CUSTOMER-IN
++    value:
++    - prefix: 10.0.0.0/8
++      max: 24
++    - prefix: prefix.lan_ds   # Dual-stack: the name is used for the ipv4 and ipv6 lists
++  p_plain:                    # A plain list keeps the <name>-<af> names
++  - prefix: 172.16.0.0/12
++
++routing.policy:
++  pol_named:
++  - match.prefix: p_named
++  - match.prefix: p_plain
++
++nodes:
++  r1:
++    routing.policy:
++      pol_named:              # Imports p_named and p_plain
++  r2:
++    routing.prefix:
++      p_local:                # Node filter with a declared name
++        name: LOCAL-OUT
++        value:
++        - prefix: 192.0.2.0/24
+-- 
+2.56.0
+

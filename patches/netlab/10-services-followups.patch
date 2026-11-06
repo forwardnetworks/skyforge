@@ -1,0 +1,942 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 00:00:00 +0000
+Subject: [PATCH] services: services.listen, Linux pod listeners and SNMP agent
+ through services, image services at day 0, passive BMP station
+
+---
+diff --git a/docs/module/services.md b/docs/module/services.md
+index acbbcb1..aaeb711 100644
+--- a/docs/module/services.md
++++ b/docs/module/services.md
+@@ -130,3 +130,15 @@ snmp-server location lab-a
+ 
+ The access level is spelled per platform -- `ro` on EOS, `RO` on IOS -- because
+ these strings are written to the device verbatim.
++
++(services-bmp)=
++## BMP Monitoring Station (EOS and Junos)
++
++**services.bmp** (global/node dictionary, Skyforge extension) renders a passive BGP Monitoring Protocol station on the device, as day-0 configuration. It is rendered only on a node that runs the **bgp** module on a device declaring `services.bmp` (EOS, and the Junos devices except vSRX); on any other node the block is removed from the node data. There is no iBGP fallback.
++
++* **station** (string, required): DNS name or address of the BMP station, written to the device verbatim (no resolution by netlab).
++* **port** (int, default 50001): the TCP port the device listens on.
++* **mode** (default and only value: `passive`).
++* **name** (id, default `skyforge`): the station name on the device.
++* **failure_handling**: carried in node data for tooling; not rendered.
++* **enabled** (bool): `false` on a node removes the declaration for that node.
+diff --git a/netsim/ansible/templates/initial/linux-kne.j2 b/netsim/ansible/templates/initial/linux-kne.j2
+index 3cf9856..7fdb9c8 100644
+--- a/netsim/ansible/templates/initial/linux-kne.j2
++++ b/netsim/ansible/templates/initial/linux-kne.j2
+@@ -240,3 +240,14 @@ chmod +x /tmp/netlab-host-activity.sh
+ pkill -f '/tmp/netlab-host-activity.sh' >/dev/null 2>&1 || true
+ nohup /tmp/netlab-host-activity.sh >/var/log/netlab-host-activity.log 2>&1 &
+ fi
++
++{#
++  SKYFORGE-SPECIFIC (patch 40): a KNE pod never runs the image entrypoint (KNE replaces the command with `sleep`), so the
++  services the skyforge-linux-host image offers (Caldera agent launcher, opt-in listeners, iperf3, LLDP) are started from here,
++  the only script that runs in a KNE lab. The helper is idempotent (a warm reconfigure re-runs this script) and fails open; an
++  image without it (any non-Skyforge linux image) is skipped. It reads its switches from the pod environment that patches 36
++  and 38 render, which `kubectl exec` inherits.
++#}
++if [ -x /usr/local/bin/skyforge-host-services.sh ]; then
++  nohup /usr/local/bin/skyforge-host-services.sh >/var/log/skyforge-host-services.log 2>&1 &
++fi
+diff --git a/netsim/ansible/templates/services/eos.j2 b/netsim/ansible/templates/services/eos.j2
+index 1e50990..5a53ca9 100644
+--- a/netsim/ansible/templates/services/eos.j2
++++ b/netsim/ansible/templates/services/eos.j2
+@@ -70,3 +70,20 @@ sflow sample {{ services.flow.sampling }}
+ {%   endif %}
+ sflow run
+ {% endif %}
++{% if services.bmp is defined and bgp.as is defined %}
++{#
++  BMP MONITORING STATION, PASSIVE. The device listens on services.bmp.port and the
++  station dials in; `connection address` names the station and is written VERBATIM
++  (a DNS name stays a name -- whether this EOS release accepts a hostname there is
++  proven on a device, not assumed). resolve_bmp() has already dropped the block from
++  any node without the bgp module, so this only guards a template rendered outside
++  the module.
++#}
++router bgp {{ bgp.as }}
++   bgp monitoring
++   monitoring port {{ services.bmp.port|default(50001) }}
++   monitoring station {{ services.bmp.name|default('skyforge') }}
++      connection address {{ services.bmp.station }}
++      connection mode {{ services.bmp.mode|default('passive') }}
++!
++{% endif %}
+diff --git a/netsim/ansible/templates/services/junos.j2 b/netsim/ansible/templates/services/junos.j2
+index 418f8b3..c1af81f 100644
+--- a/netsim/ansible/templates/services/junos.j2
++++ b/netsim/ansible/templates/services/junos.j2
+@@ -28,3 +28,24 @@ system {
+ {%   endif %}
+ {% endfor %}
+ }
++{% if services.bmp is defined and bgp.as is defined %}
++{#
++  BMP MONITORING STATION, PASSIVE. Hierarchical on purpose (see vmx.j2: a `set` line
++  in this concatenated file makes mgd reject the whole file). The station address is
++  written verbatim from the declaration. UNVERIFIED on a device: the spelling of the
++  passive connection-mode keyword and whether station-address accepts a hostname.
++#}
++routing-options {
++  bmp {
++    station {{ services.bmp.name|default('skyforge') }} {
++      connection-mode {{ services.bmp.mode|default('passive') }};
++      station-address {{ services.bmp.station }};
++      station-port {{ services.bmp.port|default(50001) }};
++      route-monitoring {
++        pre-policy;
++        post-policy;
++      }
++    }
++  }
++}
++{% endif %}
+diff --git a/netsim/ansible/templates/services/linux.j2 b/netsim/ansible/templates/services/linux.j2
+index 32a2b67..3af375a 100644
+--- a/netsim/ansible/templates/services/linux.j2
++++ b/netsim/ansible/templates/services/linux.j2
+@@ -1,2 +1,40 @@
+ #!/bin/sh
++{#
++  SKYFORGE-SPECIFIC (patch 39): the SNMP agent of a linux host, delivered like the services of every other NOS.
++
++  `services.server.snmp` is set on every node by the platform defaults (community `skyforge`, the community
++  the collector's collectors poll with), so a linux host answers SNMP exactly like a cEOS does. A node opts out with
++  `services.server.snmp: false`. A linux image without net-snmp (any non-Skyforge image) is skipped with a note,
++  never an error: the services script must not fail a lab over a missing optional daemon.
++
++  The script runs inside the pod (the linux namespace-exec lane) at day 0 AND again on every warm reconfigure,
++  so it is idempotent: it rewrites the config and signals a running snmpd to reload instead of starting a second
++  one. The community lives only in the 0600 config file; the script never prints it.
++#}
+ # Syslog configuration comes here (eventually)
++{% if services.server.snmp is defined %}
++if command -v snmpd >/dev/null 2>&1; then
++  mkdir -p /etc/snmp /var/log
++  ( umask 077
++    {
++      echo "agentAddress udp:161"
++      echo "rocommunity {{ services.server.snmp.community|default('skyforge') }} default"
++      echo "sysName $(hostname)"
++      echo "sysDescr Skyforge linux host (skyforge-linux-host)"
++{%   if services.server.snmp.location is defined %}
++      echo "sysLocation {{ services.server.snmp.location }}"
++{%   endif %}
++{%   if services.server.snmp.contact is defined %}
++      echo "sysContact {{ services.server.snmp.contact }}"
++{%   endif %}
++      echo "dontLogTCPWrappersConnects yes"
++    } > /etc/snmp/snmpd.conf )
++  if [ -s /run/snmpd.pid ] && kill -0 "$(cat /run/snmpd.pid)" 2>/dev/null; then
++    kill -HUP "$(cat /run/snmpd.pid)"
++  else
++    snmpd -C -c /etc/snmp/snmpd.conf -p /run/snmpd.pid -Lf /var/log/snmpd.log
++  fi
++else
++  echo "services: snmpd is not installed in this image; SNMP agent not started" >&2
++fi
++{% endif %}
+diff --git a/netsim/devices/eos.yml b/netsim/devices/eos.yml
+index 0aff4fb..f52d6e8 100644
+--- a/netsim/devices/eos.yml
++++ b/netsim/devices/eos.yml
+@@ -178,6 +178,7 @@ features:
+   services:
+     dns: True
+     syslog: True
++    bmp: True
+     # sFLOW. EOS speaks sFlow, not NetFlow, on cEOS: `flow tracking hardware`
+     # needs an ASIC this image does not have. Declaring only sflow is what makes
+     # the module REFUSE `protocol: netflow` here rather than render nothing and
+diff --git a/netsim/devices/junos.yml b/netsim/devices/junos.yml
+index 6cf656f..dcdaab5 100644
+--- a/netsim/devices/junos.yml
++++ b/netsim/devices/junos.yml
+@@ -98,6 +98,8 @@ features:
+       standard: True
+       large: True
+   services:
++    # BMP station: the generic Junos template renders it (services/junos.j2). vsrx opts out.
++    bmp: True
+     dns:
+       ipv4: True
+       ipv6: True
+diff --git a/netsim/devices/linux.yml b/netsim/devices/linux.yml
+index 683b849..fda0c1b 100644
+--- a/netsim/devices/linux.yml
++++ b/netsim/devices/linux.yml
+@@ -26,6 +26,7 @@ features:
+   services:
+     dns:
+       transport_vrf: false
++    server.snmp: True              # Skyforge: patch 39, services/linux.j2 (net-snmp in the skyforge-linux-host image)
+ libvirt:
+   image: bento/ubuntu-24.04
+   create_image: netlab/linux
+diff --git a/netsim/devices/vsrx.yml b/netsim/devices/vsrx.yml
+index fc00e70..449146b 100644
+--- a/netsim/devices/vsrx.yml
++++ b/netsim/devices/vsrx.yml
+@@ -11,6 +11,8 @@ group_vars:
+ 
+ features:
+   services:
++    # A firewall persona: no BMP station (the parent declares it).
++    bmp: False
+     # SNMP agent: this device answers an NMS. Ported from the
+     # snmp_config custom config module.
+     server.snmp: True
+diff --git a/netsim/modules/services.py b/netsim/modules/services.py
+index d6945e0..49e0d4a 100644
+--- a/netsim/modules/services.py
++++ b/netsim/modules/services.py
+@@ -252,6 +252,112 @@ def disable_shared_hosts(ndata: Box) -> None:
+   if 'clab.config_templates.hosts' in ndata:
+     ndata.clab.config_templates.hosts = ndata.clab.config_templates.hosts.replace(':shared','')
+ 
++# SKYFORGE: services.bmp -- BGP Monitoring Protocol, passive, on EOS and Junos.
++BMP_DEFAULT_PORT = 50001
++BMP_DEFAULT_NAME = 'skyforge'
++
++def resolve_bmp(ndata: Box, topology: Box) -> None:
++  """
++  Decide whether services.bmp is rendered on this node, and fill in its defaults.
++
++  The block is KEPT only on a node that (a) runs the bgp module with an AS and (b) is a device declaring
++  services.bmp. Anything else has the block REMOVED, not merely ignored by the templates, because the
++  node data (host_vars/<node>/topology.json) is what tooling reads to learn which nodes have a monitoring
++  station: a node that rendered nothing must not look like one that did. The drop is silent on purpose --
++  a fleet-wide declaration is expected to meet FRR, IOS and XR nodes -- and `enabled: false` is the
++  explicit per-node opt-out.
++
++  A declaration without a station is an error: a station-less block would render a device config that
++  names nothing and looks configured.
++  """
++  bmp = ndata.get('services.bmp',None)
++  if bmp is None:
++    return
++
++  if not bmp.get('enabled',True):
++    ndata.services.pop('bmp')
++    return
++
++  features = devices.get_device_features(ndata,topology.defaults)
++  has_bgp = 'bgp' in ndata.get('module',[]) and ndata.get('bgp.as',None) is not None
++  if not has_bgp or not features.get('services',{}).get('bmp',False):
++    ndata.services.pop('bmp')
++    return
++
++  if not bmp.get('station',None):
++    log.error(
++      f'services.bmp on node {ndata.name} has no station (a DNS name or address of the BMP station)',
++      category=log.MissingValue,
++      module='services')
++    return
++
++  bmp.setdefault('name',BMP_DEFAULT_NAME)
++  bmp.setdefault('port',BMP_DEFAULT_PORT)
++  bmp.setdefault('mode','passive')
++
++# SKYFORGE: services.listen -- which network services a LINUX host listens on.
++LISTEN_TRANSPORT = { 'https': 'tcp', 'http': 'tcp', 'tcp-echo': 'tcp', 'iperf3': 'tcp', 'udp-echo': 'udp' }
++LISTEN_RESERVED = { ('tcp',22): 'sshd', ('udp',161): 'the SNMP agent' }
++LISTEN_MAX_ENTRIES = 8
++
++def check_listen(ndata: Box) -> None:
++  """
++  Validate services.listen on one node (the schema has already checked proto names and port ranges).
++
++  The declaration is rendered into the linux pod's environment, where a strict parser starts one listener per
++  entry. So what is rejected here is what the image would otherwise silently drop or fail to bind: a device that
++  is not a linux host, a transport+port declared twice (the second bind fails and the first listener serves
++  both entries' names), a port the platform already owns, more entries than the image will start, and more than
++  one iperf3 server per node.
++  """
++  listen = ndata.get('services.listen',None)
++  if not listen:
++    return
++  where = f'node {ndata.name}'
++  if ndata.device != 'linux':
++    log.error(
++      f'services.listen is only supported on linux hosts, not on device {ndata.device} ({where})',
++      category=log.IncorrectValue,
++      module='services')
++    return
++
++  seen: dict = {}
++  iperf = 0
++  for idx,entry in enumerate(listen):
++    proto,port = entry.get('proto'),entry.get('port')
++    transport = LISTEN_TRANSPORT.get(proto)
++    if transport is None or port is None:
++      continue                                    # the schema already reported it
++    key = (transport,port)
++    if key in LISTEN_RESERVED:
++      log.error(
++        f'services.listen[{idx+1}] ({proto}:{port}) on {where} collides with {LISTEN_RESERVED[key]} ({transport}/{port})',
++        category=log.IncorrectValue,
++        module='services')
++      continue
++    if key in seen:
++      log.error(
++        f'services.listen[{idx+1}] ({proto}:{port}) on {where} listens on {transport}/{port}, which '
++        f'services.listen[{seen[key]+1}] already uses',
++        category=log.IncorrectValue,
++        module='services')
++      continue
++    seen[key] = idx
++    if proto == 'iperf3':
++      iperf += 1
++
++  if iperf > 1:
++    log.error(
++      f'services.listen on {where} declares {iperf} iperf3 servers; a node runs at most one',
++      category=log.IncorrectValue,
++      module='services')
++  if len(seen) - iperf > LISTEN_MAX_ENTRIES:
++    log.error(
++      f'services.listen on {where} declares {len(seen) - iperf} listeners besides iperf3; the image starts at most {LISTEN_MAX_ENTRIES}',
++      category=log.IncorrectValue,
++      module='services')
++
++
+ class Services(_Module):
+ 
+   def module_post_transform(self, topology: Box) -> None:
+@@ -273,10 +379,12 @@ class Services(_Module):
+         continue
+ 
+       svc_nodes.append(ndata)
++      resolve_bmp(ndata,topology)
+       resolve_servers(ndata,svc_data,topology,mod_attr,svc_cache)
+       set_dns_fields(ndata)
+       disable_shared_hosts(ndata)
+       check_feature_support(ndata,svc_data,topology,mod_attr)
++      check_listen(ndata)
+       # Resolve BEFORE the check: a node that named no protocol takes its
+       # device's, and check_flow_protocol then judges the resolved value -- so
+       # the resolution can never hand a template something the device refuses.
+diff --git a/netsim/modules/services.yml b/netsim/modules/services.yml
+index e605491..3bc66ce 100644
+--- a/netsim/modules/services.yml
++++ b/netsim/modules/services.yml
+@@ -72,10 +72,34 @@ attributes:
+           ipfix: { type: int, min_value: 1, max_value: 65535 }
+           sflow: { type: int, min_value: 1, max_value: 65535 }
+       transport_vrf: id
++    # BMP MONITORING STATION (EOS and Junos). Neither a client nor a server in the
++    # resolve_servers() sense: the station is named by the author (a DNS name or an
++    # address string, written to the device verbatim -- no resolution here), so it is
++    # a plain dict. The device LISTENS (passive mode) and the station dials it.
++    # Rendered only on a node that runs the bgp module on a device declaring
++    # services.bmp; everywhere else the block is dropped by resolve_bmp().
++    bmp:
++      enabled: bool
++      station: str
++      name: id
++      port: { type: int, min_value: 1, max_value: 65535 }
++      mode: { type: str, valid_values: [ passive ] }
++      failure_handling:
++        type: str
++        valid_values: [ FAIL_DEVICE, SWITCH_TO_CLI, ALWAYS_USE_CLI, ALWAYS_USE_BMP, CONTINUE_WITHOUT_BGP_DATA ]
+   node:
+     dns: { copy: global }
++    bmp: { copy: global }
+     syslog: { copy: global }
+     flow: { copy: global }
++    # SKYFORGE: network services a LINUX host LISTENS on, declared where netlab can see them (node or group
++    # level). Rendered into the pod env by the KNE linux node adjuster; the declaration also stays in the node
++    # data (host_vars/<node>/topology.json: services.listen) so tooling can answer "which node listens on
++    # which ports". No declaration = no listener.
++    listen:
++      type: list
++      make_list: True
++      _subtype: _services_listen
+     server:
+       dns:
+         type: dict
+@@ -133,9 +157,23 @@ attributes:
+       ignore: []
+       must_have: [ server, ipv4, ipv6 ]
+       check_when: [ _server_list ]
++_top:
++  attributes:
++    _services_listen:
++      proto:
++        type: str
++        valid_values: [ https, http, tcp-echo, udp-echo, iperf3 ]
++        _required: True
++      port:
++        type: int
++        min_value: 1
++        max_value: 65535
++        _required: True
++
+ features:
+   dns: DNS client
+   syslog: syslog client
++  bmp: BMP monitoring station (device listens, station dials)
+   # Split by PROTOCOL, not a flat `flow: True`. Juniper splits by platform --
+   # sFlow on the switch, inline IPFIX on the router -- so one capability flag
+   # would silently render nothing on half the fleet.
+diff --git a/netsim/providers/kne.py b/netsim/providers/kne.py
+index 06096c8..7830cb6 100644
+--- a/netsim/providers/kne.py
++++ b/netsim/providers/kne.py
+@@ -2636,26 +2636,61 @@ def adjust_iol_node_data(kne_data: Box, node: Box) -> None:
+   kne_data.env.IOL_RUNNER_LOCAL_APP = str(node_id)
+ 
+ CALDERA_AGENT_ENV_KEYS = ('SKYFORGE_CALDERA_AGENT_ENABLED','SKYFORGE_CALDERA_SERVER')
++LINUX_SERVICES_ENV_KEYS = ('SKYFORGE_SERVICES','SKYFORGE_SERVICES_NAME','SKYFORGE_IPERF3_SERVER_PORT')
+ 
+-def adjust_linux_node_data(kne_data: Box, node: Box) -> None:
++def caldera_agent_node_selected(node: Box) -> bool:
++  '''
++  Is this node one the platform asked to run the Caldera agent?
++
++  NETLAB_KNE_CALDERA_AGENT_NODES is a comma-separated list of node names the Skyforge server puts on the
++  runtime Job together with NETLAB_KNE_CALDERA_AGENT_SERVER. ABSENT (or empty) means every linux node of the
++  deployment, which is the default scope of the deployment setting; PRESENT means exactly those nodes.
++  '''
++  selected = [ n.strip() for n in str(os.environ.get('NETLAB_KNE_CALDERA_AGENT_NODES','') or '').split(',') if n.strip() ]
++  return (not selected) or node.name in selected
++
++def linux_services_env(node: Box) -> dict:
+   '''
+-  SKYFORGE-SPECIFIC: the Caldera (Sandcat) agent is OPT-IN PER LAB, and this is the only door.
++  The pod env for the node's DECLARED listeners (services.listen).
+ 
+-  The skyforge-linux-host image starts its Sandcat launcher only when the pod carries
+-  SKYFORGE_CALDERA_AGENT_ENABLED=1 and SKYFORGE_CALDERA_SERVER. Both come from ONE per-run fact,
+-  NETLAB_KNE_CALDERA_AGENT_SERVER, which the Skyforge server puts on the runtime Job only when the
+-  deployment's owner switched Caldera on for that deployment (default off, audited). Unset -> the pod
+-  gets neither variable and the image runs no agent.
++  SKYFORGE_SERVICES is the "<proto>:<port>,..." list the skyforge-linux-host image's strict parser reads
++  (https, http, tcp-echo, udp-echo); an iperf3 entry becomes SKYFORGE_IPERF3_SERVER_PORT because the image
++  starts that server on its own switch. SKYFORGE_SERVICES_NAME is the node name, echoed in the health JSON.
++  No declaration -> empty dict -> the image starts no listener.
++  '''
++  env: dict = {}
++  listen = node.get('services.listen',None) or []
++  items = [ f"{e.proto}:{e.port}" for e in listen if e.get('proto') and e.get('proto') != 'iperf3' ]
++  if items:
++    env['SKYFORGE_SERVICES'] = ','.join(items)
++    env['SKYFORGE_SERVICES_NAME'] = node.name
++  for e in listen:
++    if e.get('proto') == 'iperf3':
++      env['SKYFORGE_IPERF3_SERVER_PORT'] = str(e.port)
++  return env
+ 
+-  A topology author's own `kne.env.SKYFORGE_CALDERA_*` is DISCARDED either way: the lab file is user
+-  input and must not be able to enrol a node by itself (the Caldera NetworkPolicy is the second lock;
+-  this keeps the pod spec honest about it).
++def adjust_linux_node_data(kne_data: Box, node: Box) -> None:
++  '''
++  SKYFORGE-SPECIFIC: the pod env of a linux host comes from the platform and the declaration, not from raw env.
++
++  1. Caldera (Sandcat) agent -- OPT-IN, PLATFORM-AUTHORISED, PER DEPLOYMENT AND PER NODE SCOPE. The
++     skyforge-linux-host image starts its launcher only when the pod carries SKYFORGE_CALDERA_AGENT_ENABLED=1 and
++     SKYFORGE_CALDERA_SERVER. Both come from ONE per-run fact, NETLAB_KNE_CALDERA_AGENT_SERVER, which the
++     Skyforge server puts on the runtime Job only when the deployment's owner switched Caldera on (default off,
++     audited); the optional NETLAB_KNE_CALDERA_AGENT_NODES narrows it to the nodes the owner selected. Nothing in
++     the topology can ask for the agent: a topology author's own `kne.env.SKYFORGE_CALDERA_*` is DISCARDED either
++     way (the lab file is user input; the Caldera NetworkPolicy is the second lock).
++  2. Listeners -- `services.listen` (node or group level) is rendered into SKYFORGE_SERVICES /
++     SKYFORGE_IPERF3_SERVER_PORT, and a topology author's own values for those keys are discarded, so the
++     declaration is the only door and the node data tells the truth about what listens.
+   '''
+   kne_data.env = kne_data.get('env',Box(default_box=True,box_dots=True))
+-  for key in CALDERA_AGENT_ENV_KEYS:
++  for key in CALDERA_AGENT_ENV_KEYS + LINUX_SERVICES_ENV_KEYS:
+     kne_data.env.pop(key,None)
++  for key,value in linux_services_env(node).items():
++    kne_data.env[key] = value
+   server = str(os.environ.get('NETLAB_KNE_CALDERA_AGENT_SERVER','') or '').strip()
+-  if not server:
++  if not server or not caldera_agent_node_selected(node):
+     return
+   kne_data.env.SKYFORGE_CALDERA_AGENT_ENABLED = '1'
+   kne_data.env.SKYFORGE_CALDERA_SERVER = server
+diff --git a/tests/test_kne_provider.py b/tests/test_kne_provider.py
+index a0ce670..2920f2f 100644
+--- a/tests/test_kne_provider.py
++++ b/tests/test_kne_provider.py
+@@ -1723,6 +1723,297 @@ def test_kne_linux_caldera_agent_env_follows_the_per_run_fact(tmp_path: Path, mo
+   assert 'attacker.example' not in provider_text
+ 
+ 
++
++
++LISTEN_TOPOLOGY = """
++provider: kne
++module: [ services ]
++
++groups:
++  web:
++    members: [ h3, h4 ]
++    node_data:
++      services:
++        listen:
++          - { proto: https, port: 8443 }
++
++nodes:
++  h1:
++    device: linux
++    services:
++      listen:
++        - { proto: https, port: 443 }
++        - { proto: http, port: 80 }
++        - { proto: tcp-echo, port: 7001 }
++        - { proto: udp-echo, port: 7002 }
++        - { proto: iperf3, port: 5201 }
++    kne:
++      env:
++        SKYFORGE_SERVICES: "http:9999"
++        SKYFORGE_IPERF3_SERVER_PORT: "9998"
++        KEEP_ME: "yes"
++  h2:
++    device: linux
++  h3:
++    device: linux
++  h4:
++    device: linux
++"""
++
++
++def test_kne_linux_declared_listeners_stay_in_the_node_data(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.chdir(tmp_path)
++  topology = load_transform(write_topology(tmp_path,LISTEN_TOPOLOGY))
++  assert [ (e.proto,e.port) for e in topology.nodes.h1.services.listen ] == [
++    ('https',443),('http',80),('tcp-echo',7001),('udp-echo',7002),('iperf3',5201) ]
++  assert 'listen' not in topology.nodes.h2.get('services',{})
++  assert topology.nodes.h4.services.listen[0].port == 8443
++
++
++BAD_LISTEN = [
++  ('unknown proto',        '[ { proto: ftp, port: 21 } ]'),
++  ('port 0',               '[ { proto: http, port: 0 } ]'),
++  ('port 65536',           '[ { proto: http, port: 65536 } ]'),
++  ('port is a string',     '[ { proto: http, port: eighty } ]'),
++  ('missing port',         '[ { proto: http } ]'),
++  ('missing proto',        '[ { port: 80 } ]'),
++  ('sshd port',            '[ { proto: http, port: 22 } ]'),
++  ('snmp port',            '[ { proto: udp-echo, port: 161 } ]'),
++  ('duplicate tcp port',   '[ { proto: http, port: 80 }, { proto: https, port: 80 } ]'),
++  ('duplicate entry',      '[ { proto: http, port: 80 }, { proto: http, port: 80 } ]'),
++  ('two iperf3 servers',   '[ { proto: iperf3, port: 5201 }, { proto: iperf3, port: 5202 } ]'),
++  ('too many listeners',   '[ ' + ', '.join('{ proto: http, port: %d }' % (8000+i) for i in range(9)) + ' ]'),
++]
++
++
++@pytest.mark.parametrize('label,listen',BAD_LISTEN,ids=[b[0] for b in BAD_LISTEN])
++def test_kne_linux_services_listen_rejects_bad_declarations(label: str, listen: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.chdir(tmp_path)
++  topo_file = write_topology(tmp_path,f"""
++provider: kne
++module: [ services ]
++
++nodes:
++  h1:
++    device: linux
++    services:
++      listen: {listen}
++""")
++  init_log(raise_error=True)
++  with pytest.raises(log.ErrorAbort):
++    topology = _read.load(str(topo_file),relative_topo_name=True,user_defaults=[])
++    augment.main.transform(topology)
++
++
++def test_kne_linux_services_listen_accepts_tcp_and_udp_on_one_port(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.chdir(tmp_path)
++  topology = load_transform(write_topology(tmp_path,"""
++provider: kne
++module: [ services ]
++
++nodes:
++  h1:
++    device: linux
++    services:
++      listen: [ { proto: tcp-echo, port: 7001 }, { proto: udp-echo, port: 7001 } ]
++"""))
++  assert len(topology.nodes.h1.services.listen) == 2
++
++
++def test_kne_services_listen_is_refused_on_other_devices(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.chdir(tmp_path)
++  topo_file = write_topology(tmp_path,"""
++provider: kne
++module: [ services ]
++
++nodes:
++  r1:
++    device: eos
++    services:
++      listen: [ { proto: http, port: 80 } ]
++""")
++  init_log(raise_error=True)
++  with pytest.raises(log.ErrorAbort):
++    topology = _read.load(str(topo_file),relative_topo_name=True,user_defaults=[])
++    augment.main.transform(topology)
++
++
++def _linux_listen_env(tmp_path: Path) -> tuple:
++  topo_file = write_topology(tmp_path,LISTEN_TOPOLOGY)
++  init_log()
++  create.run(['-o','config','-o','provider',str(topo_file)])
++  return Path('topology.pb.txt').read_text()
++
++
++def _node_block(provider_text: str, name: str) -> str:
++  # topology.pb.txt lists one `nodes {` block per node; return the one named `name`
++  blocks = provider_text.split('nodes: {')
++  return next(b for b in blocks if f'name: "{name}"' in b)
++
++
++def test_kne_linux_declared_listeners_render_into_the_pod_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.chdir(tmp_path)
++  monkeypatch.delenv('NETLAB_KNE_CALDERA_AGENT_SERVER',raising=False)
++  monkeypatch.delenv('NETLAB_KNE_CALDERA_AGENT_NODES',raising=False)
++  text = _linux_listen_env(tmp_path)
++  h1 = _node_block(text,'h1')
++  assert 'value: "https:443,http:80,tcp-echo:7001,udp-echo:7002"' in h1
++  assert 'key: "SKYFORGE_IPERF3_SERVER_PORT"' in h1 and 'value: "5201"' in h1
++  assert 'value: "h1"' in h1                      # SKYFORGE_SERVICES_NAME
++  assert 'KEEP_ME' in h1
++  # the lab author's own values for the same keys are discarded: the declaration is the only door
++  assert 'http:9999' not in text and '9998' not in text
++  # a node with no declaration gets no listener env at all
++  h2 = _node_block(text,'h2')
++  assert 'SKYFORGE_SERVICES' not in h2 and 'SKYFORGE_IPERF3' not in h2
++  # group-level declaration reaches every member
++  for member in ('h3','h4'):
++    assert 'value: "https:8443"' in _node_block(text,member)
++
++
++def _caldera_text(tmp_path: Path) -> str:
++  topo_file = write_topology(tmp_path,"""
++provider: kne
++
++nodes:
++  h1:
++    device: linux
++  h2:
++    device: linux
++  r1:
++    device: eos
++""")
++  init_log()
++  create.run(['-o','config','-o','provider',str(topo_file)])
++  return Path('topology.pb.txt').read_text()
++
++
++def test_kne_linux_caldera_agent_follows_the_node_scope(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.chdir(tmp_path)
++  monkeypatch.setenv('NETLAB_KNE_CALDERA_AGENT_SERVER','http://caldera.example.invalid:8888')
++  monkeypatch.setenv('NETLAB_KNE_CALDERA_AGENT_NODES','h2')
++  text = _caldera_text(tmp_path)
++  assert 'SKYFORGE_CALDERA' not in _node_block(text,'h1')          # enabled deployment, node not selected: no agent
++  assert 'key: "SKYFORGE_CALDERA_AGENT_ENABLED"' in _node_block(text,'h2')
++  assert 'SKYFORGE_CALDERA' not in _node_block(text,'r1')          # never a non-linux node
++
++
++def test_kne_linux_caldera_agent_scope_absent_means_every_linux_node(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.chdir(tmp_path)
++  monkeypatch.setenv('NETLAB_KNE_CALDERA_AGENT_SERVER','http://caldera.example.invalid:8888')
++  monkeypatch.delenv('NETLAB_KNE_CALDERA_AGENT_NODES',raising=False)
++  text = _caldera_text(tmp_path)
++  for name in ('h1','h2'):
++    assert 'key: "SKYFORGE_CALDERA_AGENT_ENABLED"' in _node_block(text,name)
++  assert 'SKYFORGE_CALDERA' not in _node_block(text,'r1')
++
++
++def test_kne_linux_caldera_node_scope_without_a_server_starts_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  # a node list alone (deployment not enabled) must never produce an agent
++  monkeypatch.chdir(tmp_path)
++  monkeypatch.delenv('NETLAB_KNE_CALDERA_AGENT_SERVER',raising=False)
++  monkeypatch.setenv('NETLAB_KNE_CALDERA_AGENT_NODES','h1,h2')
++  assert 'SKYFORGE_CALDERA' not in _caldera_text(tmp_path)
++
++
++def test_kne_linux_caldera_env_in_the_topology_is_discarded_in_every_scope(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.chdir(tmp_path)
++  monkeypatch.setenv('NETLAB_KNE_CALDERA_AGENT_SERVER','http://caldera.example.invalid:8888')
++  monkeypatch.setenv('NETLAB_KNE_CALDERA_AGENT_NODES','h2')
++  topo_file = write_topology(tmp_path,"""
++provider: kne
++
++nodes:
++  h1:
++    device: linux
++    kne:
++      env:
++        SKYFORGE_CALDERA_AGENT_ENABLED: "1"
++        SKYFORGE_CALDERA_SERVER: http://attacker.example:8888
++  h2:
++    device: linux
++""")
++  init_log()
++  create.run(['-o','config','-o','provider',str(topo_file)])
++  text = Path('topology.pb.txt').read_text()
++  assert 'attacker.example' not in text
++  assert 'SKYFORGE_CALDERA' not in _node_block(text,'h1')
++
++
++def _linux_services_script(tmp_path: Path, node_yaml: str) -> str:
++  topo_file = write_topology(tmp_path,f"""
++provider: kne
++module: [ services ]
++
++nodes:
++  h1:
++    device: linux
++{node_yaml}
++""")
++  init_log()
++  create.run(['-o','config','-o','provider',str(topo_file)])
++  return Path('node_files/h1/services').read_text()
++
++
++def test_kne_linux_services_script_configures_snmpd_read_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.chdir(tmp_path)
++  text = _linux_services_script(tmp_path,"""    services:
++      server:
++        snmp: { community: lab-ro-7, location: "rack 3" }
++""")
++  assert text.startswith('#!/bin/sh')
++  assert 'rocommunity lab-ro-7 default' in text
++  assert 'sysLocation rack 3' in text
++  assert 'sysName $(hostname)' in text and 'Skyforge linux host' in text
++  assert 'agentAddress udp:161' in text
++  assert 'rwcommunity' not in text and 'rwuser' not in text and 'createUser' not in text
++  assert 'umask 077' in text                          # the config carrying the community is not world-readable
++  # idempotent on a warm reconfigure: reload a running daemon, start one otherwise
++  assert 'kill -HUP' in text and 'snmpd -C -c /etc/snmp/snmpd.conf' in text
++  # the community is written to the file and never echoed to the console
++  assert text.count('lab-ro-7') == 1
++  # a missing daemon is a note, not a failure
++  assert 'command -v snmpd' in text and 'not installed' in text
++
++
++def test_kne_linux_snmp_default_is_the_default_community(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.chdir(tmp_path)
++  text = _linux_services_script(tmp_path,"""    services:
++      server:
++        snmp: true
++""")
++  assert 'rocommunity skyforge default' in text
++
++
++def test_kne_linux_snmp_can_be_disabled_per_node(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.chdir(tmp_path)
++  text = _linux_services_script(tmp_path,"""    services:
++      server:
++        snmp: false
++""")
++  assert 'snmpd' not in text and 'rocommunity' not in text
++
++
++
++def test_kne_linux_initial_script_starts_the_image_services_idempotently(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  # a KNE pod never runs the image entrypoint, so the initial script is the only place the image services can start from
++  monkeypatch.chdir(tmp_path)
++  topo_file = write_topology(tmp_path,"""
++provider: kne
++
++nodes:
++  h1:
++    device: linux
++""")
++  init_log()
++  create.run(['-o','config','-o','provider',str(topo_file)])
++  text = Path('node_files/h1/initial').read_text()
++  assert 'if [ -x /usr/local/bin/skyforge-host-services.sh ]; then' in text
++  assert 'nohup /usr/local/bin/skyforge-host-services.sh' in text
++  # after sshd and the activity loop, and guarded so a foreign image is skipped
++  assert text.index('skyforge-host-services.sh') > text.index('netlab-host-activity.sh')
++
++
+ def test_kne_ioll2_uses_distinct_image_contract(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+   monkeypatch.chdir(tmp_path)
+   topo_file = write_topology(tmp_path,"""
+diff --git a/tests/test_services_bmp.py b/tests/test_services_bmp.py
+new file mode 100644
+index 0000000..8f4c615
+--- /dev/null
++++ b/tests/test_services_bmp.py
+@@ -0,0 +1,165 @@
++"""services.bmp: a passive BMP station on EOS and Junos, and nowhere else.
++
++These tests compile real topologies through the real module and render the real
++services templates, so they go red if the schema, the device declarations, the
++module's eligibility rule or either template is changed out from under the others.
++The requirement they pin: the station is rendered only on a node that runs the bgp
++module on EOS or Junos, never on any other platform, and a declaration that cannot
++render is removed from the node data rather than left looking configured.
++"""
++import textwrap
++from pathlib import Path
++
++import pytest
++from box import Box
++
++from netsim import augment
++from netsim.utils import log, templates
++from netsim.utils import read as _read
++
++SERVICES = 'ansible/templates/services'
++EXTRA = [str(Path(__file__).parent.parent / 'netsim' / 'ansible' / 'templates')]
++
++TOPOLOGY = """
++defaults.device: eos
++provider: clab
++module: [ bgp, services ]
++services.bmp.station: bmp.example.net
++bgp.as: 65000
++nodes:
++  e1:
++  j1:
++    device: vjunos-router
++    provider: libvirt
++    box: x
++  s1:
++    device: vsrx
++    provider: libvirt
++    box: x
++  f1:
++    device: frr
++  n1:
++    device: iosv
++  e2:
++    services.bmp.enabled: false
++  e3:
++    module: [ services ]
++  e4:
++    services.bmp.port: 50002
++    services.bmp.name: collector
++    services.bmp.failure_handling: SWITCH_TO_CLI
++links: [ e1-j1, e1-f1, e1-n1, e1-e2, e1-e3, e1-s1, e1-e4 ]
++"""
++
++
++def _init_log(raise_error: bool = False) -> None:
++  log.init_log_system(header=False)
++  log.set_flag(quiet=True,raise_error=raise_error,warning=False,logging=False,verbose=0)
++
++
++def compile_topology(tmp_path: Path, text: str, raise_error: bool = False) -> Box:
++  f = tmp_path / 'topology.yml'
++  f.write_text(textwrap.dedent(text).strip() + "\n")
++  _init_log(raise_error)
++  topology = _read.load(str(f),relative_topo_name=True,user_defaults=[])
++  log.exit_on_error()
++  augment.main.transform(topology)
++  return topology
++
++
++@pytest.fixture
++def topo(tmp_path: Path) -> Box:
++  return compile_topology(tmp_path,TOPOLOGY)
++
++
++def render(node: Box, device_template: str) -> str:
++  return templates.render_template(
++    data=node.to_dict(),
++    j2_file=f'{device_template}.j2',
++    path=SERVICES,extra_path=EXTRA)
++
++
++def test_eligible_nodes_keep_the_block_with_defaults_filled(topo: Box):
++  for name in ('e1','j1'):
++    bmp = topo.nodes[name].services.bmp
++    assert bmp.station == 'bmp.example.net'
++    assert bmp.port == 50001
++    assert bmp.mode == 'passive'
++    assert bmp.name == 'skyforge'
++
++
++def test_a_node_value_beats_the_default_and_failure_handling_is_carried(topo: Box):
++  bmp = topo.nodes.e4.services.bmp
++  assert (bmp.port,bmp.name,bmp.failure_handling) == (50002,'collector','SWITCH_TO_CLI')
++  assert 'failure_handling' not in topo.nodes.e1.services.bmp
++
++
++@pytest.mark.parametrize('node,why',[
++  ('f1','frr declares no bmp support'),
++  ('n1','ios declares no bmp support and has no bgp.as'),
++  ('s1','vsrx is a firewall persona that opts out of the junos declaration'),
++  ('e2','explicit enabled: false'),
++  ('e3','eos without the bgp module'),
++])
++def test_every_other_node_has_the_block_removed(topo: Box, node: str, why: str):
++  assert 'bmp' not in topo.nodes[node].get('services',{}), why
++
++
++def test_eos_renders_a_passive_station_under_router_bgp(topo: Box):
++  out = render(topo.nodes.e1,'eos')
++  assert textwrap.dedent("""\
++    router bgp 65000
++       bgp monitoring
++       monitoring port 50001
++       monitoring station skyforge
++          connection address bmp.example.net
++          connection mode passive
++    """) in out
++  assert 'collector' in render(topo.nodes.e4,'eos')
++  assert 'monitoring port 50002' in render(topo.nodes.e4,'eos')
++
++
++def test_junos_renders_hierarchical_config_never_set_lines(topo: Box):
++  out = render(topo.nodes.j1,'vjunos-router')
++  assert 'station skyforge {' in out
++  assert 'connection-mode passive;' in out
++  assert 'station-address bmp.example.net;' in out
++  assert 'station-port 50001;' in out
++  assert 'pre-policy;' in out and 'post-policy;' in out
++  assert not any(l.lstrip().startswith('set ') for l in out.splitlines())
++
++
++def test_no_bmp_text_without_the_declaration(topo: Box):
++  # e3 has no bgp module and e2 opted out: their rendered services must carry no station
++  assert 'monitoring' not in render(topo.nodes.e3,'eos')
++  assert 'bmp' not in render(topo.nodes.e2,'eos')
++  assert 'bmp' not in render(topo.nodes.s1,'vsrx')
++
++
++@pytest.mark.parametrize('template',sorted(
++  p.stem for p in (Path(__file__).parent.parent / 'netsim' / SERVICES).glob('*.j2')
++  if p.stem not in ('eos','junos','vmx','vptx','vsrx','vjunos-router','vjunos-switch')))
++def test_other_platforms_render_identically_with_or_without_the_declaration(topo: Box, template: str):
++  """IOS, IOS-XE, NX-OS, XR, FRR ... : the declaration must change not one byte."""
++  base = topo.nodes.f1.to_dict()
++  with_bmp = Box(base,box_dots=True)
++  with_bmp.services.bmp = {'station':'bmp.example.net','port':50001,'mode':'passive','name':'skyforge'}
++  data = Box(base,default_box=True,box_dots=True)
++  data.services.dns._server_list = ['10.0.0.1']
++  bare = templates.render_template(data=data.to_dict(),j2_file=f'{template}.j2',path=SERVICES,extra_path=EXTRA)
++  data.services.bmp = {'station':'bmp.example.net','port':50001,'mode':'passive','name':'skyforge'}
++  decl = templates.render_template(data=data.to_dict(),j2_file=f'{template}.j2',path=SERVICES,extra_path=EXTRA)
++  assert bare == decl
++
++
++def test_a_declaration_without_a_station_is_an_error(tmp_path: Path):
++  text = TOPOLOGY.replace('services.bmp.station: bmp.example.net','services.bmp.port: 50001')
++  with pytest.raises(log.ErrorAbort):
++    compile_topology(tmp_path,text,raise_error=True)
++
++
++def test_passive_is_the_only_mode(tmp_path: Path):
++  text = TOPOLOGY.replace('services.bmp.station: bmp.example.net',
++                          'services.bmp: { station: x, mode: active }')
++  with pytest.raises(log.ErrorAbort):
++    compile_topology(tmp_path,text,raise_error=True)
+-- 
+2.56.0
+
