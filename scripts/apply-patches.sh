@@ -8,7 +8,7 @@ here="$(cd "$(dirname "$0")/.." && pwd)"
 comp="${1:?usage: apply-patches.sh <component> [workdir]}"
 work="${2:-$here/.work}"
 case "$comp" in
-  netlab)                 url=https://github.com/ipspace/netlab.git;                       rev=ff52463be991e5e0c17ea396254625c25fef9aa6 ;;
+  netlab)                 url=https://github.com/ipspace/netlab.git;                       rev=4c3280eafa905a1f4b150a61f8d0e7484c64e1c6 ;;
   kne)                    url=https://github.com/openconfig/kne.git;                       rev=3fe74f99999ff8dbb685f45a6c18757ee0d2cf99 ;;
   meshnet-cni)            url=https://github.com/networkop/meshnet-cni.git;                rev=d7c306c635cf73a44833e3ebdefb8b163a9aa784 ;;
   koko)                   url=https://github.com/redhat-nfvpe/koko.git;                    rev=a18aa44814eabb542226e11c5568e8433810e4ab ;;

@@ -36,7 +36,7 @@ nodes:
     bgp.as: 65000
   # Each CE must ENABLE bgp itself: netlab 26.08 makes a module attribute on a
   # node without that module a fatal IncorrectAttr (measured 2026-08-17 —
-  # scotwilson's first deploy of this blueprint died at netlab create with
+  # seanmoorex's first deploy of this blueprint died at netlab create with
   # "nodes.ce_hub uses an attribute from module bgp which is not enabled").
   ce_hub:
     module: [ bgp ]

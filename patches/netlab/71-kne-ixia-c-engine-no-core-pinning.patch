@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 14:21:33 -0600
+Subject: [PATCH] kne: ixia-c traffic engine does not pin DPDK lcores to fixed
+ cores
+
+SKYFORGE-SPECIFIC: platform behaviour; not for upstream.
+
+---
+diff --git a/netsim/providers/kne.py b/netsim/providers/kne.py
+index 756369d..2f53bfc 100644
+--- a/netsim/providers/kne.py
++++ b/netsim/providers/kne.py
+@@ -1044,6 +1044,13 @@ def add_ixia_c_engine_env(node: Box, topology: Box) -> None:
+   node.kne.env = node.kne.get('env',Box(default_box=True,box_dots=True))
+   node.kne.env.OPT_NO_HUGEPAGES = 'Yes'
+   node.kne.env.OPT_LISTEN_PORT = '5555'
++  # A KNE pod's cpuset is whatever the kubelet grants, a few cores of a host
++  # that has many. The image entrypoint's default is to PIN DPDK lcores to cores
++  # 0..N (--lcores 0@0,1@1,2@2), and on a restricted cpuset EAL cannot set that
++  # affinity: "EAL: PANIC in rte_eal_init(): Cannot set affinity", exit 1, and
++  # the pod crash-loops (measured 2026-11-05). entrypoint.sh turns pinning off
++  # only for the exact value "Yes" (create_dpdk_config: `no-pinning=true`).
++  node.kne.env.OPT_NO_PINNING = 'Yes'
+ 
+   data_ifs = [
+     intf.ifname for intf in node.get('interfaces',[])
+diff --git a/tests/test_kne_provider.py b/tests/test_kne_provider.py
+index f92e751..30be895 100644
+--- a/tests/test_kne_provider.py
++++ b/tests/test_kne_provider.py
+@@ -4206,3 +4206,30 @@ links: [ ctl-eng, eng-h1 ]
+   assert 'command: "./entrypoint.sh"' in eng
+   assert 'key: "OPT_NO_HUGEPAGES"' in eng            # the env hook still runs beside the command hook
+   assert 'command:' not in _node_block(text,'h1')
++
++
++def test_kne_ixia_c_engine_disables_dpdk_core_pinning(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  # The engine image pins DPDK lcores to fixed cores by default and PANICs in
++  # rte_eal_init ("Cannot set affinity") inside a pod with a restricted cpuset.
++  # entrypoint.sh honours OPT_NO_PINNING only as the exact string "Yes".
++  monkeypatch.chdir(tmp_path)
++  topo_file = write_topology(tmp_path,"""
++provider: kne
++
++nodes:
++  ctl:
++    device: keysight_ixia-c-controller
++  eng:
++    device: keysight_ixia-c-traffic-engine
++  h1:
++    device: linux
++links: [ ctl-eng, eng-h1 ]
++""")
++  init_log()
++  create.run(['-o','config','-o','provider',str(topo_file)])
++  text = Path('topology.pb.txt').read_text()
++  eng = _node_block(text,'eng')
++  assert 'key: "OPT_NO_PINNING"' in eng
++  assert re.search(r'key: "OPT_NO_PINNING"\s+value: "Yes"',eng)
++  assert 'OPT_NO_PINNING' not in _node_block(text,'ctl')
++  assert 'OPT_NO_PINNING' not in _node_block(text,'h1')
+-- 
+2.56.0
+
