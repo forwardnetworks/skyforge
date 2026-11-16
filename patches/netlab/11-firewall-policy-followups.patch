@@ -1,0 +1,138 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 00:00:00 +0000
+Subject: [PATCH] firewall.policy: ASA management security level and ACL names
+ from rules; PAN-OS source-user on rules
+
+---
+diff --git a/netsim/ansible/templates/initial/asa.j2 b/netsim/ansible/templates/initial/asa.j2
+index 38dc225..1f435c1 100644
+--- a/netsim/ansible/templates/initial/asa.j2
++++ b/netsim/ansible/templates/initial/asa.j2
+@@ -21,7 +21,15 @@ aaa authorization exec LOCAL auto-enable
+ interface Management0/0
+  management-only
+  nameif management
+- security-level 0
++{#
++   Management0/0's security-level is 0 unless the node declares
++   firewall.policy.mgmt_security_level. The ASA derives its implicit
++   `<nameif>_same-security-level` / `_different-security-level` deny rows from the
++   levels of EVERY nameif, this one included, so a seed ASA whose Management0/0 sits
++   at 100 (demo-lab atl-bldg1-fw01: `nameif Mgmt` / `security-level 100`) only
++   matches the collector's view of it when the lab's management interface does too.
++#}
++ security-level {{ ((firewall|default({})).policy|default({})).mgmt_security_level|default(0) }}
+  ip address dhcp setroute
+  no shutdown
+ !
+diff --git a/netsim/extra/firewall/policy/__init__.py b/netsim/extra/firewall/policy/__init__.py
+index f87657a..967efa6 100644
+--- a/netsim/extra/firewall/policy/__init__.py
++++ b/netsim/extra/firewall/policy/__init__.py
+@@ -86,6 +86,7 @@ def post_transform(topology: Box) -> None:
+             continue
+ 
+         app_id = _has_feature(features, "firewall.policy_app_id")
++        user_id = _has_feature(features, "firewall.policy_user_id")
+         named_ok = _has_feature(features, "firewall.policy_named_services")
+ 
+         objects = {}
+@@ -163,6 +164,19 @@ def post_transform(topology: Box) -> None:
+                     module=_config_name,
+                 )
+ 
++            # `user` is optional and only set when the author wrote it, so a
++            # rule without it keeps the exact output it had before User-ID.
++            if rule.get("user") is not None:
++                rule.user = _as_list(rule.get("user"), "any")
++                if not user_id:
++                    log.error(
++                        f"Node {node.name}({node.device}) cannot match on user {rule.user} in "
++                        f"firewall.policy.rules[{idx}] ({rule.name}): the platform has no User-ID. "
++                        "Remove the user match or move the rule to a device that has one.",
++                        category=log.IncorrectAttr,
++                        module=_config_name,
++                    )
++
+             # Likewise, a platform without App-ID builds its ACE from the
+             # service, so an unresolvable service name renders nothing at all.
+             if not app_id:
+diff --git a/netsim/extra/firewall/policy/asa.j2 b/netsim/extra/firewall/policy/asa.j2
+index 718a8a9..83f9752 100644
+--- a/netsim/extra/firewall/policy/asa.j2
++++ b/netsim/extra/firewall/policy/asa.j2
+@@ -81,7 +81,13 @@ same-security-traffic permit inter-interface
+ {%   endif %}
+ {% endfor %}
+ {% for zone in zones %}
+-{%   set aclname = (zone | upper) ~ '-IN' %}
++{#
++   firewall.policy.acl_name_from_rule: name the zone's ACL after its first rule (the source
++   ACL's own name, e.g. `routed_nets_to_internet`) instead of <ZONE>-IN. One ACL per
++   interface and direction, so a zone's rules are expected to share a name; the first one wins.
++#}
++{%   set _first = (firewall.policy.rules | default([]) | selectattr('from_zone', 'equalto', zone) | list | first) %}
++{%   set aclname = _first.name if (firewall.policy.acl_name_from_rule | default(false) and _first.name is defined) else (zone | upper) ~ '-IN' %}
+ {%   for policy in firewall.policy.rules | default([]) if policy.from_zone == zone %}
+ {%     for src in policy.src | default(['any']) %}
+ {%       for dst in policy.dst | default(['any']) %}
+diff --git a/netsim/extra/firewall/policy/defaults.yml b/netsim/extra/firewall/policy/defaults.yml
+index 0782777..ac8015b 100644
+--- a/netsim/extra/firewall/policy/defaults.yml
++++ b/netsim/extra/firewall/policy/defaults.yml
+@@ -28,6 +28,11 @@ devices:
+     # plugin therefore hard-errors on `application:` for a device without this
+     # flag instead of rendering something weaker than what was written.
+     features.firewall.policy_app_id: True
++    # User-ID: `user:` on a rule maps to `source-user`. Separate flag for the
++    # same reason as App-ID: a rule scoped to a user that the platform ignores
++    # becomes a rule for everyone. The plugin hard-errors on `user:` for a
++    # device without this flag.
++    features.firewall.policy_user_id: True
+   none:
+     features.firewall.policy: True
+     features.firewall.policy_app_id: True
+@@ -56,6 +61,12 @@ attributes:
+       # ASA only: interfaces at EQUAL security levels cannot talk without this.
+       # It is a node-wide switch on the platform, not a per-rule one.
+       same_security_traffic: bool
++      # ASA only: security-level of Management0/0 (day-0 default 0). The ASA's
++      # implicit same/different-security-level deny entries are computed from every
++      # nameif's level, the management one included.
++      mgmt_security_level: { type: int, min_value: 0, max_value: 100 }
++      # ASA only: name each zone's ACL after its first rule (default: <ZONE>-IN).
++      acl_name_from_rule: bool
+       # ASA only: protocol inspection engines enabled in the factory
+       # global_policy / inspection_default class (MPF). `icmp` is what lets
+       # echo-reply, time-exceeded and unreachable come back through a lower
+@@ -130,6 +141,12 @@ attributes:
+     application:
+       type: list
+       _subtype: str
++    # Source user or group names (PAN-OS User-ID: `any`, `known-user`,
++    # `unknown`, or a directory user/group such as `corp\alice`). Optional:
++    # a rule that omits it renders no source-user line at all.
++    user:
++      type: list
++      _subtype: str
+     # ICMP message type, for platforms that filter on it (ASA writes it as the
+     # last token of the ACE, e.g. `permit icmp any any echo-reply`). PAN-OS
+     # expresses the same intent as an App-ID and ignores this.
+diff --git a/netsim/extra/firewall/policy/panos.j2 b/netsim/extra/firewall/policy/panos.j2
+index 94ae3b1..d342b08 100644
+--- a/netsim/extra/firewall/policy/panos.j2
++++ b/netsim/extra/firewall/policy/panos.j2
+@@ -50,6 +50,9 @@ set service "{{ inline_svc|replace('/','-') }}" description "generated from the
+ set rulebase security rules "{{ rname }}" from [ {{ rule.from_zone }} ]
+ set rulebase security rules "{{ rname }}" to [ {{ rule.to_zone }} ]
+ set rulebase security rules "{{ rname }}" source [ {{ rule.src|default(['any'])|join(' ') }} ]
++{%   if rule.user is defined %}
++set rulebase security rules "{{ rname }}" source-user [ {{ rule.user|join(' ') }} ]
++{%   endif %}
+ set rulebase security rules "{{ rname }}" destination [ {{ rule.dst|default(['any'])|join(' ') }} ]
+ set rulebase security rules "{{ rname }}" application [ {{ rule.application|default(['any'])|join(' ') }} ]
+ set rulebase security rules "{{ rname }}" service [ {{ rule.services|default(['application-default'])|map('replace','/','-')|join(' ') }} ]
+-- 
+2.56.1
+

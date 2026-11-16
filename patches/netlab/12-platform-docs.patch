@@ -16,10 +16,10 @@ index 12dca72..b58531c 100644
  ```
 diff --git a/docs/topology/otg.md b/docs/topology/otg.md
 new file mode 100644
-index 0000000..5f43765
+index 0000000..c8f85d4
 --- /dev/null
 +++ b/docs/topology/otg.md
-@@ -0,0 +1,115 @@
+@@ -0,0 +1,140 @@
 +(topology-otg)=
 +# Declared Traffic Flows (`otg:`)
 +
@@ -78,47 +78,70 @@ index 0000000..5f43765
 +
 +Flow metrics are always enabled when the platform builds the configuration. Metrics are OFF by default in OTG, and a flow configured without them transmits and reports nothing, which looks exactly like a flow that transmitted and was lost.
 +
-+The Flows API also speaks `src_mac` / `dst_mac`. They are **not** in the topology schema -- writing them under `otg.flows[]` fails the compile -- so a flow that needs them is set through the API after boot, not declared here.
++There is no MAC field, in the topology or in the Flows API: both MACs of a port-to-port flow are *netlab*'s render of the two ports (`otgPorts` on the deployment).
++
++## Free controller: what a flow can and cannot prove
++
++The generator the platform runs is the **free** ixia-c / keng controller. It cannot emulate devices or run protocol sessions, so a declared flow is a **port-to-port stream with explicit headers**: the engine on `tx` transmits Ethernet/IPv4 frames addressed from its own MAC to the `rx` engine's MAC (both as *netlab* rendered them, never typed), and the `rx` engine counts what arrives. That is a **data-plane proof through the device in the middle**, and only that:
++
++* It proves a **layer-2** path: the two engines must share a subnet, with a bridge or VLAN between them. A flow whose ports are on different subnets would have to cross a router, which needs the router's MAC; nothing here can ARP for it and *netlab* does not render it, so such a flow is **refused with that reason** instead of being sent to a MAC nobody owns.
++* It does **not** prove ARP, ICMP, routing adjacencies, BGP/OSPF sessions or anything an emulated device would do. The engines do not answer a ping, by design.
++* Emulated-device (device-to-device) flows exist in the server behind `SKYFORGE_OTG_DEVICE_FLOWS=1` for a controller and engine that can emulate devices. They are off by default: the old free controller refuses `config.devices`, and a controller that accepts them still cannot ARP in a KNE pod (the engine has no `/dev/kni`), so the flow is configured and never starts.
++* Use **`keng-controller` 1.62.0-1**, not `ixia-c-controller` 0.0.1-4555: measured 2026-11-06, the 2023 controller cannot drive the 1.8.0.544 engine at all (the engine refuses every stream, "Wrong type of stream ... configured for this runtime type").
 +
 +## Example
 +
-+Lifted from `components/blueprints/netlab/_smoke/otg-traffic/topology.yml`, the smallest topology that can prove a data plane carries traffic. Two generator ports with a router between them: a flow from `otg1` to `otg2` has to be switched by `r1` to arrive, so `rx` on the far side is evidence about the fabric.
++Lifted from `components/blueprints/netlab/_smoke/otg-traffic/topology.yml`, the smallest topology that can prove a data plane carries traffic. Three generator ports hang off one layer-2 switch with two VLANs: `otg1` and `otg2` share one, `otg3` is alone in the other. The first two flows have to be switched by `sw` to arrive, so `rx` on the far side is evidence about the fabric; the third is the **negative control** and must not arrive.
 +
 +```yaml
 +provider: kne
 +defaults.device: eos
++module: [ vlan ]
++
++vlans:
++  engines:
++    mode: bridge
++  island:
++    mode: bridge
++    prefix:                  # same prefix as `engines` on purpose
++      ipv4: 172.16.0.0/24
++      allocation: id_based
 +
 +nodes:
 +  otgctl:
 +    device: keysight_ixia-c-controller   # the API; no data links
++    module: []
 +  otg1:
 +    device: keysight_ixia-c-traffic-engine
++    module: []
 +  otg2:
 +    device: keysight_ixia-c-traffic-engine
-+  r1:
++    module: []
++  otg3:
++    device: keysight_ixia-c-traffic-engine
++    module: []
++  sw:
 +
 +links:
-+- otg1-r1
-+- otg2-r1
++- sw:
++  otg1:
++  vlan.access: engines
++- sw:
++  otg2:
++  vlan.access: engines
++- sw:
++  otg3:
++  vlan.access: island
 +
 +otg:
 +  controller: otgctl
 +  flows:
-+    - name: otg1-to-otg2
-+      tx: otg1
-+      rx: otg2
-+      rate_pps: 100
-+      size: 512
-+      protocol: udp
-+    - name: otg2-to-otg1
-+      tx: otg2
-+      rx: otg1
-+      rate_pps: 100
-+      size: 512
-+      protocol: udp
++    - {name: otg1-to-otg2, tx: otg1, rx: otg2, rate_pps: 100, size: 512, packets: 500, protocol: udp}
++    - {name: otg2-to-otg1, tx: otg2, rx: otg1, rate_pps: 100, size: 512, packets: 500, protocol: udp}
++    - {name: otg1-to-otg3-isolated, tx: otg1, rx: otg3, rate_pps: 100, size: 512, packets: 500, protocol: udp}
 +```
 +
-+Two flows, one each way, so a one-directional fault in `r1`'s forwarding shows up as an asymmetry in the metrics rather than as a symmetric zero that could equally be a dead generator. Addresses are left to the ports' own, so these prove the adjacency through `r1` rather than a route. 100 pps is enough to read a loss fraction from and small enough that a stuck flow costs nothing.
++Read the three flows together: `tx` is 500 on all of them, `rx` is 500, 500 and 0. Zero everywhere means a dead fabric or a dead generator; 500 on the isolated one means the VLAN leaks. The isolated flow shares a subnet with the others on purpose, so a zero on it is the switch's VLAN doing its job and not a routing artifact. Fixed packet counts (`packets: 500`) make `tx` exactly known and the run end on its own.
 +
 +## What happens at deploy time
 +
@@ -131,6 +154,8 @@ index 0000000..5f43765
 +
 +* **`tx` and `rx` are traffic-engine node names.** Not IP addresses, not interface names, not the router's name. The platform checks every `tx`/`rx` against the lab's `keysight_ixia-c-traffic-engine` nodes and refuses the WHOLE flow set when one is wrong: `flow "x": node "r1" is not a traffic-engine port in this deployment`. The schema types them as `str`, so *netlab* cannot catch a typo at compile time.
 +* **Face the two ports at each other and the flow proves nothing.** The same flow passes while proving only that the generator can talk to itself. Put the device under test between `tx` and `rx`.
++* **A flow across a router is refused on the free controller.** `flow "x" cannot run port to port ... different subnets`: put the two engines on one layer-2 segment, as the smoke blueprint does. A router in the path was the previous example; it could never have worked without ARP.
++* **The seeded run starts at deploy, before the switch may be configured.** The deploy path seeds and starts the flows as soon as the pods are Ready, and a cEOS switch can still be applying its config. Re-run the declaration (`apply-declared` with `force` and `start`) once `sw` is configured and read that run's counters.
 +* **The controller gets no data links.** The smoke blueprint wires none: the controller node is the API and the traffic engines own the ports. A link on the controller is not a generator port and cannot be named in `tx`/`rx`.
 +* **`otg:` renders no device config.** If the generator holds nothing after bring-up, the questions are: did the deploy record the flows (a missing `name`/`tx`/`rx` drops the flow silently), did the lab have a controller node, and did the generator already hold flows from a previous edit. Not "did netlab render the flows" -- it never does.
 +* **`controller` does not choose between controllers.** With two `keysight_ixia-c-controller` nodes the first discovered wins regardless of this field. Declare exactly one controller per lab.
@@ -198,5 +223,5 @@ index a0a446d..6aaab20 100644
  internal:                   # Internal attributes, not validated
    input:
 -- 
-2.56.0
+2.56.1
 

@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 06:22:19 -0600
+Subject: [PATCH] topo: checkNodeStatus honours context cancellation
+
+---
+diff --git a/topo/check_node_status_ctx_test.go b/topo/check_node_status_ctx_test.go
+new file mode 100644
+index 0000000..f8ff868
+--- /dev/null
++++ b/topo/check_node_status_ctx_test.go
+@@ -0,0 +1,53 @@
++package topo
++
++import (
++	"context"
++	"errors"
++	"testing"
++	"time"
++
++	"github.com/openconfig/kne/topo/node"
++)
++
++// pendingNode never becomes Running and never reports an error, which is what a client that does not surface a
++// cancelled context looks like to checkNodeStatus.
++type pendingNode struct {
++	node.Node
++	calls int
++}
++
++func (n *pendingNode) Status(context.Context) (node.Status, error) {
++	n.calls++
++	return node.StatusPending, nil
++}
++
++func (n *pendingNode) String() string { return "pending-node" }
++
++func TestCheckNodeStatusHonoursCancellation(t *testing.T) {
++	n := &pendingNode{}
++	m := &Manager{nodes: map[string]node.Node{"r1": n}}
++	ctx, cancel := context.WithCancel(context.Background())
++	go func() {
++		time.Sleep(250 * time.Millisecond)
++		cancel()
++	}()
++	start := time.Now()
++	err := m.checkNodeStatus(ctx, time.Minute)
++	if !errors.Is(err, context.Canceled) {
++		t.Fatalf("checkNodeStatus() = %v, want context.Canceled", err)
++	}
++	if d := time.Since(start); d > 5*time.Second {
++		t.Fatalf("checkNodeStatus() took %v after cancellation, want well under the 1m timeout", d)
++	}
++	if n.calls == 0 {
++		t.Fatal("node status was never polled")
++	}
++}
++
++func TestCheckNodeStatusStillTimesOut(t *testing.T) {
++	m := &Manager{nodes: map[string]node.Node{"r1": &pendingNode{}}}
++	// Unchanged behaviour: an uncancelled context ends at the timeout with no error.
++	if err := m.checkNodeStatus(context.Background(), 300*time.Millisecond); err != nil {
++		t.Fatalf("checkNodeStatus() = %v, want nil after the timeout", err)
++	}
++}
+diff --git a/topo/topo.go b/topo/topo.go
+index be7ef76..c34b16c 100644
+--- a/topo/topo.go
++++ b/topo/topo.go
+@@ -3308,6 +3308,13 @@ func (m *Manager) checkNodeStatus(ctx context.Context, timeout time.Duration) er
+ 	// Check until end state or timeout sec expired
+ 	start := time.Now()
+ 	for (timeout == 0 || time.Since(start) < timeout) && !foundAll {
++		// Stop when the caller cancels, like checkServiceStatus. Without this the loop only ends when every node is
++		// Running or `timeout` expires whenever n.Status does not surface the cancelled context (a client that
++		// ignores it, or one that reports it as context.DeadlineExceeded, which isRetryableKubeTransportError
++		// retries by design).
++		if err := ctx.Err(); err != nil {
++			return err
++		}
+ 		foundAll = true
+ 		for name, n := range m.nodes {
+ 			if _, ok := processed[name]; ok {
+-- 
+2.56.0
+

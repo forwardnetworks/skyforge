@@ -3375,5 +3375,5 @@ index 0000000..bcc3558
 +  on = pickle.loads((lab_on / 'netlab.snapshot.pickle').read_bytes())
 +  assert list(on['defaults']['outputs'].keys()) == list(off['defaults']['outputs'].keys())
 -- 
-2.56.0
+2.56.1
 

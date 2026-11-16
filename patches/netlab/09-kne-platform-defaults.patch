@@ -2534,5 +2534,5 @@ index 3383028..a0ce670 100644
 +  assert 'OPT_NO_PINNING' not in _node_block(text,'ctl')
 +  assert 'OPT_NO_PINNING' not in _node_block(text,'h1')
 -- 
-2.56.0
+2.56.1
 

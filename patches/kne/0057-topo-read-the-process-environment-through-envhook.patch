@@ -1,0 +1,525 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 10:00:00 -0600
+Subject: [PATCH 57/57] topo: read the process environment through topo/envhook
+
+---
+diff --git a/topo/envhook/envhook.go b/topo/envhook/envhook.go
+new file mode 100644
+index 0000000..2a36554
+--- /dev/null
++++ b/topo/envhook/envhook.go
+@@ -0,0 +1,61 @@
++// Package envhook is the one place the platform fork reads configuration that upstream KNE (and the first the platform
++// patches) read straight from the process environment with os.Getenv / os.LookupEnv.
++//
++// WHY. A program that embeds the fork as a library (netlab-go's adapters/kne drives topo.Manager in-process, with
++// no kne_cli child) used to have to os.Setenv the per-lab values (image pull secret, node selector, placement, ...)
++// before an operation and restore them afterwards. The process environment is shared with everything else in the
++// process, and the platform server reads about ten SKYFORGE_KNE_* keys of its own from it (for example
++// SKYFORGE_KNE_PRIORITY_CLASS_NAME and the cleanup force-finalize pair), so a per-lab os.Setenv would change the
++// server's behaviour. Reading through this package lets the embedder answer the fork's questions from a value it
++// owns and leave os.Environ() untouched.
++//
++// DEFAULT. With no hook installed Lookup is os.LookupEnv, so the fork behaves exactly as before for the kne_cli
++// binary, for tests that use t.Setenv, and for every caller that never installs a hook.
++//
++// SCOPE. The hook is a process-global function value. It answers for every goroutine of the process, so two
++// operations that need different answers must not overlap: the embedder serialises them (adapters/kne holds a
++// lease and only lets operations with an identical answer set run concurrently).
++package envhook
++
++import (
++	"os"
++	"sync/atomic"
++)
++
++// Func answers one lookup the way os.LookupEnv does: the value and whether the name is set.
++type Func func(name string) (string, bool)
++
++var hook atomic.Pointer[Func]
++
++// Lookup is os.LookupEnv unless a hook is installed, in which case it is the hook.
++func Lookup(name string) (string, bool) {
++	if f := hook.Load(); f != nil {
++		return (*f)(name)
++	}
++	return os.LookupEnv(name)
++}
++
++// Getenv is os.Getenv through Lookup: the value, or "" when the name is not set.
++func Getenv(name string) string {
++	v, _ := Lookup(name)
++	return v
++}
++
++// Set installs fn as the answer to every Lookup in the process (nil restores the default, os.LookupEnv) and returns
++// a function that reinstates what was installed before the call. The restore function is idempotent.
++func Set(fn Func) (restore func()) {
++	var next *Func
++	if fn != nil {
++		next = &fn
++	}
++	prev := hook.Swap(next)
++	var done atomic.Bool
++	return func() {
++		if done.CompareAndSwap(false, true) {
++			hook.Store(prev)
++		}
++	}
++}
++
++// Installed reports whether a hook is installed (for diagnostics and tests).
++func Installed() bool { return hook.Load() != nil }
+diff --git a/topo/envhook/envhook_test.go b/topo/envhook/envhook_test.go
+new file mode 100644
+index 0000000..b7c14d4
+--- /dev/null
++++ b/topo/envhook/envhook_test.go
+@@ -0,0 +1,93 @@
++package envhook
++
++import (
++	"os"
++	"sync"
++	"testing"
++)
++
++const probe = "SKYFORGE_ENVHOOK_TEST_PROBE"
++
++func TestDefaultIsTheProcessEnvironment(t *testing.T) {
++	t.Setenv(probe, "from-os")
++	if v, ok := Lookup(probe); !ok || v != "from-os" {
++		t.Fatalf("Lookup = %q, %v", v, ok)
++	}
++	if got := Getenv(probe); got != "from-os" {
++		t.Fatalf("Getenv = %q", got)
++	}
++	if Installed() {
++		t.Fatal("no hook should be installed by default")
++	}
++}
++
++func TestSetAnswersInsteadOfTheProcessEnvironmentAndLeavesItUntouched(t *testing.T) {
++	t.Setenv(probe, "from-os")
++	before := os.Environ()
++	restore := Set(func(name string) (string, bool) {
++		if name == probe {
++			return "from-hook", true
++		}
++		return "", false
++	})
++	if got := Getenv(probe); got != "from-hook" {
++		t.Fatalf("Getenv through the hook = %q", got)
++	}
++	if v, ok := Lookup("HOME"); ok {
++		t.Fatalf("the hook says HOME is not set, Lookup = %q", v)
++	}
++	if got := os.Getenv(probe); got != "from-os" {
++		t.Fatalf("os.Getenv changed to %q", got)
++	}
++	restore()
++	restore() // idempotent
++	if got := Getenv(probe); got != "from-os" {
++		t.Fatalf("after restore Getenv = %q", got)
++	}
++	after := os.Environ()
++	if len(before) != len(after) {
++		t.Fatalf("os.Environ changed: %d -> %d entries", len(before), len(after))
++	}
++}
++
++func TestSetNilRestoresTheDefaultAndRestoreReinstatesThePreviousHook(t *testing.T) {
++	outer := Set(func(string) (string, bool) { return "outer", true })
++	defer outer()
++	inner := Set(func(string) (string, bool) { return "inner", true })
++	if got := Getenv("X"); got != "inner" {
++		t.Fatalf("inner = %q", got)
++	}
++	inner()
++	if got := Getenv("X"); got != "outer" {
++		t.Fatalf("after inner restore = %q", got)
++	}
++	clear := Set(nil)
++	if Installed() {
++		t.Fatal("Set(nil) must remove the hook")
++	}
++	clear()
++	if got := Getenv("X"); got != "outer" {
++		t.Fatalf("after clear restore = %q", got)
++	}
++}
++
++func TestConcurrentLookupsAndSwapsAreRaceFree(t *testing.T) {
++	var wg sync.WaitGroup
++	for i := 0; i < 8; i++ {
++		wg.Add(2)
++		go func() {
++			defer wg.Done()
++			for j := 0; j < 200; j++ {
++				_ = Getenv(probe)
++			}
++		}()
++		go func() {
++			defer wg.Done()
++			for j := 0; j < 200; j++ {
++				r := Set(func(string) (string, bool) { return "v", true })
++				r()
++			}
++		}()
++	}
++	wg.Wait()
++}
+diff --git a/topo/node/arista/arista.go b/topo/node/arista/arista.go
+index e3b836d..fe87880 100644
+--- a/topo/node/arista/arista.go
++++ b/topo/node/arista/arista.go
+@@ -28,6 +28,7 @@ import (
+ 
+ 	cpb "github.com/openconfig/kne/proto/ceos"
+ 	tpb "github.com/openconfig/kne/proto/topo"
++	"github.com/openconfig/kne/topo/envhook"
+ 	"github.com/openconfig/kne/topo/node"
+ 	scraplinetwork "github.com/scrapli/scrapligo/driver/network"
+ 	scrapliopts "github.com/scrapli/scrapligo/driver/options"
+@@ -269,7 +270,7 @@ func (n *Node) CreateCRD(ctx context.Context) error {
+ 		"SKYFORGE_KNE_TAINT_EFFECT",
+ 		"SKYFORGE_KNE_PRIORITY_CLASS_NAME",
+ 	} {
+-		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
++		if value := strings.TrimSpace(envhook.Getenv(key)); value != "" {
+ 			env[key] = value
+ 		}
+ 	}
+diff --git a/topo/node/kubevirt.go b/topo/node/kubevirt.go
+index 3643bb3..2d3fe4f 100644
+--- a/topo/node/kubevirt.go
++++ b/topo/node/kubevirt.go
+@@ -18,6 +18,7 @@ import (
+ 	"time"
+ 
+ 	tpb "github.com/openconfig/kne/proto/topo"
++	"github.com/openconfig/kne/topo/envhook"
+ 	corev1 "k8s.io/api/core/v1"
+ 	rbacv1 "k8s.io/api/rbac/v1"
+ 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+@@ -1106,18 +1107,18 @@ func kubeVirtSrosLicenseMachineUUID(data string) (string, error) {
+ }
+ 
+ func kubeVirtSrosLicenseIdentityMode() string {
+-	switch strings.ToLower(strings.TrimSpace(os.Getenv("SKYFORGE_SROS_LICENSE_IDENTITY_MODE"))) {
++	switch strings.ToLower(strings.TrimSpace(envhook.Getenv("SKYFORGE_SROS_LICENSE_IDENTITY_MODE"))) {
+ 	case "", "uuid", "uuid-locked", "locked":
+ 		return "uuid-locked"
+ 	case "zero-uuid", "wildcard":
+ 		return "zero-uuid"
+ 	default:
+-		return strings.ToLower(strings.TrimSpace(os.Getenv("SKYFORGE_SROS_LICENSE_IDENTITY_MODE")))
++		return strings.ToLower(strings.TrimSpace(envhook.Getenv("SKYFORGE_SROS_LICENSE_IDENTITY_MODE")))
+ 	}
+ }
+ 
+ func kubeVirtSrosLicenseSourceMode() string {
+-	switch strings.ToLower(strings.TrimSpace(os.Getenv("SKYFORGE_SROS_LICENSE_SOURCE_MODE"))) {
++	switch strings.ToLower(strings.TrimSpace(envhook.Getenv("SKYFORGE_SROS_LICENSE_SOURCE_MODE"))) {
+ 	case "", "auto":
+ 		return "auto"
+ 	case "tftp", "secret", "secret-tftp":
+@@ -1125,16 +1126,16 @@ func kubeVirtSrosLicenseSourceMode() string {
+ 	case "image", "image-local", "embedded", "cf3":
+ 		return "image-local"
+ 	default:
+-		return strings.ToLower(strings.TrimSpace(os.Getenv("SKYFORGE_SROS_LICENSE_SOURCE_MODE")))
++		return strings.ToLower(strings.TrimSpace(envhook.Getenv("SKYFORGE_SROS_LICENSE_SOURCE_MODE")))
+ 	}
+ }
+ 
+ func kubeVirtSrosLicenseRawPayload() (string, bool) {
+-	raw := strings.TrimSpace(os.Getenv("SKYFORGE_SROS_LICENSE_B64"))
++	raw := strings.TrimSpace(envhook.Getenv("SKYFORGE_SROS_LICENSE_B64"))
+ 	if raw != "" {
+ 		return raw, true
+ 	}
+-	path := strings.TrimSpace(os.Getenv("SKYFORGE_SROS_LICENSE_B64_FILE"))
++	path := strings.TrimSpace(envhook.Getenv("SKYFORGE_SROS_LICENSE_B64_FILE"))
+ 	if path == "" {
+ 		path = "/skyforge-secrets/sros-license.b64"
+ 	}
+@@ -1156,7 +1157,7 @@ func kubeVirtSrosResolvedLicenseSource() string {
+ }
+ 
+ func kubeVirtSrosImageLocalLicenseClockBase() time.Time {
+-	raw := strings.TrimSpace(os.Getenv("SKYFORGE_SROS_IMAGE_LICENSE_CLOCK_BASE"))
++	raw := strings.TrimSpace(envhook.Getenv("SKYFORGE_SROS_IMAGE_LICENSE_CLOCK_BASE"))
+ 	if raw != "" {
+ 		if t, err := time.Parse(time.RFC3339, raw); err == nil {
+ 			return t.UTC()
+@@ -1169,7 +1170,7 @@ func kubeVirtSrosImageLocalLicenseClockBase() time.Time {
+ }
+ 
+ func kubeVirtSrosImageLocalMachineUUID() string {
+-	raw := strings.ToLower(strings.TrimSpace(os.Getenv("SKYFORGE_SROS_IMAGE_LICENSE_MACHINE_UUID")))
++	raw := strings.ToLower(strings.TrimSpace(envhook.Getenv("SKYFORGE_SROS_IMAGE_LICENSE_MACHINE_UUID")))
+ 	if raw == "" {
+ 		return kubeVirtSrosPlaceholderUUID
+ 	}
+@@ -1651,7 +1652,7 @@ var kubeVirtSrosVariantTimosLines = map[string]string{
+ var kubeVirtSrosEvalClockBase = time.Date(2022, time.May, 19, 0, 0, 0, 0, time.UTC)
+ 
+ func kubeVirtSrosSystemBaseMAC(nodeName string) string {
+-	if configured := strings.TrimSpace(os.Getenv("SKYFORGE_SROS_SYSTEM_BASE_MAC")); configured != "" {
++	if configured := strings.TrimSpace(envhook.Getenv("SKYFORGE_SROS_SYSTEM_BASE_MAC")); configured != "" {
+ 		if hw, err := net.ParseMAC(configured); err == nil && len(hw) == 6 {
+ 			return strings.ToUpper(hw.String())
+ 		}
+@@ -2240,7 +2241,7 @@ func kubeVirtBootstrapBundleDiskAndVolume(nodeName string, bundle *tpb.Bootstrap
+ }
+ 
+ func kubeVirtBootstrapBundleSourceNamespace() string {
+-	namespace := strings.TrimSpace(os.Getenv("SKYFORGE_KNE_BOOTSTRAP_SECRET_SOURCE_NAMESPACE"))
++	namespace := strings.TrimSpace(envhook.Getenv("SKYFORGE_KNE_BOOTSTRAP_SECRET_SOURCE_NAMESPACE"))
+ 	if namespace == "" {
+ 		return "skyforge"
+ 	}
+@@ -2631,7 +2632,7 @@ func kubeVirtDellOS10InjectorResourceName(nodeName string) string {
+ // namespace, so the pod sat in ImagePullBackOff instead).
+ func kubeVirtDellOS10InjectorImage() string {
+ 	for _, key := range kubeVirtSerialInjectorImageEnv {
+-		if image := strings.TrimSpace(os.Getenv(key)); image != "" {
++		if image := strings.TrimSpace(envhook.Getenv(key)); image != "" {
+ 			return image
+ 		}
+ 	}
+@@ -2674,7 +2675,7 @@ func (n *Impl) checkKubeVirtSerialInjectorImage() error {
+ }
+ 
+ func kubeVirtDellOS10InjectorPullPolicy() corev1.PullPolicy {
+-	policy := strings.TrimSpace(os.Getenv("SKYFORGE_NETLAB_RUNTIME_PULL_POLICY"))
++	policy := strings.TrimSpace(envhook.Getenv("SKYFORGE_NETLAB_RUNTIME_PULL_POLICY"))
+ 	if policy == "" {
+ 		return corev1.PullIfNotPresent
+ 	}
+@@ -2988,7 +2989,7 @@ func kubeVirtBootstrapTFTPResourceName(nodeName string) string {
+ 
+ func kubeVirtBootstrapTFTPImage() string {
+ 	for _, key := range []string{"SKYFORGE_KUBEVIRT_BOOTSTRAP_IMAGE", "SKYFORGE_NETLAB_RUNTIME_IMAGE"} {
+-		if image := strings.TrimSpace(os.Getenv(key)); image != "" {
++		if image := strings.TrimSpace(envhook.Getenv(key)); image != "" {
+ 			return image
+ 		}
+ 	}
+@@ -3024,7 +3025,7 @@ func kubeVirtTolerations() []map[string]any {
+ }
+ 
+ func kubeVirtBootstrapTFTPPullPolicy() corev1.PullPolicy {
+-	policy := strings.TrimSpace(os.Getenv("SKYFORGE_NETLAB_RUNTIME_PULL_POLICY"))
++	policy := strings.TrimSpace(envhook.Getenv("SKYFORGE_NETLAB_RUNTIME_PULL_POLICY"))
+ 	if policy == "" {
+ 		return corev1.PullIfNotPresent
+ 	}
+@@ -3033,7 +3034,7 @@ func kubeVirtBootstrapTFTPPullPolicy() corev1.PullPolicy {
+ 
+ func kubeVirtBootstrapTFTPTimeout() time.Duration {
+ 	const defaultTimeout = 10 * time.Minute
+-	raw := strings.TrimSpace(os.Getenv("SKYFORGE_KUBEVIRT_BOOTSTRAP_TFTP_TIMEOUT_SECONDS"))
++	raw := strings.TrimSpace(envhook.Getenv("SKYFORGE_KUBEVIRT_BOOTSTRAP_TFTP_TIMEOUT_SECONDS"))
+ 	if raw == "" {
+ 		return defaultTimeout
+ 	}
+@@ -4196,7 +4197,7 @@ func kubeVirtMeshnetNADConfig() map[string]any {
+ // doing so silently pins every lab to one node), so the VM path and the
+ // container path end up reading ONE number from ONE source.
+ func kubeVirtMeshnetFabricMTU() int {
+-	raw := strings.TrimSpace(os.Getenv("MESHNET_FABRIC_MTU"))
++	raw := strings.TrimSpace(envhook.Getenv("MESHNET_FABRIC_MTU"))
+ 	if raw == "" {
+ 		return 0
+ 	}
+diff --git a/topo/node/kubevirt_viptela_serial.go b/topo/node/kubevirt_viptela_serial.go
+index 0e28508..d43da01 100644
+--- a/topo/node/kubevirt_viptela_serial.go
++++ b/topo/node/kubevirt_viptela_serial.go
+@@ -5,13 +5,14 @@ import (
+ 	"context"
+ 	"crypto/sha256"
+ 	"fmt"
+-	"os"
+ 	"strings"
+ 
+ 	corev1 "k8s.io/api/core/v1"
+ 	rbacv1 "k8s.io/api/rbac/v1"
+ 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++
++	"github.com/openconfig/kne/topo/envhook"
+ )
+ 
+ // Viptela (vEdge / vSmart) day-0 over the SERIAL CONSOLE.
+@@ -128,7 +129,7 @@ func kubeVirtViptelaInjectorResourceName(nodeName string) string {
+ // created.
+ func kubeVirtViptelaInjectorImage() string {
+ 	for _, key := range kubeVirtSerialInjectorImageEnv {
+-		if image := strings.TrimSpace(os.Getenv(key)); image != "" {
++		if image := strings.TrimSpace(envhook.Getenv(key)); image != "" {
+ 			return image
+ 		}
+ 	}
+@@ -136,7 +137,7 @@ func kubeVirtViptelaInjectorImage() string {
+ }
+ 
+ func kubeVirtViptelaInjectorPullPolicy() corev1.PullPolicy {
+-	policy := strings.TrimSpace(os.Getenv("SKYFORGE_NETLAB_RUNTIME_PULL_POLICY"))
++	policy := strings.TrimSpace(envhook.Getenv("SKYFORGE_NETLAB_RUNTIME_PULL_POLICY"))
+ 	if policy == "" {
+ 		return corev1.PullIfNotPresent
+ 	}
+diff --git a/topo/node/node.go b/topo/node/node.go
+index 2d44234..c6ddb5e 100644
+--- a/topo/node/node.go
++++ b/topo/node/node.go
+@@ -20,6 +20,7 @@ import (
+ 	"github.com/openconfig/gnmi/errlist"
+ 	tpb "github.com/openconfig/kne/proto/topo"
+ 	topologyv1 "github.com/openconfig/kne/third_party/meshnet/api/types/v1beta1"
++	"github.com/openconfig/kne/topo/envhook"
+ 	scraplinetwork "github.com/scrapli/scrapligo/driver/network"
+ 	scrapliopts "github.com/scrapli/scrapligo/driver/options"
+ 	scraplilogging "github.com/scrapli/scrapligo/logging"
+@@ -44,7 +45,7 @@ import (
+ 
+ func kneAllowTaintedNodes() bool {
+ 	for _, name := range []string{"SKYFORGE_KNE_ALLOW_TAINTED_NODES", "KNE_ALLOW_TAINTED_NODES"} {
+-		switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
++		switch strings.ToLower(strings.TrimSpace(envhook.Getenv(name))) {
+ 		case "1", "true", "yes", "on":
+ 			return true
+ 		}
+@@ -56,15 +57,15 @@ func KNETolerations() []corev1.Toleration {
+ 	if !kneAllowTaintedNodes() {
+ 		return nil
+ 	}
+-	key := strings.TrimSpace(os.Getenv("SKYFORGE_KNE_TAINT_KEY"))
++	key := strings.TrimSpace(envhook.Getenv("SKYFORGE_KNE_TAINT_KEY"))
+ 	if key == "" {
+ 		key = "skyforge.example.com/forward-track"
+ 	}
+-	value := strings.TrimSpace(os.Getenv("SKYFORGE_KNE_TAINT_VALUE"))
++	value := strings.TrimSpace(envhook.Getenv("SKYFORGE_KNE_TAINT_VALUE"))
+ 	if value == "" {
+ 		value = "stable-release"
+ 	}
+-	effect := corev1.TaintEffect(strings.TrimSpace(os.Getenv("SKYFORGE_KNE_TAINT_EFFECT")))
++	effect := corev1.TaintEffect(strings.TrimSpace(envhook.Getenv("SKYFORGE_KNE_TAINT_EFFECT")))
+ 	if effect == "" {
+ 		effect = corev1.TaintEffectNoSchedule
+ 	}
+@@ -75,7 +76,7 @@ func KNETolerations() []corev1.Toleration {
+ 
+ func KNENodeSelectorHostname() string {
+ 	for _, name := range []string{"SKYFORGE_SMOKE_NODE_SELECTOR_HOSTNAME", "KNE_NODE_SELECTOR_HOSTNAME"} {
+-		if val := strings.TrimSpace(os.Getenv(name)); val != "" {
++		if val := strings.TrimSpace(envhook.Getenv(name)); val != "" {
+ 			return val
+ 		}
+ 	}
+@@ -84,7 +85,7 @@ func KNENodeSelectorHostname() string {
+ 
+ func KNENodeSelector() map[string]string {
+ 	selector := map[string]string{}
+-	if raw := strings.TrimSpace(os.Getenv("SKYFORGE_KNE_NODE_SELECTOR_JSON")); raw != "" {
++	if raw := strings.TrimSpace(envhook.Getenv("SKYFORGE_KNE_NODE_SELECTOR_JSON")); raw != "" {
+ 		if err := json.Unmarshal([]byte(raw), &selector); err != nil {
+ 			log.Errorf("invalid SKYFORGE_KNE_NODE_SELECTOR_JSON: %v", err)
+ 			return map[string]string{"skyforge.example.com/placement-error": "invalid-selector-json"}
+@@ -164,7 +165,7 @@ func KNEIOHeavyNodeAffinityUnstructured() map[string]any {
+ }
+ 
+ func KNEIOHeavyNodeAffinity() *corev1.NodeAffinity {
+-	raw := strings.TrimSpace(os.Getenv("SKYFORGE_KNE_IO_HEAVY_NODE_LABELS_JSON"))
++	raw := strings.TrimSpace(envhook.Getenv("SKYFORGE_KNE_IO_HEAVY_NODE_LABELS_JSON"))
+ 	if raw == "" {
+ 		return nil
+ 	}
+@@ -318,7 +319,7 @@ const kneVMModelLabel = "skyforge.example.com/model"
+ // same principle KNEIOHeavyNodeAffinityUnstructured's own doc states for its
+ // half of this mechanism.
+ func KNEContainerNodeAffinity() *corev1.NodeAffinity {
+-	raw := strings.TrimSpace(os.Getenv("SKYFORGE_KNE_IO_HEAVY_NODE_LABELS_JSON"))
++	raw := strings.TrimSpace(envhook.Getenv("SKYFORGE_KNE_IO_HEAVY_NODE_LABELS_JSON"))
+ 	if raw == "" {
+ 		return nil
+ 	}
+@@ -352,7 +353,7 @@ func KNEContainerNodeAffinity() *corev1.NodeAffinity {
+ }
+ 
+ func KNEPriorityClassName() string {
+-	return strings.TrimSpace(os.Getenv("SKYFORGE_KNE_PRIORITY_CLASS_NAME"))
++	return strings.TrimSpace(envhook.Getenv("SKYFORGE_KNE_PRIORITY_CLASS_NAME"))
+ }
+ 
+ type Interface interface {
+@@ -475,7 +476,7 @@ func kernelConstraintValueImpl(constraint string) (int, error) {
+ }
+ 
+ func kneImagePullSecretName() string {
+-	name := strings.TrimSpace(os.Getenv("SKYFORGE_KNE_IMAGE_PULL_SECRET"))
++	name := strings.TrimSpace(envhook.Getenv("SKYFORGE_KNE_IMAGE_PULL_SECRET"))
+ 	if name == "" {
+ 		name = "ghcr-pull"
+ 	}
+@@ -511,7 +512,7 @@ func (n *Impl) ensureImagePullSecret(ctx context.Context) error {
+ 	if secretName == "" || n == nil || n.KubeClient == nil {
+ 		return nil
+ 	}
+-	srcNamespace := strings.TrimSpace(os.Getenv("SKYFORGE_KNE_IMAGE_PULL_SECRET_SOURCE_NAMESPACE"))
++	srcNamespace := strings.TrimSpace(envhook.Getenv("SKYFORGE_KNE_IMAGE_PULL_SECRET_SOURCE_NAMESPACE"))
+ 	if srcNamespace == "" {
+ 		srcNamespace = "skyforge"
+ 	}
+@@ -944,11 +945,11 @@ func (n *Impl) SupportsWritableStartupPersistence() bool {
+ // An EMPTY (but set) knob is meaningful and honored: it returns nil, which omits
+ // storageClassName entirely and restores upstream behaviour of deferring to the cluster
+ // default. That keeps this patch backwards-compatible on clusters that DO mark a default.
+-// os.LookupEnv (not os.Getenv) is what makes "explicitly blanked" distinguishable from
++// envhook.Lookup (not envhook.Getenv) is what makes "explicitly blanked" distinguishable from
+ // "unset"; unset falls back to DefaultStartupPersistenceStorageClass.
+ func kneStartupPersistenceStorageClass() *string {
+ 	for _, name := range []string{"SKYFORGE_KNE_STARTUP_PERSISTENCE_STORAGE_CLASS", "KNE_STARTUP_PERSISTENCE_STORAGE_CLASS"} {
+-		raw, ok := os.LookupEnv(name)
++		raw, ok := envhook.Lookup(name)
+ 		if !ok {
+ 			continue
+ 		}
+diff --git a/topo/topo.go b/topo/topo.go
+index 6ee7d36..a4b2bbd 100644
+--- a/topo/topo.go
++++ b/topo/topo.go
+@@ -40,6 +40,7 @@ import (
+ 	epb "github.com/openconfig/kne/proto/event"
+ 	tpb "github.com/openconfig/kne/proto/topo"
+ 	topologyv1 "github.com/openconfig/kne/third_party/meshnet/api/types/v1beta1"
++	"github.com/openconfig/kne/topo/envhook"
+ 	"github.com/openconfig/kne/topo/node"
+ 	"golang.org/x/sync/errgroup"
+ 	"google.golang.org/grpc/codes"
+@@ -964,7 +965,7 @@ func (m *Manager) createAndAdmitNodeSet(ctx context.Context, nodes []node.Node)
+ const heavyEarlyCreateEnv = "KNE_HEAVY_EARLY_CREATE"
+ 
+ func heavyEarlyCreateEnabled() bool {
+-	switch strings.ToLower(strings.TrimSpace(os.Getenv(heavyEarlyCreateEnv))) {
++	switch strings.ToLower(strings.TrimSpace(envhook.Getenv(heavyEarlyCreateEnv))) {
+ 	case "linked-peers", "true", "1":
+ 		return true
+ 	}
+@@ -3295,7 +3296,7 @@ type runtimeAdmissionPolicyJSON struct {
+ }
+ 
+ func loadRuntimeAdmissionPoliciesFromEnv() map[string]runtimeAdmissionPolicy {
+-	raw := strings.TrimSpace(os.Getenv("SKYFORGE_KNE_ADMISSION_POLICY_JSON"))
++	raw := strings.TrimSpace(envhook.Getenv("SKYFORGE_KNE_ADMISSION_POLICY_JSON"))
+ 	if raw == "" {
+ 		return nil
+ 	}
+-- 
+2.56.1
+

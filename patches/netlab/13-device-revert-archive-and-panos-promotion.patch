@@ -1142,5 +1142,5 @@ index 0000000..3405c1a
 +    assert cli.build_queue(["show jobs all"], op_mode=True, do_commit=False) == [
 +        "set cli scripting-mode on", "set cli pager off", "show jobs all", "exit"]
 -- 
-2.56.0
+2.56.1
 
