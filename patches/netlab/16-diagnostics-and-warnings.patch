@@ -1,0 +1,568 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 00:00:00 +0000
+Subject: [PATCH] diagnostics: say why a plugin group is empty, fabric
+ near-miss node names, EVPN OSPF-on-IRB warning, firewall.zonebased rules not
+ rendered
+
+---
+diff --git a/docs/module/evpn.md b/docs/module/evpn.md
+index ecfe0bc..8e06a82 100644
+--- a/docs/module/evpn.md
++++ b/docs/module/evpn.md
+@@ -237,6 +237,8 @@ Like the [VXLAN case](vxlan-rp), _netlab_ enables all routing protocols configur
+ 
+ That could result in severe routing instabilities. You should turn off routing protocols on EVPN-controlled VLANs (use a setting similar to **vlans._name_.ospf: False**), put EVPN-controlled VLANs in a VRF, or make them layer-2-only VLANs with **vlan.mode** set to **bridge**.
+ 
++The platform fork warns about the most common case: a node that runs OSPF on the IRB SVI of an EVPN-controlled VLAN. Turn the warning off with **defaults.evpn.warnings.svi_ospf: False**.
++
+ If you're using EVPN to implement symmetrical IRB (**evpn.transit_vni** is set in a VRF), turn off routing protocols in the VRF unless you use the VRF to connect to CE-routers. Otherwise, the routers establish in-VRF IGP adjacencies over extended VLANs and use in-VRF IGP routes instead of EVPN routes for end-to-end connectivity.
+ 
+ If you want to implement an EVPN L3VPN with CE-routers, use separate segments (not VXLAN-backed VLANs) for PE-CE connectivity. There is no way to block the establishment of PE-to-PE in-VRF IGP adjacencies if you expect to have the PE-CE IGP adjacencies on a VXLAN-backed VLAN.
+diff --git a/docs/plugins/firewall.zonebased.md b/docs/plugins/firewall.zonebased.md
+index d016b45..2a1b34c 100644
+--- a/docs/plugins/firewall.zonebased.md
++++ b/docs/plugins/firewall.zonebased.md
+@@ -30,6 +30,8 @@ The plugin adds the following attributes defined at node level:
+     * **to_zone** (id, mandatory) -- Policy Destination Zone
+     * **action** (string, mandatory, one of `permit`, `deny`) -- Policy Action
+ 
++* **firewall.zonebased.rules** (list, same item format as **default_rules**) -- specific zone to zone rules. **Only PAN-OS renders it.** On FortiOS, vSRX and VyOS the attribute is accepted and silently has no effect; the platform fork warns (turn the warning off with **defaults.firewall.zonebased.warnings.rules_not_rendered: False**). Use **firewall.policy.rules** ([](plugin-firewall-policy)) for specific rules on FortiOS.
++
+ Additional interface level attributes:
+ * **firewall.zone** (id) -- the firewall zone for this firewall interface
+ 
+diff --git a/netsim/augment/groups.py b/netsim/augment/groups.py
+index 258a88b..d736211 100644
+--- a/netsim/augment/groups.py
++++ b/netsim/augment/groups.py
+@@ -103,7 +103,8 @@ def check_group_data_sanity(
+       log.error(
+         f"Definition of {grp_namespace}group '{grp}' must be a dictionary",
+         log.IncorrectType,
+-        'groups')
++        'groups',
++        more_hints=[ f"'{grp}:' has no value (YAML null). Give it attributes (module, device, members), a list of members, or write '{grp}: {{}}' for an empty group" ])  # PLATFORM-SPECIFIC hint
+       return False
+ 
+     if isinstance(parent.groups[grp],list):
+@@ -534,10 +535,14 @@ def copy_group_device_module(topology: Box) -> None:
+       print(f'Setting module for group {grp}: {gdata.module}')
+     g_members = group_members(topology,grp)
+     if not g_members and not gdata.get('_default_group',False):
++      from . import plugin as _plugin                       # PLATFORM-SPECIFIC: say WHY a group has no members
+       log.error(
+         f'Cannot use "module" attribute in group {grp} that has no direct or indirect members',
+         log.IncorrectValue,
+-        'groups')
++        'groups',
++        more_hints=_plugin.unloaded_plugin_hints(topology) + [
++          'A group gets members from its own "members" list, from the "group" attribute of nodes, '
++          'or from a plugin that generates nodes (the plugin must be listed under "plugin")' ])
+       continue
+ 
+     for name in g_members:                                  # Iterate over group members
+diff --git a/netsim/augment/plugin.py b/netsim/augment/plugin.py
+index 09c10dc..a6dff4f 100644
+--- a/netsim/augment/plugin.py
++++ b/netsim/augment/plugin.py
+@@ -18,6 +18,48 @@ from ..utils import sort as _sort
+ from . import config
+ 
+ 
++def plugin_for_global_key(key: str) -> typing.Optional[str]:
++  """
++  PLATFORM-SPECIFIC (error-path hint helper): the bundled plugin whose defaults declare 'key' as a
++  global (top-level) topology attribute, or None. Reads the plugin defaults files directly because
++  this is called when plugin defaults were NOT merged, which is exactly the case being diagnosed.
++  """
++  import yaml                                           # error path only, keep the import local
++  base = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),'extra')
++  try:
++    names = sorted(os.listdir(base))
++  except OSError:
++    return None
++  for name in names:
++    dfile = os.path.join(base,name,'defaults.yml')
++    if not os.path.isfile(dfile):
++      continue
++    try:
++      with open(dfile,'r') as fh:
++        gattr = (yaml.safe_load(fh) or {}).get('attributes',{}).get('global',{})
++    except (OSError,yaml.YAMLError,AttributeError):
++      continue
++    if isinstance(gattr,dict) and key in gattr:
++      return name
++  return None
++
++def unloaded_plugin_hints(topology: Box) -> typing.List[str]:
++  """
++  PLATFORM-SPECIFIC: hints for every top-level key that belongs to a bundled plugin the topology did
++  not enable (plugin: [ ... ]). The key is accepted by nobody else, and netlab's own complaint about
++  it (or about the groups/nodes the plugin would have created) never names the missing plugin.
++  """
++  loaded = topology.get('plugin',[])
++  loaded = [ loaded ] if isinstance(loaded,str) else (loaded if isinstance(loaded,list) else [])
++  hints: typing.List[str] = []
++  for key in list(topology.keys()):
++    if key in ('defaults','plugin','module','groups','nodes','links','vlans','vrfs','addressing'):
++      continue
++    pname = plugin_for_global_key(key)
++    if pname and pname not in loaded:
++      hints.append(f"The topology has a '{key}' block, which belongs to the '{pname}' plugin, but the plugin is not enabled: add 'plugin: [ {pname} ]'")
++  return hints
++
+ def merge_plugin_defaults(defaults: typing.Optional[Box], topology: Box) -> None:
+   '''
+   merge_plugin_defaults: Merge plugin defaults with topology defaults
+diff --git a/netsim/data/validate.py b/netsim/data/validate.py
+index 1a216d9..78fba04 100644
+--- a/netsim/data/validate.py
++++ b/netsim/data/validate.py
+@@ -953,9 +953,15 @@ def validate_attributes(
+         module)
+       continue
+ 
++    hints = [ attr_help(module,data_name) ]
++    if data_path == 'topology' and topo_pointer is not None:      # PLATFORM-SPECIFIC: a plugin block without its plugin
++      from ..augment import plugin as _plugin
++      pname = _plugin.plugin_for_global_key(k)
++      if pname and pname not in (topo_pointer.get('plugin') or []):
++        hints.insert(0,f"'{k}' is the configuration block of the '{pname}' plugin, which is not enabled: add 'plugin: [ {pname} ]'")
+     log.error(
+       text=f"Invalid {data_name} attribute '{k}' found in {data_path}",
+-      more_hints=[ attr_help(module,data_name) ],
++      more_hints=hints,
+       category=log.IncorrectAttr,
+       module=module)
+ 
+diff --git a/netsim/defaults/hints.yml b/netsim/defaults/hints.yml
+index 78d117e..2bf5286 100644
+--- a/netsim/defaults/hints.yml
++++ b/netsim/defaults/hints.yml
+@@ -15,6 +15,9 @@ evpn:
+   ebgp_vlan: >
+     In most scenarios, you don't need EBGP sessions between PE-devices across an
+     EVPN-controlled VLAN. See https://netlab.tools/module/evpn/#evpn-rp for details.
++  svi_ospf: >
++    Turn OSPF off on the VLAN (vlans.<name>.ospf: False), make the SVI passive (vlans.<name>.ospf.passive: True)
++    or make the VLAN layer-2-only (vlan.mode: bridge). See https://netlab.tools/module/evpn/#evpn-rp for details.
+ 
+ report:
+   source: >
+diff --git a/netsim/extra/fabric/__init__.py b/netsim/extra/fabric/__init__.py
+index b33cb97..63f955b 100644
+--- a/netsim/extra/fabric/__init__.py
++++ b/netsim/extra/fabric/__init__.py
+@@ -1,3 +1,4 @@
++import re
+ import typing
+ 
+ from box import Box
+@@ -182,6 +183,46 @@ def debug_fabric(topology: Box, groups: Box, nodes: Box, links: list) -> None:
+   print('=' * 80)
+   print(strings.get_yaml_string(links))
+ 
++'''
++PLATFORM-SPECIFIC: warn about a hand-declared node whose name is a near miss of a generated fabric node
++
++The plugin names its nodes from fabric.leaf.name / fabric.spine.name and puts them in its role groups (leafs, spines). A topology
++that declares a node by the role word and the node's number (<group>N or <singular>N, any case, optional - or _) creates a NEW
++node outside those groups, so the group modules, VLANs and parameters never reach it, and it sits beside the generated node with
++that number. Nothing else reports it. The role words and the numbers come from the groups and nodes the plugin just generated.
++'''
++def check_near_miss_names(topology: Box, groups: Box, fabric_nodes: Box) -> None:
++  nodes = topology.get('nodes',None)
++  if isinstance(nodes,dict):
++    declared = list(nodes.keys())
++  elif isinstance(nodes,list):
++    declared = [ n if isinstance(n,str) else n.get('name') for n in nodes if isinstance(n,(str,dict)) ]
++  else:
++    return
++
++  by_role: dict = {}                                        # role word -> { counter: generated node name }
++  for g_name,g_data in groups.items():
++    words = { g_name.lower(), g_name.lower().rstrip('s') }
++    counters = { fabric_nodes[m]._fabric_count: m for m in g_data.get('members',[]) if m in fabric_nodes }
++    for w in words:
++      if w:
++        by_role[w] = counters
++
++  for name in declared:
++    if not isinstance(name,str) or name in fabric_nodes:
++      continue
++    m = re.match(r'^([A-Za-z]+)[-_]?(\d+)$',name)
++    if not m:
++      continue
++    candidate = by_role.get(m.group(1).lower(),{}).get(int(m.group(2)))
++    if not candidate:
++      continue
++    log.warning(
++      text=f'Node {name} looks like the fabric node {candidate}, but it is a separate node outside the fabric groups (the fabric plugin generates {candidate} itself)',
++      module=_config_name,
++      flag='node_name',
++      more_hints=[ f'Use the generated name {candidate} (nodes: {{ {candidate}: ... }} adds parameters to it), or set fabric.leaf.name / fabric.spine.name to the name template you want' ])
++
+ '''
+ The fabric is generated during plugin initialization phase
+ '''
+@@ -199,9 +240,19 @@ def topology_expand(topology: Box) -> None:
+         log.IncorrectType,'fabric')
+       return
+ 
++  # PLATFORM-SPECIFIC: 'groups: { leafs: }' is a null value and netlab core treats it as an empty group
++  # (groups.py creates the empty dict); the plugin runs BEFORE that, so give it the same reading instead
++  # of crashing in the member merge below ("'NoneType' object has no attribute 'members'").
++  if isinstance(topology.get('groups'),dict):
++    for g_name in list(topology.groups.keys()):
++      if topology.groups[g_name] is None:
++        topology.groups[g_name] = {}
++
+   # Create the fabric groups, nodes and links
+   (grp,nodes,links) = generate_fabric(topology,l_cnt,s_cnt)
+ 
++  check_near_miss_names(topology,grp,nodes)
++
+   if topology.get('fabric.debug',None):                     # Dump the fabric data for debugging purposes
+     debug_fabric(topology,grp,nodes,links)
+ 
+diff --git a/netsim/extra/firewall/zonebased/__init__.py b/netsim/extra/firewall/zonebased/__init__.py
+index 3f61b43..59bbe4f 100644
+--- a/netsim/extra/firewall/zonebased/__init__.py
++++ b/netsim/extra/firewall/zonebased/__init__.py
+@@ -34,6 +34,27 @@ def check_fortios_policy_ids(node: Box) -> None:
+           category=log.IncorrectValue,
+           module=_config_name)
+ 
++# PLATFORM-SPECIFIC: `firewall.zonebased.rules` is accepted by the attribute schema on every device that
++# declares the plugin, but only the panos template renders it (fortios, vsrx and vyos render
++# `default_rules` and nothing else). The rules were dropped without a word, and the lab came up
++# without the rule the author wrote. `firewall.policy.rules` is the typed, rendered path for specific rules.
++def check_unrendered_rules(node: Box, topology: Box) -> None:
++  rules = node.get('firewall.zonebased.rules',[])
++  if not rules:
++    return
++  features = devices.get_device_features(node,topology.defaults)
++  if 'firewall.zonebased_rules' in features:
++    return
++  renderers = sorted(d for d,ddata in topology.defaults.devices.items()
++                       if ddata.get('features.firewall.zonebased_rules',False) is True)
++  log.warning(
++    text=f"Node {node.name}({node.device}) sets firewall.zonebased.rules, which {node.device} does not render: the {len(rules)} rule(s) will be silently ignored",
++    module=_config_name,
++    flag='rules_not_rendered',
++    more_hints=[
++      f"Devices that render firewall.zonebased.rules: {', '.join(renderers) or 'none'}",
++      "Use firewall.policy.rules for specific rules: it is a module-level attribute with its own per-device renderers (see the firewall.policy plugin documentation)" ])
++
+ def check_rule(node: Box, def_rule: Box, rule_idx: int) -> None:
+     global _config_name
+     for z_direction in [ 'from_zone', 'to_zone' ]:
+@@ -80,6 +101,8 @@ def post_transform(topology: Box) -> None:
+                                          node.get('firewall.zonebased.default_policy','deny') == 'permit'):
+             check_fortios_policy_ids(node)
+ 
++        check_unrendered_rules(node,topology)
++
+         # now check that zones defined in rules are defined
+         for rule_idx,def_rule in enumerate(node.get('firewall.zonebased.default_rules', [])):
+             check_rule(node,def_rule,rule_idx)
+diff --git a/netsim/extra/firewall/zonebased/defaults.yml b/netsim/extra/firewall/zonebased/defaults.yml
+index f68e903..ede6ffd 100644
+--- a/netsim/extra/firewall/zonebased/defaults.yml
++++ b/netsim/extra/firewall/zonebased/defaults.yml
+@@ -6,6 +6,9 @@ devices:
+     features.firewall.zonebased: True
+   panos:
+     features.firewall.zonebased: True
++    # PLATFORM-SPECIFIC: only panos.j2 renders firewall.zonebased.rules (fortios, vsrx and vyos
++    # render default_rules only). check_unrendered_rules() warns when another device carries them.
++    features.firewall.zonebased_rules: True
+   vsrx:
+     features.firewall.zonebased: True
+   vyos:
+diff --git a/netsim/modules/evpn.py b/netsim/modules/evpn.py
+index a20a89e..4640dd3 100644
+--- a/netsim/modules/evpn.py
++++ b/netsim/modules/evpn.py
+@@ -584,6 +584,31 @@ def remove_vlan_ebgp_neighbors(node: Box,topology: Box) -> None:
+       if 'neighbors' in bgp:
+         bgp.neighbors = [ ngb for ngb in bgp.neighbors if '_must_remove' not in ngb ]
+ 
++"""
++Warn about OSPF running on the SVI of an EVPN-controlled VLAN
++
++PLATFORM-SPECIFIC: netlab enables every routing protocol on every interface, including the IRB SVI of a VXLAN-extended VLAN
++(see "Interactions with Routing Protocols" in the EVPN module documentation). The VTEPs then form OSPF adjacencies across
++their own VXLAN tunnel and learn each other's VTEP loopback through it: recursive routing. The tunnel black-holes, the
++adjacency dies, the route falls back to the underlay, the adjacency re-forms: hosts lose traffic every 30-40 seconds.
++This runs in node_cleanup, after the OSPF module decided which interfaces carry OSPF and which are passive.
++"""
++def check_svi_ospf(node: Box, topology: Box) -> None:
++  evpn_vlans = node.get('evpn.vlans',[])
++  if not evpn_vlans:
++    return
++  bad = [ intf for intf in node.get('interfaces',[])
++            if intf.get('type') == 'svi' and intf.get('vlan.name') in evpn_vlans
++              and isinstance(intf.get('ospf'),Box) and not intf.ospf.get('passive',False) ]
++  if not bad:
++    return
++  names = ', '.join(sorted({ intf.vlan.name for intf in bad }))
++  log.warning(
++    text=f'Node {node.name} runs OSPF on the IRB SVI of EVPN-controlled VLAN(s) {names}; OSPF adjacencies will form across the VXLAN tunnel',
++    module='evpn',
++    flag='svi_ospf',
++    hint='svi_ospf')
++
+ """
+ Check whether the node supports the evpn.transport setting used in lab topology
+ """
+@@ -676,3 +701,4 @@ class EVPN(_Module):
+ 
+   def node_cleanup(self, node: Box, topology: Box) -> None:
+     remove_vlan_ebgp_neighbors(node,topology)
++    check_svi_ospf(node,topology)
+diff --git a/tests/errors/evpn-svi-ospf.log b/tests/errors/evpn-svi-ospf.log
+new file mode 100644
+index 0000000..ce41cd9
+--- /dev/null
++++ b/tests/errors/evpn-svi-ospf.log
+@@ -0,0 +1,8 @@
++ErrorAbort in evpn: Node l1 runs OSPF on the IRB SVI of EVPN-controlled VLAN(s) red; OSPF adjacencies will form across the VXLAN tunnel
++... Set defaults.evpn.warnings.svi_ospf to False to disable this check
++... Turn OSPF off on the VLAN (vlans.<name>.ospf: False), make the SVI passive
++    (vlans.<name>.ospf.passive: True) or make the VLAN layer-2-only (vlan.mode: bridge).
++    See https://netlab.tools/module/evpn/#evpn-rp for details.
++
++ErrorAbort in evpn: Node l2 runs OSPF on the IRB SVI of EVPN-controlled VLAN(s) red; OSPF adjacencies will form across the VXLAN tunnel
++Fatal error in netlab: Cannot proceed beyond this point due to errors, exiting
+diff --git a/tests/errors/evpn-svi-ospf.yml b/tests/errors/evpn-svi-ospf.yml
+new file mode 100644
+index 0000000..8ae3049
+--- /dev/null
++++ b/tests/errors/evpn-svi-ospf.yml
+@@ -0,0 +1,34 @@
++# The platform: OSPF on the IRB SVI of an EVPN-controlled VLAN. The warning is a compiled-with-warning finding; the flag is
++# set to 'error' here only so the error-test harness (which expects an abort) can capture the text.
++defaults.device: eos
++defaults.evpn.warnings.svi_ospf: error
++bgp.as: 65000
++
++vlans:
++  red:
++
++groups:
++  switches:
++    members: [ l1, l2, s1 ]
++    module: [ vlan, vxlan, ospf, bgp, evpn ]
++
++nodes:
++  l1:
++  l2:
++  s1:
++  h1:
++    device: linux
++    module: []
++  h2:
++    device: linux
++    module: []
++
++links:
++- l1-s1
++- l2-s1
++- h1:
++  l1:
++    vlan.access: red
++- h2:
++  l2:
++    vlan.access: red
+diff --git a/tests/errors/fabric-near-miss-node-name.log b/tests/errors/fabric-near-miss-node-name.log
+new file mode 100644
+index 0000000..f5ec656
+--- /dev/null
++++ b/tests/errors/fabric-near-miss-node-name.log
+@@ -0,0 +1,6 @@
++ErrorAbort in fabric: Node leaf1 looks like the fabric node L1, but it is a separate node outside the fabric groups (the fabric plugin generates L1 itself)
++... Use the generated name L1 (nodes: { L1: ... } adds parameters to it), or set fabric.leaf.name / fabric.spine.name to the name template you want
++... Set defaults.fabric.warnings.node_name to False to disable this check
++ErrorAbort in fabric: Node spine1 looks like the fabric node S1, but it is a separate node outside the fabric groups (the fabric plugin generates S1 itself)
++... Use the generated name S1 (nodes: { S1: ... } adds parameters to it), or set fabric.leaf.name / fabric.spine.name to the name template you want
++Fatal error in netlab: Cannot proceed beyond this point due to errors, exiting
+diff --git a/tests/errors/fabric-near-miss-node-name.yml b/tests/errors/fabric-near-miss-node-name.yml
+new file mode 100644
+index 0000000..40e04fd
+--- /dev/null
++++ b/tests/errors/fabric-near-miss-node-name.yml
+@@ -0,0 +1,18 @@
++# PLATFORM-SPECIFIC: a node declared as <role word><number> (leaf1, spine1) beside the fabric plugin's generated node with that number.
++# The warning flag is set to 'error' here only so the error-test harness (which expects an abort) can capture the text.
++defaults.device: eos
++defaults.fabric.warnings.node_name: error
++provider: clab
++plugin: [ fabric ]
++
++fabric:
++  spines: 1
++  leafs: 2
++
++nodes:
++  leaf1:
++  spine1:
++  sw1:        # negative controls: not a role word + generated number
++  lab1:
++  h1:
++    device: linux
+diff --git a/tests/errors/fabric-null-group.log b/tests/errors/fabric-null-group.log
+new file mode 100644
+index 0000000..c5ceb5a
+--- /dev/null
++++ b/tests/errors/fabric-null-group.log
+@@ -0,0 +1,3 @@
++IncorrectType in groups: Definition of group 'leafs' must be a dictionary
++... 'leafs:' has no value (YAML null). Give it attributes (module, device, members), a list of members, or write 'leafs: {}' for an empty group
++Fatal error in netlab: Cannot proceed beyond this point due to errors, exiting
+diff --git a/tests/errors/fabric-null-group.yml b/tests/errors/fabric-null-group.yml
+new file mode 100644
+index 0000000..06135c3
+--- /dev/null
++++ b/tests/errors/fabric-null-group.yml
+@@ -0,0 +1,18 @@
++#
++# A group with no value (YAML null) next to the fabric plugin used to crash the plugin with a traceback
++# (AttributeError: 'NoneType' object has no attribute 'members') after netlab had already reported the error
++#
++defaults.device: eos
++provider: clab
++plugin: [ fabric ]
++fabric.spines: 2
++fabric.leafs: 2
++fabric.link.pool: core
++addressing:
++  core:
++    ipv4: 10.1.0.0/16
++    prefix: 31
++
++groups:
++  leafs:
++  spines:
+diff --git a/tests/errors/firewall-zonebased-rules-not-rendered.log b/tests/errors/firewall-zonebased-rules-not-rendered.log
+new file mode 100644
+index 0000000..077f373
+--- /dev/null
++++ b/tests/errors/firewall-zonebased-rules-not-rendered.log
+@@ -0,0 +1,5 @@
++ErrorAbort in firewall.zonebased: Node fwA(fortios) sets firewall.zonebased.rules, which fortios does not render: the 1 rule(s) will be silently ignored
++... Devices that render firewall.zonebased.rules: panos
++... Use firewall.policy.rules for specific rules: it is a module-level attribute with its own per-device renderers (see the firewall.policy plugin documentation)
++... Set defaults.firewall.zonebased.warnings.rules_not_rendered to False to disable this check
++Fatal error in netlab: Cannot proceed beyond this point due to errors, exiting
+diff --git a/tests/errors/firewall-zonebased-rules-not-rendered.yml b/tests/errors/firewall-zonebased-rules-not-rendered.yml
+new file mode 100644
+index 0000000..d5fac1b
+--- /dev/null
++++ b/tests/errors/firewall-zonebased-rules-not-rendered.yml
+@@ -0,0 +1,40 @@
++# PLATFORM-SPECIFIC: firewall.zonebased.rules is accepted on every zonebased device but only panos renders it.
++# The warning flag is set to 'error' here only so the error-test harness (which expects an abort) can capture the text.
++defaults.firewall.zonebased.warnings.rules_not_rendered: error
++provider: clab
++plugin: [ firewall.zonebased ]
++
++nodes:
++  fwA:
++    device: fortios
++    firewall.zonebased:
++      default_rules:
++      - from_zone: zoneA
++        to_zone: zoneB
++        action: permit
++      rules:
++      - from_zone: zoneB
++        to_zone: zoneA
++        action: permit
++        service: [ SSH ]
++  fwB:
++    device: panos
++    firewall.zonebased:
++      rules:
++      - from_zone: zoneB
++        to_zone: zoneA
++        action: permit
++  swA:
++    device: eos
++
++links:
++- fwA:
++    firewall.zone: zoneA
++  swA:
++- fwA:
++    firewall.zone: zoneB
++  fwB:
++    firewall.zone: zoneB
++- fwB:
++    firewall.zone: zoneA
++  swA:
+diff --git a/tests/errors/plugin-block-attribute-only.log b/tests/errors/plugin-block-attribute-only.log
+new file mode 100644
+index 0000000..f5eadd8
+--- /dev/null
++++ b/tests/errors/plugin-block-attribute-only.log
+@@ -0,0 +1,3 @@
++IncorrectAttr in topology: Invalid topology attribute 'fabric' found in topology
++... 'fabric' is the configuration block of the 'fabric' plugin, which is not enabled: add 'plugin: [ fabric ]'
++Fatal error in netlab: Cannot proceed beyond this point due to errors, exiting
+diff --git a/tests/errors/plugin-block-attribute-only.yml b/tests/errors/plugin-block-attribute-only.yml
+new file mode 100644
+index 0000000..ff67208
+--- /dev/null
++++ b/tests/errors/plugin-block-attribute-only.yml
+@@ -0,0 +1,11 @@
++#
++# PLATFORM-SPECIFIC hint: the plugin block is the only problem
++#
++defaults.device: eos
++provider: clab
++
++fabric:
++  spines: 2
++  leafs: 2
++
++nodes: [ r1 ]
+diff --git a/tests/errors/plugin-block-without-plugin.log b/tests/errors/plugin-block-without-plugin.log
+new file mode 100644
+index 0000000..05f9160
+--- /dev/null
++++ b/tests/errors/plugin-block-without-plugin.log
+@@ -0,0 +1,5 @@
++IncorrectValue in groups: Cannot use "module" attribute in group leafs that has no direct or indirect members
++... The topology has a 'fabric' block, which belongs to the 'fabric' plugin, but the plugin is not enabled: add 'plugin: [ fabric ]'
++... A group gets members from its own "members" list, from the "group" attribute of nodes, or from a plugin that generates nodes (the plugin must be listed under "plugin")
++IncorrectValue in groups: Cannot use "module" attribute in group spines that has no direct or indirect members
++Fatal error in netlab: Cannot proceed beyond this point due to errors, exiting
+diff --git a/tests/errors/plugin-block-without-plugin.yml b/tests/errors/plugin-block-without-plugin.yml
+new file mode 100644
+index 0000000..ac5a7bf
+--- /dev/null
++++ b/tests/errors/plugin-block-without-plugin.yml
+@@ -0,0 +1,18 @@
++#
++# PLATFORM-SPECIFIC hints: a plugin's configuration block is present but the plugin is not
++# enabled, so the groups the plugin would have populated have no members
++#
++defaults.device: eos
++provider: clab
++
++fabric:
++  spines: 2
++  leafs: 2
++
++groups:
++  spines:
++    module: [ ospf, bgp ]
++  leafs:
++    module: [ ospf, bgp ]
++
++nodes: [ h1 ]
+-- 
+2.56.1
+

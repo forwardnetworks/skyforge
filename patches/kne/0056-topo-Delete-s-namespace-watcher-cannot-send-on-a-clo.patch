@@ -1,0 +1,149 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 14:10:00 -0600
+Subject: [PATCH 56/56] topo: Delete's namespace watcher cannot send on a
+ closed channel
+
+---
+diff --git a/topo/delete_watch_test.go b/topo/delete_watch_test.go
+new file mode 100644
+index 0000000..af3b7a8
+--- /dev/null
++++ b/topo/delete_watch_test.go
+@@ -0,0 +1,91 @@
++package topo
++
++import (
++	"context"
++	"errors"
++	"strings"
++	"testing"
++	"time"
++
++	tpb "github.com/openconfig/kne/proto/topo"
++	topologyv1 "github.com/openconfig/kne/third_party/meshnet/api/types/v1beta1"
++	"github.com/openconfig/kne/topo/node"
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/watch"
++	dfake "k8s.io/client-go/dynamic/fake"
++	kfake "k8s.io/client-go/kubernetes/fake"
++	ktest "k8s.io/client-go/testing"
++)
++
++func deleteManager(kf *kfake.Clientset) *Manager {
++	return &Manager{
++		nodes:   map[string]node.Node{},
++		topo:    &tpb.Topology{Name: "lab"},
++		kClient: kf,
++		dClient: dfake.NewSimpleDynamicClient(topologyv1.Scheme),
++	}
++}
++
++func labNamespace() *corev1.Namespace {
++	return &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "lab"}}
++}
++
++// Delete(skipWait=false) starts a watcher goroutine and returns early when the namespace delete itself fails. The
++// watcher's send used to hit a channel Delete had already closed ("send on closed channel", unrecoverable).
++func TestDeleteWatcherSendAfterEarlyReturnDoesNotPanic(t *testing.T) {
++	kf := kfake.NewSimpleClientset(labNamespace())
++	kf.PrependReactor("delete", "namespaces", func(ktest.Action) (bool, runtime.Object, error) {
++		return true, nil, errors.New("namespace delete refused")
++	})
++	w := watch.NewFake() // a watch that never delivers: the watcher can only end by its context
++	kf.PrependWatchReactor("namespaces", func(ktest.Action) (bool, watch.Interface, error) { return true, w, nil })
++	m := deleteManager(kf)
++
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	err := m.Delete(ctx)
++	if err == nil || !strings.Contains(err.Error(), "namespace delete refused") {
++		t.Fatalf("Delete() = %v, want the namespace delete error", err)
++	}
++	// the caller goes on (or gives up): the watcher ends and sends its one answer
++	cancel()
++	time.Sleep(300 * time.Millisecond) // a send on a closed channel panics here and ends the test binary
++}
++
++func TestDeleteWatcherPanicBecomesAnError(t *testing.T) {
++	kf := kfake.NewSimpleClientset(labNamespace())
++	kf.PrependWatchReactor("namespaces", func(ktest.Action) (bool, watch.Interface, error) { panic("watch bug") })
++	m := deleteManager(kf)
++	done := make(chan error, 1)
++	go func() { done <- m.Delete(context.Background()) }()
++	select {
++	case err := <-done:
++		var pe *PanicError
++		if !errors.As(err, &pe) || !strings.Contains(err.Error(), "watch bug") {
++			t.Fatalf("Delete() = %v, want a *PanicError from the watcher", err)
++		}
++	case <-time.After(10 * time.Second):
++		t.Fatal("Delete did not return")
++	}
++}
++
++func TestDeleteStillWaitsForTheNamespace(t *testing.T) {
++	kf := kfake.NewSimpleClientset(labNamespace())
++	w := watch.NewFake()
++	kf.PrependWatchReactor("namespaces", func(ktest.Action) (bool, watch.Interface, error) { return true, w, nil })
++	m := deleteManager(kf)
++	done := make(chan error, 1)
++	go func() { done <- m.Delete(context.Background()) }()
++	time.Sleep(100 * time.Millisecond)
++	w.Delete(labNamespace())
++	select {
++	case err := <-done:
++		if err != nil {
++			t.Fatalf("Delete() = %v, want nil once the namespace is deleted", err)
++		}
++	case <-time.After(10 * time.Second):
++		t.Fatal("Delete did not return after the namespace was deleted")
++	}
++}
+diff --git a/topo/topo.go b/topo/topo.go
+index 9e3cdb5..6ee7d36 100644
+--- a/topo/topo.go
++++ b/topo/topo.go
+@@ -556,11 +556,23 @@ func (m *Manager) Delete(ctx context.Context) error {
+ 		return nil
+ 	}
+ 
+-	// Watch for namespace deletion.
+-	c := make(chan error)
+-	defer close(c)
++	// Watch for namespace deletion. The channel is buffered for the watcher's single send and is never closed: Delete
++	// can return before it reads the answer (the namespace delete below fails), and the watcher then still sends once
++	// when its context ends; with an unbuffered channel closed on return that send panicked ("send on closed channel")
++	// on a goroutine nobody can recover. The watcher is cancelled when Delete returns.
++	c := make(chan error, 1)
++	wctx, stopWatch := context.WithCancel(ctx)
++	defer stopWatch()
+ 	go func() {
+-		tCtx, cancel := context.WithTimeout(ctx, deleteWatchTimeout)
++		defer func() {
++			if rec := recover(); rec != nil {
++				select {
++				case c <- newPanicError("namespace deletion watcher goroutine", rec):
++				default:
++				}
++			}
++		}()
++		tCtx, cancel := context.WithTimeout(wctx, deleteWatchTimeout)
+ 		defer cancel()
+ 		waitNSDeleted(tCtx, m.kClient, m.topo.Name, c)
+ 	}()
+@@ -580,7 +592,8 @@ func (m *Manager) Delete(ctx context.Context) error {
+ }
+ 
+ // waitNSDeleted waits for a namespace to be deleted. Write a non-nil error to the errCh
+-// if waiting is unsuccessful. Else write a nil error to errCh and then return.
++// if waiting is unsuccessful. Else write a nil error to errCh and then return. It sends exactly once, and errCh
++// must have room for that send (Delete passes a channel with capacity 1).
+ func waitNSDeleted(ctx context.Context, kClient kubernetes.Interface, ns string, errCh chan error) {
+ 	w, err := kClient.CoreV1().Namespaces().Watch(ctx, metav1.ListOptions{})
+ 	if err != nil {
+-- 
+2.56.0
+

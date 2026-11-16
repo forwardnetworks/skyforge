@@ -26,10 +26,10 @@ index acbbcb1..aaeb711 100644
 +* **failure_handling**: carried in node data for tooling; not rendered.
 +* **enabled** (bool): `false` on a node removes the declaration for that node.
 diff --git a/netsim/ansible/templates/initial/linux-kne.j2 b/netsim/ansible/templates/initial/linux-kne.j2
-index 3cf9856..7fdb9c8 100644
+index e31da30..524db05 100644
 --- a/netsim/ansible/templates/initial/linux-kne.j2
 +++ b/netsim/ansible/templates/initial/linux-kne.j2
-@@ -240,3 +240,14 @@ chmod +x /tmp/netlab-host-activity.sh
+@@ -262,3 +262,14 @@ chmod +x /tmp/netlab-host-activity.sh
  pkill -f '/tmp/netlab-host-activity.sh' >/dev/null 2>&1 || true
  nohup /tmp/netlab-host-activity.sh >/var/log/netlab-host-activity.log 2>&1 &
  fi
@@ -938,5 +938,5 @@ index 0000000..8f4c615
 +  with pytest.raises(log.ErrorAbort):
 +    compile_topology(tmp_path,text,raise_error=True)
 -- 
-2.56.0
+2.56.1
 

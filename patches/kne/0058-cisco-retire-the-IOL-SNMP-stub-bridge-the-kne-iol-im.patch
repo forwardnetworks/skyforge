@@ -1,0 +1,483 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 12:00:00 -0600
+Subject: [PATCH] cisco: retire the IOL SNMP stub bridge (the kne-iol image
+ relays to IOS)
+
+---
+diff --git a/topo/node/cisco/iol-snmp-bridge.pl b/topo/node/cisco/iol-snmp-bridge.pl
+deleted file mode 100644
+index 9cac596..0000000
+--- a/topo/node/cisco/iol-snmp-bridge.pl
++++ /dev/null
+@@ -1,467 +0,0 @@
+-#!/usr/bin/perl
+-use strict;
+-use warnings;
+-use Socket qw(AF_INET SOCK_DGRAM SOL_SOCKET SO_REUSEADDR sockaddr_in inet_aton);
+-
+-my $listen_port   = $ENV{IOL_SNMP_PORT} // 161;
+-my $community     = $ENV{IOL_SNMP_COMMUNITY} // 'public';
+-my $refresh_sec   = $ENV{IOL_SNMP_REFRESH_SEC} // 5;
+-my $config_path   = $ENV{IOL_CONFIG_PATH} // '/iol/config.txt';
+-my $console_exec  = $ENV{IOL_SNMP_CONSOLE_EXEC} // '/usr/local/bin/iol-console-exec';
+-my $use_console   = ($ENV{IOL_SNMP_ENABLE_CONSOLE} // '') eq '1';
+-my $start_time    = time();
+-my $last_refresh  = 0;
+-my @default_ifaces = map { "Ethernet0/$_" } (0 .. 3);
+-my @initial_ifaces = grep { length $_ } map { s/^\s+|\s+$//gr } split /,/, ($ENV{IOL_SNMP_INTERFACES} // '');
+-@initial_ifaces = @default_ifaces if !@initial_ifaces;
+-my %state         = (
+-  hostname => $ENV{IOL_SNMP_HOSTNAME} || 'iol',
+-  sysdescr => $ENV{IOL_SNMP_SYS_DESCR} || 'Cisco IOS Software [IOSXE], Linux Software (X86_64BI_LINUX-ADVENTERPRISEK9-M)',
+-  cpu      => defined $ENV{IOL_SNMP_CPU} ? $ENV{IOL_SNMP_CPU} + 0 : 0,
+-  mem_used => defined $ENV{IOL_SNMP_MEM_USED} ? $ENV{IOL_SNMP_MEM_USED} + 0 : 0,
+-  mem_free => defined $ENV{IOL_SNMP_MEM_FREE} ? $ENV{IOL_SNMP_MEM_FREE} + 0 : 1,
+-  ifaces   => \@initial_ifaces,
+-);
+-
+-sub read_file {
+-  my ($path) = @_;
+-  return '' if !$path || !-f $path;
+-  open my $fh, '<', $path or return '';
+-  local $/;
+-  my $data = <$fh>;
+-  close $fh;
+-  return defined $data ? $data : '';
+-}
+-
+-sub run_console_cmd {
+-  my ($cmd) = @_;
+-  return '' if !$cmd;
+-  return '' if !-x $console_exec;
+-  local $ENV{SSH_ORIGINAL_COMMAND} = $cmd;
+-  my $output = qx{$console_exec 2>/dev/null};
+-  return $output // '';
+-}
+-
+-sub parse_interfaces {
+-  my ($text) = @_;
+-  my @ifaces;
+-  for my $line (split /\n/, $text // '') {
+-    $line =~ s/\r//g;
+-    next if $line =~ /^\s*$/;
+-    next if $line =~ /^Interface\s+IP-Address/i;
+-    next if $line =~ /^[^[:space:]\r\n]+[>#]\s*$/;
+-    next if $line =~ /^[^[:space:]\r\n]+[>#]\S+/;
+-    if ($line =~ /^\s*([A-Za-z][A-Za-z0-9\/\.\-\:]+)\s+/) {
+-      push @ifaces, $1;
+-    }
+-  }
+-  return \@ifaces;
+-}
+-
+-sub parse_interfaces_from_config {
+-  my ($text) = @_;
+-  my %seen;
+-  my @ifaces;
+-  for my $line (split /\n/, $text // '') {
+-    $line =~ s/\r//g;
+-    if ($line =~ /^\s*interface\s+(\S+)/i) {
+-      my $iface = $1;
+-      next if $seen{$iface}++;
+-      push @ifaces, $iface;
+-    }
+-  }
+-  return \@ifaces;
+-}
+-
+-sub iface_type {
+-  my ($name) = @_;
+-  return 24  if $name =~ /^Loopback/i;
+-  return 53  if $name =~ /^Vlan/i;
+-  return 6;
+-}
+-
+-sub iface_speed {
+-  my ($name) = @_;
+-  return 1000 if $name =~ /^Ethernet/i;
+-  return 0;
+-}
+-
+-sub refresh_state {
+-  my $now = time();
+-  return if $now - $last_refresh < $refresh_sec;
+-  $last_refresh = $now;
+-
+-  if (!$ENV{IOL_SNMP_HOSTNAME}) {
+-    my $cfg = read_file($config_path);
+-    if ($cfg =~ /^\s*hostname\s+(\S+)/m) {
+-      $state{hostname} = $1;
+-    }
+-    if (!$ENV{IOL_SNMP_INTERFACES}) {
+-      my $ifaces = parse_interfaces_from_config($cfg);
+-      if (@{$ifaces}) {
+-        $state{ifaces} = $ifaces;
+-      }
+-    }
+-  }
+-
+-  return if !$use_console;
+-
+-  if (!$ENV{IOL_SNMP_SYS_DESCR}) {
+-    my $descr = run_console_cmd('show version | include Cisco IOS Software');
+-    if ($descr =~ /(Cisco IOS Software[^\r\n]*)/) {
+-      $state{sysdescr} = $1;
+-    }
+-  }
+-
+-  if (!$ENV{IOL_SNMP_INTERFACES}) {
+-    my $brief = run_console_cmd('show ip interface brief');
+-    my $ifaces = parse_interfaces($brief);
+-    if (@{$ifaces}) {
+-      $state{ifaces} = $ifaces;
+-    }
+-  }
+-
+-  if (!$ENV{IOL_SNMP_CPU}) {
+-    my $cpu = run_console_cmd('show processes cpu | include CPU utilization');
+-    if ($cpu =~ /five minutes:\s*(\d+)%/i) {
+-      $state{cpu} = $1;
+-    }
+-  }
+-}
+-
+-sub oid_tuple {
+-  my ($oid_str) = @_;
+-  return [ map { 0 + $_ } split /\./, $oid_str ];
+-}
+-
+-sub oid_compare {
+-  my ($a, $b) = @_;
+-  my $len = @$a > @$b ? @$a : @$b;
+-  for (my $i = 0; $i < $len; $i++) {
+-    my $av = $i < @$a ? $a->[$i] : -1;
+-    my $bv = $i < @$b ? $b->[$i] : -1;
+-    return $av <=> $bv if $av != $bv;
+-  }
+-  return 0;
+-}
+-
+-sub oid_to_string {
+-  my ($oid) = @_;
+-  return join '.', @$oid;
+-}
+-
+-sub encode_length {
+-  my ($len) = @_;
+-  return pack('C', $len) if $len < 0x80;
+-  my $bytes = '';
+-  while ($len > 0) {
+-    $bytes = pack('C', $len & 0xff) . $bytes;
+-    $len >>= 8;
+-  }
+-  return pack('C', 0x80 | length($bytes)) . $bytes;
+-}
+-
+-sub encode_tlv {
+-  my ($tag, $value) = @_;
+-  return pack('C', $tag) . encode_length(length($value)) . $value;
+-}
+-
+-sub encode_integer {
+-  my ($value, $tag) = @_;
+-  $tag //= 0x02;
+-  my $bytes = '';
+-  if ($value == 0) {
+-    $bytes = "\x00";
+-  } else {
+-    my $v = $value;
+-    while ($v > 0) {
+-      $bytes = pack('C', $v & 0xff) . $bytes;
+-      $v >>= 8;
+-    }
+-    if ((ord(substr($bytes, 0, 1)) & 0x80) != 0) {
+-      $bytes = "\x00" . $bytes;
+-    }
+-  }
+-  return encode_tlv($tag, $bytes);
+-}
+-
+-sub encode_octet_string {
+-  my ($value) = @_;
+-  $value = '' if !defined $value;
+-  return encode_tlv(0x04, $value);
+-}
+-
+-sub encode_null {
+-  return "\x05\x00";
+-}
+-
+-sub encode_exception {
+-  my ($tag) = @_;
+-  return pack('CC', $tag, 0);
+-}
+-
+-sub encode_oid {
+-  my ($oid) = @_;
+-  my @parts = @{$oid};
+-  my $first = shift @parts // 0;
+-  my $second = shift @parts // 0;
+-  my @bytes = (($first * 40) + $second);
+-  for my $part (@parts) {
+-    my @stack = ($part & 0x7f);
+-    $part >>= 7;
+-    while ($part > 0) {
+-      unshift @stack, 0x80 | ($part & 0x7f);
+-      $part >>= 7;
+-    }
+-    push @bytes, @stack;
+-  }
+-  return encode_tlv(0x06, pack('C*', @bytes));
+-}
+-
+-sub decode_length {
+-  my ($data, $offset) = @_;
+-  my $first = ord(substr($data, $offset, 1));
+-  $offset++;
+-  return ($first, $offset) if ($first & 0x80) == 0;
+-  my $count = $first & 0x7f;
+-  my $len = 0;
+-  for (1 .. $count) {
+-    $len = ($len << 8) | ord(substr($data, $offset, 1));
+-    $offset++;
+-  }
+-  return ($len, $offset);
+-}
+-
+-sub decode_tlv {
+-  my ($data, $offset) = @_;
+-  my $tag = ord(substr($data, $offset, 1));
+-  $offset++;
+-  my ($len, $value_offset) = decode_length($data, $offset);
+-  my $value = substr($data, $value_offset, $len);
+-  return ($tag, $len, $value, $value_offset + $len);
+-}
+-
+-sub decode_integer {
+-  my ($bytes) = @_;
+-  my $value = 0;
+-  for my $byte (unpack('C*', $bytes)) {
+-    $value = ($value << 8) | $byte;
+-  }
+-  return $value;
+-}
+-
+-sub decode_oid {
+-  my ($bytes) = @_;
+-  my @octets = unpack('C*', $bytes);
+-  return [1,3] if !@octets;
+-  my $first = shift @octets;
+-  my @parts = (int($first / 40), $first % 40);
+-  my $value = 0;
+-  for my $octet (@octets) {
+-    $value = ($value << 7) | ($octet & 0x7f);
+-    if (($octet & 0x80) == 0) {
+-      push @parts, $value;
+-      $value = 0;
+-    }
+-  }
+-  return \@parts;
+-}
+-
+-sub build_mib {
+-  refresh_state();
+-  my %mib = (
+-    '1.3.6.1.2.1.1.1.0'              => { type => 'octet',     value => $state{sysdescr} },
+-    '1.3.6.1.2.1.1.2.0'              => { type => 'oid',       value => [1,3,6,1,4,1,9,1,1] },
+-    '1.3.6.1.2.1.1.3.0'              => { type => 'timeticks', value => int((time() - $start_time) * 100) },
+-    '1.3.6.1.2.1.1.5.0'              => { type => 'octet',     value => $state{hostname} },
+-    '1.3.6.1.4.1.9.9.109.1.1.1.1.8'  => { type => 'integer',   value => $state{cpu} },
+-    '1.3.6.1.4.1.9.9.48.1.1.1.5.1'   => { type => 'integer',   value => $state{mem_used} },
+-    '1.3.6.1.4.1.9.9.48.1.1.1.6.1'   => { type => 'integer',   value => $state{mem_free} },
+-  );
+-
+-  my $idx = 1;
+-  for my $iface (@{$state{ifaces}}) {
+-    $mib{"1.3.6.1.2.1.31.1.1.1.1.$idx"}  = { type => 'octet',     value => $iface };
+-    $mib{"1.3.6.1.2.1.31.1.1.1.6.$idx"}  = { type => 'counter64', value => 0 };
+-    $mib{"1.3.6.1.2.1.31.1.1.1.10.$idx"} = { type => 'counter64', value => 0 };
+-    $mib{"1.3.6.1.2.1.31.1.1.1.15.$idx"} = { type => 'gauge32',   value => iface_speed($iface) };
+-    $mib{"1.3.6.1.2.1.2.2.1.13.$idx"}    = { type => 'counter32', value => 0 };
+-    $mib{"1.3.6.1.2.1.2.2.1.19.$idx"}    = { type => 'counter32', value => 0 };
+-    $mib{"1.3.6.1.2.1.2.2.1.14.$idx"}    = { type => 'counter32', value => 0 };
+-    $mib{"1.3.6.1.2.1.2.2.1.20.$idx"}    = { type => 'counter32', value => 0 };
+-    $mib{"1.3.6.1.2.1.2.2.1.3.$idx"}     = { type => 'integer',   value => iface_type($iface) };
+-    $idx++;
+-  }
+-
+-  my @oids = sort { oid_compare(oid_tuple($a), oid_tuple($b)) } keys %mib;
+-  return (\%mib, \@oids);
+-}
+-
+-sub encode_value {
+-  my ($entry) = @_;
+-  return encode_exception(0x80) if !$entry;
+-  return encode_octet_string($entry->{value}) if $entry->{type} eq 'octet';
+-  return encode_oid($entry->{value})          if $entry->{type} eq 'oid';
+-  return encode_integer($entry->{value}, 0x43) if $entry->{type} eq 'timeticks';
+-  return encode_integer($entry->{value}, 0x41) if $entry->{type} eq 'counter32';
+-  return encode_integer($entry->{value}, 0x42) if $entry->{type} eq 'gauge32';
+-  return encode_integer($entry->{value}, 0x46) if $entry->{type} eq 'counter64';
+-  return encode_integer($entry->{value}, 0x02);
+-}
+-
+-sub exact_lookup {
+-  my ($mib, $oid) = @_;
+-  return $mib->{ oid_to_string($oid) };
+-}
+-
+-sub next_lookup {
+-  my ($mib, $sorted, $oid) = @_;
+-  for my $candidate (@{$sorted}) {
+-    return ($candidate, $mib->{$candidate}) if oid_compare(oid_tuple($candidate), $oid) > 0;
+-  }
+-  return (undef, undef);
+-}
+-
+-sub build_varbind {
+-  my ($oid, $entry) = @_;
+-  return encode_tlv(0x30, encode_oid($oid) . encode_value($entry));
+-}
+-
+-sub handle_get {
+-  my ($mib, $sorted, $requests) = @_;
+-  my @out;
+-  for my $oid (@{$requests}) {
+-    push @out, build_varbind($oid, exact_lookup($mib, $oid));
+-  }
+-  return @out;
+-}
+-
+-sub handle_getnext {
+-  my ($mib, $sorted, $requests) = @_;
+-  my @out;
+-  for my $oid (@{$requests}) {
+-    my ($next_oid_str, $entry) = next_lookup($mib, $sorted, $oid);
+-    if (defined $next_oid_str) {
+-      push @out, build_varbind(oid_tuple($next_oid_str), $entry);
+-    } else {
+-      push @out, encode_tlv(0x30, encode_oid($oid) . encode_exception(0x82));
+-    }
+-  }
+-  return @out;
+-}
+-
+-sub handle_getbulk {
+-  my ($mib, $sorted, $requests, $non_repeaters, $max_repetitions) = @_;
+-  my @out;
+-  $non_repeaters = 0 if $non_repeaters < 0;
+-  $max_repetitions = 1 if $max_repetitions < 1;
+-  my $count = scalar @{$requests};
+-  my $nr = $non_repeaters > $count ? $count : $non_repeaters;
+-
+-  for my $i (0 .. $nr - 1) {
+-    my ($next_oid_str, $entry) = next_lookup($mib, $sorted, $requests->[$i]);
+-    if (defined $next_oid_str) {
+-      push @out, build_varbind(oid_tuple($next_oid_str), $entry);
+-    } else {
+-      push @out, encode_tlv(0x30, encode_oid($requests->[$i]) . encode_exception(0x82));
+-    }
+-  }
+-
+-  for my $i ($nr .. $count - 1) {
+-    my $cursor = $requests->[$i];
+-    for (1 .. $max_repetitions) {
+-      my ($next_oid_str, $entry) = next_lookup($mib, $sorted, $cursor);
+-      if (defined $next_oid_str) {
+-        my $next_oid = oid_tuple($next_oid_str);
+-        push @out, build_varbind($next_oid, $entry);
+-        $cursor = $next_oid;
+-      } else {
+-        push @out, encode_tlv(0x30, encode_oid($cursor) . encode_exception(0x82));
+-        last;
+-      }
+-    }
+-  }
+-  return @out;
+-}
+-
+-sub parse_message {
+-  my ($payload) = @_;
+-  my ($tag, undef, $msg_value, undef) = decode_tlv($payload, 0);
+-  die "invalid message" if $tag != 0x30;
+-  my $offset = 0;
+-  my ($v_tag, undef, $v_val, $off1) = decode_tlv($msg_value, $offset);
+-  die "invalid version" if $v_tag != 0x02;
+-  my $version = decode_integer($v_val);
+-  $offset = $off1;
+-  my ($c_tag, undef, $c_val, $off2) = decode_tlv($msg_value, $offset);
+-  die "invalid community" if $c_tag != 0x04;
+-  my $msg_community = $c_val;
+-  $offset = $off2;
+-  my ($pdu_tag, undef, $pdu_val, undef) = decode_tlv($msg_value, $offset);
+-  my $pdu_off = 0;
+-  my (undef, undef, $req_id_val, $p1) = decode_tlv($pdu_val, $pdu_off);
+-  my $req_id = decode_integer($req_id_val);
+-  $pdu_off = $p1;
+-  my (undef, undef, $field2_val, $p2) = decode_tlv($pdu_val, $pdu_off);
+-  my $field2 = decode_integer($field2_val);
+-  $pdu_off = $p2;
+-  my (undef, undef, $field3_val, $p3) = decode_tlv($pdu_val, $pdu_off);
+-  my $field3 = decode_integer($field3_val);
+-  $pdu_off = $p3;
+-  my ($vb_tag, undef, $vb_val, undef) = decode_tlv($pdu_val, $pdu_off);
+-  die "invalid varbind list" if $vb_tag != 0x30;
+-  my @oids;
+-  my $vb_off = 0;
+-  while ($vb_off < length($vb_val)) {
+-    my ($row_tag, undef, $row_val, $row_next) = decode_tlv($vb_val, $vb_off);
+-    last if $row_tag != 0x30;
+-    my ($oid_tag, undef, $oid_val, undef) = decode_tlv($row_val, 0);
+-    last if $oid_tag != 0x06;
+-    push @oids, decode_oid($oid_val);
+-    $vb_off = $row_next;
+-  }
+-  return ($version, $msg_community, $pdu_tag, $req_id, $field2, $field3, \@oids);
+-}
+-
+-sub build_response {
+-  my ($req_id, $varbinds) = @_;
+-  my $varbind_list = encode_tlv(0x30, join('', @{$varbinds}));
+-  my $pdu = encode_integer($req_id) . encode_integer(0) . encode_integer(0) . $varbind_list;
+-  return encode_tlv(0x30, encode_integer(1) . encode_octet_string($community) . encode_tlv(0xA2, $pdu));
+-}
+-
+-sub serve_once {
+-  my ($sock) = @_;
+-  my $peer = recv($sock, my $payload, 65535, 0);
+-  return if !defined $peer;
+-  my ($mib, $sorted) = build_mib();
+-  my ($version, $msg_community, $pdu_tag, $req_id, $field2, $field3, $oids);
+-  eval {
+-    ($version, $msg_community, $pdu_tag, $req_id, $field2, $field3, $oids) = parse_message($payload);
+-  };
+-  return if $@;
+-  return if $version > 1;
+-  return if $msg_community ne $community;
+-
+-  my @varbinds;
+-  if ($pdu_tag == 0xA0) {
+-    @varbinds = handle_get($mib, $sorted, $oids);
+-  } elsif ($pdu_tag == 0xA1) {
+-    @varbinds = handle_getnext($mib, $sorted, $oids);
+-  } elsif ($pdu_tag == 0xA5) {
+-    @varbinds = handle_getbulk($mib, $sorted, $oids, $field2, $field3);
+-  } else {
+-    return;
+-  }
+-
+-  my $response = build_response($req_id, \@varbinds);
+-  send($sock, $response, 0, $peer);
+-}
+-
+-socket(my $sock, AF_INET, SOCK_DGRAM, 0) or die "socket: $!";
+-setsockopt($sock, SOL_SOCKET, SO_REUSEADDR, 1) or die "setsockopt: $!";
+-bind($sock, sockaddr_in($listen_port, inet_aton('0.0.0.0'))) or die "bind: $!";
+-
+-while (1) {
+-  serve_once($sock);
+-}
+-- 
+2.56.0
+

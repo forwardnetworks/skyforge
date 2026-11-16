@@ -8,10 +8,10 @@ Subject: [PATCH 02/35] node and kubevirt VM runtime (placement contract, pull
 ---
 diff --git a/topo/node/kubevirt.go b/topo/node/kubevirt.go
 new file mode 100644
-index 0000000..36fb9f0
+index 0000000..3643bb3
 --- /dev/null
 +++ b/topo/node/kubevirt.go
-@@ -0,0 +1,4231 @@
+@@ -0,0 +1,4271 @@
 +package node
 +
 +import (
@@ -2639,15 +2639,52 @@ index 0000000..36fb9f0
 +// MUST bundle `virtctl`, python3 and pexpect. It reuses the skyforge netlab-runtime image
 +// when that carries virtctl; a dedicated override takes precedence. There is deliberately
 +// no plain-python default (unlike the TFTP helper): without virtctl the pod cannot reach
-+// the console, so an unset image is a loud misconfiguration at pod start rather than a
-+// silent no-op.
++// the console. An unset image returns "" and checkKubeVirtSerialInjectorImage refuses
++// the node before anything is created (there used to be a fallback literal naming
++// forward/kubevirt/serial-injector:latest, an image that exists in no registry
++// namespace, so the pod sat in ImagePullBackOff instead).
 +func kubeVirtDellOS10InjectorImage() string {
-+	for _, key := range []string{"SKYFORGE_KUBEVIRT_SERIAL_INJECTOR_IMAGE", "SKYFORGE_NETLAB_RUNTIME_IMAGE"} {
++	for _, key := range kubeVirtSerialInjectorImageEnv {
 +		if image := strings.TrimSpace(os.Getenv(key)); image != "" {
 +			return image
 +		}
 +	}
-+	return "registry.example.com/skyforge/kubevirt/serial-injector:latest"
++	return ""
++}
++
++// kubeVirtSerialInjectorImageEnv lists, in precedence order, where the serial config
++// injector image comes from. Both resolvers read exactly this list and the preflight
++// error names it, so the message cannot drift from what is actually read.
++var kubeVirtSerialInjectorImageEnv = []string{"SKYFORGE_KUBEVIRT_SERIAL_INJECTOR_IMAGE", "SKYFORGE_NETLAB_RUNTIME_IMAGE"}
++
++// checkKubeVirtSerialInjectorImage refuses, at validation time, a node that
++// needs the serial config injector (Dell OS10, or a Viptela serial-inject model, with
++// startup config) when no injector image is configured. Without it the injector pod
++// would be created with an empty or non-existent image and sit in ImagePullBackOff,
++// and the device would boot without its config. The platform always sets
++// SKYFORGE_NETLAB_RUNTIME_IMAGE on the runtime Job, so this only fires on a
++// misconfigured caller. It runs from Impl.ValidateConstraints, which topo's push()
++// calls for every node before the namespace or any node object exists, and again at
++// the top of CreateKubeVirtVM for callers that create a node directly.
++func (n *Impl) checkKubeVirtSerialInjectorImage() error {
++	if n == nil || n.Proto == nil || n.Proto.Config == nil || n.Proto.Config.ConfigData == nil {
++		return nil
++	}
++	model := n.Proto.Model
++	switch {
++	case kubeVirtIsDellOS10(model):
++		if kubeVirtDellOS10InjectorImage() != "" {
++			return nil
++		}
++	case kubeVirtIsViptelaSerialInject(model):
++		if kubeVirtViptelaInjectorImage() != "" {
++			return nil
++		}
++	default:
++		return nil
++	}
++	return fmt.Errorf("node %q (model %q) needs the KubeVirt serial config injector, but no injector image is configured: set %s or %s (the image must carry virtctl, python3 and pexpect)",
++		n.Name(), model, kubeVirtSerialInjectorImageEnv[0], kubeVirtSerialInjectorImageEnv[1])
 +}
 +
 +func kubeVirtDellOS10InjectorPullPolicy() corev1.PullPolicy {
@@ -3972,6 +4009,9 @@ index 0000000..36fb9f0
 +}
 +
 +func (n *Impl) CreateKubeVirtVM(ctx context.Context) error {
++	if err := n.checkKubeVirtSerialInjectorImage(); err != nil {
++		return err
++	}
 +	if err := n.ensureImagePullSecret(ctx); err != nil {
 +		return err
 +	}
@@ -4661,6 +4701,96 @@ index 0000000..f7e4a4d
 +		}
 +	}
 +}
+diff --git a/topo/node/kubevirt_serial_injector_image_test.go b/topo/node/kubevirt_serial_injector_image_test.go
+new file mode 100644
+index 0000000..a70c4da
+--- /dev/null
++++ b/topo/node/kubevirt_serial_injector_image_test.go
+@@ -0,0 +1,84 @@
++package node
++
++import (
++	"strings"
++	"testing"
++
++	topopb "github.com/openconfig/kne/proto/topo"
++)
++
++func serialInjectorTestNode(model string, withConfig bool) *Impl {
++	n := &Impl{Proto: &topopb.Node{Name: "r1", Model: model, Config: &topopb.Config{}}}
++	if withConfig {
++		n.Proto.Config.ConfigData = &topopb.Config_Data{Data: []byte("hostname r1\n")}
++	}
++	return n
++}
++
++// A node that needs the serial config injector, with no injector image configured,
++// is refused before anything is created, and the error names both variables.
++// No fallback image is invented.
++func TestCheckKubeVirtSerialInjectorImageRefusesWhenUnset(t *testing.T) {
++	t.Setenv("SKYFORGE_KUBEVIRT_SERIAL_INJECTOR_IMAGE", "")
++	t.Setenv("SKYFORGE_NETLAB_RUNTIME_IMAGE", "")
++	for _, model := range []string{"dellos10", "vedge", "vsmart"} {
++		err := serialInjectorTestNode(model, true).checkKubeVirtSerialInjectorImage()
++		if err == nil {
++			t.Fatalf("%s: want an error when no injector image is configured", model)
++		}
++		for _, want := range []string{"SKYFORGE_KUBEVIRT_SERIAL_INJECTOR_IMAGE", "SKYFORGE_NETLAB_RUNTIME_IMAGE", model} {
++			if !strings.Contains(err.Error(), want) {
++				t.Fatalf("%s: error %q does not name %q", model, err, want)
++			}
++		}
++	}
++	if got := kubeVirtDellOS10InjectorImage(); got != "" {
++		t.Fatalf("Dell OS10 resolver invented an image: %q", got)
++	}
++	if got := kubeVirtViptelaInjectorImage(); got != "" {
++		t.Fatalf("Viptela resolver invented an image: %q", got)
++	}
++}
++
++// Either variable is enough, the dedicated one wins, and nodes that never use the
++// injector (another model, or no startup config) are not affected.
++func TestCheckKubeVirtSerialInjectorImageAcceptsEitherVariable(t *testing.T) {
++	t.Setenv("SKYFORGE_KUBEVIRT_SERIAL_INJECTOR_IMAGE", "")
++	t.Setenv("SKYFORGE_NETLAB_RUNTIME_IMAGE", "reg.example.invalid/netlab@sha256:py")
++	for _, model := range []string{"dellos10", "vedge"} {
++		if err := serialInjectorTestNode(model, true).checkKubeVirtSerialInjectorImage(); err != nil {
++			t.Fatalf("%s with SKYFORGE_NETLAB_RUNTIME_IMAGE: %v", model, err)
++		}
++	}
++	if got := kubeVirtDellOS10InjectorImage(); got != "reg.example.invalid/netlab@sha256:py" {
++		t.Fatalf("Dell OS10 resolver = %q", got)
++	}
++	t.Setenv("SKYFORGE_KUBEVIRT_SERIAL_INJECTOR_IMAGE", "reg.example.invalid/injector:1")
++	if got := kubeVirtViptelaInjectorImage(); got != "reg.example.invalid/injector:1" {
++		t.Fatalf("Viptela resolver = %q, want the dedicated override", got)
++	}
++
++	t.Setenv("SKYFORGE_KUBEVIRT_SERIAL_INJECTOR_IMAGE", "")
++	t.Setenv("SKYFORGE_NETLAB_RUNTIME_IMAGE", "")
++	if err := serialInjectorTestNode("ceos", true).checkKubeVirtSerialInjectorImage(); err != nil {
++		t.Fatalf("a model without the injector must not be refused: %v", err)
++	}
++	if err := serialInjectorTestNode("dellos10", false).checkKubeVirtSerialInjectorImage(); err != nil {
++		t.Fatalf("a node without startup config never starts the injector: %v", err)
++	}
++}
++
++// The refusal happens at validation time: topo's push() calls ValidateConstraints for
++// every node before the namespace or any node object is created.
++func TestValidateConstraintsRefusesSerialInjectorNodeWithoutImage(t *testing.T) {
++	t.Setenv("SKYFORGE_KUBEVIRT_SERIAL_INJECTOR_IMAGE", "")
++	t.Setenv("SKYFORGE_NETLAB_RUNTIME_IMAGE", "")
++	err := serialInjectorTestNode("vsmart", true).ValidateConstraints()
++	if err == nil || !strings.Contains(err.Error(), "SKYFORGE_KUBEVIRT_SERIAL_INJECTOR_IMAGE") {
++		t.Fatalf("ValidateConstraints = %v, want the injector-image refusal", err)
++	}
++	t.Setenv("SKYFORGE_KUBEVIRT_SERIAL_INJECTOR_IMAGE", "reg.example.invalid/injector:1")
++	if err := serialInjectorTestNode("vsmart", true).ValidateConstraints(); err != nil {
++		t.Fatalf("Viptela with only the dedicated variable set: %v", err)
++	}
++}
 diff --git a/topo/node/kubevirt_sros_tftp_test.go b/topo/node/kubevirt_sros_tftp_test.go
 new file mode 100644
 index 0000000..885786c
@@ -4791,10 +4921,10 @@ index 0000000..885786c
 +}
 diff --git a/topo/node/kubevirt_viptela_serial.go b/topo/node/kubevirt_viptela_serial.go
 new file mode 100644
-index 0000000..f2e6978
+index 0000000..0e28508
 --- /dev/null
 +++ b/topo/node/kubevirt_viptela_serial.go
-@@ -0,0 +1,1684 @@
+@@ -0,0 +1,1685 @@
 +package node
 +
 +import (
@@ -4920,15 +5050,16 @@ index 0000000..f2e6978
 +
 +// kubeVirtViptelaInjectorImage resolves the injector image. It MUST carry
 +// virtctl, python3 and pexpect. There is deliberately no plain-python fallback:
-+// without virtctl the pod cannot reach the console at all, so an unset image
-+// must fail loudly at pod start rather than sit as a silent no-op.
++// without virtctl the pod cannot reach the console at all. An unset image returns
++// "" and checkKubeVirtSerialInjectorImage refuses the node before anything is
++// created.
 +func kubeVirtViptelaInjectorImage() string {
-+	for _, key := range []string{"SKYFORGE_KUBEVIRT_SERIAL_INJECTOR_IMAGE", "SKYFORGE_NETLAB_RUNTIME_IMAGE"} {
++	for _, key := range kubeVirtSerialInjectorImageEnv {
 +		if image := strings.TrimSpace(os.Getenv(key)); image != "" {
 +			return image
 +		}
 +	}
-+	return "registry.example.com/skyforge/kubevirt/serial-injector:latest"
++	return ""
 +}
 +
 +func kubeVirtViptelaInjectorPullPolicy() corev1.PullPolicy {
@@ -6973,7 +7104,7 @@ index 0000000..5f628ae
 +	}
 +}
 diff --git a/topo/node/node.go b/topo/node/node.go
-index bd36f49..4ebe83b 100644
+index bd36f49..2d44234 100644
 --- a/topo/node/node.go
 +++ b/topo/node/node.go
 @@ -2,12 +2,15 @@ package node
@@ -7561,7 +7692,17 @@ index bd36f49..4ebe83b 100644
  	if err := n.CreatePod(ctx); err != nil {
  		return fmt.Errorf("node %s failed to create pod %w", n.Name(), err)
  	}
-@@ -385,6 +875,205 @@ func (n *Impl) readConfig() ([]byte, error) {
+@@ -300,6 +790,9 @@ func (n *Impl) Create(ctx context.Context) error {
+ // ValidateConstraints will check the host constraints and returns a list of errors for cases which do not meet
+ // the constraints
+ func (n *Impl) ValidateConstraints() error {
++	if err := n.checkKubeVirtSerialInjectorImage(); err != nil {
++		return err
++	}
+ 	hostConstraints := n.GetProto().GetHostConstraints()
+ 	if hostConstraints == nil {
+ 		return nil
+@@ -385,6 +878,205 @@ func (n *Impl) readConfig() ([]byte, error) {
  	}
  }
  
@@ -7767,7 +7908,7 @@ index bd36f49..4ebe83b 100644
  // CreateConfig creates a boot config for the node based on the underlying proto.
  // A volume containing the boot config is returned. If the config size is <3MB
  // then a ConfigMap is created as the volume source. Else a temporary file
-@@ -458,6 +1147,9 @@ func (n *Impl) CreateConfig(ctx context.Context) (*corev1.Volume, error) {
+@@ -458,6 +1150,9 @@ func (n *Impl) CreateConfig(ctx context.Context) (*corev1.Volume, error) {
  // CreatePod creates a Pod for the Node based on the underlying proto.
  func (n *Impl) CreatePod(ctx context.Context) error {
  	pb := n.Proto
@@ -7777,7 +7918,7 @@ index bd36f49..4ebe83b 100644
  	links, err := GetNodeLinks(pb)
  	if err != nil {
  		return err
-@@ -476,6 +1168,7 @@ func (n *Impl) CreatePod(ctx context.Context) error {
+@@ -476,6 +1171,7 @@ func (n *Impl) CreatePod(ctx context.Context) error {
  			},
  		},
  		Spec: corev1.PodSpec{
@@ -7785,7 +7926,7 @@ index bd36f49..4ebe83b 100644
  			InitContainers: []corev1.Container{{
  				Name:  fmt.Sprintf("init-%s", pb.Name),
  				Image: initContainerImage,
-@@ -500,8 +1193,11 @@ func (n *Impl) CreatePod(ctx context.Context) error {
+@@ -500,8 +1196,11 @@ func (n *Impl) CreatePod(ctx context.Context) error {
  			}},
  			TerminationGracePeriodSeconds: pointer.Int64(0),
  			EnableServiceLinks:            pointer.Bool(false),
@@ -7798,7 +7939,7 @@ index bd36f49..4ebe83b 100644
  				PodAntiAffinity: &corev1.PodAntiAffinity{
  					PreferredDuringSchedulingIgnoredDuringExecution: []corev1.WeightedPodAffinityTerm{{
  						Weight: 100,
-@@ -523,23 +1219,8 @@ func (n *Impl) CreatePod(ctx context.Context) error {
+@@ -523,23 +1222,8 @@ func (n *Impl) CreatePod(ctx context.Context) error {
  	for label, v := range n.GetProto().GetLabels() {
  		pod.ObjectMeta.Labels[label] = v
  	}
@@ -7824,7 +7965,7 @@ index bd36f49..4ebe83b 100644
  	}
  	sPod, err := n.KubeClient.CoreV1().Pods(n.Namespace).Create(ctx, pod, metav1.CreateOptions{})
  	if err != nil {
-@@ -549,6 +1230,35 @@ func (n *Impl) CreatePod(ctx context.Context) error {
+@@ -549,6 +1233,35 @@ func (n *Impl) CreatePod(ctx context.Context) error {
  	return nil
  }
  
@@ -7860,7 +8001,7 @@ index bd36f49..4ebe83b 100644
  func k8sServiceType(t tpb.Service_Type) corev1.ServiceType {
  	switch t {
  	case tpb.Service_NODE_PORT:
-@@ -614,8 +1324,12 @@ func (n *Impl) CreateService(ctx context.Context) (rErr error) {
+@@ -614,8 +1327,12 @@ func (n *Impl) CreateService(ctx context.Context) (rErr error) {
  		if k > math.MaxUint16 {
  			return fmt.Errorf("service port %d out of range (max: %d)", k, math.MaxUint16)
  		}
@@ -7874,7 +8015,7 @@ index bd36f49..4ebe83b 100644
  			Port:       int32(k),
  			NodePort:   int32(nodePort),
  			TargetPort: intstr.FromInt(int(v.Inside)),
-@@ -658,11 +1372,9 @@ func (n *Impl) CreateService(ctx context.Context) (rErr error) {
+@@ -658,11 +1375,9 @@ func (n *Impl) CreateService(ctx context.Context) (rErr error) {
  				},
  			},
  			Spec: corev1.ServiceSpec{
@@ -7889,7 +8030,7 @@ index bd36f49..4ebe83b 100644
  			},
  		}
  		if st == corev1.ServiceTypeLoadBalancer {
-@@ -672,6 +1384,7 @@ func (n *Impl) CreateService(ctx context.Context) (rErr error) {
+@@ -672,6 +1387,7 @@ func (n *Impl) CreateService(ctx context.Context) (rErr error) {
  			// supported in default clusters.
  			// https://kubernetes.io/docs/concepts/services-networking/service/#load-balancer-nodeport-allocation
  			s.Spec.AllocateLoadBalancerNodePorts = pointer.Bool(false)
@@ -7897,7 +8038,7 @@ index bd36f49..4ebe83b 100644
  		}
  		sS, err := n.KubeClient.CoreV1().Services(n.Namespace).Create(ctx, s, metav1.CreateOptions{})
  		if err != nil {
-@@ -800,6 +1513,16 @@ func (n *Impl) Delete(ctx context.Context) error {
+@@ -800,6 +1516,16 @@ func (n *Impl) Delete(ctx context.Context) error {
  // DeleteConfig removes the node configmap from the cluster if it exists. If
  // a config file hostPath was used for the boot config volume, clean the file up instead.
  func (n *Impl) DeleteConfig(ctx context.Context) error {
@@ -7914,7 +8055,7 @@ index bd36f49..4ebe83b 100644
  	pod, err := n.KubeClient.CoreV1().Pods(n.Namespace).Get(ctx, n.Name(), metav1.GetOptions{})
  	if err != nil {
  		if apierrors.IsNotFound(err) {
-@@ -871,6 +1594,34 @@ func (n *Impl) DeleteService(ctx context.Context) error {
+@@ -871,6 +1597,34 @@ func (n *Impl) DeleteService(ctx context.Context) error {
  // DeleteResource removes the resource definition for the Node.
  func (n *Impl) DeleteResource(ctx context.Context) error {
  	log.Infof("Deleting Resource for Pod:%s", n.Name())
@@ -7949,7 +8090,7 @@ index bd36f49..4ebe83b 100644
  	if err := n.DeleteConfig(ctx); err != nil && !apierrors.IsNotFound(err) {
  		return err
  	}
-@@ -883,10 +1634,23 @@ func (n *Impl) DeleteResource(ctx context.Context) error {
+@@ -883,10 +1637,23 @@ func (n *Impl) DeleteResource(ctx context.Context) error {
  // Exec will make a connection via spdy transport to the Pod and execute the provided command.
  // It will wire up stdin, stdout, stderr to provided io channels.
  func (n *Impl) Exec(ctx context.Context, cmd []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) error {
@@ -7975,7 +8116,7 @@ index bd36f49..4ebe83b 100644
  		Stdin:     true,
  		Stdout:    true,
  		Stderr:    true,
-@@ -904,7 +1668,11 @@ func (n *Impl) Exec(ctx context.Context, cmd []string, stdin io.Reader, stdout i
+@@ -904,7 +1671,11 @@ func (n *Impl) Exec(ctx context.Context, cmd []string, stdin io.Reader, stdout i
  	if err != nil {
  		return err
  	}
@@ -7988,7 +8129,7 @@ index bd36f49..4ebe83b 100644
  	return exec.StreamWithContext(ctx, remotecommand.StreamOptions{
  		Stdin:  stdin,
  		Stdout: stdout,
-@@ -918,6 +1686,9 @@ func (n *Impl) Status(ctx context.Context) (Status, error) {
+@@ -918,6 +1689,9 @@ func (n *Impl) Status(ctx context.Context) (Status, error) {
  	if err != nil {
  		return StatusUnknown, err
  	}
@@ -7998,7 +8139,7 @@ index bd36f49..4ebe83b 100644
  	if len(p) != 1 {
  		return StatusUnknown, fmt.Errorf("expected exactly one pod for node %s", n.Name())
  	}
-@@ -941,6 +1712,13 @@ func (n *Impl) Name() string {
+@@ -941,6 +1715,13 @@ func (n *Impl) Name() string {
  
  // Pod returns the pod definition for the node.
  func (n *Impl) Pods(ctx context.Context) ([]*corev1.Pod, error) {
@@ -11528,5 +11669,5 @@ index 5e6e868..ff3f53d 100644
 +	}
 +}
 -- 
-2.56.0
+2.56.1
 

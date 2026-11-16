@@ -1,0 +1,213 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 06:38:48 -0600
+Subject: [PATCH] topo: WithoutHostCommands, an Option that never runs host
+ programs
+
+---
+diff --git a/topo/host_commands_test.go b/topo/host_commands_test.go
+new file mode 100644
+index 0000000..0102b8b
+--- /dev/null
++++ b/topo/host_commands_test.go
+@@ -0,0 +1,144 @@
++package topo
++
++import (
++	"context"
++	"io"
++	"os"
++	"path/filepath"
++	"sync"
++	"testing"
++	"time"
++
++	kexec "github.com/openconfig/kne/exec"
++	tpb "github.com/openconfig/kne/proto/topo"
++	topologyv1 "github.com/openconfig/kne/third_party/meshnet/api/types/v1beta1"
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	dfake "k8s.io/client-go/dynamic/fake"
++	kfake "k8s.io/client-go/kubernetes/fake"
++	"k8s.io/client-go/rest"
++)
++
++// execRecorder replaces exec.Command for a test and records every program the code under test tries to run.
++type execRecorder struct {
++	mu   sync.Mutex
++	cmds []string
++}
++
++func (r *execRecorder) command(cmd string, args ...string) kexec.Cmd {
++	r.mu.Lock()
++	r.cmds = append(r.cmds, cmd)
++	r.mu.Unlock()
++	return recordedCmd{}
++}
++
++func (r *execRecorder) seen() []string {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	return append([]string(nil), r.cmds...)
++}
++
++type recordedCmd struct{}
++
++func (recordedCmd) SetStdout(io.Writer) {}
++func (recordedCmd) SetStderr(io.Writer) {}
++func (recordedCmd) SetStdin(io.Reader)  {}
++func (recordedCmd) Run() error          { return nil }
++
++func recordExec(t *testing.T) *execRecorder {
++	t.Helper()
++	r := &execRecorder{}
++	orig := kexec.Command
++	kexec.Command = r.command
++	t.Cleanup(func() { kexec.Command = orig })
++	return r
++}
++
++func hostScript(t *testing.T) string {
++	t.Helper()
++	p := filepath.Join(t.TempDir(), "set_pid_max.sh")
++	if err := os.WriteFile(p, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
++		t.Fatal(err)
++	}
++	orig := setPIDMaxScript
++	setPIDMaxScript = p
++	t.Cleanup(func() { setPIDMaxScript = orig })
++	return p
++}
++
++func hostCommandTopo() *tpb.Topology {
++	return &tpb.Topology{Name: "host-cmds", Nodes: []*tpb.Node{{Name: "r1", Vendor: tpb.Vendor(1001)}}}
++}
++
++func hostCommandOpts(extra ...Option) []Option {
++	return append([]Option{
++		WithClusterConfig(&rest.Config{}),
++		WithKubeClient(kfake.NewSimpleClientset()),
++		WithDynamicClient(dfake.NewSimpleDynamicClient(topologyv1.Scheme)),
++	}, extra...)
++}
++
++func TestWithoutHostCommandsSkipsPIDMaxScript(t *testing.T) {
++	script := hostScript(t)
++
++	// Control: default behaviour is unchanged, the script is run while loading nodes.
++	rec := recordExec(t)
++	if _, err := New(hostCommandTopo(), hostCommandOpts()...); err != nil {
++		t.Fatalf("New() = %v", err)
++	}
++	if got := rec.seen(); len(got) != 1 || got[0] != script {
++		t.Fatalf("default New() ran %v, want exactly [%s]", got, script)
++	}
++
++	rec = recordExec(t)
++	if _, err := New(hostCommandTopo(), hostCommandOpts(WithoutHostCommands())...); err != nil {
++		t.Fatalf("New(WithoutHostCommands) = %v", err)
++	}
++	if got := rec.seen(); len(got) != 0 {
++		t.Fatalf("New(WithoutHostCommands) ran host programs: %v", got)
++	}
++}
++
++func TestCreateWithoutHostCommandsNeverRefreshesKind(t *testing.T) {
++	orig := kindClusterIsKind
++	t.Cleanup(func() { kindClusterIsKind = orig })
++	asked := 0
++	kindClusterIsKind = func() (bool, error) { asked++; return true, nil }
++	// RefreshGARAccess reads the kube context itself (cluster/kind) before it runs `kind`.
++	kubecfg := filepath.Join(t.TempDir(), "kubeconfig")
++	if err := os.WriteFile(kubecfg, []byte("apiVersion: v1\nkind: Config\nclusters:\n- name: c\n  cluster: {server: 'https://127.0.0.1:1'}\n"+
++		"users:\n- name: u\n  user: {token: x}\ncontexts:\n- name: kind-kne\n  context: {cluster: c, user: u}\ncurrent-context: kind-kne\n"), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	t.Setenv("KUBECONFIG", kubecfg)
++
++	create := func(opts ...Option) []string {
++		rec := recordExec(t)
++		opts = append(hostCommandOpts(WithKubeClient(kfake.NewSimpleClientset(
++			&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n1"}}))), opts...)
++		m, err := New(hostCommandTopo(), opts...)
++		if err != nil {
++			t.Fatalf("New() = %v", err)
++		}
++		// The cluster has one NotReady node, so Create waits in waitClusterReady until the context expires: after
++		// the kind check this test is about and before it would build any pod.
++		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
++		defer cancel()
++		if err := m.Create(ctx, time.Second); err == nil {
++			t.Fatal("Create() against a NotReady cluster = nil, want the context error")
++		}
++		return rec.seen()
++	}
++
++	// Control: by default a kind context makes Create run the host's `kind` (RefreshGARAccess -> `kind get nodes`).
++	if got := create(); len(got) == 0 || got[0] != "kind" {
++		t.Fatalf("default Create on a kind context ran %v, want it to start with `kind`", got)
++	}
++	asked = 0
++	if got := create(WithoutHostCommands()); len(got) != 0 {
++		t.Fatalf("Create(WithoutHostCommands) on a kind context ran host programs: %v", got)
++	}
++	if asked != 1 {
++		t.Fatalf("kindClusterIsKind asked %d times, want 1 (the kind branch must have been reached)", asked)
++	}
++}
+diff --git a/topo/topo.go b/topo/topo.go
+index c34b16c..e78a098 100644
+--- a/topo/topo.go
++++ b/topo/topo.go
+@@ -160,6 +160,9 @@ type Manager struct {
+ 	basePath             string
+ 	skipDeleteWait       bool
+ 	lifecycleProbeRunner LifecycleProbeRunner
++	// noHostCommands disables the two places where the Manager runs programs of the host it executes on (the
++	// kernel.pid_max helper script and the kind GAR refresh). See WithoutHostCommands.
++	noHostCommands bool
+ 
+ 	// If reportUsage is set, report anonymous usage metrics.
+ 	reportUsage bool
+@@ -264,6 +267,18 @@ func WithSkipDeleteWait(b bool) Option {
+ 	}
+ }
+ 
++// WithoutHostCommands stops the Manager from executing programs of the host it runs on: the optional
++// ~/kne-internal/set_pid_max.sh workaround (run while loading each node) and the kind GAR-access refresh
++// (docker/kind, run by Create when the current kube context is kind-*). For an embedding process with no
++// shell or host tools (and no business changing the host's sysctls or docker state). Cluster operations are
++// unaffected; with the option set, the pid_max script is not run and a kind context only logs a warning.
++// Without the option behaviour is unchanged.
++func WithoutHostCommands() Option {
++	return func(m *Manager) {
++		m.noHostCommands = true
++	}
++}
++
+ // WithLifecycleProbeRunner installs the vendor readiness adapter used by
+ // declarative lifecycle phases.
+ func WithLifecycleProbeRunner(r LifecycleProbeRunner) Option {
+@@ -383,7 +398,9 @@ func (m *Manager) Create(ctx context.Context, timeout time.Duration) (rerr error
+ 	}
+ 	// Refresh cluster GAR access if needed.
+ 	if isKind, err := kindClusterIsKind(); err == nil && isKind {
+-		if err := kind.RefreshGARAccess(ctx); err != nil {
++		if m.noHostCommands {
++			log.Warningf("Kind cluster detected; GAR access refresh needs host docker/kind and is disabled (WithoutHostCommands)")
++		} else if err := kind.RefreshGARAccess(ctx); err != nil {
+ 			log.Warningf("Failed to refresh GAR access, cluster may need to be re-created using `kne teardown` and `kne deploy`")
+ 		}
+ 	}
+@@ -697,7 +714,7 @@ func (m *Manager) load() error {
+ 		// Bug: Some vendors incorrectly increase the value of kernel.pid_max which
+ 		// causes other vendors to have issues. Run this script as a temporary
+ 		// workaround.
+-		if _, err := os.Stat(setPIDMaxScript); err == nil {
++		if _, err := os.Stat(setPIDMaxScript); err == nil && !m.noHostCommands {
+ 			if out, err := run.OutLogCommand(setPIDMaxScript); err != nil {
+ 				if len(out) != 0 {
+ 					return fmt.Errorf("failed to exec set_pid_max script: %w: %s", err, strings.TrimSpace(string(out)))
+-- 
+2.56.0
+

@@ -646,10 +646,10 @@ index 0000000..a3d6064
 +{% endif %}
 diff --git a/netsim/ansible/templates/initial/linux-kne.j2 b/netsim/ansible/templates/initial/linux-kne.j2
 new file mode 100644
-index 0000000..3cf9856
+index 0000000..e31da30
 --- /dev/null
 +++ b/netsim/ansible/templates/initial/linux-kne.j2
-@@ -0,0 +1,242 @@
+@@ -0,0 +1,264 @@
 +{% from "initial/linux/create-bond.j2" import create_bond_dev %}
 +{#
 +  WARM-RECONFIGURE IDEMPOTENCY CONTRACT (proven live on quick-fleet8/app 2026-08-14):
@@ -803,6 +803,28 @@ index 0000000..3cf9856
 +  pkill -f '/usr/sbin/sshd -f /tmp/sshd_config.skyforge' >/dev/null 2>&1 || true
 +  nohup /usr/sbin/sshd -f /tmp/sshd_config.skyforge >/var/log/netlab-sshd.log 2>&1 &
 +fi
++
++#
++# Lab host names (/etc/hosts)
++#
++{#
++  PLATFORM-SPECIFIC (patch 01): upstream linux.j2 builds the netlab hosts block with `{% include 'linux/hosts.j2' %}`; this
++  template never did, so a KNE linux host could not resolve another lab node by name and netlab validate's ping('h2')
++  (netsim/validate/linux.py pings by NAME) failed "Name does not resolve" (G5 run 4, EVPN/symmetric-irb, 2026-11-15).
++  This is linux/hosts.j2's NON-clab branch on purpose: the clab branch rewrites /etc/hosts from scratch, and here kubelet
++  owns that file (it carries the pod's own name and is rewritten when the container starts). Appending under the
++  "Created by netlab" guard keeps kubelet's lines and keeps the warm-reconfigure contract: a re-run finds the marker and
++  appends nothing. The block is lost when kubelet rewrites the file (container restart or pod re-create) and comes back
++  the next time this script runs (reconfigure, or a stop/start that re-runs initial).
++  It runs after sshd on purpose: under set -e a failed append must not leave the host without SSH to diagnose it.
++#}
++cat <<'SCRIPT' >/tmp/hosts
++#
++# Created by netlab initial
++#
++{% include 'linux/hosts-common.j2' %}
++SCRIPT
++grep -q "Created by netlab" /etc/hosts || uniq /tmp/hosts >>/etc/hosts
 +
 +# Emit deterministic background traffic so attached switches build ARP/MAC state
 +# even when nobody is logged into the host.
@@ -10163,5 +10185,5 @@ index 0000000..ebcbb8c
 +  r1:
 +    device: vmx
 -- 
-2.56.0
+2.56.1
 

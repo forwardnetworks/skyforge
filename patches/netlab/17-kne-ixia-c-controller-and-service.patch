@@ -1,0 +1,175 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 00:00:00 +0000
+Subject: [PATCH] kne: ixia-c controller defaults to keng-controller; each
+ ixia-c traffic engine declares the Service the controller dials
+
+---
+diff --git a/netsim/devices/keysight_ixia-c-controller.yml b/netsim/devices/keysight_ixia-c-controller.yml
+index 08acb8e..fd5329f 100644
+--- a/netsim/devices/keysight_ixia-c-controller.yml
++++ b/netsim/devices/keysight_ixia-c-controller.yml
+@@ -25,8 +25,21 @@ interface_name: eth{ifindex}
+ mgmt_if: eth0
+ role: host
+ 
++# THE CONTROLLER IS keng-controller 1.62.0-1, NOT ixia-c-controller 0.0.1-4555.
++# MEASURED 2026-11-06 against the real images: the 0.0.1-4555 controller (built
++# 2023) cannot drive the 1.8.0.544 traffic engine at all -- the engine refuses
++# every stream ("Wrong type of stream ... configured for this runtime type") and
++# the controller answers BAD_REQUEST. keng-controller 1.62.0-1, the same
++# project's current controller, configures, starts and measures port flows on the
++# same engine image. The digest pin lives in skyforge_runtime.yml, not here.
++#
++# The repository path IS the snapshot image contract: the server derives each
++# device's expected image prefix from this default (and from the runtime pin),
++# and netlab.py refuses a rendered node whose image sits under a different path.
++# A blueprint that overrode the image to keng-controller while this still said
++# ixia-c-controller failed the netlab job before any pod existed (2026-11-07).
+ clab:
+-  image: registry.example.com/skyforge/ixia-c-controller:0.0.1-4555
++  image: registry.example.com/skyforge/keng-controller:1.62.0-1
+   node:
+     kind: keysight_ixia-c-controller
+   interface:
+diff --git a/netsim/providers/kne.py b/netsim/providers/kne.py
+index 2f53bfc..89311a0 100644
+--- a/netsim/providers/kne.py
++++ b/netsim/providers/kne.py
+@@ -225,12 +225,34 @@ KNE_SERVICE_MAP: dict = {
+   # generator is unreachable on it has a generator that cannot be told to
+   # send anything.
+   # Only the CONTROLLER serves the OTG API. The traffic engines own data
+-  # interfaces and are reached through the controller, never directly, so
+-  # giving them a service entry would advertise an endpoint nothing answers.
++  # interfaces and are not driven by anyone but the controller -- but the
++  # controller reaches each engine through the engine's KNE Service, so an engine
++  # with no service entry is an engine the controller cannot dial (see below).
+   'keysight_ixia-c-controller': [
+     { 'outside': 8443, 'inside': 8443, 'name': 'https', 'names': ['https','otg'] },
+     { 'outside': 40051, 'inside': 40051, 'name': 'grpc', 'names': ['grpc'] },
+   ],
++  # THE ENGINE'S TRAFFIC PORT. An OTG port is addressed by LOCATION, and for
++  # ixia-c the location is the engine's own host:port. The platform writes it as
++  # service-<node>.<namespace>.svc.cluster.local:5555, and the controller dials
++  # it when it applies a config. KNE creates `service-<node>` from the node's
++  # `services` map and from nothing else -- so without this entry no Service
++  # exists for any engine, the name does not resolve, and the controller answers
++  # "could not create traffic service for service-otg1...:5555: zmq4: could not
++  # dial" (live 2026-11-07, lab otg-proof-r9: Services existed for the
++  # controller and the switch only, 5/5 pods Running, engines listening on 5555).
++  # The comment that used to sit here said an engine entry "would advertise an
++  # endpoint nothing answers"; the engine answers on 5555, and the controller is
++  # the thing that asks. The name is not 'ssh'/'https', so this is never taken
++  # for a management service (get_kne_mgmt_service looks for those). 5555 is a
++  # LITERAL on purpose: it is also OPT_LISTEN_PORT in add_ixia_c_engine_env (a
++  # test pins that they agree) and the platform capability generator reads this
++  # map as text, so a named constant here would be silently dropped. The
++  # protocol engine's 50071 is NOT declared: no protocol-engine node exists and
++  # port flows (all the free controller accepts) do not use it.
++  'keysight_ixia-c-traffic-engine': [
++    { 'outside': 5555, 'inside': 5555, 'name': 'otg-traffic', 'names': ['otg-traffic'] },
++  ],
+   'arubacx': [
+     { 'outside': 22, 'inside': 22, 'name': 'ssh', 'names': ['ssh'] },
+   ],
+diff --git a/tests/test_kne_provider.py b/tests/test_kne_provider.py
+index 30be895..c8f611c 100644
+--- a/tests/test_kne_provider.py
++++ b/tests/test_kne_provider.py
+@@ -4233,3 +4233,92 @@ links: [ ctl-eng, eng-h1 ]
+   assert re.search(r'key: "OPT_NO_PINNING"\s+value: "Yes"',eng)
+   assert 'OPT_NO_PINNING' not in _node_block(text,'ctl')
+   assert 'OPT_NO_PINNING' not in _node_block(text,'h1')
++
++
++def test_kne_ixia_c_controller_defaults_to_keng_controller(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  # The 2023 ixia-c-controller 0.0.1-4555 cannot drive the 1.8.0.544 engine
++  # (measured 2026-11-06); the controller device must default to keng-controller.
++  # The REPOSITORY PATH matters beyond pulling: it is the prefix the platform's
++  # rendered-image contract holds the node to. The engine keeps its own path.
++  import os
++  monkeypatch.chdir(tmp_path)
++  for key in list(os.environ):
++    if key.startswith('NETLAB_DEVICES_KEYSIGHT'):
++      monkeypatch.delenv(key,raising=False)
++  topo_file = write_topology(tmp_path,"""
++provider: kne
++
++nodes:
++  ctl:
++    device: keysight_ixia-c-controller
++  eng:
++    device: keysight_ixia-c-traffic-engine
++links: [ ctl-eng ]
++""")
++  init_log()
++  create.run(['-o','config','-o','provider',str(topo_file)])
++  text = Path('topology.pb.txt').read_text()
++  ctl = _node_block(text,'ctl')
++  eng = _node_block(text,'eng')
++  # (image refs are read back and compared in pieces: a full quoted ref here would read as a deployment pin to the artifact-provenance scan)
++  ctl_image = re.search(r'image:\s*"([^"]+)"',ctl).group(1)
++  eng_image = re.search(r'image:\s*"([^"]+)"',eng).group(1)
++  assert ctl_image.startswith('registry.example.com/skyforge/')
++  assert ctl_image.endswith('/keng-controller:1.62.0-1')
++  assert 'ixia-c-controller' not in ctl
++  assert eng_image.startswith('registry.example.com/skyforge/ixia-c-traffic-engine:')
++
++
++def test_kne_ixia_c_every_traffic_engine_declares_the_service_the_controller_dials(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  # The OTG controller reaches an engine at service-<node>.<ns>.svc:5555, and KNE
++  # creates service-<node> only from the node's `services`. An engine with none
++  # has no Service (live 2026-11-07: "zmq4: could not dial"). Every engine must
++  # carry exactly the 5555 entry, the controller keeps its own two, and no other
++  # node gains a service from this (a linux host keeps only its ssh; the switch
++  # keeps only what its device declares and gets no 5555).
++  monkeypatch.chdir(tmp_path)
++  topo_file = write_topology(tmp_path,"""
++provider: kne
++
++nodes:
++  ctl:
++    device: keysight_ixia-c-controller
++  e1:
++    device: keysight_ixia-c-traffic-engine
++  e2:
++    device: keysight_ixia-c-traffic-engine
++  e3:
++    device: keysight_ixia-c-traffic-engine
++  h1:
++    device: linux
++  sw:
++    device: eos
++links: [ e1-sw, e2-sw, e3-sw, h1-sw ]
++""")
++  init_log()
++  create.run(['-o','config','-o','provider',str(topo_file)])
++  text = Path('topology.pb.txt').read_text()
++  for eng in ('e1','e2','e3'):
++    block = _node_block(text,eng)
++    assert block.count('services: {') == 1, eng
++    assert re.search(r'services: \{\s+key: 5555\s+value: \{\s+name: "otg-traffic"\s+inside: 5555',block), eng
++    # the engine listens on the very port the Service targets
++    assert re.search(r'key: "OPT_LISTEN_PORT"\s+value: "5555"',block), eng
++  ctl = _node_block(text,'ctl')
++  assert sorted(re.findall(r'inside: (\d+)',ctl)) == ['40051','8443']
++  assert '5555' not in ctl
++  h1 = _node_block(text,'h1')
++  assert re.findall(r'inside: (\d+)',h1) == ['22']          # the linux device's own ssh, nothing more
++  sw = _node_block(text,'sw')
++  assert 'inside: 5555' not in sw and 'otg-traffic' not in sw
++
++
++def test_kne_ixia_c_engine_service_is_not_a_management_service() -> None:
++  # Declaring the engine's service must not make the engine look like a node
++  # with an SSH/HTTPS/NETCONF management endpoint to post_start_lab's inventory
++  # refresh (it would then rewrite ansible_host/port to the traffic port).
++  from netsim.providers import kne as kne_module
++  node = Box({'device':'keysight_ixia-c-traffic-engine'})
++  assert [s.inside for s in kne_module.get_kne_services(node)] == [5555]
++  assert kne_module.get_kne_service_by_name_or_port(node,['ssh'],[22]) is None
++  assert kne_module.get_kne_service_by_name_or_port(node,['https','httpapi','http','netconf'],[80,443,830]) is None
+-- 
+2.56.1
+

@@ -1,0 +1,144 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 06:39:02 -0600
+Subject: [PATCH] topo: refuse host-CLI cert generation under
+ WithoutHostCommands
+
+---
+diff --git a/topo/host_cli_cert_test.go b/topo/host_cli_cert_test.go
+new file mode 100644
+index 0000000..89dfdfe
+--- /dev/null
++++ b/topo/host_cli_cert_test.go
+@@ -0,0 +1,71 @@
++package topo
++
++import (
++	"context"
++	"strings"
++	"testing"
++	"time"
++
++	tpb "github.com/openconfig/kne/proto/topo"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++)
++
++// Helpers (recordExec, hostCommandOpts) are in host_commands_test.go.
++
++func hostCLITopo(vendor tpb.Vendor, selfSigned bool) *tpb.Topology {
++	n := &tpb.Node{Name: "r1", Vendor: vendor, Config: &tpb.Config{}}
++	if selfSigned {
++		n.Config.Cert = &tpb.CertificateCfg{Config: &tpb.CertificateCfg_SelfSigned{SelfSigned: &tpb.SelfSignedCertCfg{CertName: "kne-profile", KeyName: "N/A", KeySize: 2048}}}
++	}
++	return &tpb.Topology{Name: "host-cli", Nodes: []*tpb.Node{n}}
++}
++
++func TestCreateRefusesHostCLICertWithoutHostCommands(t *testing.T) {
++	for _, v := range []tpb.Vendor{tpb.Vendor_NOKIA, tpb.Vendor_JUNIPER} {
++		t.Run(v.String(), func(t *testing.T) {
++			rec := recordExec(t)
++			m, err := New(hostCLITopo(v, true), hostCommandOpts(WithoutHostCommands())...)
++			if err != nil {
++				t.Fatalf("New() = %v", err)
++			}
++			err = m.Create(context.Background(), time.Second)
++			if err == nil || !strings.Contains(err.Error(), "needs `kubectl exec` on the host") {
++				t.Fatalf("Create() = %v, want the host-CLI refusal", err)
++			}
++			if err := m.GenerateSelfSigned(context.Background(), "r1"); err == nil || !strings.Contains(err.Error(), "WithoutHostCommands") {
++				t.Fatalf("GenerateSelfSigned() = %v, want the refusal (it would exec kubectl)", err)
++			}
++			// nothing was created: the refusal comes before any cluster change
++			ns, _ := m.kClient.CoreV1().Namespaces().List(context.Background(), metav1.ListOptions{})
++			if len(ns.Items) != 0 {
++				t.Fatalf("Create changed the cluster before refusing: %d namespaces", len(ns.Items))
++			}
++			if got := rec.seen(); len(got) != 0 {
++				t.Fatalf("host programs ran: %v", got)
++			}
++		})
++	}
++}
++
++func TestHostCLICertCheckIsScoped(t *testing.T) {
++	// no cert block, or other vendors: not affected; and without the option nothing changes.
++	for _, tc := range []struct {
++		name string
++		pb   *tpb.Topology
++		opts []Option
++	}{
++		{"nokia no cert", hostCLITopo(tpb.Vendor_NOKIA, false), hostCommandOpts(WithoutHostCommands())},
++		{"arista cert (Unimplemented, no CLI)", hostCLITopo(tpb.Vendor_ARISTA, true), hostCommandOpts(WithoutHostCommands())},
++		{"nokia cert, host commands allowed", hostCLITopo(tpb.Vendor_NOKIA, true), hostCommandOpts()},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			m, err := New(tc.pb, tc.opts...)
++			if err != nil {
++				t.Fatalf("New() = %v", err)
++			}
++			if err := m.checkNoHostCLI(); err != nil {
++				t.Fatalf("checkNoHostCLI() = %v, want nil", err)
++			}
++		})
++	}
++}
+diff --git a/topo/topo.go b/topo/topo.go
+index e78a098..3b0ca35 100644
+--- a/topo/topo.go
++++ b/topo/topo.go
+@@ -279,6 +279,31 @@ func WithoutHostCommands() Option {
+ 	}
+ }
+ 
++// hostCLICertNode reports whether generating the node's self-signed certificate runs the vendor CLI through the
++// scrapligo system transport, i.e. a `kubectl exec -it` child process of the host (SR Linux and cJunos, only when
++// config.cert.self_signed is set; the other vendors return Unimplemented or do nothing).
++func hostCLICertNode(n node.Node) bool {
++	if n.GetProto().GetConfig().GetCert().GetSelfSigned() == nil {
++		return false
++	}
++	v := n.GetProto().GetVendor()
++	return v == tpb.Vendor_NOKIA || v == tpb.Vendor_JUNIPER
++}
++
++// checkNoHostCLI fails when the Manager has been told not to run host programs but a node asks for something that
++// needs one, instead of trying and failing midway (or running kubectl).
++func (m *Manager) checkNoHostCLI() error {
++	if !m.noHostCommands {
++		return nil
++	}
++	for name, n := range m.nodes {
++		if hostCLICertNode(n) {
++			return fmt.Errorf("node %q: config.cert.self_signed needs `kubectl exec` on the host (vendor CLI over the scrapligo system transport), which WithoutHostCommands forbids; remove the cert block or install the certificate through the node's startup config", name)
++		}
++	}
++	return nil
++}
++
+ // WithLifecycleProbeRunner installs the vendor readiness adapter used by
+ // declarative lifecycle phases.
+ func WithLifecycleProbeRunner(r LifecycleProbeRunner) Option {
+@@ -396,6 +421,10 @@ func (m *Manager) Create(ctx context.Context, timeout time.Duration) (rerr error
+ 		finish := m.reportCreateEvent(ctx)
+ 		defer func() { finish(rerr) }()
+ 	}
++	// Fail before any cluster change when a node needs a host program the Manager was told not to run.
++	if err := m.checkNoHostCLI(); err != nil {
++		return err
++	}
+ 	// Refresh cluster GAR access if needed.
+ 	if isKind, err := kindClusterIsKind(); err == nil && isKind {
+ 		if m.noHostCommands {
+@@ -3552,6 +3581,9 @@ func (m *Manager) GenerateSelfSigned(ctx context.Context, nodeName string) error
+ 		log.V(1).Infof("No cert info for %q, skipping cert generation", nodeName)
+ 		return nil
+ 	}
++	if m.noHostCommands && hostCLICertNode(n) {
++		return m.checkNoHostCLI()
++	}
+ 	c, ok := n.(node.Certer)
+ 	if !ok {
+ 		return status.Errorf(codes.Unimplemented, "node %q does not implement Certer interface", nodeName)
+-- 
+2.56.0
+

@@ -1,0 +1,363 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 13:40:00 -0600
+Subject: [PATCH 55/56] topo: a panic on a goroutine the Manager starts becomes
+ an error
+
+---
+diff --git a/topo/goroutine_panic.go b/topo/goroutine_panic.go
+new file mode 100644
+index 0000000..5fbd5ef
+--- /dev/null
++++ b/topo/goroutine_panic.go
+@@ -0,0 +1,33 @@
++package topo
++
++import (
++	"fmt"
++	"runtime/debug"
++)
++
++// PanicError is a panic recovered on a goroutine the Manager started itself (an errgroup worker of Create, the
++// per-node status / services / resources goroutines). Such a goroutine cannot be recovered by the caller of
++// Create / Show / Resources: an unrecovered panic there ends the whole process, which is acceptable for the
++// kne CLI and not for a server that embeds the Manager. The panic is returned through the error the goroutine's
++// caller already returns, so a vendor node implementation that panics fails that one operation.
++type PanicError struct {
++	// Where names the goroutine.
++	Where string
++	// Value is the recovered value.
++	Value any
++	// Stack is debug.Stack() at the panic (taken inside the deferred recover, so it shows the panicking frames).
++	Stack []byte
++}
++
++func (e *PanicError) Error() string { return fmt.Sprintf("panic in %s: %v", e.Where, e.Value) }
++
++// Unwrap returns the recovered value when it is an error (a runtime.Error, for example).
++func (e *PanicError) Unwrap() error {
++	err, _ := e.Value.(error)
++	return err
++}
++
++// newPanicError must be called from the deferred function that recovered r.
++func newPanicError(where string, r any) error {
++	return &PanicError{Where: where, Value: r, Stack: debug.Stack()}
++}
+diff --git a/topo/goroutine_panic_test.go b/topo/goroutine_panic_test.go
+new file mode 100644
+index 0000000..f2d1668
+--- /dev/null
++++ b/topo/goroutine_panic_test.go
+@@ -0,0 +1,156 @@
++package topo
++
++import (
++	"context"
++	"errors"
++	"strings"
++	"testing"
++	"time"
++
++	tpb "github.com/openconfig/kne/proto/topo"
++	"github.com/openconfig/kne/topo/node"
++	corev1 "k8s.io/api/core/v1"
++	"k8s.io/client-go/dynamic"
++	dfake "k8s.io/client-go/dynamic/fake"
++
++	topologyv1 "github.com/openconfig/kne/third_party/meshnet/api/types/v1beta1"
++)
++
++// panickingNode is a vendor node implementation that panics in the method named by `in`. Every other method is the
++// embedded nil node.Node (a call on it would itself panic, so GetProto and the methods the goroutines reach first are
++// overridden).
++type panickingNode struct {
++	node.Node
++	pb *tpb.Node
++	in string
++}
++
++func (n *panickingNode) boom(where string) {
++	if n.in == where {
++		panic("vendor node bug in " + where)
++	}
++}
++
++func (n *panickingNode) Name() string                 { return n.pb.GetName() }
++func (n *panickingNode) String() string               { return n.pb.GetName() }
++func (n *panickingNode) GetProto() *tpb.Node          { n.boom("GetProto"); return n.pb }
++func (n *panickingNode) Create(context.Context) error { n.boom("Create"); return nil }
++func (n *panickingNode) Pods(context.Context) ([]*corev1.Pod, error) {
++	n.boom("Pods")
++	return []*corev1.Pod{{}}, nil
++}
++func (n *panickingNode) Services(context.Context) ([]*corev1.Service, error) {
++	n.boom("Services")
++	return nil, nil
++}
++func (n *panickingNode) Status(context.Context) (node.Status, error) {
++	n.boom("Status")
++	return node.StatusRunning, nil
++}
++
++func newPanickingManager(in string, withService bool) (*Manager, *panickingNode) {
++	pb := &tpb.Node{Name: "r1"}
++	if withService {
++		pb.Services = map[uint32]*tpb.Service{22: {Name: "ssh", Inside: 22}}
++	}
++	n := &panickingNode{pb: pb, in: in}
++	return &Manager{nodes: map[string]node.Node{"r1": n}, topo: &tpb.Topology{Name: "lab", Nodes: []*tpb.Node{pb}},
++		dClient: dfake.NewSimpleDynamicClient(topologyv1.Scheme)}, n
++}
++
++// run fails the test (instead of letting the process die) if f does not return in time; a panic that escapes a
++// goroutine kills the test binary, which is exactly the failure these tests exist to show.
++func within(t *testing.T, f func()) {
++	t.Helper()
++	done := make(chan struct{})
++	go func() { defer close(done); f() }()
++	select {
++	case <-done:
++	case <-time.After(10 * time.Second):
++		t.Fatal("did not return")
++	}
++}
++
++func wantPanicError(t *testing.T, err error, in string) {
++	t.Helper()
++	var pe *PanicError
++	if !errors.As(err, &pe) {
++		t.Fatalf("err = %v, want a *PanicError", err)
++	}
++	if !strings.Contains(err.Error(), "vendor node bug in "+in) {
++		t.Fatalf("err = %v, want the panic value", err)
++	}
++	if !strings.Contains(string(pe.Stack), "goroutine_panic_test.go") {
++		t.Fatalf("the stack must show the panicking frame:\n%s", pe.Stack)
++	}
++}
++
++func TestResourcesTurnsANodePanicIntoAnError(t *testing.T) {
++	m, _ := newPanickingManager("Pods", false)
++	within(t, func() {
++		_, err := m.Resources(context.Background())
++		wantPanicError(t, err, "Pods")
++	})
++}
++
++func TestShowTurnsAStatusPanicIntoAnError(t *testing.T) {
++	m, _ := newPanickingManager("Status", false)
++	within(t, func() {
++		resp, err := m.Show(context.Background())
++		wantPanicError(t, err, "Status")
++		if resp != nil {
++			t.Fatalf("Show returned a response with a failed node status: %v", resp)
++		}
++	})
++}
++
++func TestCheckServiceStatusTurnsAServicesPanicIntoAnError(t *testing.T) {
++	m, _ := newPanickingManager("Services", true)
++	within(t, func() {
++		wantPanicError(t, m.checkServiceStatus(context.Background(), time.Second), "Services")
++	})
++}
++
++func TestCreateNodeResourcesTurnsACreatePanicIntoAnError(t *testing.T) {
++	for _, in := range []string{"Create", "GetProto"} {
++		m, n := newPanickingManager(in, false)
++		within(t, func() {
++			wantPanicError(t, m.createNodeResources(context.Background(), []node.Node{n}, 2), in)
++		})
++	}
++}
++
++func TestAdmissionGroupsTurnAPanicIntoAnError(t *testing.T) {
++	m, n := newPanickingManager("GetProto", false)
++	within(t, func() {
++		err := m.admitNodeGroupsAndGenerateCerts(context.Background(), []nodeAdmissionGroup{{name: "g", nodes: []node.Node{n}, parallelism: 1}})
++		wantPanicError(t, err, "GetProto")
++	})
++}
++
++type panickingProbeRunner struct{}
++
++func (panickingProbeRunner) Run(context.Context, *tpb.ReadinessProbe, node.Node) error {
++	panic("vendor node bug in probe")
++}
++
++func TestLifecycleProbeRunnerPanicBecomesAnError(t *testing.T) {
++	m, _ := newPanickingManager("", false)
++	m.lifecycleProbeRunner = panickingProbeRunner{}
++	within(t, func() {
++		err := m.runLifecyclePhaseProbes(context.Background(), &tpb.LifecyclePhase{Probes: []*tpb.ReadinessProbe{{Name: "p", Node: "r1", Timeout: "1s"}}})
++		wantPanicError(t, err, "probe")
++	})
++}
++
++func TestMeshnetCreateGoroutinePanicBecomesAnError(t *testing.T) {
++	m, _ := newPanickingManager("", false)
++	m.dClient = struct{ dynamic.Interface }{} // any call on the nil embedded client panics
++	within(t, func() {
++		err := m.createMeshnetTopologiesWithLimit(context.Background(), []*topologyv1.Topology{{}})
++		var pe *PanicError
++		if !errors.As(err, &pe) {
++			t.Fatalf("err = %v, want a *PanicError", err)
++		}
++	})
++}
+diff --git a/topo/topo.go b/topo/topo.go
+index 3b0ca35..9e3cdb5 100644
+--- a/topo/topo.go
++++ b/topo/topo.go
+@@ -642,10 +642,20 @@ func (m *Manager) Show(ctx context.Context) (*cpb.ShowTopologyResponse, error) {
+ 	stateMap := &stateMap{}
+ 	var mu sync.Mutex
+ 	var wg sync.WaitGroup
++	var showErr error
+ 	for _, n := range m.nodes {
+ 		wg.Add(1)
+ 		go func(nod node.Node) {
+ 			defer wg.Done()
++			defer func() {
++				if r := recover(); r != nil {
++					mu.Lock()
++					if showErr == nil {
++						showErr = newPanicError("node status goroutine", r)
++					}
++					mu.Unlock()
++				}
++			}()
+ 			phase, _ := nod.Status(ctx)
+ 			mu.Lock()
+ 			stateMap.setNodeState(nod.Name(), phase)
+@@ -653,6 +663,9 @@ func (m *Manager) Show(ctx context.Context) (*cpb.ShowTopologyResponse, error) {
+ 		}(n)
+ 	}
+ 	wg.Wait()
++	if showErr != nil {
++		return nil, showErr
++	}
+ 	return &cpb.ShowTopologyResponse{
+ 		State:    stateMap.topologyState(),
+ 		Topology: m.topo,
+@@ -1085,8 +1098,14 @@ func (m *Manager) checkServiceStatus(ctx context.Context, timeout time.Duration)
+ 			wg.Add(1)
+ 			go func(name string, nod node.Node) {
+ 				defer wg.Done()
+-				ready, err := nodeServicesReady(ctx, nod)
+-				resCh <- statusResult{name: name, nod: nod, ready: ready, err: err}
++				res := statusResult{name: name, nod: nod}
++				defer func() {
++					if r := recover(); r != nil {
++						res.ready, res.err = false, newPanicError("node services check goroutine", r)
++					}
++					resCh <- res
++				}()
++				res.ready, res.err = nodeServicesReady(ctx, nod)
+ 			}(name, n)
+ 		}
+ 		wg.Wait()
+@@ -1165,7 +1184,12 @@ func (m *Manager) runLifecyclePhaseProbes(ctx context.Context, phase *tpb.Lifecy
+ 	g, ctx := errgroup.WithContext(ctx)
+ 	for _, probe := range phase.GetProbes() {
+ 		probe := probe
+-		g.Go(func() error {
++		g.Go(func() (panicErr error) {
++			defer func() {
++				if r := recover(); r != nil {
++					panicErr = newPanicError("lifecycle probe goroutine", r)
++				}
++			}()
+ 			timeout, _ := time.ParseDuration(probe.GetTimeout())
+ 			probeCtx, cancel := context.WithTimeout(ctx, timeout)
+ 			defer cancel()
+@@ -1229,7 +1253,12 @@ func (m *Manager) admitNodeGroupsAndGenerateCerts(ctx context.Context, groups []
+ 		if len(group.nodes) == 0 {
+ 			continue
+ 		}
+-		g.Go(func() error {
++		g.Go(func() (panicErr error) {
++			defer func() {
++				if r := recover(); r != nil {
++					panicErr = newPanicError("node admission group goroutine", r)
++				}
++			}()
+ 			if err := m.admitNodesAndGenerateCerts(ctx, group.nodes, group.parallelism); err != nil {
+ 				if group.name == "" {
+ 					return err
+@@ -1294,7 +1323,12 @@ func (m *Manager) createNodeResourcesPaced(ctx context.Context, nodes []node.Nod
+ 	g.SetLimit(parallelism)
+ 	for _, n := range nodes {
+ 		n := n
+-		g.Go(func() error {
++		g.Go(func() (panicErr error) {
++			defer func() {
++				if r := recover(); r != nil {
++					panicErr = newPanicError("node create goroutine", r)
++				}
++			}()
+ 			for key, service := range n.GetProto().Services {
+ 				updateServicePortName(service, key)
+ 			}
+@@ -1357,7 +1391,12 @@ func (m *Manager) createHeavyNodeResourcesGrouped(ctx context.Context, nodes []n
+ 	g.SetLimit(len(groups))
+ 	for _, group := range groups {
+ 		group := group
+-		g.Go(func() error {
++		g.Go(func() (panicErr error) {
++			defer func() {
++				if r := recover(); r != nil {
++					panicErr = newPanicError("heavy node create goroutine", r)
++				}
++			}()
+ 			if err := pacer.admit(ctx, group); err != nil {
+ 				return err
+ 			}
+@@ -1527,7 +1566,12 @@ func (m *Manager) admitNodesAndGenerateCerts(ctx context.Context, nodes []node.N
+ 	g.SetLimit(parallelism)
+ 	for _, n := range nodes {
+ 		n := n
+-		g.Go(func() error {
++		g.Go(func() (panicErr error) {
++			defer func() {
++				if r := recover(); r != nil {
++					panicErr = newPanicError("node admission goroutine", r)
++				}
++			}()
+ 			if err := m.waitForNodeAdmission(ctx, n, nodeAdmissionTimeoutForNode(n)); err != nil {
+ 				return fmt.Errorf("failed waiting for node %s pod admission: %w", n, err)
+ 			}
+@@ -2719,7 +2763,12 @@ func (m *Manager) createMeshnetTopologiesWithLimit(ctx context.Context, topologi
+ 	g.SetLimit(meshnetTopologyParallelism(len(topologies)))
+ 	for _, t := range topologies {
+ 		topo := t
+-		g.Go(func() error {
++		g.Go(func() (panicErr error) {
++			defer func() {
++				if r := recover(); r != nil {
++					panicErr = newPanicError("meshnet topology create goroutine", r)
++				}
++			}()
+ 			log.Infof("Creating topology for meshnet node %s", topo.ObjectMeta.Name)
+ 			topo.TypeMeta = metav1.TypeMeta{
+ 				Kind:       "Topology",
+@@ -3438,6 +3487,15 @@ func (m *Manager) Resources(ctx context.Context) (*Resources, error) {
+ 		wg.Add(1)
+ 		go func(name string, nod node.Node) {
+ 			defer wg.Done()
++			defer func() {
++				if rec := recover(); rec != nil {
++					mu.Lock()
++					if firstErr == nil {
++						firstErr = newPanicError("node resources goroutine for "+name, rec)
++					}
++					mu.Unlock()
++				}
++			}()
+ 			pods, err := nod.Pods(ctx)
+ 			if err != nil {
+ 				mu.Lock()
+-- 
+2.56.0
+

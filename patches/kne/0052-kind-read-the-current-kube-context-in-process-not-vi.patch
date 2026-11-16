@@ -1,0 +1,206 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 06:23:01 -0600
+Subject: [PATCH] kind: read the current kube context in process, not via
+ kubectl
+
+---
+diff --git a/cluster/kind/current_context_test.go b/cluster/kind/current_context_test.go
+new file mode 100644
+index 0000000..faef5e5
+--- /dev/null
++++ b/cluster/kind/current_context_test.go
+@@ -0,0 +1,54 @@
++package kind
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++func writeKubeconfig(t *testing.T, dir, name, current string) string {
++	t.Helper()
++	p := filepath.Join(dir, name)
++	cfg := "apiVersion: v1\nkind: Config\nclusters:\n- name: c\n  cluster: {server: 'https://127.0.0.1:1'}\n" +
++		"users:\n- name: u\n  user: {token: x}\ncontexts:\n- name: kind-kne\n  context: {cluster: c, user: u}\n" +
++		"- name: prod\n  context: {cluster: c, user: u}\n"
++	if current != "" {
++		cfg += "current-context: " + current + "\n"
++	}
++	if err := os.WriteFile(p, []byte(cfg), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	return p
++}
++
++// TestClusterIsKindFromKubeconfig runs the real (unstubbed) seam against kubeconfig files: no kubectl, no PATH.
++func TestClusterIsKindFromKubeconfig(t *testing.T) {
++	t.Setenv("PATH", "") // any attempt to exec kubectl would fail loudly
++	dir := t.TempDir()
++	tests := []struct {
++		desc      string
++		kubecfg   string // KUBECONFIG value; empty = file does not exist
++		want      bool
++		wantErr   bool
++		wantKName string
++	}{
++		{desc: "kind context", kubecfg: writeKubeconfig(t, dir, "kind", "kind-kne"), want: true, wantKName: "kne"},
++		{desc: "other context", kubecfg: writeKubeconfig(t, dir, "prod", "prod")},
++		{desc: "no current-context", kubecfg: writeKubeconfig(t, dir, "none", ""), wantErr: true},
++		{desc: "no kubeconfig (in-cluster)", kubecfg: filepath.Join(dir, "absent"), wantErr: true},
++	}
++	for _, tt := range tests {
++		t.Run(tt.desc, func(t *testing.T) {
++			t.Setenv("KUBECONFIG", tt.kubecfg)
++			got, err := ClusterIsKind()
++			if (err != nil) != tt.wantErr || got != tt.want {
++				t.Fatalf("ClusterIsKind() = %v, %v; want %v (err %v)", got, err, tt.want, tt.wantErr)
++			}
++			if tt.wantKName != "" {
++				if n, err := clusterKindName(); err != nil || n != tt.wantKName {
++					t.Fatalf("clusterKindName() = %q, %v; want %q", n, err, tt.wantKName)
++				}
++			}
++		})
++	}
++}
+diff --git a/cluster/kind/kind.go b/cluster/kind/kind.go
+index 16d21b2..a5c243c 100644
+--- a/cluster/kind/kind.go
++++ b/cluster/kind/kind.go
+@@ -3,6 +3,7 @@ package kind
+ import (
+ 	"context"
+ 	"encoding/json"
++	"errors"
+ 	"fmt"
+ 	"os"
+ 	"path/filepath"
+@@ -11,6 +12,7 @@ import (
+ 
+ 	"github.com/openconfig/kne/exec/run"
+ 	"golang.org/x/oauth2/google"
++	"k8s.io/client-go/tools/clientcmd"
+ 	log "k8s.io/klog/v2"
+ )
+ 
+@@ -23,8 +25,25 @@ var (
+ 	kubeletConfigPathTemplate    = "%s:" + kubeletConfigPath
+ 	googleFindDefaultCredentials = google.FindDefaultCredentials
+ 	clusterKindNameRE            = regexp.MustCompile("kind-(.*)")
++
++	// currentContext returns the kubeconfig current-context. It is a variable so tests can stub it.
++	currentContext = kubeconfigCurrentContext
+ )
+ 
++// kubeconfigCurrentContext is `kubectl config current-context` without kubectl: the same merged kubeconfig
++// (KUBECONFIG list, else ~/.kube/config, via client-go's default loading rules, which is what kubectl uses) and
++// the same failure when no current-context is set (kubectl: "error: current-context is not set").
++func kubeconfigCurrentContext() (string, error) {
++	cfg, err := clientcmd.NewDefaultClientConfigLoadingRules().Load()
++	if err != nil {
++		return "", err
++	}
++	if cfg.CurrentContext == "" {
++		return "", errors.New("current-context is not set")
++	}
++	return cfg.CurrentContext, nil
++}
++
+ func ClusterIsKind() (bool, error) {
+ 	name, err := clusterName()
+ 	if err != nil {
+@@ -38,11 +57,11 @@ func ClusterIsKind() (bool, error) {
+ }
+ 
+ func clusterName() (string, error) {
+-	b, err := run.OutCommand("kubectl", "config", "current-context")
++	name, err := currentContext()
+ 	if err != nil {
+ 		return "", fmt.Errorf("unable to determine cluster information: %v", err)
+ 	}
+-	return string(b), nil
++	return name, nil
+ }
+ 
+ func clusterKindName() (string, error) {
+diff --git a/cluster/kind/kind_test.go b/cluster/kind/kind_test.go
+index 634ee25..692d85e 100644
+--- a/cluster/kind/kind_test.go
++++ b/cluster/kind/kind_test.go
+@@ -43,7 +43,7 @@ func TestClusterIsKind(t *testing.T) {
+ 			fexec.LogCommand = func(s string) {
+ 				t.Logf("%s: %s", tt.desc, s)
+ 			}
+-			cmds := fexec.Commands(tt.resp)
++			cmds := fexec.Commands(stubCurrentContext(t, tt.resp))
+ 			kexec.Command = cmds.Command
+ 			defer checkCmds(t, cmds)
+ 
+@@ -88,7 +88,7 @@ func TestClusterKindName(t *testing.T) {
+ 			fexec.LogCommand = func(s string) {
+ 				t.Logf("%s: %s", tt.desc, s)
+ 			}
+-			cmds := fexec.Commands(tt.resp)
++			cmds := fexec.Commands(stubCurrentContext(t, tt.resp))
+ 			kexec.Command = cmds.Command
+ 			defer checkCmds(t, cmds)
+ 
+@@ -154,7 +154,7 @@ func TestClusterKindNodes(t *testing.T) {
+ 			fexec.LogCommand = func(s string) {
+ 				t.Logf("%s: %s", tt.desc, s)
+ 			}
+-			cmds := fexec.Commands(tt.resp)
++			cmds := fexec.Commands(stubCurrentContext(t, tt.resp))
+ 			kexec.Command = cmds.Command
+ 			defer checkCmds(t, cmds)
+ 
+@@ -281,7 +281,7 @@ func TestSetupGARAccess(t *testing.T) {
+ 			fexec.LogCommand = func(s string) {
+ 				t.Logf("%s: %s", tt.desc, s)
+ 			}
+-			cmds := fexec.Commands(tt.resp)
++			cmds := fexec.Commands(stubCurrentContext(t, tt.resp))
+ 			kexec.Command = cmds.Command
+ 			defer checkCmds(t, cmds)
+ 
+@@ -370,7 +370,7 @@ func TestRefreshGARAccess(t *testing.T) {
+ 			fexec.LogCommand = func(s string) {
+ 				t.Logf("%s: %s", tt.desc, s)
+ 			}
+-			cmds := fexec.Commands(tt.resp)
++			cmds := fexec.Commands(stubCurrentContext(t, tt.resp))
+ 			kexec.Command = cmds.Command
+ 			defer checkCmds(t, cmds)
+ 
+@@ -392,3 +392,26 @@ func checkCmds(t *testing.T, cmds *fexec.Command) {
+ 		t.Errorf("%v", err)
+ 	}
+ }
++
++// stubCurrentContext serves the leading `kubectl config current-context` response of a table row from the
++// currentContext seam (the code no longer runs kubectl) and returns the remaining responses for the fake exec.
++func stubCurrentContext(t *testing.T, resp []fexec.Response) []fexec.Response {
++	t.Helper()
++	orig := currentContext
++	t.Cleanup(func() { currentContext = orig })
++	currentContext = func() (string, error) { return "", errors.New("current-context is not set") }
++	var rest []fexec.Response
++	for _, r := range resp {
++		if r.Cmd == "kubectl" && len(r.Args) == 2 && r.Args[0] == "config" && r.Args[1] == "current-context" {
++			currentContext = func() (string, error) {
++				if r.Err != nil {
++					return "", errors.New("failed to get name")
++				}
++				return r.Stdout, nil
++			}
++			continue
++		}
++		rest = append(rest, r)
++	}
++	return rest
++}
+-- 
+2.56.0
+
