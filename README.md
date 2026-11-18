@@ -24,4 +24,4 @@ Patches marked SKYFORGE-SPECIFIC are our platform's behaviour, not upstream cand
 
 ## Licence
 
-Docs and scripts: Apache-2.0 ([LICENSE](LICENSE)). Patches: each upstream's licence. Blueprints: ipSpace's licence ([LICENSE.md](components/blueprints/netlab/LICENSE.md)), which forbids offering them as a hosted or SaaS service. See [NOTICE](NOTICE).
+Everything we wrote here (docs, scripts and, with the control plane, `components/server` and `components/portal`): [Functional Source License 1.1, Apache-2.0 future licence](LICENSE) (FSL-1.1-ALv2). It is source-available, not open source: you can read, run, modify and redistribute it for any purpose except a competing commercial product or service, and each release converts to Apache-2.0 two years after it is published. Commits up to `aa25fed` were published under Apache-2.0 and stay under it. Patches: each upstream's licence. Blueprints: ipSpace's licence ([LICENSE.md](components/blueprints/netlab/LICENSE.md)), which forbids offering them as a hosted or SaaS service. See [NOTICE](NOTICE).

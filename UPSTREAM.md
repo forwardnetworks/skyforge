@@ -7,7 +7,7 @@ Each series applies to the upstream version below and stays under that upstream'
 | netlab | https://github.com/ipspace/netlab | `4c3280eafa905a1f4b150a61f8d0e7484c64e1c6` (dev, 2026-11-02) | 17 | MIT-style |
 | kne | https://github.com/openconfig/kne | `3fe74f99999ff8dbb685f45a6c18757ee0d2cf99` (master) | 58 | Apache-2.0 |
 | koko | https://github.com/redhat-nfvpe/koko | `a18aa44814eabb542226e11c5568e8433810e4ab` (master) | 15 | Apache-2.0 |
-| meshnet-cni | https://github.com/networkop/meshnet-cni | `d7c306c635cf73a44833e3ebdefb8b163a9aa784` (master) | 25 | BSD-3-Clause |
+| meshnet-cni | https://github.com/networkop/meshnet-cni | `d7c306c635cf73a44833e3ebdefb8b163a9aa784` (master) | 26 | BSD-3-Clause |
 | arista-ceoslab-operator | https://github.com/aristanetworks/arista-ceoslab-operator | `v2.1.2` = `72c8685ee56c26087211846a5262d2954f543b59` | 20 | Apache-2.0 |
 | catalystwan (Ansible collection) | https://github.com/cisco-en-programmability/ansible-collection-catalystwan | `b8adf36e2279624c6e3dfe573b65de62e2e25b96` (galaxy.yml 0.3.4; not released on Galaxy) | 5 | GPL-3.0 |
 | catalystwan (Python SDK) | https://github.com/cisco-open/cisco-catalyst-wan-sdk | `catalystwan==0.41.5.dev2` | 1 | Apache-2.0 |

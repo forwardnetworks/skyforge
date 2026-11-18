@@ -3,7 +3,8 @@ From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 00:00:00 +0000
 Subject: [PATCH] kne: platform defaults, day-0 shims, Caldera agent env,
  config-exec bulkhead, boot-config mode, ixia-c entrypoint and engine pinning,
- netmiko parameters as device features
+ netmiko parameters as device features, runtime inventory skips unmanaged
+ nodes
 
 ---
 diff --git a/netsim/ansible/templates/initial/asa.j2 b/netsim/ansible/templates/initial/asa.j2
@@ -1754,7 +1755,7 @@ index 0185970..efce9cc 100644
  cleanup: [ clab.yml, clab_files ]
  bridge_type: bridge # Use 'ovs-bridge' to create Openvswitch bridges
 diff --git a/netsim/providers/kne.py b/netsim/providers/kne.py
-index 81ad405..06096c8 100644
+index 81ad405..c92bd51 100644
 --- a/netsim/providers/kne.py
 +++ b/netsim/providers/kne.py
 @@ -380,7 +380,11 @@ KNE_PRE_STARTUP_BOOTSTRAP_HOOKS: dict = {
@@ -2000,7 +2001,22 @@ index 81ad405..06096c8 100644
  def adjust_eos_node_data(kne_data: Box, node: Box, topology: Box, cfg_mode: str) -> None:
    kne_data.env = kne_data.get('env',Box(default_box=True,box_dots=True))
    kne_data.env.pop('CLAB_MGMT_VRF',None)
-@@ -3127,7 +3285,7 @@ class KNE(_Provider):
+@@ -2923,7 +3081,13 @@ class KNE(_Provider):
+       return
+ 
+     namespace = get_kne_topology_name(topology)
+-    kne_nodes = [ node for node in topology.nodes.values() if devices.get_provider(node,topology.defaults) == 'kne' ]
++    # An unmanaged node (`unmanaged: true`) is not deployed by KNE, so no
++    # service-<node> ever exists for it and refreshed_nodes can never reach
++    # len(kne_nodes): the loop below would run every retry (12 x 5 s = 60 s)
++    # on every lab that has one. Leave those nodes out of the expected set.
++    kne_nodes = [
++      node for node in topology.nodes.values()
++      if devices.get_provider(node,topology.defaults) == 'kne' and not node.get('unmanaged',False) ]
+     changed = False
+     refreshed_nodes: set[str] = set()
+ 
+@@ -3127,7 +3291,7 @@ class KNE(_Provider):
          else:
            config_cmd.append(cfg_item.target)
          log.info(f'Executing {mod_name} configuration for node {node.name}')
@@ -2413,7 +2429,7 @@ index c891471..13808c3 100644
    monkeypatch.setattr(initial_netmiko._netmiko,'check_netmiko',lambda n: True)
    monkeypatch.setattr(initial_netmiko._netmiko,'prepare_params',lambda n,t: { 'session_log': 'netmiko.log' })
 diff --git a/tests/test_kne_provider.py b/tests/test_kne_provider.py
-index 3383028..a0ce670 100644
+index 3383028..e41dd78 100644
 --- a/tests/test_kne_provider.py
 +++ b/tests/test_kne_provider.py
 @@ -1683,6 +1683,46 @@ nodes:
@@ -2463,7 +2479,69 @@ index 3383028..a0ce670 100644
  def test_kne_ioll2_uses_distinct_image_contract(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
    monkeypatch.chdir(tmp_path)
    topo_file = write_topology(tmp_path,"""
-@@ -3244,7 +3284,7 @@ def test_kne_fortios_reconfigure_goes_over_netmiko_with_the_same_user_data(
+@@ -2198,6 +2238,61 @@ links:
+   assert snapshot.nodes.r2.ansible_port == 30023
+ 
+ 
++def test_kne_post_start_lab_runtime_inventory_does_not_wait_for_unmanaged_nodes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++  monkeypatch.chdir(tmp_path)
++  topo_file = write_topology(tmp_path,"""
++provider: kne
++
++nodes:
++  r1:
++    device: eos
++    netlab_config_mode: sh
++  r2:
++    device: eos
++    netlab_config_mode: sh
++  ext:
++    device: eos
++    unmanaged: true
++
++links:
++- r1-r2
++""")
++
++  init_log()
++  topology = create.run([str(topo_file)])
++  provider = cast(KNE,get_provider_module(topology,'kne'))
++  namespace = dns_1035_name(topology.name,'topo')
++  assert topology.nodes.ext.unmanaged
++
++  # Only r1 is deployed, so only service-r1 ever exists. Every attempt
++  # returns the same answer: waiting for service-ext cannot succeed.
++  services = '{"items":[{"metadata":{"name":"service-r1"},"spec":{"ports":[{"name":"ssh","port":22,"nodePort":30022}]}},{"metadata":{"name":"service-r2"},"spec":{"ports":[{"name":"ssh","port":22,"nodePort":30023}]}}]}'
++  pods = '{"items":[{"metadata":{"name":"r1"},"spec":{"nodeName":"worker-1"}},{"metadata":{"name":"r2"},"spec":{"nodeName":"worker-1"}}]}'
++  nodes = '{"items":[{"metadata":{"name":"worker-1"},"status":{"addresses":[{"type":"InternalIP","address":"10.0.0.11"}]}}]}'
++  svc_calls: list[int] = []
++  sleep_delays: list[int] = []
++
++  def fake_run_command(cmd: list[str], **kwargs: object) -> object:
++    if cmd == ['kubectl','-n',namespace,'get','svc','-o','json']:
++      svc_calls.append(1)
++      return services
++    if cmd == ['kubectl','-n',namespace,'get','pods','-o','json']:
++      return pods
++    if cmd == ['kubectl','get','nodes','-o','json']:
++      return nodes
++    raise AssertionError(f'unexpected command {cmd}')
++
++  monkeypatch.setattr(external_commands,'run_command',fake_run_command)
++  monkeypatch.setattr('netsim.providers.kne.time.sleep',sleep_delays.append)
++  provider.post_start_lab(topology)
++
++  # One pass, no sleep: the managed node was refreshed on the first attempt.
++  assert len(svc_calls) == 1
++  assert sleep_delays == []
++  assert topology.nodes.r1.ansible_host == '10.0.0.11'
++  assert topology.nodes.r1.ansible_port == 30022
++
++
+ def test_kne_post_start_lab_prefers_service_cluster_ip_in_kubernetes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+   monkeypatch.chdir(tmp_path)
+   topo_file = write_topology(tmp_path,"""
+@@ -3244,7 +3339,7 @@ def test_kne_fortios_reconfigure_goes_over_netmiko_with_the_same_user_data(
    assert fw1._node_config.initial == ':netmiko'
    assert fw1._node_config.ospf == ':netmiko'
    assert set(fw1.get('netlab_ansible_skip_module',[])) >= {'initial','ospf'}
@@ -2472,7 +2550,7 @@ index 3383028..a0ce670 100644
    assert reconf_user_data == bringup_user_data
  
  
-@@ -3760,3 +3800,60 @@ links: [ r1-r2 ]
+@@ -3760,3 +3855,60 @@ links: [ r1-r2 ]
      create.run(['-o','none',str(topo)])
    # The FEATURE refuses it, not the schema: the attribute is valid netlab.
    assert f'does not support {attr.split(":")[0]}' in '\n'.join(log._ERROR_LOG)

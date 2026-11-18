@@ -1987,7 +1987,7 @@ index a29540c..42ae083 100644
    p_module.call(hook,topology)
  
 diff --git a/netsim/providers/kne.py b/netsim/providers/kne.py
-index 7830cb6..3859b94 100644
+index 8c0993c..d1a6edd 100644
 --- a/netsim/providers/kne.py
 +++ b/netsim/providers/kne.py
 @@ -21,7 +21,7 @@ from ..augment import devices

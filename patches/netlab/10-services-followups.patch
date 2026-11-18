@@ -387,7 +387,7 @@ index e605491..3bc66ce 100644
    # sFlow on the switch, inline IPFIX on the router -- so one capability flag
    # would silently render nothing on half the fleet.
 diff --git a/netsim/providers/kne.py b/netsim/providers/kne.py
-index 06096c8..7830cb6 100644
+index c92bd51..8c0993c 100644
 --- a/netsim/providers/kne.py
 +++ b/netsim/providers/kne.py
 @@ -2636,26 +2636,61 @@ def adjust_iol_node_data(kne_data: Box, node: Box) -> None:
@@ -465,7 +465,7 @@ index 06096c8..7830cb6 100644
    kne_data.env.SKYFORGE_CALDERA_AGENT_ENABLED = '1'
    kne_data.env.SKYFORGE_CALDERA_SERVER = server
 diff --git a/tests/test_kne_provider.py b/tests/test_kne_provider.py
-index a0ce670..2920f2f 100644
+index e41dd78..e04d7ff 100644
 --- a/tests/test_kne_provider.py
 +++ b/tests/test_kne_provider.py
 @@ -1723,6 +1723,297 @@ def test_kne_linux_caldera_agent_env_follows_the_per_run_fact(tmp_path: Path, mo

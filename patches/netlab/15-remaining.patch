@@ -629,7 +629,7 @@ index fda0c1b..dde2d6c 100644
    image: none
  graphite.icon: server
 diff --git a/netsim/providers/kne.py b/netsim/providers/kne.py
-index 3859b94..2f53bfc 100644
+index d1a6edd..ee20044 100644
 --- a/netsim/providers/kne.py
 +++ b/netsim/providers/kne.py
 @@ -63,13 +63,6 @@ KNE_NODE_MAP: dict = {
@@ -1032,7 +1032,7 @@ index ab1db16..31ed592 100644
      kne dropped it from that node's own meshnet Topology CR, and the link's
      OTHER endpoint failed bring-up with "could not find peer ... link UID N".
 diff --git a/tests/test_kne_provider.py b/tests/test_kne_provider.py
-index 2920f2f..30be895 100644
+index e04d7ff..7683a92 100644
 --- a/tests/test_kne_provider.py
 +++ b/tests/test_kne_provider.py
 @@ -1,5 +1,6 @@

@@ -33,7 +33,7 @@ index 08acb8e..fd5329f 100644
      kind: keysight_ixia-c-controller
    interface:
 diff --git a/netsim/providers/kne.py b/netsim/providers/kne.py
-index 2f53bfc..89311a0 100644
+index ee20044..c5dd557 100644
 --- a/netsim/providers/kne.py
 +++ b/netsim/providers/kne.py
 @@ -225,12 +225,34 @@ KNE_SERVICE_MAP: dict = {
@@ -74,10 +74,10 @@ index 2f53bfc..89311a0 100644
      { 'outside': 22, 'inside': 22, 'name': 'ssh', 'names': ['ssh'] },
    ],
 diff --git a/tests/test_kne_provider.py b/tests/test_kne_provider.py
-index 30be895..c8f611c 100644
+index 7683a92..e4301f9 100644
 --- a/tests/test_kne_provider.py
 +++ b/tests/test_kne_provider.py
-@@ -4233,3 +4233,92 @@ links: [ ctl-eng, eng-h1 ]
+@@ -4288,3 +4288,92 @@ links: [ ctl-eng, eng-h1 ]
    assert re.search(r'key: "OPT_NO_PINNING"\s+value: "Yes"',eng)
    assert 'OPT_NO_PINNING' not in _node_block(text,'ctl')
    assert 'OPT_NO_PINNING' not in _node_block(text,'h1')
