@@ -1,0 +1,1150 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 12:00:00 -0500
+Subject: [PATCH] daemon: hold KubeVirt k6t bridges at group_fwd_mask 0x4000 so
+ LLDP crosses a VM link
+
+---
+diff --git a/daemon/main.go b/daemon/main.go
+index 447317d..20de222 100644
+--- a/daemon/main.go
++++ b/daemon/main.go
+@@ -67,6 +67,12 @@ func main() {
+ 	defer cancelReconciler()
+ 	m.StartWireReconciler(ctx)
+ 
++	// KubeVirt's k6t-<id> bridges are created with group_fwd_mask=0, which drops
++	// LLDP between VMs. Hold them at 0x4000 on its own short cadence: it is not
++	// part of the 5-minute, confirmation-gated reconcile and it also runs when
++	// INTER_NODE_LINK_TYPE=GRPC (see daemon/meshnet/lldp_mask.go).
++	m.StartLLDPMaskLoop(ctx)
++
+ 	// Converge the CNI chain once multus has written its conf (see
+ 	// cni.WatchMultusWrap): meshnetd can start before multus does at node boot.
+ 	go cni.WatchMultusWrap(ctx)
+diff --git a/daemon/meshnet/lldp_mask.go b/daemon/meshnet/lldp_mask.go
+new file mode 100644
+index 0000000..f409923
+--- /dev/null
++++ b/daemon/meshnet/lldp_mask.go
+@@ -0,0 +1,580 @@
++package meshnet
++
++/*
++LLDP across a KubeVirt bridge: keep group_fwd_mask at 0x4000.
++
++WHY THIS EXISTS. KubeVirt's bridge binding puts every VM interface behind a
++Linux bridge, k6t-<id>, inside the virt-launcher pod's network namespace. A
++Linux bridge is created with group_fwd_mask=0, the kernel default that DROPS
++the whole IEEE 802.1D reserved multicast range 01:80:c2:00:00:00-0F, which
++includes LLDP (...0e). The guest NOS can have LLDP configured perfectly and
++its neighbour never hears it, because the frame dies in the bridge. Nothing
++inside the pod can change that (the compute container's /sys is read-only and
++KubeVirt's hook sidecars run unprivileged); the owner has to be something with
++CAP_NET_ADMIN in the pod's namespace. meshnetd already is: it enters the pod's
++netns for every wire it builds, repairs or inspects, and it already knows which
++interface of which pod is a KubeVirt slot (resolveSlot / kubevirtNames, 0020).
++
++Until now a separate DaemonSet (components/vm-bridge-agent) walked the host's
++process table every 15 s and ran `ip link set k6t-* type bridge group_fwd_mask
++0x4000`. This is the same behaviour, done by the daemon that owns the wires.
++
++THE RULE. Replicates the agent exactly:
++  - only bridges literally named k6t-<id> where "pod<id>" is the LocalIntf of a
++    link on a Topology this node owns (never any other bridge in the pod);
++  - set 0x4000 (bit 14, the ...0e slot, LLDP only) when the current mask is
++    anything else, including a non-zero value somebody else wrote: the agent
++    did the same and nothing on this platform sets those bits, so "mask !=
++    0x4000" is the whole test. STP/LACP/pause stay dropped. The kernel refuses
++    bits 0-2 anyway (BR_GROUPFWD_RESTRICTED);
++  - a bridge already at 0x4000, a missing bridge, a link that is not a bridge,
++    or a namespace that cannot be entered is left alone.
++
++WHERE IT RUNS. It is NOT part of the wire reconciler's pass. That pass runs
++every 5 minutes after a 90 s delay, repairs only after two agreeing passes and
++at most 32 per pass, and is disabled entirely in INTER_NODE_LINK_TYPE=GRPC
++mode: all right for a wire repair, wrong for this. A VM that boots or restarts
++gets a fresh k6t bridge at mask 0 and the lab is LLDP-blind until the next
++tick, so this loop is its own goroutine on its own short cadence
++(MESHNET_LLDP_MASK_INTERVAL seconds, default 15, 0 disables), started
++separately from StartWireReconciler and NOT gated on INTER_NODE_LINK_TYPE: the
++mask is needed for same-node veth, vxlan and gRPC wires alike, because the VM
++sits behind k6t-<id> in all three.
++
++API LOAD. A pass every 15 s must not list every Topology in the cluster 4x a
++minute per node. The loop therefore keeps a Topology cache fed by ONE list and
++a watch (re-established from the last resourceVersion; a fresh list only after
++a watch error, with backoff), and each pass reads that cache. Steady state is
++one open watch per node. The only other call is the node-source lookup, cached
++for five minutes.
++
++NETLINK. The pinned vishvananda/netlink (v1.1.1-0.2020...) has no
++Bridge.GroupFwdMask, neither parsed nor written. Rather than bump the library
++(which would touch 0001's toolchain/localdeps work and every other netlink
++user in the daemon), the two messages are built by hand with the nl package
++that is already vendored: RTM_GETLINK to read IFLA_LINKINFO/IFLA_INFO_DATA/
++IFLA_BR_GROUP_FWD_MASK, RTM_NEWLINK to write it. No iproute2 needed.
++*/
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"sort"
++	"strings"
++	"sync"
++	"syscall"
++	"time"
++
++	"github.com/containernetworking/plugins/pkg/ns"
++	"github.com/vishvananda/netlink/nl"
++	"golang.org/x/sys/unix"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/watch"
++
++	topologyv1 "github.com/networkop/meshnet-cni/api/types/v1beta1"
++)
++
++const (
++	// lldpGroupFwdMask is bit 14: forward 01:80:c2:00:00:0e (LLDP) only.
++	lldpGroupFwdMask uint16 = 0x4000
++
++	defaultLLDPMaskInterval = 15 * time.Second
++	// nodeSourceTTL bounds how often a mask pass asks the API server who this
++	// node is. The answer changes only when the node's labels do.
++	nodeSourceTTL = 5 * time.Minute
++)
++
++// kubevirtBridgeName is the k6t bridge for a meshnet wire name ("pod<id>"), or
++// "" when the name cannot be a KubeVirt slot. It is the same mapping as
++// vxlan.kubevirtNames and resolveVethSlot.
++func kubevirtBridgeName(linkName string) string {
++	renamed := kubevirtRenamedName(linkName)
++	if renamed == "" {
++		return ""
++	}
++	return "k6t-" + strings.TrimPrefix(strings.TrimSpace(linkName), "pod")
++}
++
++// maskTarget is the part of one Topology the mask pass needs.
++type maskTarget struct {
++	Namespace string
++	Name      string
++	NetNS     string
++	SrcIP     string
++	Bridges   []string // k6t-<id>, one per KubeVirt-shaped LocalIntf, sorted
++}
++
++func (t maskTarget) key() string { return t.Namespace + "/" + t.Name }
++
++// targetFor reduces a Topology to a maskTarget; ok is false when it has no
++// KubeVirt-shaped link, so the cache holds only VM pods.
++func targetFor(t *topologyv1.Topology) (maskTarget, bool) {
++	seen := map[string]bool{}
++	var bridges []string
++	for _, l := range t.Spec.Links {
++		if l.PeerPod == "" || l.PeerPod == "localhost" {
++			continue
++		}
++		if b := kubevirtBridgeName(l.LocalIntf); b != "" && !seen[b] {
++			seen[b] = true
++			bridges = append(bridges, b)
++		}
++	}
++	if len(bridges) == 0 {
++		return maskTarget{}, false
++	}
++	sort.Strings(bridges)
++	return maskTarget{
++		Namespace: t.GetNamespace(),
++		Name:      t.GetName(),
++		NetNS:     strings.TrimSpace(t.Status.NetNS),
++		SrcIP:     strings.TrimSpace(t.Status.SrcIP),
++		Bridges:   bridges,
++	}, true
++}
++
++// ---------------------------------------------------------------------------
++// Topology cache: one list + one watch instead of a list per pass.
++// ---------------------------------------------------------------------------
++
++type topologyWatcher interface {
++	List(ctx context.Context, opts metav1.ListOptions) (*topologyv1.TopologyList, error)
++	Watch(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error)
++}
++
++type maskCache struct {
++	src topologyWatcher
++
++	mu      sync.RWMutex
++	targets map[string]maskTarget
++	synced  bool
++
++	backoff time.Duration // test seam; default 5s, doubling to 12x
++}
++
++func newMaskCache(src topologyWatcher) *maskCache {
++	return &maskCache{src: src, targets: map[string]maskTarget{}, backoff: 5 * time.Second}
++}
++
++func (c *maskCache) snapshot() ([]maskTarget, bool) {
++	c.mu.RLock()
++	defer c.mu.RUnlock()
++	out := make([]maskTarget, 0, len(c.targets))
++	for _, t := range c.targets {
++		out = append(out, t)
++	}
++	sort.Slice(out, func(i, j int) bool { return out[i].key() < out[j].key() })
++	return out, c.synced
++}
++
++func (c *maskCache) apply(t *topologyv1.Topology, deleted bool) {
++	key := t.GetNamespace() + "/" + t.GetName()
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if deleted {
++		delete(c.targets, key)
++		return
++	}
++	if mt, ok := targetFor(t); ok {
++		c.targets[key] = mt
++	} else {
++		delete(c.targets, key)
++	}
++}
++
++// relist replaces the cache with one full list and returns its resourceVersion.
++func (c *maskCache) relist(ctx context.Context) (string, error) {
++	list, err := c.src.List(ctx, metav1.ListOptions{})
++	if err != nil {
++		return "", err
++	}
++	fresh := map[string]maskTarget{}
++	for i := range list.Items {
++		if mt, ok := targetFor(&list.Items[i]); ok {
++			fresh[mt.key()] = mt
++		}
++	}
++	c.mu.Lock()
++	c.targets = fresh
++	c.synced = true
++	c.mu.Unlock()
++	return list.GetResourceVersion(), nil
++}
++
++// run keeps the cache current until ctx is done. A watch that merely ends is
++// resumed from the last resourceVersion; any error relists, after a backoff.
++func (c *maskCache) run(ctx context.Context) {
++	delay := c.backoff
++	for ctx.Err() == nil {
++		rv, err := c.relist(ctx)
++		if err != nil {
++			mnetdLogger.Warnf("LLDP mask: cannot list topologies (retry in %s): %v", delay, err)
++			if !sleepCtx(ctx, delay) {
++				return
++			}
++			if delay < 12*c.backoff {
++				delay *= 2
++			}
++			continue
++		}
++		delay = c.backoff
++		if err := c.watchFrom(ctx, rv); err != nil && ctx.Err() == nil {
++			mnetdLogger.Warnf("LLDP mask: topology watch failed, relisting: %v", err)
++			if !sleepCtx(ctx, delay) {
++				return
++			}
++		}
++	}
++}
++
++func sleepCtx(ctx context.Context, d time.Duration) bool {
++	select {
++	case <-ctx.Done():
++		return false
++	case <-time.After(d):
++		return true
++	}
++}
++
++// watchFrom consumes events until an error (returned, caller relists) or ctx
++// is done. A cleanly closed watch is resumed from the last seen resourceVersion.
++func (c *maskCache) watchFrom(ctx context.Context, rv string) error {
++	for ctx.Err() == nil {
++		w, err := c.src.Watch(ctx, metav1.ListOptions{ResourceVersion: rv, AllowWatchBookmarks: true})
++		if err != nil {
++			return err
++		}
++		closed := false
++		for !closed {
++			select {
++			case <-ctx.Done():
++				w.Stop()
++				return nil
++			case ev, ok := <-w.ResultChan():
++				if !ok {
++					closed = true
++					break
++				}
++				switch ev.Type {
++				case watch.Error:
++					w.Stop()
++					return fmt.Errorf("watch error event: %v", ev.Object)
++				case watch.Added, watch.Modified, watch.Deleted, watch.Bookmark:
++					t, err := toTopology(ev.Object)
++					if err != nil {
++						w.Stop()
++						return err
++					}
++					if v := t.GetResourceVersion(); v != "" {
++						rv = v
++					}
++					if ev.Type != watch.Bookmark {
++						c.apply(t, ev.Type == watch.Deleted)
++					}
++				}
++			}
++		}
++		w.Stop()
++	}
++	return nil
++}
++
++func toTopology(obj runtime.Object) (*topologyv1.Topology, error) {
++	if t, ok := obj.(*topologyv1.Topology); ok {
++		return t, nil
++	}
++	u, ok := obj.(interface{ UnstructuredContent() map[string]interface{} })
++	if !ok {
++		return nil, fmt.Errorf("unexpected watch object %T", obj)
++	}
++	t := &topologyv1.Topology{}
++	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(u.UnstructuredContent(), t); err != nil {
++		return nil, fmt.Errorf("decode watch object: %w", err)
++	}
++	return t, nil
++}
++
++// ---------------------------------------------------------------------------
++// The mask pass.
++// ---------------------------------------------------------------------------
++
++// lldpMaskDeps is the IO boundary of the mask pass; tests substitute fakes.
++type lldpMaskDeps struct {
++	netNSUsable func(nsName string) bool
++	// bridgeMask reports a bridge's group_fwd_mask. found is false when the
++	// link does not exist or is not a bridge (never an error: a VM whose
++	// binding has not run yet simply has nothing to do).
++	bridgeMask func(nsName, bridge string) (mask uint16, found bool, err error)
++	setMask    func(nsName, bridge string, mask uint16) error
++}
++
++func productionLLDPMaskDeps() lldpMaskDeps {
++	return lldpMaskDeps{netNSUsable: netNSUsable, bridgeMask: readBridgeGroupFwdMask, setMask: writeBridgeGroupFwdMask}
++}
++
++type lldpMasker struct {
++	deps     lldpMaskDeps
++	targets  func() ([]maskTarget, bool)
++	nodeIP   func(ctx context.Context) (string, error)
++	interval time.Duration
++
++	nodeIPValue string
++	nodeIPAt    time.Time
++	nodeIPErr   string // last logged resolution error, to avoid per-pass noise
++	// lastErr remembers the last error logged per bridge so a persistent
++	// failure is logged once, not every 15 s; it is cleared on success.
++	lastErr map[string]string
++}
++
++type maskStats struct{ Checked, Changed, Failed, Skipped int }
++
++func (s *lldpMasker) resolveNodeIP(ctx context.Context) string {
++	if s.nodeIPValue != "" && time.Since(s.nodeIPAt) < nodeSourceTTL {
++		return s.nodeIPValue
++	}
++	ip, err := s.nodeIP(ctx)
++	ip = strings.TrimSpace(ip)
++	if err != nil || ip == "" {
++		msg := "empty node source"
++		if err != nil {
++			msg = err.Error()
++		}
++		if msg != s.nodeIPErr {
++			s.nodeIPErr = msg
++			mnetdLogger.Warnf("LLDP mask: cannot resolve this node's meshnet source (using %q): %s", s.nodeIPValue, msg)
++		}
++		return s.nodeIPValue // last good value, possibly ""
++	}
++	s.nodeIPErr = ""
++	s.nodeIPValue, s.nodeIPAt = ip, time.Now()
++	return ip
++}
++
++// pass makes one sweep. It is silent unless a bridge changed or a failure is
++// new: a healthy node logs nothing.
++func (s *lldpMasker) pass(ctx context.Context) maskStats {
++	var st maskStats
++	targets, synced := s.targets()
++	if !synced {
++		return st
++	}
++	nodeIP := s.resolveNodeIP(ctx)
++	if nodeIP == "" {
++		return st
++	}
++	if s.lastErr == nil {
++		s.lastErr = map[string]string{}
++	}
++	for _, t := range targets {
++		if t.SrcIP != nodeIP || t.NetNS == "" {
++			continue // not ours, or its CNI ADD has not run
++		}
++		if !s.deps.netNSUsable(t.NetNS) {
++			st.Skipped += len(t.Bridges)
++			continue
++		}
++		for _, br := range t.Bridges {
++			st.Checked++
++			key := t.NetNS + "#" + br
++			cur, found, err := s.deps.bridgeMask(t.NetNS, br)
++			if err == nil && !found {
++				st.Skipped++
++				delete(s.lastErr, key)
++				continue
++			}
++			if err == nil && cur == lldpGroupFwdMask {
++				delete(s.lastErr, key)
++				continue
++			}
++			if err == nil {
++				err = s.deps.setMask(t.NetNS, br, lldpGroupFwdMask)
++			}
++			if err != nil {
++				st.Failed++
++				if s.lastErr[key] != err.Error() {
++					s.lastErr[key] = err.Error()
++					mnetdLogger.Warnf("LLDP mask: pod %s bridge %s: cannot set group_fwd_mask: %v", t.key(), br, err)
++				}
++				continue
++			}
++			delete(s.lastErr, key)
++			st.Changed++
++			mnetdLogger.Infof("LLDP mask: pod %s bridge %s group_fwd_mask 0x%04x -> 0x%04x", t.key(), br, cur, lldpGroupFwdMask)
++		}
++	}
++	return st
++}
++
++func (s *lldpMasker) run(ctx context.Context) {
++	ticker := time.NewTicker(s.interval)
++	defer ticker.Stop()
++	for {
++		s.pass(ctx)
++		select {
++		case <-ctx.Done():
++			return
++		case <-ticker.C:
++		}
++	}
++}
++
++// lldpMaskInterval is the mask loop cadence; 0 means disabled.
++func lldpMaskInterval() time.Duration {
++	return envDuration("MESHNET_LLDP_MASK_INTERVAL", defaultLLDPMaskInterval)
++}
++
++// StartLLDPMaskLoop starts the mask loop; it returns immediately. It is
++// independent of StartWireReconciler and of INTER_NODE_LINK_TYPE (see the
++// header). MESHNET_LLDP_MASK_INTERVAL=0 disables it.
++func (m *Meshnet) StartLLDPMaskLoop(ctx context.Context) {
++	interval := lldpMaskInterval()
++	if interval <= 0 {
++		mnetdLogger.Infof("LLDP mask loop disabled by MESHNET_LLDP_MASK_INTERVAL=0")
++		return
++	}
++	cache := newMaskCache(m.tClient.Topology(metav1.NamespaceAll))
++	go cache.run(ctx)
++	s := &lldpMasker{
++		deps:     productionLLDPMaskDeps(),
++		targets:  cache.snapshot,
++		interval: interval,
++		nodeIP: func(ctx context.Context) (string, error) {
++			ip, _, err := m.nodeSourceForCurrentNode(ctx)
++			return ip, err
++		},
++	}
++	mnetdLogger.Infof("LLDP mask loop starting: KubeVirt k6t bridges of this node's pods are held at group_fwd_mask 0x%04x, every %s", lldpGroupFwdMask, interval)
++	go s.run(ctx)
++}
++
++// ---------------------------------------------------------------------------
++// Netlink: IFLA_BR_GROUP_FWD_MASK by hand (the pinned netlink lacks it).
++// ---------------------------------------------------------------------------
++
++func readBridgeGroupFwdMask(nsName, bridge string) (uint16, bool, error) {
++	netNS, err := ns.GetNS(nsName)
++	if err != nil {
++		return 0, false, fmt.Errorf("enter %s: %w", nsName, err)
++	}
++	defer netNS.Close()
++	var (
++		mask  uint16
++		found bool
++	)
++	err = netNS.Do(func(_ ns.NetNS) error {
++		var e error
++		_, mask, found, e = getBridgeGroupFwdMask(bridge)
++		return e
++	})
++	return mask, found, err
++}
++
++func writeBridgeGroupFwdMask(nsName, bridge string, mask uint16) error {
++	netNS, err := ns.GetNS(nsName)
++	if err != nil {
++		return fmt.Errorf("enter %s: %w", nsName, err)
++	}
++	defer netNS.Close()
++	return netNS.Do(func(_ ns.NetNS) error {
++		idx, _, found, err := getBridgeGroupFwdMask(bridge)
++		if err != nil {
++			return err
++		}
++		if !found {
++			return fmt.Errorf("bridge %s is gone", bridge)
++		}
++		return setBridgeGroupFwdMask(idx, mask)
++	})
++}
++
++// getBridgeGroupFwdMask must run inside the target netns (netNS.Do).
++func getBridgeGroupFwdMask(name string) (index int, mask uint16, found bool, err error) {
++	req := nl.NewNetlinkRequest(unix.RTM_GETLINK, unix.NLM_F_ACK)
++	req.AddData(nl.NewIfInfomsg(unix.AF_UNSPEC))
++	req.AddData(nl.NewRtAttr(unix.IFLA_IFNAME, nl.ZeroTerminated(name)))
++	msgs, err := req.Execute(unix.NETLINK_ROUTE, 0)
++	if err != nil {
++		if errors.Is(err, syscall.ENODEV) {
++			return 0, 0, false, nil
++		}
++		return 0, 0, false, fmt.Errorf("RTM_GETLINK %s: %w", name, err)
++	}
++	if len(msgs) == 0 {
++		return 0, 0, false, nil
++	}
++	index, mask, isBridge, err := parseBridgeGroupFwdMask(msgs[0])
++	if err != nil {
++		return 0, 0, false, fmt.Errorf("parse %s: %w", name, err)
++	}
++	return index, mask, isBridge, nil
++}
++
++// parseBridgeGroupFwdMask decodes one RTM_NEWLINK reply. found is false when
++// the link is not a bridge (it is then never touched).
++func parseBridgeGroupFwdMask(msg []byte) (index int, mask uint16, found bool, err error) {
++	if len(msg) < unix.SizeofIfInfomsg {
++		return 0, 0, false, fmt.Errorf("short link message (%d bytes)", len(msg))
++	}
++	index = int(nl.DeserializeIfInfomsg(msg).Index)
++	attrs, err := nl.ParseRouteAttr(msg[unix.SizeofIfInfomsg:])
++	if err != nil {
++		return 0, 0, false, err
++	}
++	const typeMask = 0x3fff // strip NLA_F_NESTED / NLA_F_NET_BYTEORDER
++	for _, a := range attrs {
++		if int(a.Attr.Type&typeMask) != unix.IFLA_LINKINFO {
++			continue
++		}
++		info, err := nl.ParseRouteAttr(a.Value)
++		if err != nil {
++			return 0, 0, false, err
++		}
++		kind := ""
++		var data []byte
++		for _, ia := range info {
++			switch int(ia.Attr.Type & typeMask) {
++			case nl.IFLA_INFO_KIND:
++				kind = strings.TrimRight(string(ia.Value), "\x00")
++			case nl.IFLA_INFO_DATA:
++				data = ia.Value
++			}
++		}
++		if kind != "bridge" {
++			return index, 0, false, nil
++		}
++		// A bridge whose kernel does not report the attribute reads as 0,
++		// which is also what an unset mask is.
++		if data != nil {
++			da, err := nl.ParseRouteAttr(data)
++			if err != nil {
++				return 0, 0, false, err
++			}
++			for _, d := range da {
++				if int(d.Attr.Type&typeMask) == nl.IFLA_BR_GROUP_FWD_MASK && len(d.Value) >= 2 {
++					mask = nl.NativeEndian().Uint16(d.Value)
++				}
++			}
++		}
++		return index, mask, true, nil
++	}
++	return index, 0, false, nil
++}
++
++// setBridgeGroupFwdMask must run inside the target netns (netNS.Do).
++func setBridgeGroupFwdMask(index int, mask uint16) error {
++	req := nl.NewNetlinkRequest(unix.RTM_NEWLINK, unix.NLM_F_ACK)
++	msg := nl.NewIfInfomsg(unix.AF_UNSPEC)
++	msg.Index = int32(index)
++	req.AddData(msg)
++	linkInfo := nl.NewRtAttr(unix.IFLA_LINKINFO, nil)
++	nl.NewRtAttrChild(linkInfo, nl.IFLA_INFO_KIND, nl.NonZeroTerminated("bridge"))
++	data := nl.NewRtAttrChild(linkInfo, nl.IFLA_INFO_DATA, nil)
++	nl.NewRtAttrChild(data, nl.IFLA_BR_GROUP_FWD_MASK, nl.Uint16Attr(mask))
++	req.AddData(linkInfo)
++	if _, err := req.Execute(unix.NETLINK_ROUTE, 0); err != nil {
++		return fmt.Errorf("RTM_NEWLINK group_fwd_mask: %w", err)
++	}
++	return nil
++}
+diff --git a/daemon/meshnet/lldp_mask_test.go b/daemon/meshnet/lldp_mask_test.go
+new file mode 100644
+index 0000000..b01bc93
+--- /dev/null
++++ b/daemon/meshnet/lldp_mask_test.go
+@@ -0,0 +1,531 @@
++package meshnet
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	"os"
++	"os/exec"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/containernetworking/plugins/pkg/ns"
++	"github.com/vishvananda/netlink"
++	"github.com/vishvananda/netlink/nl"
++	"golang.org/x/sys/unix"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/watch"
++
++	koko "github.com/redhat-nfvpe/koko/api"
++
++	topologyv1 "github.com/networkop/meshnet-cni/api/types/v1beta1"
++)
++
++// ---------------------------------------------------------------------------
++// The mask pass, through fake netlink/netns.
++// ---------------------------------------------------------------------------
++
++type fakeBridges struct {
++	usable map[string]bool
++	// masks is keyed "netns#bridge"; an absent key is "no such bridge".
++	masks   map[string]uint16
++	readErr map[string]error
++	setErr  map[string]error
++
++	reads []string
++	sets  []string
++}
++
++func (f *fakeBridges) deps() lldpMaskDeps {
++	return lldpMaskDeps{
++		netNSUsable: func(nsName string) bool { return f.usable[nsName] },
++		bridgeMask: func(nsName, br string) (uint16, bool, error) {
++			k := nsName + "#" + br
++			f.reads = append(f.reads, k)
++			if err := f.readErr[k]; err != nil {
++				return 0, false, err
++			}
++			m, ok := f.masks[k]
++			return m, ok, nil
++		},
++		setMask: func(nsName, br string, mask uint16) error {
++			k := nsName + "#" + br
++			if err := f.setErr[k]; err != nil {
++				return err
++			}
++			f.sets = append(f.sets, k+"="+hex16(mask))
++			f.masks[k] = mask
++			return nil
++		},
++	}
++}
++
++func hex16(m uint16) string {
++	const d = "0123456789abcdef"
++	return "0x" + string([]byte{d[m>>12&15], d[m>>8&15], d[m>>4&15], d[m&15]})
++}
++
++func newMasker(f *fakeBridges, targets ...maskTarget) *lldpMasker {
++	InitLogger()
++	return &lldpMasker{
++		deps:     f.deps(),
++		targets:  func() ([]maskTarget, bool) { return targets, true },
++		nodeIP:   func(context.Context) (string, error) { return "10.0.0.1", nil },
++		interval: time.Second,
++	}
++}
++
++func vmTarget(netNS string, bridges ...string) maskTarget {
++	return maskTarget{Namespace: "lab", Name: "vm1", NetNS: netNS, SrcIP: "10.0.0.1", Bridges: bridges}
++}
++
++func newFake(masks map[string]uint16) *fakeBridges {
++	return &fakeBridges{
++		usable:  map[string]bool{nsLocal: true, nsPeer: true},
++		masks:   masks,
++		readErr: map[string]error{},
++		setErr:  map[string]error{},
++	}
++}
++
++func captureLog(t *testing.T) *bytes.Buffer {
++	t.Helper()
++	InitLogger()
++	var buf bytes.Buffer
++	old := mnetdLogger.Logger.Out
++	mnetdLogger.Logger.SetOutput(&buf)
++	t.Cleanup(func() { mnetdLogger.Logger.SetOutput(old) })
++	return &buf
++}
++
++func TestMaskZeroIsSetToLLDPOnly(t *testing.T) {
++	logs := captureLog(t)
++	f := newFake(map[string]uint16{nsLocal + "#k6t-abc": 0})
++	st := newMasker(f, vmTarget(nsLocal, "k6t-abc")).pass(context.Background())
++	if len(f.sets) != 1 || f.sets[0] != nsLocal+"#k6t-abc=0x4000" {
++		t.Fatalf("want exactly one set to 0x4000, got %v", f.sets)
++	}
++	if st.Changed != 1 || st.Failed != 0 {
++		t.Fatalf("stats = %+v", st)
++	}
++	// one info line per change: pod, bridge, old -> new
++	line := logs.String()
++	for _, want := range []string{"lab/vm1", "k6t-abc", "0x0000 -> 0x4000"} {
++		if !strings.Contains(line, want) {
++			t.Fatalf("change log line missing %q: %q", want, line)
++		}
++	}
++	if strings.Count(line, "LLDP mask:") != 1 {
++		t.Fatalf("want one log line, got %q", line)
++	}
++}
++
++func TestMaskAlreadyLLDPIsUntouchedAndSilent(t *testing.T) {
++	logs := captureLog(t)
++	f := newFake(map[string]uint16{nsLocal + "#k6t-abc": 0x4000})
++	m := newMasker(f, vmTarget(nsLocal, "k6t-abc"))
++	for i := 0; i < 3; i++ {
++		m.pass(context.Background())
++	}
++	if len(f.sets) != 0 {
++		t.Fatalf("a bridge at 0x4000 must not be written: %v", f.sets)
++	}
++	if logs.Len() != 0 {
++		t.Fatalf("a converged node must log nothing, got %q", logs.String())
++	}
++}
++
++// The agent's rule is "mask != 0x4000", not "mask == 0": another value is
++// replaced. Pinned here so a later "only when zero" change is deliberate.
++func TestMaskOtherNonZeroValueIsReplacedLikeTheAgent(t *testing.T) {
++	f := newFake(map[string]uint16{nsLocal + "#k6t-abc": 0x8000})
++	newMasker(f, vmTarget(nsLocal, "k6t-abc")).pass(context.Background())
++	if len(f.sets) != 1 || f.sets[0] != nsLocal+"#k6t-abc=0x4000" {
++		t.Fatalf("got %v", f.sets)
++	}
++}
++
++func TestMaskMissingBridgeIsSkipped(t *testing.T) {
++	f := newFake(map[string]uint16{}) // k6t-abc does not exist yet
++	st := newMasker(f, vmTarget(nsLocal, "k6t-abc")).pass(context.Background())
++	if len(f.sets) != 0 || st.Skipped != 1 || st.Failed != 0 {
++		t.Fatalf("sets=%v stats=%+v", f.sets, st)
++	}
++}
++
++func TestMaskUnusableNetnsIsSkippedWithoutTouchingIt(t *testing.T) {
++	f := newFake(map[string]uint16{"/gone#k6t-abc": 0})
++	st := newMasker(f, vmTarget("/gone", "k6t-abc")).pass(context.Background())
++	if len(f.reads) != 0 || len(f.sets) != 0 || st.Skipped != 1 {
++		t.Fatalf("reads=%v sets=%v stats=%+v", f.reads, f.sets, st)
++	}
++}
++
++func TestMaskOtherNodesPodsAreNotTouched(t *testing.T) {
++	f := newFake(map[string]uint16{nsLocal + "#k6t-abc": 0})
++	other := vmTarget(nsLocal, "k6t-abc")
++	other.SrcIP = "10.0.0.9"
++	newMasker(f, other).pass(context.Background())
++	if len(f.reads) != 0 || len(f.sets) != 0 {
++		t.Fatalf("reads=%v sets=%v", f.reads, f.sets)
++	}
++}
++
++func TestOnlyKubeVirtSlotsOfMeshnetLinksBecomeTargets(t *testing.T) {
++	tp := topo("vm1", "lab", "10.0.0.1", nsLocal, "c1",
++		topologyv1.Link{LocalIntf: "eth1", PeerIntf: "eth1", PeerPod: "a", UID: 1},           // plain container wire
++		topologyv1.Link{LocalIntf: "pod63c8fdd4323", PeerIntf: "eth2", PeerPod: "b", UID: 2}, // KubeVirt slot
++		topologyv1.Link{LocalIntf: "pod63c8fdd4323", PeerIntf: "eth3", PeerPod: "c", UID: 3}, // same slot twice
++		topologyv1.Link{LocalIntf: "pod", PeerIntf: "eth4", PeerPod: "d", UID: 4},            // bare "pod" is not a slot
++		topologyv1.Link{LocalIntf: "podX", PeerIntf: "", PeerPod: "localhost", UID: 5},       // host link
++		topologyv1.Link{LocalIntf: "br0", PeerIntf: "eth5", PeerPod: "e", UID: 6},            // a bridge that is not k6t
++	)
++	got, ok := targetFor(tp)
++	if !ok || len(got.Bridges) != 1 || got.Bridges[0] != "k6t-63c8fdd4323" {
++		t.Fatalf("targetFor = %+v ok=%v", got, ok)
++	}
++	plain := topo("c1", "lab", "10.0.0.1", nsLocal, "c1",
++		topologyv1.Link{LocalIntf: "eth1", PeerIntf: "eth1", PeerPod: "a", UID: 1})
++	if _, ok := targetFor(plain); ok {
++		t.Fatal("a pod with no KubeVirt slot must not be a mask target")
++	}
++
++	// and the pass asks about nothing but that bridge
++	f := newFake(map[string]uint16{nsLocal + "#k6t-63c8fdd4323": 0})
++	newMasker(f, got).pass(context.Background())
++	if len(f.reads) != 1 || !strings.HasSuffix(f.reads[0], "#k6t-63c8fdd4323") {
++		t.Fatalf("reads = %v", f.reads)
++	}
++}
++
++func TestMaskNetlinkErrorIsLoggedOnceNotFatal(t *testing.T) {
++	logs := captureLog(t)
++	f := newFake(map[string]uint16{nsLocal + "#k6t-bad": 0, nsLocal + "#k6t-good": 0})
++	f.setErr[nsLocal+"#k6t-bad"] = errors.New("operation not permitted")
++	m := newMasker(f, vmTarget(nsLocal, "k6t-bad", "k6t-good"))
++	st := m.pass(context.Background()) // must not panic, must still do k6t-good
++	if st.Failed != 1 || st.Changed != 1 {
++		t.Fatalf("stats = %+v", st)
++	}
++	if len(f.sets) != 1 || !strings.Contains(f.sets[0], "k6t-good") {
++		t.Fatalf("the healthy bridge must still be fixed: %v", f.sets)
++	}
++	m.pass(context.Background())
++	m.pass(context.Background())
++	if n := strings.Count(logs.String(), "operation not permitted"); n != 1 {
++		t.Fatalf("a persistent failure must be logged once, logged %d times: %q", n, logs.String())
++	}
++	// a read error is handled the same way
++	f.readErr[nsLocal+"#k6t-bad"] = errors.New("netlink: i/o error")
++	if st := m.pass(context.Background()); st.Failed != 1 {
++		t.Fatalf("read error stats = %+v", st)
++	}
++}
++
++func TestMaskNodeSourceFailureSkipsThePassAndKeepsLastGood(t *testing.T) {
++	logs := captureLog(t)
++	f := newFake(map[string]uint16{nsLocal + "#k6t-abc": 0})
++	m := newMasker(f, vmTarget(nsLocal, "k6t-abc"))
++	m.nodeIP = func(context.Context) (string, error) { return "", errors.New("api down") }
++	if st := m.pass(context.Background()); st.Checked != 0 || len(f.sets) != 0 {
++		t.Fatalf("no node identity: nothing may be touched, stats=%+v", st)
++	}
++	m.pass(context.Background())
++	if n := strings.Count(logs.String(), "api down"); n != 1 {
++		t.Fatalf("logged %d times", n)
++	}
++}
++
++func TestMaskNotSyncedCacheDoesNothing(t *testing.T) {
++	f := newFake(map[string]uint16{nsLocal + "#k6t-abc": 0})
++	m := newMasker(f, vmTarget(nsLocal, "k6t-abc"))
++	m.targets = func() ([]maskTarget, bool) { return []maskTarget{vmTarget(nsLocal, "k6t-abc")}, false }
++	m.pass(context.Background())
++	if len(f.sets) != 0 {
++		t.Fatalf("%v", f.sets)
++	}
++}
++
++// The full reconcile will not act on a wire until two passes agree; the mask
++// pass must not wait for that. Drive both against the same VM pod: the first
++// reconcile pass only counts "confirmation 1 of 2", and the mask is set anyway.
++func TestMaskRunsWhereTheReconcileConfirmationGateBlocks(t *testing.T) {
++	const slot = "pod63c8fdd4323"
++	const bridge = "k6t-63c8fdd4323"
++	rf := &fakeDeps{
++		usableNS:   map[string]bool{nsLocal: true, nsPeer: true},
++		vethHealth: map[string]koko.WireHealth{nsLocal + "/" + slot: koko.WireHealthBroken},
++	}
++	local := topo("vm1", "lab", "10.0.0.1", nsLocal, "c1",
++		topologyv1.Link{LocalIntf: slot, PeerIntf: "eth1", PeerPod: "sw1", UID: 7})
++	peer := topo("sw1", "lab", "10.0.0.1", nsPeer, "c2")
++	_, stats := runPod(t, rf, 2, local, peer)
++	if stats.Pending != 1 || stats.Repaired != 0 || len(rf.vethRepairs) != 0 {
++		t.Fatalf("precondition: the reconcile must still be gated: %+v", stats)
++	}
++
++	mt, ok := targetFor(local)
++	if !ok {
++		t.Fatal("VM pod must be a mask target")
++	}
++	f := newFake(map[string]uint16{nsLocal + "#" + bridge: 0})
++	newMasker(f, mt).pass(context.Background())
++	if len(f.sets) != 1 {
++		t.Fatalf("mask must be applied on the first pass regardless of the reconcile gate: %v", f.sets)
++	}
++}
++
++func TestMaskLoopIsDisabledByIntervalZeroAndIndependentOfGRPCMode(t *testing.T) {
++	InitLogger()
++	t.Setenv("MESHNET_LLDP_MASK_INTERVAL", "0")
++	// A nil tClient would panic if the loop tried to start.
++	(&Meshnet{}).StartLLDPMaskLoop(context.Background())
++	if lldpMaskInterval() != 0 {
++		t.Fatal("interval 0 must read as disabled")
++	}
++
++	t.Setenv("MESHNET_LLDP_MASK_INTERVAL", "")
++	if got := lldpMaskInterval(); got != 15*time.Second {
++		t.Fatalf("default interval = %s", got)
++	}
++	t.Setenv("MESHNET_LLDP_MASK_INTERVAL", "30")
++	if got := lldpMaskInterval(); got != 30*time.Second {
++		t.Fatalf("env interval = %s", got)
++	}
++	t.Setenv("MESHNET_LLDP_MASK_INTERVAL", "garbage")
++	if got := lldpMaskInterval(); got != 15*time.Second {
++		t.Fatalf("invalid interval must fall back to the default, got %s", got)
++	}
++
++	// The wire reconciler refuses GRPC mode; the mask loop must not read that
++	// variable at all: with GRPC set and the loop enabled it starts (and so
++	// dereferences the client) where the reconciler returns early.
++	t.Setenv("INTER_NODE_LINK_TYPE", "GRPC")
++	t.Setenv("MESHNET_LLDP_MASK_INTERVAL", "15")
++	defer func() {
++		if recover() == nil {
++			t.Fatal("expected the mask loop to start in GRPC mode (it dereferenced the nil client)")
++		}
++	}()
++	(&Meshnet{}).StartLLDPMaskLoop(context.Background())
++}
++
++// ---------------------------------------------------------------------------
++// The Topology cache: one list, then events.
++// ---------------------------------------------------------------------------
++
++type fakeWatcher struct {
++	mu       sync.Mutex
++	lists    int
++	watches  []string // resourceVersion of each Watch call
++	listRV   string
++	items    []topologyv1.Topology
++	streams  chan *watch.FakeWatcher
++	watchErr error
++}
++
++func (f *fakeWatcher) List(context.Context, metav1.ListOptions) (*topologyv1.TopologyList, error) {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	f.lists++
++	l := &topologyv1.TopologyList{Items: append([]topologyv1.Topology(nil), f.items...)}
++	l.SetResourceVersion(f.listRV)
++	return l, nil
++}
++
++func (f *fakeWatcher) Watch(_ context.Context, o metav1.ListOptions) (watch.Interface, error) {
++	f.mu.Lock()
++	f.watches = append(f.watches, o.ResourceVersion)
++	err := f.watchErr
++	f.mu.Unlock()
++	if err != nil {
++		return nil, err
++	}
++	return <-f.streams, nil
++}
++
++func (f *fakeWatcher) counts() (int, []string) {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	return f.lists, append([]string(nil), f.watches...)
++}
++
++func vmTopo(name, rv string) *topologyv1.Topology {
++	tp := topo(name, "lab", "10.0.0.1", nsLocal, "c", topologyv1.Link{LocalIntf: "podabc", PeerIntf: "eth1", PeerPod: "x", UID: 1})
++	tp.SetResourceVersion(rv)
++	return tp
++}
++
++func waitFor(t *testing.T, what string, cond func() bool) {
++	t.Helper()
++	deadline := time.Now().Add(3 * time.Second)
++	for time.Now().Before(deadline) {
++		if cond() {
++			return
++		}
++		time.Sleep(5 * time.Millisecond)
++	}
++	t.Fatalf("timed out waiting for %s", what)
++}
++
++func TestCacheListsOnceThenFollowsWatchEvents(t *testing.T) {
++	InitLogger()
++	w1, w2 := watch.NewFake(), watch.NewFake()
++	src := &fakeWatcher{listRV: "10", items: []topologyv1.Topology{*vmTopo("vm1", "9")}, streams: make(chan *watch.FakeWatcher, 2)}
++	src.streams <- w1
++	src.streams <- w2
++	c := newMaskCache(src)
++	c.backoff = time.Millisecond
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	go c.run(ctx)
++
++	names := func() []string {
++		ts, _ := c.snapshot()
++		var n []string
++		for _, x := range ts {
++			n = append(n, x.Name)
++		}
++		return n
++	}
++	waitFor(t, "initial list", func() bool { return len(names()) == 1 })
++
++	w1.Add(vmTopo("vm2", "11"))
++	waitFor(t, "added vm2", func() bool { return len(names()) == 2 })
++	// a Modified event that removes the KubeVirt slot drops the target
++	plain := topo("vm2", "lab", "10.0.0.1", nsLocal, "c", topologyv1.Link{LocalIntf: "eth1", PeerIntf: "eth1", PeerPod: "x", UID: 1})
++	plain.SetResourceVersion("12")
++	w1.Modify(plain)
++	waitFor(t, "vm2 no longer a slot", func() bool { return len(names()) == 1 })
++	w1.Delete(vmTopo("vm1", "13"))
++	waitFor(t, "vm1 deleted", func() bool { return len(names()) == 0 })
++
++	// the server ends the watch: it is resumed from the LAST resourceVersion,
++	// not relisted.
++	w1.Stop()
++	waitFor(t, "second watch", func() bool { _, w := src.counts(); return len(w) == 2 })
++	lists, watches := src.counts()
++	if lists != 1 || watches[0] != "10" || watches[1] != "13" {
++		t.Fatalf("lists=%d watches=%v (want 1 list, watch from 10 then resumed from 13)", lists, watches)
++	}
++	w2.Add(vmTopo("vm3", "14"))
++	waitFor(t, "event on resumed watch", func() bool { return len(names()) == 1 })
++}
++
++func TestCacheRelistsAfterAWatchError(t *testing.T) {
++	InitLogger()
++	w1, w2 := watch.NewFake(), watch.NewFake()
++	src := &fakeWatcher{listRV: "1", streams: make(chan *watch.FakeWatcher, 2)}
++	src.streams <- w1
++	src.streams <- w2
++	c := newMaskCache(src)
++	c.backoff = time.Millisecond
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	go c.run(ctx)
++	waitFor(t, "first watch", func() bool { _, w := src.counts(); return len(w) == 1 })
++	w1.Error(&metav1.Status{Status: metav1.StatusFailure, Reason: metav1.StatusReasonExpired, Code: 410})
++	waitFor(t, "relist", func() bool { l, _ := src.counts(); return l == 2 })
++	if _, ok := c.snapshot(); !ok {
++		t.Fatal("cache must stay synced")
++	}
++}
++
++func TestToTopologyDecodesUnstructuredWatchObjects(t *testing.T) {
++	tp := vmTopo("vm1", "5")
++	u, err := runtime.DefaultUnstructuredConverter.ToUnstructured(tp)
++	if err != nil {
++		t.Fatal(err)
++	}
++	got, err := toTopology(&unstructured.Unstructured{Object: u})
++	if err != nil || got.GetName() != "vm1" || len(got.Spec.Links) != 1 {
++		t.Fatalf("got %+v err=%v", got, err)
++	}
++}
++
++// ---------------------------------------------------------------------------
++// Netlink encoding/decoding, and the real thing when this process may.
++// ---------------------------------------------------------------------------
++
++func buildLinkMsg(kind string, mask *uint16) []byte {
++	m := nl.NewIfInfomsg(unix.AF_UNSPEC)
++	m.Index = 42
++	li := nl.NewRtAttr(unix.IFLA_LINKINFO, nil)
++	nl.NewRtAttrChild(li, nl.IFLA_INFO_KIND, nl.NonZeroTerminated(kind))
++	if mask != nil {
++		d := nl.NewRtAttrChild(li, nl.IFLA_INFO_DATA, nil)
++		nl.NewRtAttrChild(d, nl.IFLA_BR_GROUP_FWD_MASK, nl.Uint16Attr(*mask))
++	}
++	return append(m.Serialize(), li.Serialize()...)
++}
++
++func TestParseBridgeGroupFwdMask(t *testing.T) {
++	m := uint16(0x4000)
++	idx, got, found, err := parseBridgeGroupFwdMask(buildLinkMsg("bridge", &m))
++	if err != nil || !found || got != 0x4000 || idx != 42 {
++		t.Fatalf("idx=%d mask=%#x found=%v err=%v", idx, got, found, err)
++	}
++	if _, got, found, _ := parseBridgeGroupFwdMask(buildLinkMsg("bridge", nil)); !found || got != 0 {
++		t.Fatalf("a bridge without the attribute reads as 0: %#x %v", got, found)
++	}
++	// anything that is not a bridge is never reported as one
++	if _, _, found, _ := parseBridgeGroupFwdMask(buildLinkMsg("dummy", nil)); found {
++		t.Fatal("a dummy must not be treated as a bridge")
++	}
++	if _, _, _, err := parseBridgeGroupFwdMask([]byte{1, 2, 3}); err == nil {
++		t.Fatal("a short message must be an error")
++	}
++}
++
++// TestRealBridgeMaskRoundTrip drives the hand-built netlink messages against
++// the kernel. It needs CAP_NET_ADMIN in the current netns, so it skips unless
++// it has it; run it unprivileged with: unshare -Urn go test -run RealBridge
++func TestRealBridgeMaskRoundTrip(t *testing.T) {
++	if os.Getenv("MESHNET_REAL_NETLINK_TEST") != "1" {
++		t.Skip("set MESHNET_REAL_NETLINK_TEST=1 and run under `unshare -Urn` (needs CAP_NET_ADMIN)")
++	}
++	const self = "/proc/self/ns/net"
++	netNS, err := ns.GetNS(self)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer netNS.Close()
++	if err := netNS.Do(func(ns.NetNS) error {
++		if err := netlink.LinkAdd(&netlink.Bridge{LinkAttrs: netlink.LinkAttrs{Name: "k6t-test"}}); err != nil {
++			return err
++		}
++		return netlink.LinkAdd(&netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "podtest"}})
++	}); err != nil {
++		t.Skipf("cannot create links here (%v): not run", err)
++	}
++
++	mask, found, err := readBridgeGroupFwdMask(self, "k6t-test")
++	if err != nil || !found || mask != 0 {
++		t.Fatalf("fresh bridge: mask=%#x found=%v err=%v", mask, found, err)
++	}
++	if err := writeBridgeGroupFwdMask(self, "k6t-test", 0x4000); err != nil {
++		t.Fatal(err)
++	}
++	if mask, _, _ = readBridgeGroupFwdMask(self, "k6t-test"); mask != 0x4000 {
++		t.Fatalf("after set: %#x", mask)
++	}
++	// iproute2 is the independent witness, if present
++	if out, err := exec.Command("ip", "-d", "link", "show", "k6t-test").CombinedOutput(); err == nil {
++		if !strings.Contains(string(out), "group_fwd_mask 0x4000") {
++			t.Fatalf("ip does not see the mask: %s", out)
++		}
++	}
++	if _, found, err := readBridgeGroupFwdMask(self, "podtest"); err != nil || found {
++		t.Fatalf("a dummy is not a bridge: found=%v err=%v", found, err)
++	}
++	if _, found, err := readBridgeGroupFwdMask(self, "k6t-nope"); err != nil || found {
++		t.Fatalf("a missing link is not an error: found=%v err=%v", found, err)
++	}
++	if err := writeBridgeGroupFwdMask(self, "k6t-nope", 0x4000); err == nil {
++		t.Fatal("setting a missing bridge must fail")
++	}
++}
+-- 
+2.56.1
+
