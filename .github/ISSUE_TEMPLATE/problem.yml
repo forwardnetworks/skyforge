@@ -1,0 +1,29 @@
+name: Something does not work
+description: A patch series does not apply, a blueprint does not compile or boot, or the install guide is wrong
+labels: []
+body:
+  - type: dropdown
+    id: area
+    attributes:
+      label: What is it about?
+      options: [A patch series, A blueprint, INSTALL.md, Something else]
+    validations:
+      required: true
+  - type: input
+    id: which
+    attributes:
+      label: Which series, blueprint or section?
+      placeholder: "netlab, or components/blueprints/netlab/EVPN/ebgp, or INSTALL.md step 3"
+    validations:
+      required: true
+  - type: textarea
+    id: ran
+    attributes:
+      label: What you ran, and what happened
+      description: The exact command and its output. For a patch series, the pin from UPSTREAM.md you applied it to.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
