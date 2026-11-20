@@ -1,0 +1,217 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 05:56:10 -0600
+Subject: [PATCH] kubevirt: NX-OS 10.6+ NICs sit on pcie.0 (explicit
+ pciAddress)
+
+---
+diff --git a/topo/node/kubevirt.go b/topo/node/kubevirt.go
+index 5b6c6e3..3f16c2d 100644
+--- a/topo/node/kubevirt.go
++++ b/topo/node/kubevirt.go
+@@ -1372,12 +1372,26 @@ func kubeVirtInterfaces(namespace string, proto *tpb.Node) []any {
+ 		defaultInterface["model"] = model
+ 	}
+ 
++	// NX-OS 10.6+ cannot drive a NIC that sits behind the KubeVirt pcie-pci-bridge.
++	// Default (nil) for every other model and every older nxos image: byte-identical
++	// to what was rendered before kubeVirtNxosRootComplexAddresses existed.
++	var rootComplex []string
++	if kubeVirtIsNxos(proto.Model) {
++		rootComplex = kubeVirtNxosRootComplexAddresses(proto.GetConfig().GetImage(), len(kubeVirtDataInterfaces(proto)))
++	}
++	if len(rootComplex) > 0 {
++		defaultInterface["pciAddress"] = rootComplex[0]
++	}
++
+ 	interfaces := []any{defaultInterface}
+-	for _, name := range kubeVirtDataInterfaces(proto) {
++	for i, name := range kubeVirtDataInterfaces(proto) {
+ 		dataInterface := map[string]any{
+ 			"name":   name,
+ 			"bridge": map[string]any{},
+ 		}
++		if len(rootComplex) > i+1 {
++			dataInterface["pciAddress"] = rootComplex[i+1]
++		}
+ 		if model := kubeVirtInterfaceModel(proto.Model); model != "" {
+ 			dataInterface["model"] = model
+ 		}
+@@ -1951,6 +1965,80 @@ func kubeVirtF5SlotIdentityFromNode(proto *tpb.Node) (kubeVirtF5SlotIdentity, er
+ 	return identity, nil
+ }
+ 
++// kubeVirtNxosRootComplexMinVersion is the first NX-OS release that needs its
++// NICs on the PCIe root complex (pcie.0). PLATFORM-SPECIFIC.
++//
++// Measured 2026-11-18 on the transplanted 10.6(4) image (q35, e1000): with the
++// NICs behind the pcie-pci-bridge KubeVirt adds by default, the guest kernel
++// logs "pci 0000:01:00.0: Unable to change power state from D3cold to D0", the
++// e1000 reads an empty EEPROM ("Invalid MAC Address", "Hardware Error") and
++// mgmt0 plus every data port stay dead. With pciAddress 0000:00:03.0 (mgmt) and
++// 0000:00:04.0 (first data NIC) on pcie.0 the NICs probe and traffic flows.
++// 9.3.8 boots and passes traffic behind the bridge, so it keeps that layout.
++const (
++	kubeVirtNxosRootComplexMajor = 10
++	kubeVirtNxosRootComplexMinor = 6
++	// pcie.0 slots 0x03..0x1d: slot 0 is the host bridge, 1 and 2 are taken by
++	// KubeVirt's VGA/other defaults, 0x1f is the ICH9 LPC/SATA/SMBus multifunction
++	// device the sata disks hang off. Management takes 0x03, data NICs 0x04...
++	kubeVirtNxosRootComplexFirstSlot = 0x03
++	kubeVirtNxosRootComplexLastSlot  = 0x1d
++)
++
++// kubeVirtNxosImageVersion extracts "major.minor" from an nxos image reference
++// ("...:10.6.4", "...:10.6.4-transplant-r1@sha256:..."). ok is false for a
++// reference with no parseable tag (digest-only, untagged): those keep the
++// default layout.
++func kubeVirtNxosImageVersion(image string) (major, minor int, ok bool) {
++	tag := strings.TrimSpace(image)
++	if idx := strings.Index(tag, "@"); idx >= 0 {
++		tag = tag[:idx]
++	}
++	idx := strings.LastIndex(tag, ":")
++	if idx < 0 || strings.Contains(tag[idx+1:], "/") {
++		return 0, 0, false
++	}
++	parts := strings.SplitN(tag[idx+1:], ".", 3)
++	if len(parts) < 2 {
++		return 0, 0, false
++	}
++	major, err := strconv.Atoi(parts[0])
++	if err != nil {
++		return 0, 0, false
++	}
++	minorDigits := parts[1]
++	if cut := strings.IndexFunc(minorDigits, func(r rune) bool { return r < '0' || r > '9' }); cut >= 0 {
++		minorDigits = minorDigits[:cut]
++	}
++	minor, err = strconv.Atoi(minorDigits)
++	if err != nil {
++		return 0, 0, false
++	}
++	return major, minor, true
++}
++
++// kubeVirtNxosRootComplexAddresses returns the explicit pciAddress for the
++// management NIC (index 0) followed by dataCount data NICs, or nil when the
++// image is not NX-OS 10.6 or newer. A node with more data NICs than free
++// root-complex slots gets addresses for as many as fit (the rest keep the
++// default placement); that case is not proven on 10.6.
++func kubeVirtNxosRootComplexAddresses(image string, dataCount int) []string {
++	major, minor, ok := kubeVirtNxosImageVersion(image)
++	if !ok || major < kubeVirtNxosRootComplexMajor ||
++		(major == kubeVirtNxosRootComplexMajor && minor < kubeVirtNxosRootComplexMinor) {
++		return nil
++	}
++	total := dataCount + 1
++	if max := kubeVirtNxosRootComplexLastSlot - kubeVirtNxosRootComplexFirstSlot + 1; total > max {
++		total = max
++	}
++	out := make([]string, 0, total)
++	for i := 0; i < total; i++ {
++		out = append(out, fmt.Sprintf("0000:00:%02x.0", kubeVirtNxosRootComplexFirstSlot+i))
++	}
++	return out
++}
++
+ func kubeVirtIsNxos(model string) bool {
+ 	return strings.EqualFold(strings.TrimSpace(model), "nxos")
+ }
+diff --git a/topo/node/kubevirt_nxos_pci_test.go b/topo/node/kubevirt_nxos_pci_test.go
+new file mode 100644
+index 0000000..ee61789
+--- /dev/null
++++ b/topo/node/kubevirt_nxos_pci_test.go
+@@ -0,0 +1,88 @@
++package node
++
++import (
++	"fmt"
++	"testing"
++
++	topopb "github.com/openconfig/kne/proto/topo"
++)
++
++func nxosInterfacesFor(image string, dataNICs int) []any {
++	ifs := map[string]*topopb.Interface{}
++	for i := 1; i <= dataNICs; i++ {
++		name := fmt.Sprintf("eth%d", i)
++		ifs[name] = &topopb.Interface{Name: fmt.Sprintf("Ethernet1/%d", i), IntName: name}
++	}
++	return kubeVirtInterfaces("test", &topopb.Node{
++		Name: "sw1", Vendor: topopb.Vendor_CISCO, Model: "nxos",
++		Config: &topopb.Config{Image: image}, Interfaces: ifs,
++	})
++}
++
++// NX-OS 10.6 needs its NICs on pcie.0 (measured 2026-11-18: behind the
++// pcie-pci-bridge the guest cannot power the bridge up and every NIC is dead).
++// Older images keep the default placement: no pciAddress at all.
++func TestKubeVirtNxosPciAddressOnlyForRelease106AndNewer(t *testing.T) {
++	const repo = "registry.example.com/skyforge/kubevirt/nxos"
++	cases := []struct {
++		image   string
++		wantPCI bool
++	}{
++		{repo + ":9.3.8", false},
++		{repo + ":9.3.8@sha256:01ba98b058d74fa981e04e9b74c7f4adad0e06a498d8e18e3f80aa886c5ce121", false},
++		{repo + ":9.3.10", false},
++		{repo + ":10.5.3", false},
++		{repo, false},
++		{repo + "@sha256:b41bd0e3dc6068631800d08012908a439fee376c3c58f4d5c829354f165f875e", false},
++		{"localhost:5000/nxos", false},
++		{repo + ":10.6.4", true},
++		{repo + ":10.6.4-transplant-r1@sha256:b41bd0e3dc6068631800d08012908a439fee376c3c58f4d5c829354f165f875e", true},
++		{repo + ":10.6", true},
++		{repo + ":10.7.1", true},
++		{repo + ":11.0.1", true},
++	}
++	for _, tc := range cases {
++		for _, ifs := range nxosInterfacesFor(tc.image, 2) {
++			_, has := ifs.(map[string]any)["pciAddress"]
++			if has != tc.wantPCI {
++				t.Errorf("image %q interface %v: pciAddress present=%v, want %v", tc.image, ifs.(map[string]any)["name"], has, tc.wantPCI)
++			}
++		}
++	}
++}
++
++func TestKubeVirtNxos106PciAddressesAreUniqueAndOrdered(t *testing.T) {
++	got := nxosInterfacesFor("x/nxos:10.6.4", 3)
++	want := []string{"0000:00:03.0", "0000:00:04.0", "0000:00:05.0", "0000:00:06.0"}
++	if len(got) != len(want) {
++		t.Fatalf("got %d interfaces, want %d", len(got), len(want))
++	}
++	for i, w := range want {
++		if g := got[i].(map[string]any)["pciAddress"]; g != w {
++			t.Errorf("interface %d pciAddress = %v, want %s", i, g, w)
++		}
++	}
++	// More NICs than root-complex slots: addresses stay unique and in range.
++	seen := map[string]bool{}
++	for _, a := range kubeVirtNxosRootComplexAddresses("x/nxos:10.6.4", 100) {
++		if seen[a] {
++			t.Fatalf("duplicate pciAddress %s", a)
++		}
++		seen[a] = true
++	}
++	if len(seen) != 27 {
++		t.Errorf("got %d addresses for 100 data NICs, want 27 (slots 0x03..0x1d)", len(seen))
++	}
++}
++
++// Other models never get a pciAddress from this code.
++func TestKubeVirtNonNxosGetsNoPciAddress(t *testing.T) {
++	for _, ifs := range kubeVirtInterfaces("test", &topopb.Node{
++		Name: "n1", Model: "panos", Config: &topopb.Config{Image: "x/panos:10.6.4"},
++		Interfaces: map[string]*topopb.Interface{"eth1": {IntName: "eth1"}},
++	}) {
++		if _, has := ifs.(map[string]any)["pciAddress"]; has {
++			t.Errorf("non-nxos interface %v has pciAddress", ifs.(map[string]any)["name"])
++		}
++	}
++}
+-- 
+2.56.1
+

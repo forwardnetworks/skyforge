@@ -1,0 +1,639 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 09:23:52 -0600
+Subject: [PATCH] kubevirt: Huawei VRP VMs (CE12800, NE40V): checksum-off hook,
+ NIC placeholder, HUAWEI vendor
+
+---
+diff --git a/proto/topo.proto b/proto/topo.proto
+index 352272c..3dd80c4 100644
+--- a/proto/topo.proto
++++ b/proto/topo.proto
+@@ -80,6 +80,8 @@ enum Vendor {
+   VERSA = 22;
+   // F5 is 21 in patch 0022 on the old base. Renumbered to 23 after PALOALTO took 21.
+   F5 = 23;
++  // PLATFORM-SPECIFIC: Huawei VRP VMs (CE12800, NE40E), see patch 0085.
++  HUAWEI = 24;
+ }
+ 
+ // Node is a single container inside the topology
+diff --git a/proto/topo/topo.pb.go b/proto/topo/topo.pb.go
+index 90901f3..3e9a04d 100644
+--- a/proto/topo/topo.pb.go
++++ b/proto/topo/topo.pb.go
+@@ -66,6 +66,8 @@ const (
+ 	Vendor_VERSA    Vendor = 22
+ 	// F5 is 21 in patch 0022 on the old base. Renumbered to 23 after PALOALTO took 21.
+ 	Vendor_F5 Vendor = 23
++	// PLATFORM-SPECIFIC: Huawei VRP VMs (CE12800, NE40E), see patch 0085.
++	Vendor_HUAWEI Vendor = 24
+ )
+ 
+ // Enum value maps for Vendor.
+@@ -95,6 +97,7 @@ var (
+ 		21: "PALOALTO",
+ 		22: "VERSA",
+ 		23: "F5",
++		24: "HUAWEI",
+ 	}
+ 	Vendor_value = map[string]int32{
+ 		"UNKNOWN":          0,
+@@ -121,6 +124,7 @@ var (
+ 		"PALOALTO":         21,
+ 		"VERSA":            22,
+ 		"F5":               23,
++		"HUAWEI":           24,
+ 	}
+ )
+ 
+@@ -1898,7 +1902,7 @@ var file_topo_proto_rawDesc = []byte{
+ 	0x4e, 0x4f, 0x57, 0x4e, 0x10, 0x00, 0x12, 0x11, 0x0a, 0x0d, 0x4c, 0x4f, 0x41, 0x44, 0x5f, 0x42,
+ 	0x41, 0x4c, 0x41, 0x4e, 0x43, 0x45, 0x52, 0x10, 0x01, 0x12, 0x0d, 0x0a, 0x09, 0x4e, 0x4f, 0x44,
+ 	0x45, 0x5f, 0x50, 0x4f, 0x52, 0x54, 0x10, 0x02, 0x12, 0x0e, 0x0a, 0x0a, 0x43, 0x4c, 0x55, 0x53,
+-	0x54, 0x45, 0x52, 0x5f, 0x49, 0x50, 0x10, 0x03, 0x2a, 0xad, 0x02, 0x0a, 0x06, 0x56, 0x65, 0x6e,
++	0x54, 0x45, 0x52, 0x5f, 0x49, 0x50, 0x10, 0x03, 0x2a, 0xb9, 0x02, 0x0a, 0x06, 0x56, 0x65, 0x6e,
+ 	0x64, 0x6f, 0x72, 0x12, 0x0b, 0x0a, 0x07, 0x55, 0x4e, 0x4b, 0x4e, 0x4f, 0x57, 0x4e, 0x10, 0x00,
+ 	0x12, 0x08, 0x0a, 0x04, 0x48, 0x4f, 0x53, 0x54, 0x10, 0x01, 0x12, 0x0a, 0x0a, 0x06, 0x41, 0x52,
+ 	0x49, 0x53, 0x54, 0x41, 0x10, 0x02, 0x12, 0x09, 0x0a, 0x05, 0x43, 0x49, 0x53, 0x43, 0x4f, 0x10,
+@@ -1917,10 +1921,11 @@ var file_topo_proto_rawDesc = []byte{
+ 	0x08, 0x0a, 0x04, 0x44, 0x45, 0x4c, 0x4c, 0x10, 0x13, 0x12, 0x0c, 0x0a, 0x08, 0x46, 0x4f, 0x52,
+ 	0x54, 0x49, 0x4e, 0x45, 0x54, 0x10, 0x14, 0x12, 0x0c, 0x0a, 0x08, 0x50, 0x41, 0x4c, 0x4f, 0x41,
+ 	0x4c, 0x54, 0x4f, 0x10, 0x15, 0x12, 0x09, 0x0a, 0x05, 0x56, 0x45, 0x52, 0x53, 0x41, 0x10, 0x16,
+-	0x12, 0x06, 0x0a, 0x02, 0x46, 0x35, 0x10, 0x17, 0x42, 0x26, 0x5a, 0x24, 0x67, 0x69, 0x74, 0x68,
+-	0x75, 0x62, 0x2e, 0x63, 0x6f, 0x6d, 0x2f, 0x6f, 0x70, 0x65, 0x6e, 0x63, 0x6f, 0x6e, 0x66, 0x69,
+-	0x67, 0x2f, 0x6b, 0x6e, 0x65, 0x2f, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x2f, 0x74, 0x6f, 0x70, 0x6f,
+-	0x62, 0x06, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x33,
++	0x12, 0x06, 0x0a, 0x02, 0x46, 0x35, 0x10, 0x17, 0x12, 0x0a, 0x0a, 0x06, 0x48, 0x55, 0x41, 0x57,
++	0x45, 0x49, 0x10, 0x18, 0x42, 0x26, 0x5a, 0x24, 0x67, 0x69, 0x74, 0x68, 0x75, 0x62, 0x2e, 0x63,
++	0x6f, 0x6d, 0x2f, 0x6f, 0x70, 0x65, 0x6e, 0x63, 0x6f, 0x6e, 0x66, 0x69, 0x67, 0x2f, 0x6b, 0x6e,
++	0x65, 0x2f, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x2f, 0x74, 0x6f, 0x70, 0x6f, 0x62, 0x06, 0x70, 0x72,
++	0x6f, 0x74, 0x6f, 0x33,
+ }
+ 
+ var (
+diff --git a/proto/topo/vendor_enum_test.go b/proto/topo/vendor_enum_test.go
+index 71ac5ed..44b3da3 100644
+--- a/proto/topo/vendor_enum_test.go
++++ b/proto/topo/vendor_enum_test.go
+@@ -34,6 +34,7 @@ func TestVendorEnumNumbersArePinned(t *testing.T) {
+ 		"PALOALTO":         21,
+ 		"VERSA":            22,
+ 		"F5":               23,
++		"HUAWEI":           24,
+ 	}
+ 	if len(Vendor_value) != len(want) {
+ 		t.Errorf("Vendor has %d values, want %d", len(Vendor_value), len(want))
+diff --git a/topo/node/forward/forward.go b/topo/node/forward/forward.go
+index 21d0d06..8d260b4 100644
+--- a/topo/node/forward/forward.go
++++ b/topo/node/forward/forward.go
+@@ -61,6 +61,17 @@ var (
+ 		Memory: "8Gi",
+ 	}
+ 
++	// Huawei VRP VMs (patch 0085): the sizes the images were measured at.
++	defaultHuaweiCE12800Constraints = node.Constraints{
++		CPU:    "4000m",
++		Memory: "4Gi",
++	}
++
++	defaultHuaweiNE40VConstraints = node.Constraints{
++		CPU:    "2000m",
++		Memory: "4Gi",
++	}
++
+ 	defaultF5Constraints = node.Constraints{
+ 		CPU:    "4000m",
+ 		Memory: "12Gi",
+@@ -437,6 +448,21 @@ func defaults(pb *tpb.Node) *tpb.Node {
+ 			pb.Constraints["memory"] = defaultPanosConstraints.Memory
+ 		}
+ 		ensureSNMPService(pb)
++	case "ce12800", "ne40v":
++		huawei := defaultHuaweiCE12800Constraints
++		if pb.Model == "ne40v" {
++			huawei = defaultHuaweiNE40VConstraints
++		}
++		if pb.Constraints == nil {
++			pb.Constraints = map[string]string{}
++		}
++		if pb.Constraints["cpu"] == "" {
++			pb.Constraints["cpu"] = huawei.CPU
++		}
++		if pb.Constraints["memory"] == "" {
++			pb.Constraints["memory"] = huawei.Memory
++		}
++		ensureSNMPService(pb)
+ 	case "f5-bigip":
+ 		if pb.Constraints == nil {
+ 			pb.Constraints = map[string]string{}
+@@ -496,5 +522,6 @@ func init() {
+ 	node.Vendor(tpb.Vendor_DELL, New)
+ 	node.Vendor(tpb.Vendor_F5, New)
+ 	node.Vendor(tpb.Vendor_FORTINET, New)
++	node.Vendor(tpb.Vendor_HUAWEI, New)
+ 	node.Vendor(tpb.Vendor_PALOALTO, New)
+ }
+diff --git a/topo/node/kubevirt.go b/topo/node/kubevirt.go
+index 3f16c2d..f80c056 100644
+--- a/topo/node/kubevirt.go
++++ b/topo/node/kubevirt.go
+@@ -176,6 +176,7 @@ var kubeVirtSupportedVMModelsByVendor = map[tpb.Vendor]map[string]struct{}{
+ 	tpb.Vendor_DELL:     {"dellos10": {}},
+ 	tpb.Vendor_F5:       {"f5-bigip": {}},
+ 	tpb.Vendor_FORTINET: {"fortios": {}},
++	tpb.Vendor_HUAWEI:   {"ce12800": {}, "ne40v": {}},
+ 	tpb.Vendor_JUNIPER:  {"vjunos-router": {}, "vjunos-switch": {}, "vsrx": {}},
+ 	tpb.Vendor_NOKIA:    {"sros": {}},
+ 	tpb.Vendor_PALOALTO: {"panos": {}},
+@@ -753,6 +754,54 @@ var kubeVirtHardwareProfiles = map[string]kubeVirtHardwareProfile{
+ 			Path: "/disk/disk.qcow2",
+ 		}},
+ 	},
++	// Huawei VRP VMs (CE12800 switch, NE40E router). PLATFORM-SPECIFIC, patch 0085.
++	//
++	// Three measured facts shape this profile (2026-11-19, V200R005C10 CE12800 and
++	// V800R011C00 NE40E on node-a):
++	//  1. SSH never reached VRP over a plain virtio NIC: the host hands the guest TCP
++	//     segments CHECKSUM_PARTIAL and VRP's TCP stack drops them (tcpdump on tap0 shows
++	//     the SYN with an incomplete checksum; `display tcp statistics` stays 0 while the
++	//     interface Input counter rises). `ethtool -K tap0 tx off` fixes it, and so does
++	//     the libvirt <driver><guest csum='off' .../> setting the hook below applies.
++	//     e1000 is NOT an alternative: the guest never transmits on it.
++	//  2. NIC index 1 (the first NIC after the masquerade management NIC) is a
++	//     placeholder VRP never maps to a port (vrnetlab's "required dummy"). The first
++	//     data port (CE GE1/0/0, NE Ethernet1/0/0) is NIC index 2. See
++	//     kubeVirtHuaweiNICSlots.
++	//  3. q35 + host-passthrough + virtio on every NIC boots both images.
++	"ce12800": {
++		CPUModel:           "host-passthrough",
++		InterfaceModel:     "virtio",
++		MachineType:        "q35",
++		BootstrapTransport: "image-owned",
++		IdentityInputs:     []string{"model"},
++		ReadinessProbes:    []string{"ssh"},
++		// 4 vCPU / 4Gi: the size the image was measured at (~340m CPU, 1.67Gi idle).
++		MinimumCPU:          4,
++		MinimumMemory:       "4Gi",
++		ConfigApplyRequires: []string{"VMReady", "ManagementReady"},
++		ContainerDisks: []kubeVirtContainerDiskSpec{{
++			Name: "containerdisk",
++			Bus:  "virtio",
++			Path: "",
++		}},
++	},
++	"ne40v": {
++		CPUModel:            "host-passthrough",
++		InterfaceModel:      "virtio",
++		MachineType:         "q35",
++		BootstrapTransport:  "image-owned",
++		IdentityInputs:      []string{"model"},
++		ReadinessProbes:     []string{"ssh"},
++		MinimumCPU:          2,
++		MinimumMemory:       "4Gi",
++		ConfigApplyRequires: []string{"VMReady", "ManagementReady"},
++		ContainerDisks: []kubeVirtContainerDiskSpec{{
++			Name: "containerdisk",
++			Bus:  "virtio",
++			Path: "",
++		}},
++	},
+ 	"nxos": {
+ 		InterfaceModel:     "e1000",
+ 		BootstrapTransport: "config-drive",
+@@ -1384,6 +1433,9 @@ func kubeVirtInterfaces(namespace string, proto *tpb.Node) []any {
+ 	}
+ 
+ 	interfaces := []any{defaultInterface}
++	if kubeVirtIsHuaweiVRP(proto.Model) {
++		return kubeVirtHuaweiInterfaces(proto, interfaces)
++	}
+ 	for i, name := range kubeVirtDataInterfaces(proto) {
+ 		dataInterface := map[string]any{
+ 			"name":   name,
+@@ -1540,6 +1592,9 @@ func kubeVirtNetworks(proto *tpb.Node) []any {
+ 			"pod":  map[string]any{},
+ 		},
+ 	}
++	if kubeVirtIsHuaweiVRP(proto.Model) {
++		return kubeVirtHuaweiNetworks(proto, networks)
++	}
+ 	for _, name := range kubeVirtDataInterfaces(proto) {
+ 		networks = append(networks, map[string]any{
+ 			"name": name,
+@@ -3363,6 +3418,8 @@ func kubeVirtSMBIOSHookConfigMapNameForModel(nodeName, model string) (string, bo
+ 		return kubeVirtSrosSMBIOSHookConfigMapName(nodeName), true
+ 	case kubeVirtVJunosNeedsVMXSMBIOS(model):
+ 		return kubeVirtVJunosSMBIOSHookConfigMapName(nodeName), true
++	case kubeVirtIsHuaweiVRP(model):
++		return kubeVirtHuaweiNICHookConfigMapName(nodeName), true
+ 	}
+ 	return "", false
+ }
+@@ -3448,6 +3505,8 @@ func kubeVirtSMBIOSHookAnnotationsForModel(nodeName, model string) map[string]st
+ 		return kubeVirtSrosHookAnnotations(nodeName)
+ 	case kubeVirtVJunosNeedsVMXSMBIOS(model):
+ 		return kubeVirtSMBIOSHookAnnotations(kubeVirtVJunosSMBIOSHookConfigMapName(nodeName))
++	case kubeVirtIsHuaweiVRP(model):
++		return kubeVirtSMBIOSHookAnnotations(kubeVirtHuaweiNICHookConfigMapName(nodeName))
+ 	}
+ 	return nil
+ }
+@@ -3704,6 +3763,8 @@ func (n *Impl) kubeVirtSMBIOSHookScriptForModel(labels map[string]string, tftpHo
+ 		return kubeVirtSrosSMBIOSHookScript(n.Name(), tftpHost, hasBootstrapConfig, timosLine), true, nil
+ 	case kubeVirtVJunosNeedsVMXSMBIOS(model):
+ 		return kubeVirtVJunosSMBIOSHookScript(model), true, nil
++	case kubeVirtIsHuaweiVRP(model):
++		return kubeVirtHuaweiNICHookScript, true, nil
+ 	}
+ 	return "", false, nil
+ }
+@@ -4301,6 +4362,11 @@ func kubeVirtMeshnetFabricMTU() int {
+ }
+ 
+ func (n *Impl) ensureKubeVirtMeshnetNAD(ctx context.Context, dc dynamic.Interface) error {
++	if kubeVirtIsHuaweiVRP(n.Proto.GetModel()) {
++		if err := n.ensureKubeVirtHuaweiPlaceholderNAD(ctx, dc); err != nil {
++			return err
++		}
++	}
+ 	if len(kubeVirtDataInterfaces(n.Proto)) == 0 {
+ 		return nil
+ 	}
+diff --git a/topo/node/kubevirt_huawei.go b/topo/node/kubevirt_huawei.go
+new file mode 100644
+index 0000000..4bfe2cd
+--- /dev/null
++++ b/topo/node/kubevirt_huawei.go
+@@ -0,0 +1,238 @@
++package node
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"regexp"
++	"sort"
++	"strconv"
++
++	tpb "github.com/openconfig/kne/proto/topo"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++	"k8s.io/client-go/dynamic"
++)
++
++// Huawei VRP (CE12800 switch, NE40E router) on KubeVirt. PLATFORM-SPECIFIC, patch 0085.
++//
++// Two things the generic KubeVirt path cannot do for these guests, both measured on
++// the real images on 2026-11-19 (see the "ce12800" profile comment for the evidence):
++//
++//  1. The guest must not negotiate virtio-net checksum/TSO offload, or SSH (inbound
++//     TCP) never reaches VRP's TCP stack. kubeVirtHuaweiNICHookScript is the
++//     onDefineDomain hook that turns it off; it rides the same sidecar-shim +
++//     per-node ConfigMap machinery SR-OS and vJunos already use.
++//  2. NIC index 1 is a placeholder VRP does not map to a port, so data NICs start
++//     at index 2. kubeVirtHuaweiNICSlots renders it, and fills holes in the ethN
++//     numbering so ethN always lands on port N-1 (eth1 = GE1/0/0 = Ethernet1/0/0).
++
++const (
++	kubeVirtHuaweiPlaceholderName = "vrp-placeholder"
++	kubeVirtHuaweiGapPrefix       = "vrp-gap"
++	kubeVirtHuaweiPlaceholderNAD  = "vrp-placeholder"
++)
++
++// kubeVirtHuaweiNICHookScript is the libvirt onDefineDomain hook: every virtio NIC
++// gets <driver><guest csum='off' tso4='off' tso6='off' ecn='off' ufo='off'/></driver>
++// so the guest never receives CHECKSUM_PARTIAL segments (VRP's TCP stack drops them).
++const kubeVirtHuaweiNICHookScript = `#!/usr/bin/env python3
++import argparse
++import sys
++import xml.etree.ElementTree as ET
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--vmi", required=False)
++    parser.add_argument("--domain", required=True)
++    args, _ = parser.parse_known_args()
++    root = ET.fromstring(args.domain)
++    for iface in root.findall("./devices/interface"):
++        model = iface.find("model")
++        if model is None or not model.attrib.get("type", "").startswith("virtio"):
++            continue
++        for old in iface.findall("driver"):
++            iface.remove(old)
++        driver = ET.SubElement(iface, "driver")
++        ET.SubElement(driver, "guest", {"csum": "off", "tso4": "off", "tso6": "off", "ecn": "off", "ufo": "off"})
++    sys.stdout.write(ET.tostring(root, encoding="unicode"))
++
++
++if __name__ == "__main__":
++    main()
++`
++
++func kubeVirtIsHuaweiVRP(model string) bool {
++	switch normalizeKubeVirtModel(model) {
++	case "ce12800", "ne40v":
++		return true
++	}
++	return false
++}
++
++func kubeVirtHuaweiNICHookConfigMapName(nodeName string) string {
++	return kubeVirtSMBIOSHookConfigMapName(nodeName, "huawei-vrp-nic-hook")
++}
++
++var kubeVirtHuaweiEthRe = regexp.MustCompile(`^eth([0-9]+)$`)
++
++// kubeVirtHuaweiNICSlots returns the KubeVirt interface names for NIC index 1, 2, ...
++// (index 0 is the masquerade management NIC). Index 1 is the placeholder; index
++// N+1 is ethN, with undeclared numbers filled by a placeholder so a sparse topology
++// (eth1 and eth4 only) still puts eth4 on port 3. A declared name that is not ethN
++// disables gap filling and falls back to a natural-number sort of what is declared.
++// real[name] is true for the slots that carry a meshnet link.
++func kubeVirtHuaweiNICSlots(proto *tpb.Node) (slots []string, real map[string]bool) {
++	declared := kubeVirtDataInterfaces(proto)
++	real = map[string]bool{}
++	slots = []string{kubeVirtHuaweiPlaceholderName}
++	max := 0
++	nums := map[int]string{}
++	regular := true
++	for _, name := range declared {
++		m := kubeVirtHuaweiEthRe.FindStringSubmatch(name)
++		if m == nil {
++			regular = false
++			break
++		}
++		n, _ := strconv.Atoi(m[1])
++		if n < 1 || n > 64 {
++			regular = false
++			break
++		}
++		nums[n] = name
++		if n > max {
++			max = n
++		}
++	}
++	if !regular {
++		sorted := append([]string(nil), declared...)
++		sort.SliceStable(sorted, func(i, j int) bool { return kubeVirtNaturalLess(sorted[i], sorted[j]) })
++		for _, name := range sorted {
++			slots = append(slots, name)
++			real[name] = true
++		}
++		return slots, real
++	}
++	for n := 1; n <= max; n++ {
++		if name, ok := nums[n]; ok {
++			slots = append(slots, name)
++			real[name] = true
++			continue
++		}
++		slots = append(slots, fmt.Sprintf("%s%d", kubeVirtHuaweiGapPrefix, n))
++	}
++	return slots, real
++}
++
++// kubeVirtNaturalLess orders "eth2" before "eth10".
++func kubeVirtNaturalLess(a, b string) bool {
++	split := func(s string) (string, int, bool) {
++		i := len(s)
++		for i > 0 && s[i-1] >= '0' && s[i-1] <= '9' {
++			i--
++		}
++		if i == len(s) {
++			return s, 0, false
++		}
++		n, _ := strconv.Atoi(s[i:])
++		return s[:i], n, true
++	}
++	pa, na, oka := split(a)
++	pb, nb, okb := split(b)
++	if oka && okb && pa == pb {
++		return na < nb
++	}
++	return a < b
++}
++
++func kubeVirtHuaweiInterfaces(proto *tpb.Node, interfaces []any) []any {
++	slots, real := kubeVirtHuaweiNICSlots(proto)
++	for _, name := range slots {
++		nic := map[string]any{
++			"name":   name,
++			"bridge": map[string]any{},
++		}
++		if model := kubeVirtInterfaceModel(proto.Model); model != "" {
++			nic["model"] = model
++		}
++		if real[name] {
++			if mac := kubeVirtDataInterfaceMAC(proto, kubeVirtVendorInterfaceName(proto, name)); mac != "" {
++				nic["macAddress"] = mac
++			}
++		}
++		interfaces = append(interfaces, nic)
++	}
++	return interfaces
++}
++
++func kubeVirtHuaweiNetworks(proto *tpb.Node, networks []any) []any {
++	slots, real := kubeVirtHuaweiNICSlots(proto)
++	for _, name := range slots {
++		network := kubeVirtHuaweiPlaceholderNAD
++		if real[name] {
++			network = "meshnet"
++		}
++		networks = append(networks, map[string]any{
++			"name": name,
++			"multus": map[string]any{
++				"networkName": network,
++			},
++		})
++	}
++	return networks
++}
++
++// kubeVirtHuaweiPlaceholderNADConfig is a plain bridge CNI attachment for the
++// placeholder NICs. meshnet cannot serve them: its secondary ADD fails closed on an
++// interface with no topology link. Nothing is ever linked to or transmitted on it.
++func kubeVirtHuaweiPlaceholderNADConfig() map[string]any {
++	return map[string]any{
++		"cniVersion": "0.3.1",
++		"name":       kubeVirtHuaweiPlaceholderNAD,
++		"type":       "bridge",
++		"bridge":     "vrpph0",
++		"ipam":       map[string]any{},
++	}
++}
++
++func (n *Impl) ensureKubeVirtHuaweiPlaceholderNAD(ctx context.Context, dc dynamic.Interface) error {
++	config, err := json.Marshal(kubeVirtHuaweiPlaceholderNADConfig())
++	if err != nil {
++		return err
++	}
++	nad := &unstructured.Unstructured{
++		Object: map[string]any{
++			"apiVersion": "k8s.cni.cncf.io/v1",
++			"kind":       "NetworkAttachmentDefinition",
++			"metadata": map[string]any{
++				"name":      kubeVirtHuaweiPlaceholderNAD,
++				"namespace": n.Namespace,
++				"labels":    map[string]any{"kne/topologyOwner": n.Namespace},
++			},
++			"spec": map[string]any{"config": string(config)},
++		},
++	}
++	resource := dc.Resource(networkAttachmentDefinitionGVR).Namespace(n.Namespace)
++	if _, err := resource.Create(ctx, nad, metav1.CreateOptions{}); err != nil {
++		if !apierrors.IsAlreadyExists(err) {
++			return err
++		}
++		existing, getErr := resource.Get(ctx, kubeVirtHuaweiPlaceholderNAD, metav1.GetOptions{})
++		if getErr != nil {
++			return getErr
++		}
++		if current, _, _ := unstructured.NestedString(existing.Object, "spec", "config"); current == string(config) {
++			return nil
++		}
++		if err := unstructured.SetNestedField(existing.Object, string(config), "spec", "config"); err != nil {
++			return err
++		}
++		if _, err := resource.Update(ctx, existing, metav1.UpdateOptions{}); err != nil {
++			return err
++		}
++	}
++	return nil
++}
+diff --git a/topo/node/kubevirt_huawei_test.go b/topo/node/kubevirt_huawei_test.go
+new file mode 100644
+index 0000000..ad4e64f
+--- /dev/null
++++ b/topo/node/kubevirt_huawei_test.go
+@@ -0,0 +1,123 @@
++package node
++
++import (
++	"fmt"
++	"strings"
++	"testing"
++
++	topopb "github.com/openconfig/kne/proto/topo"
++)
++
++func huaweiNode(model string, ethNumbers ...int) *topopb.Node {
++	ifs := map[string]*topopb.Interface{}
++	for _, n := range ethNumbers {
++		name := fmt.Sprintf("eth%d", n)
++		ifs[name] = &topopb.Interface{Name: fmt.Sprintf("GE1/0/%d", n-1), IntName: name}
++	}
++	return &topopb.Node{Name: "sw1", Vendor: topopb.Vendor_HUAWEI, Model: model, Interfaces: ifs}
++}
++
++func ifaceNames(list []any) []string {
++	var out []string
++	for _, i := range list {
++		out = append(out, i.(map[string]any)["name"].(string))
++	}
++	return out
++}
++
++// Measured 2026-11-19: GE1/0/0 (CE) and Ethernet1/0/0 (NE) sit on NIC index 2; NIC index 1 is
++// a placeholder VRP never maps. So the rendered order must be mgmt, placeholder, eth1, eth2...
++func TestKubeVirtHuaweiPlaceholderThenEthN(t *testing.T) {
++	for _, model := range []string{"ce12800", "ne40v"} {
++		got := ifaceNames(kubeVirtInterfaces("ns", huaweiNode(model, 1, 2, 3)))
++		want := []string{"default", "vrp-placeholder", "eth1", "eth2", "eth3"}
++		if strings.Join(got, ",") != strings.Join(want, ",") {
++			t.Errorf("%s interfaces = %v, want %v", model, got, want)
++		}
++	}
++}
++
++// eth10 must come after eth9 (lexicographic order would put it after eth1), and a sparse
++// topology must keep ethN on slot N: eth4 alone still takes NIC index 5 (port 3).
++func TestKubeVirtHuaweiGapsAndNumericOrder(t *testing.T) {
++	got := ifaceNames(kubeVirtInterfaces("ns", huaweiNode("ce12800", 1, 4)))
++	want := []string{"default", "vrp-placeholder", "eth1", "vrp-gap2", "vrp-gap3", "eth4"}
++	if strings.Join(got, ",") != strings.Join(want, ",") {
++		t.Errorf("sparse interfaces = %v, want %v", got, want)
++	}
++	all := []int{}
++	for i := 1; i <= 10; i++ {
++		all = append(all, i)
++	}
++	got = ifaceNames(kubeVirtInterfaces("ns", huaweiNode("ne40v", all...)))
++	if got[len(got)-1] != "eth10" || got[len(got)-2] != "eth9" {
++		t.Errorf("ten data NICs end %v, want ... eth9 eth10", got[len(got)-2:])
++	}
++	if len(got) != 12 {
++		t.Errorf("got %d NICs, want 12 (mgmt + placeholder + 10)", len(got))
++	}
++}
++
++func TestKubeVirtHuaweiNetworksMatchInterfaces(t *testing.T) {
++	n := huaweiNode("ce12800", 1, 3)
++	ifs := ifaceNames(kubeVirtInterfaces("ns", n))
++	nets := kubeVirtNetworks(n)
++	if len(nets) != len(ifs) {
++		t.Fatalf("%d networks for %d interfaces", len(nets), len(ifs))
++	}
++	wantNet := map[string]string{"vrp-placeholder": "vrp-placeholder", "vrp-gap2": "vrp-placeholder", "eth1": "meshnet", "eth3": "meshnet"}
++	for i, raw := range nets {
++		m := raw.(map[string]any)
++		if m["name"] != ifs[i] {
++			t.Errorf("network %d name %v != interface %v", i, m["name"], ifs[i])
++		}
++		if i == 0 {
++			continue
++		}
++		if got := m["multus"].(map[string]any)["networkName"]; got != wantNet[ifs[i]] {
++			t.Errorf("%s attached to %v, want %s", ifs[i], got, wantNet[ifs[i]])
++		}
++	}
++}
++
++func TestKubeVirtHuaweiHookAndProfile(t *testing.T) {
++	for _, model := range []string{"ce12800", "ne40v"} {
++		ann := kubeVirtSMBIOSHookAnnotationsForModel("sw1", model)
++		if !strings.Contains(ann["hooks.kubevirt.io/hookSidecars"], "huawei-vrp-nic-hook") {
++			t.Errorf("%s: no Huawei NIC hook annotation: %v", model, ann)
++		}
++		if name, ok := kubeVirtSMBIOSHookConfigMapNameForModel("sw1", model); !ok || name != "sw1-huawei-vrp-nic-hook" {
++			t.Errorf("%s: hook configmap name %q ok=%v", model, name, ok)
++		}
++		if got := kubeVirtInterfaceModel(model); got != "virtio" {
++			t.Errorf("%s: interface model %q, want virtio (e1000 never transmits on VRP)", model, got)
++		}
++		p := kubeVirtHardwareProfileFor(model, "")
++		if p.MachineType != "q35" || p.CPUModel != "host-passthrough" {
++			t.Errorf("%s: machine %q cpu %q", model, p.MachineType, p.CPUModel)
++		}
++	}
++	if kubeVirtHardwareProfileFor("ce12800", "").MinimumCPU != 4 || kubeVirtHardwareProfileFor("ne40v", "").MinimumCPU != 2 {
++		t.Errorf("minimum CPU: ce12800 %d (want 4), ne40v %d (want 2)", kubeVirtHardwareProfileFor("ce12800", "").MinimumCPU, kubeVirtHardwareProfileFor("ne40v", "").MinimumCPU)
++	}
++	if !strings.Contains(kubeVirtHuaweiNICHookScript, `"csum": "off"`) {
++		t.Error("hook script does not turn guest csum off")
++	}
++	if !kubeVirtModelSupportedByVendor(topopb.Vendor_HUAWEI, "ce12800") || !kubeVirtModelSupportedByVendor(topopb.Vendor_HUAWEI, "ne40v") {
++		t.Error("HUAWEI vendor does not list ce12800 and ne40v")
++	}
++}
++
++// Every other model renders exactly as before: no placeholder, no hook.
++func TestKubeVirtNonHuaweiUnchanged(t *testing.T) {
++	for _, model := range []string{"nxos", "a10", "fortios", "panos", "cat8000v", "sros", "vjunos-router"} {
++		n := &topopb.Node{Name: "n1", Model: model, Interfaces: map[string]*topopb.Interface{"eth1": {IntName: "eth1"}, "eth2": {IntName: "eth2"}}}
++		got := ifaceNames(kubeVirtInterfaces("ns", n))
++		if strings.Join(got, ",") != "default,eth1,eth2" {
++			t.Errorf("%s interfaces = %v", model, got)
++		}
++		if _, ok := kubeVirtSMBIOSHookConfigMapNameForModel("n1", model); ok && !strings.Contains("sros vjunos-router", model) {
++			t.Errorf("%s gained a hook", model)
++		}
++	}
++}
+-- 
+2.56.1
+
