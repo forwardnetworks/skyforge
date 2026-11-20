@@ -1,0 +1,400 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 00:00:00 +0000
+Subject: [PATCH] devices: Huawei VRP (CloudEngine CE12800, NE40E) on KubeVirt
+
+---
+diff --git a/netsim/ansible/templates/initial/huawei_vrp.j2 b/netsim/ansible/templates/initial/huawei_vrp.j2
+new file mode 100644
+index 0000000..ae6ba97
+--- /dev/null
++++ b/netsim/ansible/templates/initial/huawei_vrp.j2
+@@ -0,0 +1,69 @@
++{#
++  Huawei VRP day-0 (CE12800 and NE40V). PLATFORM-SPECIFIC; our own text.
++
++  This is the CONFIGURATION part only. Reachability is not configured here: a fresh VRP VM boots
++  as <HUAWEI> with no address, user or SSH host key, so netlab could not reach it to push anything,
++  and VRP has no cloud-init. KNE patch 0086 types the console bootstrap (kubevirt_huawei_console.go:
++  sysname = node name, management port + route, the lab user (ansible_user / ansible_ssh_pass),
++  vty, stelnet, RSA host key, and on NE `undo user-security-policy enable` + `undo dcn`) BEFORE
++  netlab connects. Those lines are deliberately absent here, each for a measured reason (netmiko
++  4.8.0 huawei_vrpv8, send_config_from_file with its default per-line prompt wait on a real VM):
++    * `undo dcn` asks `Continue? [Y/N]:`; netmiko waits for a prompt that never comes (ReadTimeout).
++    * `rsa local-key-pair create` on a VM that already has the key asks `Confirm to replace them?`.
++    * `local-user <name> password ...` on an existing user asks `Please enter old password:`.
++    * re-applying the management `ip address` is `Error: The address already exists.`
++  The VM already carries the node name, so the netmiko base prompt learned at login
++  (`<ce1>`) is the one the VM keeps after the closing `commit` ([~ce1]); a sysname change inside
++  the candidate does not move the prompt (it shows the RUNNING name until `commit`), but a
++  `commit` that renames it does, and then the wait for `ce1` would be a wait for the old name.
++  `sysname` below is therefore the same name the bootstrap set (idempotent).
++
++  Everything is staged in the candidate and made live by the single `commit` at the end (VRP has
++  a two-phase commit; prompts [~host] clean, [*host] pending).
++
++  CE12800 vs NE40V (both measured):
++    CE  data ports GE1/0/N are SWITCHPORTS and shut by default -> `undo portswitch` before
++        `ip address`, `undo shutdown`; LLDP is off by default.
++    NE  data ports Ethernet1/0/N are routed and up.
++#}
++{% set ce = netlab_device_type == 'huawei_ce12800' %}
++sysname {{ inventory_hostname }}
++{% if ce %}
++{#  UNVERIFIED on a CE VM: `lldp enable` is not in any capture (the CE image has LLDP off by
++    default; NE has it on). Standard VRP syntax. #}
++lldp enable
++{% endif %}
++{% if loopback is defined and loopback.ipv4 is defined and loopback.ipv4 is string and loopback.ipv4|ansible.utils.ipv4 %}
++{#  UNVERIFIED on a VM: LoopBack<N> exists on the NE40V (an `ip address unnumbered interface
++    LoopBack<N>` line is in its default config) but no loopback was created in a capture. #}
++interface {{ loopback.ifname }}
++{% if not ce %}
++ undo ip address
++{% endif %}
++ ip address {{ loopback.ipv4|ansible.utils.ipaddr('address') }} {{ loopback.ipv4|ansible.utils.ipaddr('prefix') }}
++ quit
++{% endif %}
++{% for l in interfaces|default([]) if l.ifname != mgmt.ifname %}
++interface {{ l.ifname }}
++{%   if not ce %}
++{{ ' shutdown' if l.shutdown|default(False) else ' undo shutdown' }}
++{%   endif %}
++{%   if ce and l.type|default('') != 'loopback' %}
++ undo portswitch
++{%   endif %}
++{%   if 'ipv4' in l and l.ipv4 is string and l.ipv4|ansible.utils.ipv4 %}
++{%     if not ce %}
++ undo ip address
++{%     endif %}
++ ip address {{ l.ipv4|ansible.utils.ipaddr('address') }} {{ l.ipv4|ansible.utils.ipaddr('prefix') }}
++{%   elif 'ipv4' in l %}
++{#   unnumbered / DHCP are not declared in features.initial.ipv4, so netlab refuses them earlier #}
++{%   endif %}
++{#   Order as proven: NE40V `undo shutdown` then address; CE `undo portswitch`, address, then
++     `undo shutdown`. #}
++{%   if ce %}
++{{ ' shutdown' if l.shutdown|default(False) else ' undo shutdown' }}
++{%   endif %}
++ quit
++{% endfor %}
++commit
+diff --git a/netsim/ansible/templates/services/huawei_vrp.j2 b/netsim/ansible/templates/services/huawei_vrp.j2
+new file mode 100644
+index 0000000..7431ebd
+--- /dev/null
++++ b/netsim/ansible/templates/services/huawei_vrp.j2
+@@ -0,0 +1,3 @@
++{# Huawei VRP: no services sub-feature (dns, syslog, snmp, flow) is declared in the device
++   features, so there is nothing to render. The file exists because the platform hands every
++   node the services module and netlab requires a template for each module it runs. #}
+diff --git a/netsim/devices/huawei_ce12800.yml b/netsim/devices/huawei_ce12800.yml
+new file mode 100644
+index 0000000..43ed925
+--- /dev/null
++++ b/netsim/devices/huawei_ce12800.yml
+@@ -0,0 +1,27 @@
++---
++description: Huawei CloudEngine CE12800 (VRP 8)
++parent: huawei_vrp
++support:
++  level: minimal
++  caveats:
++  - Day-0 (management, AAA, SSH, IPv4 interface addressing) only; routing protocols, VLAN and VRF are not declared until captured on the device
++  - Data ports GE1/0/0..9 are switchports (and shut) by default; the template runs `undo portswitch` before addressing
++interface_name: GE1/0/{ifindex}
++mgmt_if: MEth0/0/0
++clab:
++  image: registry.example.com/skyforge/kubevirt/huawei-ce12800:v200r005c10
++  build: https://containerlab.dev/manual/kinds/vr-vrp/
++  interface:
++    name: eth{ifindex+1}
++group_vars:
++  netlab_device_type: huawei_ce12800
++  ansible_user: admin
++  # Must equal the user/password the KNE console bootstrap (patch 0086, kubevirt_huawei_console.go)
++  # creates before netlab connects. Lab credential for an ephemeral VM. VRP's local-user password policy wants upper + lower +
++  # digit + special, which this satisfies.
++  ansible_ssh_pass: "Admin@123"
++  ansible_password: "Admin@123"
++kne:
++  # Documentation only: the KNE provider names pod links eth{ifindex} and bumps by one for devices in
++  # KNE_RESERVED_ETH0_DEVICES (these two are), i.e. port N = pod eth{N+1} (KNE 0085: ethN = port N-1).
++  interface.name: eth{ifindex+1}
+diff --git a/netsim/devices/huawei_ne40v.yml b/netsim/devices/huawei_ne40v.yml
+new file mode 100644
+index 0000000..9e03328
+--- /dev/null
++++ b/netsim/devices/huawei_ne40v.yml
+@@ -0,0 +1,29 @@
++---
++description: Huawei NE40E virtual router (NE40V, VRP 8)
++parent: huawei_vrp
++support:
++  level: minimal
++  caveats:
++  - Day-0 (management, AAA, SSH, IPv4 interface addressing) only; routing protocols and VRF are not declared until captured on the device
++  - Data ports Ethernet1/0/0..9 are routed ports with automatic .4094 DCN sub-interfaces; management is GigabitEthernet0/0/0 in the __MGMT_VPN__ VPN instance
++interface_name: Ethernet1/0/{ifindex}
++mgmt_if: GigabitEthernet0/0/0
++clab:
++  image: registry.example.com/skyforge/kubevirt/huawei-ne40v:v800r011c00
++  build: https://containerlab.dev/manual/kinds/vr-vrp/
++  interface:
++    name: eth{ifindex+1}
++group_vars:
++  netlab_device_type: huawei_ne40v
++  # `admin` is a reserved name on NE40E.
++  ansible_user: labadmin
++  # Must equal the user/password the KNE console bootstrap (patch 0086, kubevirt_huawei_console.go)
++  # creates before netlab connects. Lab credential for an ephemeral VM. VRP's local-user password policy wants upper + lower +
++  # digit + special, which this satisfies.
++  ansible_ssh_pass: "Admin@123"
++  ansible_password: "Admin@123"
++  netlab_mgmt_vrf: __MGMT_VPN__
++kne:
++  # Documentation only: the KNE provider names pod links eth{ifindex} and bumps by one for devices in
++  # KNE_RESERVED_ETH0_DEVICES (these two are), i.e. port N = pod eth{N+1} (KNE 0085: ethN = port N-1).
++  interface.name: eth{ifindex+1}
+diff --git a/netsim/devices/huawei_vrp.yml b/netsim/devices/huawei_vrp.yml
+new file mode 100644
+index 0000000..ef49809
+--- /dev/null
++++ b/netsim/devices/huawei_vrp.yml
+@@ -0,0 +1,55 @@
++---
++# Huawei VRP (abstract parent). PLATFORM-SPECIFIC: lives only in the platform patch series.
++#
++# Naming: upstream netlab has no Huawei device (no netsim/devices entry, no docs page), so
++# there is no netlab name to follow. containerlab's (vrnetlab) kind is `huawei_vrp`; that is
++# the name of this shared definition, and the two concrete platforms carry the model name
++# (huawei_ce12800 / huawei_ne40v) the way csr/cat8000v hang off ios.
++#
++# What the two platforms share, proven on the console of both images (VRP 8.180): prompts
++# ([~host] clean, [*host] uncommitted candidate), the two-phase commit model (every template
++# ends with `commit`), the error format, the AAA/vty/stelnet day-0 sequence.
++description: Huawei VRP (parent device)
++docname: Huawei VRP
++_meta_device: True
++template: true
++loopback_interface_name: LoopBack{ifindex}
++ifindex_offset: 0
++role: router
++group_vars:
++  # No Ansible network OS exists for VRP in the runtime (no Huawei collection is vendored): the
++  # value only names the template set (templates/<module>/huawei_vrp.j2); config is delivered
++  # with netmiko (huawei_vrpv8) and, on the platform, by the netlab-go scrapligo lane.
++  ansible_network_os: huawei_vrp
++  ansible_connection: network_cli
++  netlab_config_mode: netmiko
++  netlab_console_connection: ssh
++  netlab_ready: [ ssh ]
++  # ansible_user / ansible_ssh_pass are set in each child device (the platform user differs: CE admin,
++  # NE labadmin) -- the platform's defaults generator reads a credential per device file.
++  # VRP boots slowly (CE ~2 min, NE ~3.5 min to the CLI prompt); same budget idea as c8000v.
++  netlab_check_retries: 120
++  netlab_check_delay: 5
++  # VRP 8.x host keys are ssh-dss, ssh-rsa, ecdsa-sha2-nistp521 only: ssh-rsa works but is not required (measured).
++  netlab_ssh_args: "-o KexAlgorithms=+diffie-hellman-group14-sha1 -o PubkeyAcceptedKeyTypes=+ssh-rsa -o HostKeyAlgorithms=+ssh-rsa"
++clab:
++  node:
++    kind: huawei_vrp
++  group_vars:
++    netlab_ready: [ ssh ]
++features:
++  initial:
++    # Only what the console captures prove: IPv4 interface addressing and loopbacks.
++    # No IPv6, unnumbered, MTU or ra claims until they are captured on a device.
++    roles: [ router ]
++    config_mode: [ netmiko ]
++  # The platform hands every node the services module; with no sub-feature declared (no DNS, syslog,
++  # SNMP, flow) it renders nothing for VRP and refuses an author who asks for those.
++  services: true
++  netmiko:
++    # netmiko's huawei_vrpv8 driver knows the two-phase commit; VRP error lines start "Error:"
++    # (and are preceded by a caret line), which is what the day-0 captures show.
++    device_type: huawei_vrpv8
++    error_regexp:
++    - '^Error:'
++    - '^\s*Error:'
+diff --git a/netsim/providers/kne.py b/netsim/providers/kne.py
+index c5dd557..68ae9d8 100644
+--- a/netsim/providers/kne.py
++++ b/netsim/providers/kne.py
+@@ -68,6 +68,18 @@ KNE_NODE_MAP: dict = {
+     'model': 'panos',
+     'os': 'panos',
+   },
++  # Huawei VRP (KubeVirt VMs). The vendor string is a KNE topology-proto enum value: the KNE
++  # series must carry Vendor HUAWEI (patches/kne) before a lab with these nodes can be created.
++  'huawei_ce12800': {
++    'vendor': 'HUAWEI',
++    'model': 'ce12800',
++    'os': 'vrp',
++  },
++  'huawei_ne40v': {
++    'vendor': 'HUAWEI',
++    'model': 'ne40v',
++    'os': 'vrp',
++  },
+   'iosxr': {
+     'vendor': 'CISCO',
+     'model': 'xrd',
+@@ -281,6 +293,12 @@ KNE_SERVICE_MAP: dict = {
+     { 'outside': 22, 'inside': 22, 'name': 'ssh', 'names': ['ssh'] },
+     { 'outside': 443, 'inside': 443, 'name': 'https', 'names': ['https','httpapi'] },
+   ],
++  'huawei_ce12800': [
++    { 'outside': 22, 'inside': 22, 'name': 'ssh', 'names': ['ssh'] },
++  ],
++  'huawei_ne40v': [
++    { 'outside': 22, 'inside': 22, 'name': 'ssh', 'names': ['ssh'] },
++  ],
+   'iosxr': [
+     { 'outside': 22, 'inside': 22, 'name': 'ssh', 'names': ['ssh'] },
+     { 'outside': 9339, 'inside': 57400, 'name': 'gnmi', 'names': ['gnmi','gnoi','gnsi'] },
+@@ -756,6 +774,12 @@ KNE_RESERVED_ETH0_DEVICES = {
+   # incident above). vsrx had no other real KNE deploy in this repo to have
+   # caught it sooner.
+   'vsrx',
++  # Huawei VRP (CE12800, NE40V): ifindex_offset is 0 (GE1/0/0, Ethernet1/0/0 are ifindex 0),
++  # so without this entry the first data link lands on pod eth0, which KNE excludes from
++  # wiring. With the bump port N is pod ethN+1: KNE patch 0085 renders the VM NICs as mgmt,
++  # placeholder, eth1, eth2, ... and ethN lands on port N-1 (measured: tcpdump + ping).
++  'huawei_ce12800',
++  'huawei_ne40v',
+ }
+ 
+ # Devices whose NOS builds its out-of-band management interface from the KNE
+diff --git a/tests/test_huawei_vrp_day0.py b/tests/test_huawei_vrp_day0.py
+new file mode 100644
+index 0000000..2202ec9
+--- /dev/null
++++ b/tests/test_huawei_vrp_day0.py
+@@ -0,0 +1,123 @@
++"""Huawei VRP day-0 (PLATFORM-SPECIFIC): the rendered initial config is the CONFIGURATION part
++only (sysname, LLDP on CE, loopback, data ports, commit). Reachability and AAA belong to the KNE
++console bootstrap and must not be in it, because the netmiko lane cannot push them to a VM that
++already has SSH (see the template header for the four measured failures).
++"""
++import os
++import re
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++
++ROOT = Path(__file__).parent.parent
++
++# Lines the KNE console bootstrap (patch 0086, kubevirt_huawei_console.go) owns. The day-0 netmiko
++# push must NOT contain them: each one stalls or errors on a VM that already has SSH
++# (measured 2026-11-19 with netmiko 4.8.0 huawei_vrpv8 against CE12800 and NE40V VMs).
++BOOTSTRAP_OWNED = [
++  r"^undo user-security-policy enable$",
++  r"^undo dcn$",
++  r"^y$",
++  r"^ip vpn-instance ",
++  r"^interface (MEth0/0/0|GigabitEthernet0/0/0)$",
++  r"^ip route-static ",
++  r"^aaa$",
++  r"^ *local-user ",
++  r"^ *undo local-user policy",
++  r"^user-interface vty",
++  r"^stelnet server enable$",
++  r"^ssh authentication-type",
++  r"^rsa local-key-pair create$",
++]
++
++
++def render(tmp_path: Path, device: str, extra: str = "") -> str:
++  topo = f"""
++provider: kne
++defaults.device: {device}
++nodes:
++  n1:
++    loopback.ipv4: 10.255.0.1/32
++  n2:
++links: [ n1-n2 ]
++{extra}
++"""
++  (tmp_path / "topology.yml").write_text(topo)
++  env = dict(os.environ, PYTHONPATH=str(ROOT))
++  code = "import sys; from netsim.cli import main; sys.argv[0]='netlab'; main()"
++  for args in (["create", "topology.yml"], ["initial", "-o", "out"]):
++    r = subprocess.run([sys.executable, "-c", code, *args], cwd=tmp_path, env=env,
++                       capture_output=True, text=True)
++    assert r.returncode == 0, r.stdout + r.stderr
++  return (tmp_path / "out" / "n1.initial.cfg").read_text()
++
++
++@pytest.mark.parametrize("device", ["huawei_ce12800", "huawei_ne40v"])
++def test_day0_has_no_bootstrap_owned_lines(tmp_path, device):
++  cfg = render(tmp_path, device)
++  for pat in BOOTSTRAP_OWNED:
++    assert not re.search(pat, cfg, re.M), (pat, cfg)
++  assert "Admin@123" not in cfg  # the lab password is the bootstrap's, not a pushed line
++
++
++@pytest.mark.parametrize("device", ["huawei_ce12800", "huawei_ne40v"])
++def test_day0_starts_with_the_node_name(tmp_path, device):
++  """The bootstrap names the VM after the node; this line repeats the same name, so netmiko's
++  login-time base prompt (<n1>) is still the prompt after the closing commit."""
++  assert render(tmp_path, device).splitlines()[0] == "sysname n1"
++
++
++def test_ce_data_port_is_routed_before_addressing(tmp_path):
++  cfg = render(tmp_path, "huawei_ce12800")
++  m = re.search(r"^interface GE1/0/0\n undo portswitch\n ip address 10\.\d+\.\d+\.\d+ 30\n undo shutdown\n quit\n", cfg, re.M)
++  assert m, cfg
++  assert "interface LoopBack0\n ip address 10.255.0.1 32\n quit\n" in cfg
++
++
++@pytest.mark.parametrize("device,port", [("huawei_ce12800", "GE1/0/"), ("huawei_ne40v", "Ethernet1/0/")])
++def test_port_n_is_pod_link_ethN_plus_1(tmp_path, device, port):
++  """Port 0 (netlab ifindex 0) is KNE pod link eth1, port 1 is eth2: KNE 0085 renders the VM NICs
++  as mgmt, placeholder, eth1, eth2, ... so ethN lands on port N-1. pod eth0 is the management
++  plane and KNE never wires it, so a first link on eth0 would be silently dropped."""
++  render(tmp_path, device, "")
++  pb = (tmp_path / "topology.pb.txt").read_text()
++  assert re.findall(r'a_int: "(eth\d+)"', pb) == ["eth1"], pb
++  cfg = (tmp_path / "out" / "n1.initial.cfg").read_text()
++  assert f"interface {port}0\n" in cfg and f"interface {port}1\n" not in cfg
++
++
++def test_ce_lldp_is_enabled_and_ne_has_no_lldp_line(tmp_path):
++  assert "lldp enable\n" in render(tmp_path, "huawei_ce12800")
++  assert "lldp" not in render(tmp_path, "huawei_ne40v")
++
++
++def test_ne_addresses_are_replaced_so_a_rerun_is_idempotent(tmp_path):
++  """NE40V answers a repeated `ip address` with `Error: The address already exists.` (netmiko then
++  aborts the whole push), and `undo ip address` first is silent on a port with no address. CE
++  re-runs clean, so it does not get the extra line."""
++  ne = render(tmp_path, "huawei_ne40v")
++  assert "interface LoopBack0\n undo ip address\n ip address 10.255.0.1 32\n" in ne
++  assert ne.count(" undo ip address\n ip address") == 2
++  (tmp_path / "ce").mkdir()
++  ce = render(tmp_path / "ce", "huawei_ce12800")
++  assert "undo ip address" not in ce
++
++
++def test_ne_data_port_is_not_portswitched_and_uses_port_zero(tmp_path):
++  cfg = render(tmp_path, "huawei_ne40v")
++  assert "interface Ethernet1/0/0\n undo shutdown\n undo ip address\n ip address" in cfg
++  assert "portswitch" not in cfg
++
++
++@pytest.mark.parametrize("device", ["huawei_ce12800", "huawei_ne40v"])
++def test_ends_with_commit_after_the_last_interface_block(tmp_path, device):
++  lines = render(tmp_path, device).rstrip().splitlines()
++  assert lines[-1] == "commit" and lines[-2] == " quit"
++
++
++def test_unvalidated_modules_are_refused(tmp_path):
++  with pytest.raises(AssertionError) as ex:
++    render(tmp_path, "huawei_ne40v", "module: [ ospf ]")
++  assert "does not support module ospf" in str(ex.value)
+-- 
+2.56.1
+

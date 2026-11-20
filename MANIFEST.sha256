@@ -4,7 +4,7 @@ a5c79a7b2b6cb2e5c5123a50a1d95e25bafc1d8dbf55c44660d6d9be146aca5f  LICENSE
 da52617c6bb6927b0e5341482fc52e1b4403379c4351a2361a43a0812eda2ae9  NOTICE
 58c5a9a981b89f79e0d4a8140bc26b58068c13c5882b92cb8551d2c847da730c  README.md
 37f6a9b17cb66137c00fe8bc5b4c6430bc9dc419915c3f1fb410c66f48a9e0e6  SECURITY.md
-5fdac63d75362330a38c9f0bf87d868e6fdc1a1490436f746ef86e048a679f64  UPSTREAM.md
+807713832bcc0e0cdacdcfb10c86f1e0fa6649f55e1eea74a21a6ba1b34875ae  UPSTREAM.md
 b2d98a6ea69176cff5c8b2ad38b762e3ec8007b0027678f97c05ffbdfae09076  components/blueprints/netlab/.devcontainer/devcontainer.json
 bc51b2b6d1c317fd8bcd89c3539044bfc6e6858588967c85d98699fcfd9cf04f  components/blueprints/netlab/.gitmodules
 7960f11e69a93b510dce3fe4d1aa6eeec9022b4e5ddbdb99767c6ee52e46fdbd  components/blueprints/netlab/BGP/AS-prepend/bgp-as-path.j2
@@ -710,6 +710,9 @@ fad3f3bf92a6140bc395b48225fc490de61fba3871fe1d25f129a4c4b250441c  patches/kne/00
 afdbdae8ca8f26af57e339d5f62e418f716bc5e4c9c0c0cc7703765b34d17fd3  patches/kne/0058-cisco-retire-the-IOL-SNMP-stub-bridge-the-kne-iol-im.patch
 95eb2bd5f37cc538e95a47bc2130b6777ccc8cce08028c03dd8cf741afedf7e1  patches/kne/0082-kubevirt-SSD-preference-follows-one-data-list-of-models.patch
 28ea886f0de5f83ac32a93635a83fd60d5663f12522d884d6f6b4c39fa9d05a5  patches/kne/0083-service-the-per-node-lab-Service-is-ClusterIP-not-Lo.patch
+6e792c2d1dc4d5fa321ee68198410720998ade71e951bc831c25b16ecea7dfbf  patches/kne/0084-kubevirt-NX-OS-10-6-NICs-sit-on-pcie-0-explicit-pciA.patch
+f979ebeeba9dd1d375ad05a57c83bf9dbd88a6321caec462d1850f37205a8bc0  patches/kne/0085-kubevirt-Huawei-VRP-VMs-CE12800-NE40V-csum-off-hook-NIC-placeholder.patch
+c74881c6ad7576b7a99f9c5a286c33a0fc7e5db12fa03f2d397881da35ad51b0  patches/kne/0086-kubevirt-Huawei-VRP-VMs-serial-console-bootstrap-ConfigPush.patch
 1475d616b092c7417a430a657ccaa9da7030bf878e9605cb5e9d52008f364af6  patches/koko/0001-fix-isexistlinkinns-always-false.patch
 3573a7f43dcc18a81c4054d8b7b85b461fef7045963ca12b9d60b408d0f18435  patches/koko/0002-crypto-rand-ifname.patch
 48519c3dd606f1260c84bb80dd03d32bf68872b630136a7f648f6af76de4e339  patches/koko/0003-setvethlink-cleanup-and-addr-eexist.patch
@@ -768,5 +771,6 @@ e98371664231bc16a36d3b968437aebe7febccf4bbe5d77ca8e77e33fd972fd5  patches/netlab
 50b3c0cc802a007078371cc0692de76be4039620a362416e07ab4bd4bf602504  patches/netlab/15-remaining.patch
 738164ac1fb9bdde7f40126ce704b5f48eb964b8352a579c670f9874e259db72  patches/netlab/16-diagnostics-and-warnings.patch
 e02a7c2d82160bee758b94a4bf9c092086c8c952e3c9c8e1f7efc73c9e48daeb  patches/netlab/17-kne-ixia-c-controller-and-service.patch
+93f3a99649433f5c7d4ff948ce5d817c575a6494519e7d157fbdb354f3cdd232  patches/netlab/18-devices-huawei-vrp.patch
 67732e33d8d2af169ea64b79a10ea30b45b4cd16ce3a21359e21d6a6309747b2  patches/nokia-grpc/0001-gnmi-snapshot-the-dict-keys-before-mutating-the-dict.patch
 9f45c464a91e770c1e19d29dec4b7edfa44ecbc820e13ec3342516172f184476  scripts/apply-patches.sh

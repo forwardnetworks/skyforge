@@ -1,0 +1,536 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Johnson <1545411+captainpacket@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 10:58:32 -0600
+Subject: [PATCH] kubevirt: Huawei VRP VMs get a serial-console bootstrap
+ (ConfigPush): sysname, mgmt, user, SSH
+
+---
+diff --git a/topo/node/forward/forward.go b/topo/node/forward/forward.go
+index 8d260b4..b326a6f 100644
+--- a/topo/node/forward/forward.go
++++ b/topo/node/forward/forward.go
+@@ -16,6 +16,7 @@ package forward
+ import (
+ 	"context"
+ 	"fmt"
++	"io"
+ 	"net"
+ 	"strconv"
+ 	"strings"
+@@ -23,6 +24,8 @@ import (
+ 	fpb "github.com/openconfig/kne/proto/forward"
+ 	tpb "github.com/openconfig/kne/proto/topo"
+ 	"github.com/openconfig/kne/topo/node"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
+ 	"google.golang.org/protobuf/encoding/prototext"
+ 	"google.golang.org/protobuf/proto"
+ 	corev1 "k8s.io/api/core/v1"
+@@ -126,6 +129,20 @@ func (n *Node) Create(ctx context.Context) error {
+ // CreateService creates the services declared in the topology, plus a headless
+ // Service named after the node so that peers naming it with local_node can
+ // reach it as "<node>:<wirePort>".
++// ConfigPush on a Huawei VRP VM types the day-0 console bootstrap (empty data = the built-in
++// one, see node.Impl.HuaweiConsoleBootstrap). Every other vendor this node type serves has no
++// push, which `kne topology push` skips on Unimplemented.
++func (n *Node) ConfigPush(ctx context.Context, r io.Reader) error {
++	if n.Proto.GetVendor() != tpb.Vendor_HUAWEI {
++		return status.Errorf(codes.Unimplemented, "node %q does not implement ConfigPusher", n.Name())
++	}
++	cfg, err := io.ReadAll(r)
++	if err != nil {
++		return err
++	}
++	return n.Impl.HuaweiConsoleBootstrap(ctx, cfg)
++}
++
+ func (n *Node) CreateService(ctx context.Context) error {
+ 	if err := n.createPeerService(ctx); err != nil {
+ 		return err
+diff --git a/topo/node/kubevirt_huawei_console.go b/topo/node/kubevirt_huawei_console.go
+new file mode 100644
+index 0000000..192d949
+--- /dev/null
++++ b/topo/node/kubevirt_huawei_console.go
+@@ -0,0 +1,281 @@
++package node
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"io"
++	"regexp"
++	"strings"
++	"time"
++
++	log "k8s.io/klog/v2"
++)
++
++// Huawei VRP console bootstrap. PLATFORM-SPECIFIC, patch 0086.
++//
++// A fresh CE12800/NE40V boots as <HUAWEI> with no management address, no user and no SSH
++// host key, and VRP has no cloud-init, so nothing can reach it over SSH. Whatever reaches it
++// first has to type on the serial console. Doing that here, in the node's ConfigPush (the
++// hook `kne topology push` already calls for a node that has config data), means the
++// netlab Python netmiko lane only ever sees a VM that already boots under its node name with
++// SSH working: its prompt never changes mid-push (so netmiko's per-line prompt wait holds)
++// and nothing it sends is a Y/N question.
++//
++// The serial console is reached the way a human would: ncat on the launcher's
++// virt-serial0 socket, through the same pod-exec path every other node uses.
++
++const (
++	// Lab credentials, the same constants as netlab's device definitions
++	// (netsim/devices/huawei_ce12800.yml: admin, huawei_ne40v.yml: labadmin). They are lab-only,
++	// ephemeral VMs; `admin` is a reserved name on NE40E.
++	kubeVirtHuaweiLabPassword = "Admin@123"
++
++	huaweiConsoleBootTimeout = 8 * time.Minute
++	huaweiConsoleLineTimeout = 60 * time.Second
++	huaweiConsoleCommitTime  = 4 * time.Minute
++)
++
++var errHuaweiConsoleClosed = errors.New("console closed")
++
++var huaweiBusyRetryDelay = 5 * time.Second
++
++var (
++	huaweiPromptRe   = regexp.MustCompile(`(?m)(<[^<>\r\n]+>|\[[~*]?[^\[\]\r\n]+\])[ \t]*\z`)
++	huaweiQuestionRe = regexp.MustCompile(`(?i)\[y/n\]:?[ \t]*\z`)
++	huaweiErrorRe    = regexp.MustCompile(`(?m)^\s*Error:[^\r\n]*`)
++	huaweiBusyRe     = regexp.MustCompile(`(?i)system is busy`)
++)
++
++// huaweiBootstrapLines is the console day-0: everything SSH needs, and nothing else.
++// ce: management port MEth0/0/0 in the global table, user admin. NE: GigabitEthernet0/0/0 in
++// the __MGMT_VPN__ instance, user labadmin, no forced password change on first SSH login,
++// DCN sub-interfaces removed. 10.0.2.2/24 via 10.0.2.1 are the KubeVirt masquerade constants.
++// A line "y" answers the Y/N question the previous line raised.
++func huaweiBootstrapLines(model, hostname string) ([]string, error) {
++	var l []string
++	switch normalizeKubeVirtModel(model) {
++	case "ce12800":
++		l = []string{
++			"sysname " + hostname,
++			"interface MEth0/0/0", "undo shutdown", "ip address 10.0.2.2 255.255.255.0", "quit",
++			"ip route-static 0.0.0.0 0 10.0.2.1",
++			"aaa", "undo local-user policy security-enhance",
++			"local-user admin password irreversible-cipher " + kubeVirtHuaweiLabPassword,
++			"local-user admin service-type ssh terminal telnet", "local-user admin level 3", "quit",
++		}
++	case "ne40v":
++		l = []string{
++			"undo user-security-policy enable",
++			"undo dcn", "y",
++			"sysname " + hostname,
++			"ip vpn-instance __MGMT_VPN__", "ipv4-family", "quit", "quit",
++			"interface GigabitEthernet0/0/0", "undo shutdown", "ip binding vpn-instance __MGMT_VPN__",
++			"ip address 10.0.2.2 255.255.255.0", "quit",
++			"ip route-static vpn-instance __MGMT_VPN__ 0.0.0.0 0 10.0.2.1",
++			"aaa",
++			"local-user labadmin password irreversible-cipher " + kubeVirtHuaweiLabPassword,
++			"local-user labadmin service-type ssh terminal telnet", "local-user labadmin level 3", "quit",
++		}
++	default:
++		return nil, fmt.Errorf("model %q is not a Huawei VRP VM", model)
++	}
++	return append(l,
++		"user-interface vty 0 4", "authentication-mode aaa", "protocol inbound all", "quit",
++		"stelnet server enable", "ssh authentication-type default password",
++		"rsa local-key-pair create",
++		"commit",
++	), nil
++}
++
++// huaweiConsole is an expect-style driver over a serial console byte stream.
++type huaweiConsole struct {
++	in  io.Writer
++	rx  chan []byte
++	buf string
++	err error
++}
++
++func newHuaweiConsole(r io.Reader, w io.Writer) *huaweiConsole {
++	c := &huaweiConsole{in: w, rx: make(chan []byte, 64)}
++	go func() {
++		defer close(c.rx)
++		b := make([]byte, 4096)
++		for {
++			n, err := r.Read(b)
++			if n > 0 {
++				c.rx <- append([]byte(nil), b[:n]...)
++			}
++			if err != nil {
++				return
++			}
++		}
++	}()
++	return c
++}
++
++func (c *huaweiConsole) send(s string) error {
++	_, err := io.WriteString(c.in, s+"\r")
++	return err
++}
++
++// wait reads until done(buf) holds, the context ends, or the timeout passes. The console is
++// quiet for 250ms before done is believed: VRP prints a prompt and then more output.
++func (c *huaweiConsole) wait(ctx context.Context, timeout time.Duration, done func(string) bool) error {
++	deadline := time.NewTimer(timeout)
++	defer deadline.Stop()
++	settle := time.NewTimer(time.Hour)
++	defer settle.Stop()
++	armed := false
++	for {
++		select {
++		case <-ctx.Done():
++			return ctx.Err()
++		case <-deadline.C:
++			return fmt.Errorf("console wait timed out after %s; tail %q", timeout, c.tail())
++		case b, ok := <-c.rx:
++			if !ok {
++				return fmt.Errorf("%w; tail %q", errHuaweiConsoleClosed, c.tail())
++			}
++			c.buf += strings.ReplaceAll(string(b), "\r", "")
++			armed = done(c.buf)
++			if armed {
++				settle.Reset(250 * time.Millisecond)
++			}
++		case <-settle.C:
++			if armed && done(c.buf) {
++				return nil
++			}
++		}
++	}
++}
++
++func (c *huaweiConsole) tail() string {
++	if len(c.buf) > 200 {
++		return c.buf[len(c.buf)-200:]
++	}
++	return c.buf
++}
++
++func huaweiAtPrompt(s string) bool   { return huaweiPromptRe.MatchString(s) }
++func huaweiAtQuestion(s string) bool { return huaweiQuestionRe.MatchString(s) }
++func huaweiPromptOrQuestion(s string) bool {
++	return huaweiAtPrompt(s) || huaweiAtQuestion(s)
++}
++
++func huaweiRedact(line string) string {
++	if strings.Contains(line, "password") || strings.Contains(line, "cipher") {
++		return "<redacted>"
++	}
++	return line
++}
++
++// huaweiConsolePush waits for the CLI, then types lines one at a time, each only after the
++// previous one returned to a prompt. A line that gets a Y/N question must be followed by
++// its answer line; an `Error:` reply aborts. `commit` is retried while VRP is still
++// generating the RSA key ("system is busy").
++func huaweiConsolePush(ctx context.Context, r io.Reader, w io.Writer, lines []string) error {
++	c := newHuaweiConsole(r, w)
++	// Wake the console and wait for a CLI prompt (a booting VRP prints a lot of noise first).
++	if err := c.send(""); err != nil {
++		return err
++	}
++	bootCtx, cancel := context.WithTimeout(ctx, huaweiConsoleBootTimeout)
++	defer cancel()
++	for {
++		err := c.wait(bootCtx, 6*time.Second, huaweiAtPrompt)
++		if err == nil {
++			break
++		}
++		if errors.Is(err, errHuaweiConsoleClosed) {
++			return err
++		}
++		if bootCtx.Err() != nil {
++			return fmt.Errorf("no VRP CLI prompt within %s: %w", huaweiConsoleBootTimeout, err)
++		}
++		_ = c.send("")
++	}
++	for _, raw := range append([]string{"screen-length 0 temporary", "system-view"}, lines...) {
++		line := strings.TrimSpace(raw)
++		if line == "" {
++			continue
++		}
++		if err := huaweiConsoleLine(ctx, c, line); err != nil {
++			return fmt.Errorf("console line %q: %w", huaweiRedact(line), err)
++		}
++	}
++	return huaweiConsoleLine(ctx, c, "return")
++}
++
++func huaweiConsoleLine(ctx context.Context, c *huaweiConsole, line string) error {
++	timeout := huaweiConsoleLineTimeout
++	if line == "commit" {
++		timeout = huaweiConsoleCommitTime
++	}
++	deadline := time.Now().Add(timeout)
++	for {
++		c.buf = ""
++		if err := c.send(line); err != nil {
++			return err
++		}
++		if err := c.wait(ctx, time.Until(deadline), huaweiPromptOrQuestion); err != nil {
++			return err
++		}
++		out := c.buf
++		if line == "commit" && huaweiBusyRe.MatchString(out) {
++			if time.Now().After(deadline) {
++				return fmt.Errorf("device still busy: %q", c.tail())
++			}
++			time.Sleep(huaweiBusyRetryDelay)
++			continue
++		}
++		if m := huaweiErrorRe.FindString(out); m != "" {
++			return fmt.Errorf("device replied %q", strings.TrimSpace(m))
++		}
++		// A Y/N question ends the wait too: the next line in the sequence is its answer.
++		return nil
++	}
++}
++
++// HuaweiConsoleBootstrap types the day-0 console bootstrap (huaweiBootstrapLines, or the
++// given config text if it is not empty) into the VM's serial console.
++func (n *Impl) HuaweiConsoleBootstrap(ctx context.Context, cfg []byte) error {
++	if !kubeVirtIsHuaweiVRP(n.Proto.GetModel()) {
++		return fmt.Errorf("node %s model %q is not a Huawei VRP VM", n.Name(), n.Proto.GetModel())
++	}
++	var lines []string
++	if text := strings.TrimSpace(string(cfg)); text != "" {
++		lines = strings.Split(text, "\n")
++	} else {
++		var err error
++		if lines, err = huaweiBootstrapLines(n.Proto.GetModel(), n.Name()); err != nil {
++			return err
++		}
++	}
++	pr, pw := io.Pipe()
++	outR, outW := io.Pipe()
++	var execErr error
++	execDone := make(chan struct{})
++	ectx, cancel := context.WithCancel(ctx)
++	defer cancel()
++	go func() {
++		// TTY raw: the exec TTY must not echo our keystrokes back into the parser.
++		execErr = n.Exec(ectx, []string{"sh", "-c", "stty raw -echo 2>/dev/null; exec ncat -U $(ls -d /var/run/kubevirt-private/*/virt-serial0 | head -1)"}, pr, outW, io.Discard)
++		outW.Close()
++		pr.CloseWithError(errors.New("console exec ended")) // unblock a pending write
++		close(execDone)
++	}()
++	log.Infof("%s - console bootstrap (%d lines)", n.Name(), len(lines))
++	err := huaweiConsolePush(ctx, outR, pw, lines)
++	cancel()
++	pw.Close()
++	<-execDone
++	if err != nil {
++		if execErr != nil && !errors.Is(execErr, context.Canceled) {
++			err = fmt.Errorf("%w (console exec: %v)", err, execErr)
++		}
++		return err
++	}
++	log.Infof("%s - console bootstrap done", n.Name())
++	return nil
++}
+diff --git a/topo/node/kubevirt_huawei_console_test.go b/topo/node/kubevirt_huawei_console_test.go
+new file mode 100644
+index 0000000..7115cf8
+--- /dev/null
++++ b/topo/node/kubevirt_huawei_console_test.go
+@@ -0,0 +1,191 @@
++package node
++
++import (
++	"bufio"
++	"context"
++	"io"
++	"os"
++	"strings"
++	"testing"
++	"time"
++
++	topopb "github.com/openconfig/kne/proto/topo"
++	"k8s.io/client-go/kubernetes"
++	"k8s.io/client-go/tools/clientcmd"
++)
++
++// fakeVRP is a console that behaves the way the two captures show: <HUAWEI> user view, [~x]
++// clean and [*x] dirty system view, the prompt keeps the RUNNING sysname until `commit`, the
++// NE `undo dcn` Y/N question, `Error:` for anything unknown (a stray `y`), and `commit`
++// answering "system is busy" while the RSA key is still being generated.
++type fakeVRP struct {
++	sent      []string
++	pendingQ  bool
++	busyLeft  int
++	running   string
++	candidate string
++	dirty     bool
++	sysview   bool
++}
++
++func (f *fakeVRP) prompt() string {
++	switch {
++	case !f.sysview:
++		return "<" + f.running + ">"
++	case f.dirty:
++		return "[*" + f.running + "]"
++	}
++	return "[~" + f.running + "]"
++}
++
++func (f *fakeVRP) serve(in io.Reader, out io.Writer) {
++	io.WriteString(out, "boot noise\r\n[SVRPTIME(1) x] Not OSN\r\n"+f.prompt())
++	sc := bufio.NewScanner(in)
++	sc.Split(func(d []byte, eof bool) (int, []byte, error) {
++		if i := strings.IndexByte(string(d), '\r'); i >= 0 {
++			return i + 1, d[:i], nil
++		}
++		return 0, nil, nil
++	})
++	for sc.Scan() {
++		l := strings.TrimSpace(sc.Text())
++		f.sent = append(f.sent, l)
++		io.WriteString(out, l+"\r\n")
++		switch {
++		case f.pendingQ:
++			f.pendingQ = false
++			if l != "y" {
++				io.WriteString(out, "Error: Please choose YES or NO first before pressing Enter.\r\n")
++			}
++		case l == "":
++		case l == "system-view":
++			f.sysview = true
++		case l == "return":
++			f.sysview = false
++		case l == "undo dcn":
++			f.dirty, f.pendingQ = true, true
++			io.WriteString(out, "Warning: This operation will disable DCN function. Continue? [Y/N]:")
++			continue
++		case l == "rsa local-key-pair create":
++			f.busyLeft = 2
++			f.dirty = true
++		case l == "commit":
++			if f.busyLeft > 0 {
++				f.busyLeft--
++				io.WriteString(out, "Error: The system is busy in building system configurations. Please wait a moment and then try again.\r\n")
++			} else {
++				f.running, f.dirty = f.candidate, false
++			}
++		case strings.HasPrefix(l, "sysname "):
++			f.candidate = strings.TrimPrefix(l, "sysname ")
++			f.dirty = true
++		case l == "y":
++			io.WriteString(out, "                        ^\r\nError: Unrecognized command found at '^' position.\r\n")
++		case strings.HasPrefix(l, "screen-length"):
++		default:
++			if f.sysview {
++				f.dirty = true
++			}
++		}
++		io.WriteString(out, f.prompt())
++	}
++}
++
++func runFake(t *testing.T, lines []string) (*fakeVRP, error) {
++	t.Helper()
++	huaweiBusyRetryDelay = 10 * time.Millisecond
++	f := &fakeVRP{running: "HUAWEI", candidate: "HUAWEI"}
++	inR, inW := io.Pipe()
++	outR, outW := io.Pipe()
++	go f.serve(inR, outW)
++	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
++	defer cancel()
++	err := huaweiConsolePush(ctx, outR, inW, lines)
++	inW.Close()
++	return f, err
++}
++
++// The bootstrap of both models must run to the end, answer `undo dcn` with its `y` and leave
++// the VM named after the node (the whole point: netmiko's prompt never changes afterwards).
++func TestHuaweiConsoleBootstrapNamesTheVMAndAnswersTheQuestion(t *testing.T) {
++	for _, model := range []string{"ce12800", "ne40v"} {
++		lines, err := huaweiBootstrapLines(model, "r1")
++		if err != nil {
++			t.Fatal(err)
++		}
++		f, err := runFake(t, lines)
++		if err != nil {
++			t.Fatalf("%s: %v", model, err)
++		}
++		if f.running != "r1" || f.dirty {
++			t.Errorf("%s: running sysname %q dirty=%v, want r1 committed", model, f.running, f.dirty)
++		}
++		if got := strings.Count(strings.Join(f.sent, "\n"), "commit"); got != 3 {
++			t.Errorf("%s: commit sent %d times, want 3 (two busy retries + the success)", model, got)
++		}
++	}
++}
++
++// A Y/N question whose answer line is missing must fail the push, not hang or pass.
++func TestHuaweiConsoleUnansweredQuestionFails(t *testing.T) {
++	_, err := runFake(t, []string{"undo dcn", "sysname r1"})
++	if err == nil || !strings.Contains(err.Error(), "Error:") {
++		t.Fatalf("want a device Error from the unanswered question, got %v", err)
++	}
++}
++
++// And a stray `y` with no question pending is the device's `Error:` too (the rerun-on-a-
++// provisioned-VM case), so it surfaces instead of being swallowed.
++func TestHuaweiConsoleStrayAnswerFails(t *testing.T) {
++	_, err := runFake(t, []string{"y"})
++	if err == nil {
++		t.Fatal("stray y must fail")
++	}
++}
++
++func TestHuaweiBootstrapKeepsNoPasswordInLogs(t *testing.T) {
++	lines, _ := huaweiBootstrapLines("ne40v", "r1")
++	for _, l := range lines {
++		if strings.Contains(l, "password") && huaweiRedact(l) != "<redacted>" {
++			t.Errorf("line %q would be logged in clear", l)
++		}
++	}
++	if _, err := huaweiBootstrapLines("iol", "r1"); err == nil {
++		t.Error("non-Huawei model must be refused")
++	}
++}
++
++// Live check against a real VM (not run in CI): HUAWEI_LIVE_NODE=<vmi name> HUAWEI_LIVE_NS=<ns>
++// HUAWEI_LIVE_MODEL=ce12800|ne40v HUAWEI_LIVE_NAME=<sysname> KUBECONFIG=... go test -run Live.
++func TestHuaweiConsoleBootstrapLive(t *testing.T) {
++	vmi, ns := os.Getenv("HUAWEI_LIVE_NODE"), os.Getenv("HUAWEI_LIVE_NS")
++	if vmi == "" || ns == "" {
++		t.Skip("HUAWEI_LIVE_NODE/HUAWEI_LIVE_NS not set: live VM check skipped")
++	}
++	rc, err := clientcmd.BuildConfigFromFlags("", os.Getenv("KUBECONFIG"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	kc, err := kubernetes.NewForConfig(rc)
++	if err != nil {
++		t.Fatal(err)
++	}
++	pb := &topopb.Node{Name: vmi, Vendor: topopb.Vendor_HUAWEI, Model: os.Getenv("HUAWEI_LIVE_MODEL"), Config: &topopb.Config{Image: "registry.invalid/skyforge/kubevirt/huawei:live"}}
++	n := &Impl{Namespace: ns, KubeClient: kc, RestConfig: rc, Proto: pb}
++	if err := n.HuaweiConsoleBootstrap(context.Background(), nil); err != nil {
++		t.Fatal(err)
++	}
++}
++
++// A console whose transport dies (exec failed, pod gone) must fail the push fast, not retry
++// writes into a closed pipe forever.
++func TestHuaweiConsoleClosedTransportFails(t *testing.T) {
++	inR, inW := io.Pipe()
++	go io.Copy(io.Discard, inR)
++	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
++	defer cancel()
++	err := huaweiConsolePush(ctx, strings.NewReader(""), inW, []string{"sysname r1"})
++	if err == nil || !strings.Contains(err.Error(), "console closed") {
++		t.Fatalf("want console closed error, got %v", err)
++	}
++}
+-- 
+2.56.1
+
