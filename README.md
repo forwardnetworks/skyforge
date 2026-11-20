@@ -4,6 +4,12 @@ The patches and netlab topologies we run in Skyforge, our network lab platform o
 
 We run it on Talos Linux with Cilium, KubeVirt and Multus. netlab compiles each lab, KNE deploys it, and meshnet wires the links (VXLAN across nodes).
 
+## What is and is not here
+
+Here: the patch series, the netlab blueprints (8 of them carry `validate:` checks, which `netlab validate` runs against a booted lab, for example an end-to-end ping across an EVPN/VXLAN overlay), and the install guide.
+
+Not here: the Skyforge control plane and portal (the web service that deploys labs, runs change checks and pushes changes). They are not published and there is no date.
+
 ## Contents
 
 - `patches/<project>/`: patch series on pinned upstream versions. See [UPSTREAM.md](UPSTREAM.md).
@@ -24,4 +30,4 @@ Patches marked SKYFORGE-SPECIFIC are our platform's behaviour, not upstream cand
 
 ## Licence
 
-Everything we wrote here (docs, scripts and, with the control plane, `components/server` and `components/portal`): [Functional Source License 1.1, Apache-2.0 future licence](LICENSE) (FSL-1.1-ALv2). It is source-available, not open source: you can read, run, modify and redistribute it for any purpose except a competing commercial product or service, and each release converts to Apache-2.0 two years after it is published. Commits up to `aa25fed` were published under Apache-2.0 and stay under it. Patches: each upstream's licence. Blueprints: ipSpace's licence ([LICENSE.md](components/blueprints/netlab/LICENSE.md)), which forbids offering them as a hosted or SaaS service. See [NOTICE](NOTICE).
+The docs and scripts we wrote here: [Functional Source License 1.1, Apache-2.0 future licence](LICENSE) (FSL-1.1-ALv2). It is source-available, not open source: you can read, run, modify and redistribute it for any purpose except a competing commercial product or service, and each release converts to Apache-2.0 two years after it is published. Commits up to `aa25fed` were published under Apache-2.0 and stay under it. Patches: each upstream's licence. Blueprints: ipSpace's licence ([LICENSE.md](components/blueprints/netlab/LICENSE.md)), which forbids offering them as a hosted or SaaS service. See [NOTICE](NOTICE).
