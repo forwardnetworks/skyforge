@@ -1,0 +1,49 @@
+# expect: evpn-svi-ospf-overlay
+# Control for evpn-svi-interface-mode-route: l1 routes the VLAN on its interface and has no SVI, but l2 and l3 still carry it as IRB, so two
+# SVIs remain and the warning stands (the interface mode must not silence the whole VLAN).
+defaults.device: eos
+bgp.as: 65000
+evpn.session: [ ibgp ]
+addressing:
+  core:
+    ipv4: 10.1.0.0/16
+    prefix: 31
+vlans:
+  red:
+groups:
+  spines:
+    members: [ s1, s2 ]
+    module: [ ospf, bgp ]
+  leafs:
+    members: [ l1, l2, l3 ]
+    module: [ ospf, bgp, vlan, vxlan, evpn ]
+  hosts:
+    members: [ h1, h2, h3 ]
+    device: linux
+    module: []
+nodes:
+  s1:
+  s2:
+  l1:
+  l2:
+  l3:
+  h1:
+  h2:
+  h3:
+links:
+- { s1: , l1: , pool: core }
+- { s1: , l2: , pool: core }
+- { s1: , l3: , pool: core }
+- { s2: , l1: , pool: core }
+- { s2: , l2: , pool: core }
+- { s2: , l3: , pool: core }
+- h1:
+  l1:
+    vlan.access: red
+    vlan.mode: route
+- h2:
+  l2:
+    vlan.access: red
+- h3:
+  l3:
+    vlan.access: red

@@ -1,0 +1,295 @@
+(plugin-bgp-session)=
+# BGP Sessions Plugin
+
+The **bgp.session** plugin (initially contributed by Stefano Sasso) implements numerous BGP session ~~nerd knobs~~ attributes, from BGP session protection to AS path manipulation.
+
+```eval_rst
+.. contents:: Table of Contents
+   :depth: 2
+   :local:
+   :backlinks: none
+```
+
+## Supported BGP Attributes
+
+The plugin adds the following BGP session attributes:
+
+* **bgp.allowas_in** is an attribute that controls whether a BGP router accepts one or more copies of its own AS number in incoming update. It takes an integer value between 1 and 10. A *true* value sets it to 1.
+* **bgp.as_override** is a boolean attribute that controls whether a BGP router replaces peer AS with its own AS.
+* **bgp.bfd** is a boolean attribute that enables BFD with BGP neighbors.
+* **bgp.default_originate** is a boolean attribute that controls whether a BGP router advertises a default route to its neighbor(s).
+* **bgp.gr** defines [BGP graceful restart](plugin-bgp-session-gr) capabilities
+* **bgp.gtsm** is an integer attribute that enables the Generic TTL Security Mechanism (GTSM). A *true* value sets it to 1 (the remote router can be up to one hop away).
+* **bgp.passive** is a boolean attribute that makes a node act as a passive BGP peer[^PBP] on an interface or on all applicable sessions (when specified as a node parameter).
+* **bgp.password** is a string attribute that specifies the MD5  or TCP-AO password used on EBGP sessions.
+* **bgp.remove_private_as** is a boolean/string/list attribute that describes the desired removal of private autonomous system(s) from the AS path. See [](bgp-session-remove-private-as) section for more details.
+* **bgp.rs** is a boolean attribute specifying that a BGP router is a BGP route server. See [](bgp-session-route-server) section for more details.
+* **bgp.tcp_ao** is an attribute that enables TCP-AO on a BGP session[^AOO]. The attribute value *true* enables TCP-AO with the HMAC-SHA1-96[^AOA] algorithm. You can specify the desired algorithm as the string value of the **bgp.tcp_ao** parameter (valid values are `hmac-sha-1` and `aes-128-cmac`).
+* **bgp.timers** is a dictionary of BGP session timers. It has three elements:
+
+	* **bgp.timers.keepalive** -- keepalive timer in seconds
+	* **bgp.timers.hold** -- hold timer in seconds
+	* **bgp.timers.min_hold** -- minimum hold timer accepted from the remote node. It is used only on devices that support specifying the minimum hold timer per BGP neighbor.
+
+[^PBP]: A passive BGP peer waits for its neighbor to initiate the conversation and never tries to establish a TCP session with its neighbor.
+
+[^AOO]: The TCP-AO is configured to include TCP options in the checksum calculation
+
+[^AOA]: The HMAC-SHA1-96 algorithm is specified as **hmac-sha-1** in the **bgp.tcp_ao** parameter and configured as HMAC-SHA-96 in several implementations (for example, Cisco IOS XR and Arista EOS)
+
+BGP session attributes can be specified at the global, node, link, or interface (node-to-link attachment) level. The following table describes where you could apply individual attributes:
+
+| BGP session attribute | Global | Node | Link | Interface | VRF |
+|-----------------------|:--:|:--:|:--:|:--:|:--:|
+| allowas_in            | ❌  | ❌  | ❌  | ✅ | ❌  |
+| as_override           | ❌  | ❌  | ❌  | ✅ | ❌  |
+| bfd                   | ✅ | ✅ | ✅ | ✅ | ❌  |
+| default_originate     | ❌  | ✅ | ❌  | ✅ | ❌  |
+| gr                    | ❌  | ✅ | ✅ | ✅ | ✅ |
+| gtsm                  | ✅ | ✅ | ✅ | ✅ | ❌  |
+| passive               | ❌  | ✅ | ❌  | ✅ | ❌  |
+| password              | ✅ | ✅ | ✅ | ✅ | ❌  |
+| remove_private_as     | ❌  | ❌  | ❌  | ✅ | ❌  |
+| rs                    | ❌  | ✅ | ❌  | ✅ | ❌  |
+| tcp_ao                | ✅ | ✅ | ✅ | ✅ | ❌  |
+| timers                | ✅ | ✅  |✅ | ✅ | ❌  |
+
+## Platform Support
+
+The plugin implements generic BGP session features for the following platforms:
+
+(bgp-session-platforms)=
+```{features}
+- title: default<br>originate
+  enabled: |
+    bgp.default_originate
+- title: BGP<br>timers
+  enabled: |
+    bgp.timers
+- title: BFD
+  enabled: |
+    bgp.bfd
+- title: Passive<br>peer
+  enabled: |
+    bgp.passive
+- title: Graceful<br>Restart
+  enabled: |
+    bgp.gr
+  caveats: |
+    bgp.gr.caveats
+```
+
+**Notes:**
+* Arista EOS supports TCP-AO only when running as a virtual machine
+* _netlab_ always configures HMAC-SHA1-96 as the cryptographic algorithm on IOS XE
+
+(bgp-session-security)=
+BGP session security features are available on these platforms:
+
+```{features}
+- title: password
+  enabled: |
+    bgp.password
+- title: GTSM
+  enabled: |
+    bgp.gtsm
+- title: TCP-AO
+  enabled: |
+    bgp.tcp_ao
+```
+
+(bgp-session-as-path)=
+The plugin implements AS-path-mangling nerd knobs for the following platforms:
+
+```{features}
+- title: Allow<br>AS in
+  enabled: |
+    bgp.allowas_in
+- title: AS<br>override
+  enabled: |
+    bgp.as_override
+- title: Remove<br>private AS
+  enabled: |
+    bgp.remove_private_as
+- title: Route<br>Server
+  enabled: |
+    bgp.rs
+- title: Route Server<br>Client
+  enabled: |
+    bgp.rs_client
+```
+
+(bgp-session-apply)=
+## Applying BGP Session Attributes to IBGP Sessions
+
+The plugin applies BGP session attributes to EBGP sessions -- either all EBGP sessions a node has if the attribute has been specified on a global or node level, or all EBGP sessions on a link where the BGP session attribute has been specified.
+
+If you want to apply BGP session attributes to IBGP sessions, you must set the **bgp.session.apply** global/node parameter -- a list or a dictionary of BGP neighbor types to which the BGP session attributes are applied. The default behavior is equivalent to `bgp.session.apply: [ ebgp ]`; if you want to apply the session attributes to IBGP and EBGP sessions, specify `bgp.session.apply: [ ibgp, ebgp ]` as a global or node attribute.
+
+IBGP sessions are not associated with links/interfaces and, therefore, cannot inherit the BGP session parameters specified on links or interfaces -- only the parameters specified on the global or node level are applied to IBGP sessions. For example, to use MD5 password `secret` on all IBGP and EBGP sessions in your lab, use the following global settings:
+
+```
+bgp.session.apply: [ ibgp, ebgp ]
+bgp.password: secret
+```
+
+If you don't want to apply all node-level BGP session parameters to IBGP sessions, you could use the dictionary format of **bgp.session.apply** parameter: the BGP neighbor types are the dictionary keys, and the values are lists of parameters you want to apply to IBGP and EBGP sessions (a missing value means _apply all parameters_).
+
+For example, the node settings from the following example cause the BGP password to be applied to IBGP and EBGP sessions, while all other BGP session parameters (including the default route origination) are used only on EBGP sessions:
+
+```
+bgp.password: secret
+
+nodes:
+  core:
+    bgp.default_originate: True
+    bgp.session.apply:
+      ibgp: [ password ]
+      ebgp:
+```
+
+The following example is even more specific: default route origination and a few AS-related session parameters (but not MD5 password) are applied to EBGP sessions, while the MD5 passwords are applied only to IBGP sessions:
+
+```
+bgp.password: secret
+bgp.session.apply:
+  ibgp: [ password ]
+  ebgp: [ default_originate, allowas_in, as_override ]
+```
+
+(bgp-session-remove-private-as)=
+## Remove Private AS Options
+
+This plugin accepts the following values of the **bgp.remove_private_as** attribute.
+
+* **True** (or **on**[^QON]): enable simple removal of private AS on egress updates
+* **all**: remove all instances of private AS numbers in egress updates
+* **replace**: replace all instances of private AS number with the router's own AS number in egress updates
+* **ingress**: remove private AS numbers from ingress updates
+* **ingress-replace**: replace all private AS numbers with the peer AS number in ingress updates
+
+[^QON]: You have to quote the **on** string, otherwise the Python YAML parser treats it as a boolean. For example, you have to specify `bgp.remove_private_as: [ 'on', ingress ]`
+
+You can specify the **bgp.remove_private_as** attribute as a boolean value (equivalent to **on**), as a single string value, or as a list of string values in case you have to specify egress and ingress behavior.
+
+The implementations of the **neighbor remove-private-as** command vary widely across supported network devices, as described in the following table:
+
+```{features}
+- title: "on"
+  enabled: |
+    'on' in bgp.remove_private_as.valid
+- title: all
+  enabled: |
+    'all' in bgp.remove_private_as.valid
+  caveats: |
+    bgp.remove_private_as.caveats.all
+- title: replace
+  enabled: |
+    'replace' in bgp.remove_private_as.valid
+  caveats: |
+    bgp.remove_private_as.caveats.replace
+- title: ingress
+  enabled: |
+    'ingress' in bgp.remove_private_as.valid
+  caveats: |
+    bgp.remove_private_as.caveats.ingress
+- title: ingress-replace
+  enabled: |
+    'ingress-replace' in bgp.remove_private_as.valid
+  caveats: |
+    bgp.remove_private_as.caveats.ingress-replace
+```
+
+(bgp-session-route-server)=
+## BGP Route Servers
+
+The **bgp.rs** attribute set on a node or on an interface indicates that the node acts like a [BGP route server](https://datatracker.ietf.org/doc/html/rfc7947) on the specified interface or all interfaces.
+
+A route server does not add its BGP AS into the AS path; its EBGP neighbors must accept AS paths with 'incorrect' first AS. Most devices reject what seem to be malformed AS paths and have to be configured to ignore the mismatch in the first AS. _netlab_ configures that setting on all route server EBGP neighbors and rejects the lab topology if a route server EBGP neighbor is not capable of being a route server client.
+
+Introducing a BGP route server to an IP subnet also prunes the full mesh of EBGP sessions established over that subnet. _netlab_ removes all EBGP sessions from the subnet unless one of the EBGP neighbors is a route server and the other neighbor is a route server client. The following table summarizes the EBGP session pruning:
+
+| Node A             | Node B             | EBGP session state |
+|--------------------|--------------------|----------|
+| Route server       | Regular BGP router | retained |
+| Route server       | Route server       | removed  |
+| Regular BGP router | Regular BGP route  | removed  |
+
+Please note that an IBGP session between route servers in the same autonomous system is retained and might generate a warning unless you also run an IGP between the route servers. To remove the IBGP session between route servers, set the `bgp.sessions.ipv4: [ ebgp ]` and `bgp.sessions.ipv6: [ ebgp ]` node attributes on route server nodes.
+
+(plugin-bgp-session-gr)=
+## BGP Graceful Restart Capabilities
+
+BGP Graceful Restart capabilities can be defined per node, per VRF, or per EBGP neighbor. The node- and VRF-level **bgp.gr** attribute is a dictionary with these parameters (it can also be specified as the **bgp.gr.state** string value):
+
+* **bgp.gr.state** -- node Graceful Restart state (`enable`, `disable` or `helper`).
+* **bgp.gr.restart_time** -- the expected neighbor restart time (integer, up to 3600 seconds)
+* **bgp.gr.stalepath_time** -- the time after which the stale paths are purged (integer, up to 3600 seconds)
+
+```{warning}
+* The built-in device BGP Graceful Restart default (usually: helper) is not changed unless you specify node-level **bgp.gr.state** value.
+* The node-level **‌bgp.gr** parameters are not applied to VRF BGP instances. Usually, you have to define **‌bgp.gr** on the VRFs to get non-default behavior.
+* _netlab_ does its best to configure node-level **bgp.gr** parameters. Some devices do not support all of them, and we only test the `disable` node-level **bgp.gr.state** in integration tests.
+```
+
+You can also specify per-EBGP-neighbor **bgp.gr** state, a string value with values from node-level **bgp.gr.state** parameter.
+
+In the following topology snippet, the router acts as a GR helper, but not for the X1 EBGP peer:
+
+```
+nodes:
+  rtr:
+    bgp.as: 65000
+    bgp.gr.state: helper
+
+links:
+- rtr:
+    bgp.gr: disable
+  x1:
+```
+
+## Test Topology
+
+The following test topology illustrates a subset of plugin capabilities. You might also want to explore the topologies used in [ipSpace.net BGP labs](https://github.com/ipspace/bgplab) and the [BGP session plugin test topology](https://github.com/ipspace/netlab/blob/dev/tests/topology/input/ebgp.utils.yml).
+
+```
+---
+defaults:
+  device: eos
+
+module: [ bgp, vrf, bfd ]
+plugin: [ bgp.session ]
+
+vrfs:
+  red:
+  blue:
+
+bgp.timers:
+  hold: 10
+  keepalive: 3
+
+bgp.bfd: True
+
+nodes:
+  y1:
+    bgp.as: 65001
+  y2:
+    bgp.as: 65002
+
+links:
+- y1:
+    bgp.default_originate: True
+  y2:
+  bgp.password: TestPassword
+- y1:
+    vrf: red
+  y2:
+    vrf: red
+    bgp.allowas_in: True
+    bgp.default_originate: True
+- y1:
+    vrf: blue
+  y2:
+    vrf: blue
+    bgp.as_override: True
+```

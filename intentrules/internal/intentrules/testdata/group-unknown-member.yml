@@ -1,0 +1,12 @@
+# expect: none
+# A group lists a member that is not defined anywhere: netlab refuses that itself, and the group is not also reported as empty.
+defaults.device: eos
+groups:
+  core:
+    members: [ ghost ]
+    module: [ ospf ]
+nodes:
+  r1:
+  r2:
+links:
+- r1-r2

@@ -1,0 +1,9 @@
+Warning in ospf: spine1 does not use ospf on any non-loopback interface or VRF
+... It has been removed from the list of modules active on spine1
+... Set defaults.ospf.warnings.inactive to False to hide this warning
+Warning in bgp: Node spine1 has IBGP sessions but no IGP
+... Add a supported IGP (ospf, eigrp, isis, ripv2) to the list of modules
+... Set defaults.bgp.warnings.missing_igp to False to hide this warning
+Warning in ospf: spine2 does not use ospf on any non-loopback interface or VRF
+... It has been removed from the list of modules active on spine2
+Warning in bgp: Node spine2 has IBGP sessions but no IGP

@@ -1,0 +1,30 @@
+# expect: zonebased-rules-not-rendered
+# Synthetic: a specific zone-to-zone rule is written under firewall.zonebased.rules on a FortiOS node. netlab accepts it and
+# renders nothing (only PAN-OS renders it); the default_rules on the same node render. Exit 0, one warning.
+name: zfw_rules
+provider: kne
+plugin: [ firewall.zonebased ]
+
+nodes:
+  fwA:
+    device: fortios
+    firewall.zonebased:
+      default_rules:
+        - from_zone: zoneA
+          to_zone: zoneB
+          action: permit
+      rules:
+        - from_zone: zoneB
+          to_zone: zoneA
+          action: permit
+          service: [ SSH ]
+  swA:
+    device: eos
+
+links:
+  - fwA:
+      firewall.zone: zoneA
+    swA:
+  - fwA:
+      firewall.zone: zoneB
+    swA:

@@ -1,0 +1,90 @@
+## Complex Addressing Scenarios
+
+In the [IPv6 section](addr-example-ipv6), we described how to [enable IPv6 on an interface](addr-example-lla) without assigning a static address to it. *netlab* provides similar functionality for IPv4 -- when setting **ipv4** attribute to *True*, the device configuration modules try to configure [unnumbered IPv4 Ethernet interfaces](https://blog.ipspace.net/series/unnumbered-interfaces/)[^UNNUM].
+
+[^UNNUM]: Some network operating systems do not support unnumbered IPv4 Ethernet interfaces. In some other cases, device configuration templates don't provide that functionality. *netlab* tries to warn you about those exceptions.
+
+Now that you've seen that you can set the **ipv4** or **ipv6** attribute to *True*, you might wonder what happens if you set it to *False*. If you do that, _netlab_ does not assign an IPv4/IPv6 address to the affected interface (or link).
+
+Let's see how you can use these features in real-life scenarios.
+
+### Unnumbered Links
+
+To create an unnumbered IPv4 link, set the **ipv4** attribute of a link **prefix** to *True*. For example:
+
+```
+nodes: [ r1, r2 ]
+links:
+- r1:
+  r2:
+  prefix:
+    ipv4: True
+```
+
+Unnumbered point-to-point links (when supported) usually work reasonably well with OSPF and IS-IS. Some devices go a step further: you can use multi-access unnumbered links with IS-IS, for example:
+
+```
+module: [ isis ]
+nodes: [ r1, r2, r3 ]
+links:
+- r1:
+  r2:
+  r3:
+  prefix:
+    ipv4: True
+    ipv6: True
+```
+
+You also can define unnumbered address pools -- the above topology could be rewritten into this one:
+
+```
+addressing:
+  core:
+    ipv4: True
+    ipv6: True
+    
+module: [ isis ]
+nodes: [ r1, r2, r3 ]
+links:
+- r1:
+  r2:
+  r3:
+  pool: core
+```
+
+```{tip}
+Using link **prefix** makes more sense when you're testing device behavior over a single link. An unnumbered address pool makes life easier in large-scale scenarios and allows you to evaluate a migration from numbered to unnumbered links (or vice versa).
+```
+
+### Devices Without IP Addresses
+
+Several ways of building layer-2-only networks have been described in this document ([address pools](addr-example-l2only), [static prefixes](addr-example-static)), but what if you want to connect a segment of IP hosts to a bridge (with no IP address)? Remove the IP addresses from the bridge interface with **ipv4: False** and/or **ipv6: False**.
+
+```{tip}
+You should probably use the [VLAN configuration module](module-vlan) and set **vlan.mode** to **bridge**. However, if you want to test technologies not yet supported by *netlab*, like bridging over SRv6, you might have to use unaddressed interfaces.
+```
+
+Imagine a network with four hosts and a bridge connecting two parts of the same subnet. You could describe the network with the following lab topology:
+
+```
+nodes: [ h1, h2, h3, h4, b ]
+
+links:
+- prefix: 10.42.42.0/24
+  h1:
+  h2:
+  b:
+    ipv4: False
+- prefix: 10.42.42.0/24
+  h3:
+  h4:
+  b:
+    ipv4: False
+```
+
+**Notes:**
+* _netlab_ will not configure bridging between the two links on B; you must use a custom configuration template to provision layer-2 functionality. Use [VLAN configuration module](module-vlan) to implement bridging with _netlab_.
+* The bridge B connects two parts of the same subnet. *netlab* IPAM implementation does not support such a topology unless you use [VLAN configuration module](module-vlan). You must use the same static **prefix** on both links to make the above example work.
+* Hosts will get IP addresses assigned from the link prefix based on their node ID (h1: 10.42.42.1/24 through h4: 10.42.42.4/24)
+* Bridge B would get the same IP address (10.42.42.5/24) assigned to both interface. Most network operating systems wouldn't agree with such an approach.
+* To make the topology work, remove the IPv4 address from bridge interfaces with **ipv4: False** interface attribute.

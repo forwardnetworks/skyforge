@@ -1,0 +1,13 @@
+# expect: group-module-no-members
+# A plugin's configuration block and role groups, but the plugin is not enabled.
+provider: clab
+defaults.device: eos
+fabric:
+  spines: 2
+  leafs: 2
+groups:
+  spines:
+    module: [ ospf, bgp ]
+  leafs:
+    module: [ ospf, bgp ]
+nodes: [ h1 ]

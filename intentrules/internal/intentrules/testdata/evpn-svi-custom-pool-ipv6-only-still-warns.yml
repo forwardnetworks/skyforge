@@ -1,0 +1,43 @@
+# expect: evpn-svi-ospf-overlay
+# A custom pool with IPv6 only still gives the SVI an address, and netlab runs OSPFv3 on it (measured): the warning stands.
+defaults.device: eos
+bgp.as: 65000
+evpn.session: [ ibgp ]
+addressing:
+  core:
+    ipv4: 10.1.0.0/16
+    prefix: 31
+  v6only:
+    ipv6: 2001:db8:1::/48
+vlans:
+  red:
+    pool: v6only
+groups:
+  spines:
+    members: [ s1, s2 ]
+    module: [ ospf, bgp ]
+  leafs:
+    members: [ l1, l2 ]
+    module: [ ospf, bgp, vlan, vxlan, evpn ]
+  hosts:
+    members: [ h1, h2 ]
+    device: linux
+    module: []
+nodes:
+  s1:
+  s2:
+  l1:
+  l2:
+  h1:
+  h2:
+links:
+- { s1: , l1: , pool: core }
+- { s1: , l2: , pool: core }
+- { s2: , l1: , pool: core }
+- { s2: , l2: , pool: core }
+- h1:
+  l1:
+    vlan.access: red
+- h2:
+  l2:
+    vlan.access: red

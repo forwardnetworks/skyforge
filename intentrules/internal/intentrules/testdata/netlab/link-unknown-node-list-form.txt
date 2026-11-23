@@ -1,0 +1,4 @@
+Errors encountered while processing topology.yml
+IncorrectValue in links: Interface links[2].interfaces.2 refers to an unknown node r3
+Fatal error in netlab: Cannot proceed beyond this point due to errors, exiting
+rc=1

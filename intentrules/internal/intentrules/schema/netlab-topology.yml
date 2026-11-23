@@ -1,0 +1,333 @@
+# Skyforge intent model for a netlab topology, in Infrahub's schema language (schema version 1.0), unmodified.
+#
+# This file is stock Infrahub schema YAML: it loads into an Infrahub instance as it is, and a schema check
+# proves it against Infrahub's published JSON schema (additionalProperties is false there, so a key of ours would fail).
+# Skyforge's own extensions (netlab key mapping, which finding code a violated constraint reports, rule predicates) live in
+# ../sidecar/, keyed Kind.attribute, never in this directory: Infrahub rejects extension keys, so they cannot sit here.
+#
+# It models what the rules need and nothing else: the objects a netlab topology.yml is made of after the loader (loader.go)
+# has resolved netlab's own inheritance and defaults. Anything it does not model is not judged here; netlab stays the
+# authority for the rest.
+#
+# What the constraints are (Infrahub semantics, enforced by internal/intentrules/constraints.go because Infrahub 1.11.11
+# does not enforce min_count on create):
+#   uniqueness_constraints   no two objects share the listed attribute/relationship values
+#   relationship peer        the referenced object exists (a link endpoint names a defined node)
+#   min_count / max_count    the number of related objects; a point-to-point link has exactly two endpoints
+#   optional: false          a required relationship has at least one peer
+version: "1.0"
+
+generics:
+  - name: Link
+    namespace: Netlab
+    label: Network link
+    description: A netlab link, as the kind netlab gives it (point-to-point, LAN or stub) from its type or endpoint count.
+    include_in_menu: false
+    uniqueness_constraints:
+      - ["topology", "linkid__value"]
+    attributes:
+      - name: name
+        kind: Text
+        optional: true
+        description: The position of the link in the document, for example links[2].
+      - name: linkid
+        kind: Text
+        optional: true
+        description: The author-assigned link id; netlab refuses two links with the same one.
+      - name: link_type
+        kind: Text
+        optional: true
+        description: The type written on the link (p2p, lan, stub, loopback), when there is one.
+    relationships:
+      - name: topology
+        peer: NetlabTopology
+        kind: Parent
+        cardinality: one
+        optional: false
+        identifier: netlabtopology__netlablink
+
+nodes:
+  - name: Topology
+    namespace: Netlab
+    label: Netlab topology
+    description: One topology document.
+    include_in_menu: false
+    attributes:
+      - name: name
+        kind: Text
+        optional: true
+        description: The topology name, when the document sets one.
+
+  - name: Device
+    namespace: Netlab
+    label: Network device
+    description: A netlab node.
+    include_in_menu: false
+    uniqueness_constraints:
+      - ["topology", "name__value"]
+    attributes:
+      - name: name
+        kind: Text
+        description: The node name.
+      - name: svi_possible
+        kind: Boolean
+        default_value: true
+        description: False when the node's or a group's vlan.mode is bridge or route, so its VLANs have no SVI.
+      - name: device
+        kind: Text
+        optional: true
+        description: The netlab device the node resolves to (node, then group, then defaults.device).
+    relationships:
+      - name: topology
+        peer: NetlabTopology
+        kind: Parent
+        cardinality: one
+        optional: false
+        identifier: netlabtopology__netlabdevice
+      - name: modules
+        peer: NetlabModule
+        kind: Attribute
+        cardinality: many
+        optional: true
+        identifier: netlabdevice__netlabmodule
+        description: The modules the node ends up with (its own list, or the topology list, plus every group list).
+      - name: missing_modules
+        peer: NetlabModule
+        kind: Attribute
+        cardinality: many
+        optional: true
+        identifier: netlabdevice__missingmodule
+        description: The modules a module of the node requires that the node does not have.
+      - name: vlans
+        peer: NetlabVlan
+        kind: Attribute
+        cardinality: many
+        optional: true
+        identifier: netlabdevice__netlabvlan
+        description: The VLANs the node attaches to, through a link vlan.access, vlan.trunk or vlan.native, or its own vlans block.
+      - name: groups
+        peer: NetlabGroup
+        kind: Attribute
+        cardinality: many
+        optional: true
+        identifier: netlabdevice__netlabgroup
+
+  - name: Group
+    namespace: Netlab
+    label: Node group
+    description: A netlab group of nodes.
+    include_in_menu: false
+    uniqueness_constraints:
+      - ["topology", "name__value"]
+    attributes:
+      - name: name
+        kind: Text
+      - name: has_module_list
+        kind: Boolean
+        default_value: false
+        description: True when the group sets a module list, even an empty one (netlab then needs the group to have members).
+      - name: populated_by_plugin
+        kind: Boolean
+        default_value: false
+        description: True when members cannot be listed from the document (generating plugin, include, pattern, or a special group).
+    relationships:
+      - name: topology
+        peer: NetlabTopology
+        kind: Parent
+        cardinality: one
+        optional: false
+        identifier: netlabtopology__netlabgroup
+      - name: members
+        peer: NetlabDevice
+        kind: Attribute
+        cardinality: many
+        optional: true
+        identifier: netlabdevice__netlabgroup
+      - name: modules
+        peer: NetlabModule
+        kind: Attribute
+        cardinality: many
+        optional: true
+        identifier: netlabgroup__netlabmodule
+
+  - name: Module
+    namespace: Netlab
+    label: Netlab module
+    description: A netlab module that some node or group enables.
+    include_in_menu: false
+    uniqueness_constraints:
+      - ["topology", "name__value"]
+    attributes:
+      - name: name
+        kind: Text
+    relationships:
+      - name: topology
+        peer: NetlabTopology
+        kind: Parent
+        cardinality: one
+        optional: false
+        identifier: netlabtopology__netlabmodule
+      - name: requires
+        peer: NetlabModule
+        kind: Attribute
+        cardinality: many
+        optional: true
+        direction: outbound
+        identifier: netlabmodule__requires
+        description: The modules netlab refuses this one without (generated from netlab's own module definitions).
+
+  - name: Plugin
+    namespace: Netlab
+    label: Enabled plugin
+    description: A plugin listed under plugin:.
+    include_in_menu: false
+    uniqueness_constraints:
+      - ["topology", "name__value"]
+    attributes:
+      - name: name
+        kind: Text
+    relationships:
+      - name: topology
+        peer: NetlabTopology
+        kind: Parent
+        cardinality: one
+        optional: false
+        identifier: netlabtopology__netlabplugin
+
+  - name: PluginBlock
+    namespace: Netlab
+    label: Plugin configuration block
+    description: A top-level key that is the configuration block of a plugin netlab ships.
+    include_in_menu: false
+    uniqueness_constraints:
+      - ["topology", "key__value"]
+    attributes:
+      - name: key
+        kind: Text
+        description: The top-level key.
+      - name: owner
+        kind: Text
+        description: The plugin that owns the key, read from netlab's own plugin definitions.
+    relationships:
+      - name: topology
+        peer: NetlabTopology
+        kind: Parent
+        cardinality: one
+        optional: false
+        identifier: netlabtopology__netlabpluginblock
+      - name: plugin
+        peer: NetlabPlugin
+        kind: Attribute
+        cardinality: one
+        optional: false
+        identifier: netlabpluginblock__netlabplugin
+        description: The owning plugin, which must be enabled.
+
+  - name: Vlan
+    namespace: Netlab
+    label: VLAN
+    description: A VLAN defined under vlans:, with netlab's defaults filled in.
+    include_in_menu: false
+    uniqueness_constraints:
+      - ["topology", "name__value"]
+    attributes:
+      - name: name
+        kind: Text
+      - name: mode
+        kind: Dropdown
+        default_value: irb
+        description: netlab's vlan.mode; irb is its default.
+        choices:
+          - { name: irb, label: IRB }
+          - { name: bridge, label: Bridge }
+          - { name: route, label: Route }
+      - name: svi_ospf
+        kind: Dropdown
+        default_value: "on"
+        description: Whether OSPF runs on the SVI. Default on; ospf false or role external turns it off, ospf passive makes it passive.
+        choices:
+          - { name: "on", label: "On" }
+          - { name: "off", label: "Off" }
+          - { name: passive, label: Passive }
+      - name: mixed_as
+        kind: Boolean
+        default_value: false
+        description: True when the BGP speakers on the VLAN are in more than one AS. BGP marks such a link external and OSPF does not run on it.
+      - name: svi_ospf_warning
+        kind: Boolean
+        default_value: true
+        description: "False when defaults.evpn.warnings.svi_ospf is false (the author turned netlab's own SVI-OSPF warning off)."
+      - name: in_vrf
+        kind: Boolean
+        default_value: false
+        description: True when the VLAN is bound to a VRF, which changes which protocols reach the SVI.
+    relationships:
+      - name: topology
+        peer: NetlabTopology
+        kind: Parent
+        cardinality: one
+        optional: false
+        identifier: netlabtopology__netlabvlan
+      - name: devices
+        peer: NetlabDevice
+        kind: Attribute
+        cardinality: many
+        optional: true
+        identifier: netlabdevice__netlabvlan
+
+  - name: Interface
+    namespace: Netlab
+    label: Link endpoint
+    description: One end of a link, naming a node.
+    include_in_menu: false
+    attributes:
+      - name: node
+        kind: Text
+        description: The node name as written in the link.
+    relationships:
+      - name: device
+        peer: NetlabDevice
+        kind: Attribute
+        cardinality: one
+        optional: false
+        identifier: netlabdevice__netlabinterface
+        description: The node the end sits on; it must be defined.
+
+  - name: P2pLink
+    namespace: Netlab
+    label: Point-to-point link
+    inherit_from: [NetlabLink]
+    relationships:
+      - name: endpoints
+        peer: NetlabInterface
+        kind: Attribute
+        cardinality: many
+        min_count: 2
+        max_count: 2
+        optional: false
+        identifier: netlablink__netlabinterface
+
+  - name: LanLink
+    namespace: Netlab
+    label: LAN link
+    inherit_from: [NetlabLink]
+    relationships:
+      - name: endpoints
+        peer: NetlabInterface
+        kind: Attribute
+        cardinality: many
+        min_count: 1
+        optional: false
+        identifier: netlablink__netlabinterface
+
+  - name: StubLink
+    namespace: Netlab
+    label: Stub or loopback link
+    inherit_from: [NetlabLink]
+    relationships:
+      - name: endpoints
+        peer: NetlabInterface
+        kind: Attribute
+        cardinality: one
+        optional: false
+        identifier: netlablink__netlabinterface

@@ -1,0 +1,11 @@
+# expect: schema-unique
+defaults.device: eos
+nodes:
+  r1:
+  r2:
+  r3:
+links:
+- r1-r2
+- r2-r3
+- { r1: , r3: , linkid: lk7 }
+- { r1: , r2: , linkid: lk7 }

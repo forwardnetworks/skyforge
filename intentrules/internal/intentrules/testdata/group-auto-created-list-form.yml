@@ -1,0 +1,8 @@
+# expect: none
+# A group written as a list is its members list, and _auto_create makes the members into nodes.
+defaults.device: eos
+defaults.groups._auto_create: true
+groups:
+  core: [ c1, c2 ]
+links:
+- c1-c2

@@ -1,0 +1,9 @@
+# expect: link-unknown-node
+# The list form of a link: netlab words this one differently from the string form.
+defaults.device: eos
+nodes:
+  r1:
+  r2:
+links:
+- [ r1, r2 ]
+- [ r1, r3 ]

@@ -1,0 +1,4 @@
+Errors encountered while processing topology.yml
+IncorrectValue in groups: Member ghost of group core is not a valid node or group name
+Fatal error in netlab: Cannot proceed beyond this point due to errors, exiting
+rc=1

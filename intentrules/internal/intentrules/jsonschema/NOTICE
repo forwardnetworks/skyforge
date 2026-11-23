@@ -1,0 +1,17 @@
+Third-party material in this directory
+
+infrahub-schema.json
+  What:      the JSON schema Infrahub publishes for its schema files (the format of ../schema/*.yml).
+  Source:    https://schema.infrahub.app/infrahub/schema/latest.json
+  Fetched:   2026-11-07; sha256 c19896447c0055f577e8dc60718398821952c68b37385596d6758907183a98fe
+  Version:   the "latest" alias at the fetch date. It carries no version field. The schema files here were also checked offline
+             with the infrahub-server 1.11.11 wheel. The Skyforge schema files declare schema version "1.0".
+  Licence:   Apache License 2.0 (Infrahub Community, Copyright 2025 OpsMill SAS). The licence text is in LICENSE-Apache-2.0.txt,
+             copied from https://github.com/opsmill/infrahub/blob/develop/LICENSE.txt.
+  Changes:   none. The file is byte-for-byte what the source served.
+  Use:       (1) the schema loader reads the key names from it to reject a key Infrahub would reject; (2)
+             a schema check validates ../schema/*.yml against it.
+  Trademark: Apache-2.0 grants no right to the Infrahub name or marks. Skyforge ships an "Infrahub-compatible schema", not Infrahub.
+
+To refresh: download the source URL, replace the file, update the sha256 above and run the schema check. A
+refresh is a reviewed change, never an automatic one.

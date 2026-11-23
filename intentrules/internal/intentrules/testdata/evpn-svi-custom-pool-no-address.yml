@@ -1,0 +1,43 @@
+# expect: none
+# A custom pool that defines no IPv4 and no IPv6 prefix addresses nothing, so the SVI has no address and no OSPF (measured).
+defaults.device: eos
+bgp.as: 65000
+evpn.session: [ ibgp ]
+addressing:
+  core:
+    ipv4: 10.1.0.0/16
+    prefix: 31
+  nowhere:
+    prefix: 24
+vlans:
+  red:
+    pool: nowhere
+groups:
+  spines:
+    members: [ s1, s2 ]
+    module: [ ospf, bgp ]
+  leafs:
+    members: [ l1, l2 ]
+    module: [ ospf, bgp, vlan, vxlan, evpn ]
+  hosts:
+    members: [ h1, h2 ]
+    device: linux
+    module: []
+nodes:
+  s1:
+  s2:
+  l1:
+  l2:
+  h1:
+  h2:
+links:
+- { s1: , l1: , pool: core }
+- { s1: , l2: , pool: core }
+- { s2: , l1: , pool: core }
+- { s2: , l2: , pool: core }
+- h1:
+  l1:
+    vlan.access: red
+- h2:
+  l2:
+    vlan.access: red

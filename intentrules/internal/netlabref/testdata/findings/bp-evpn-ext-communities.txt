@@ -1,0 +1,5 @@
+Warning in evpn: Extended BGP communities are not enabled on ebgp BGP sessions on ca
+... EVPN needs extended BGP communities attached to EVPN routes
+... Set defaults.evpn.warnings.extcommunity to False to hide this warning
+Warning in evpn: Extended BGP communities are not enabled on ebgp BGP sessions on cb
+files:  [INFO] Created nhs/eos.j2

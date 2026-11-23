@@ -1,0 +1,7 @@
+# expect: none
+# `links: [ r1, ... ]` is netlab's way to attach a stub network to one node. A single node and no type is not a missing end.
+defaults.device: eos
+nodes:
+  r1:
+  r2:
+links: [ r1, r1-r2, r2 ]

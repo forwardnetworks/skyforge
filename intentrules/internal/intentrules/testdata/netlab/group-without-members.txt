@@ -1,0 +1,5 @@
+Errors encountered while processing topology.yml
+IncorrectValue in groups: Cannot use "module" attribute in group leafs that has no direct or indirect members
+... A group gets members from its own "members" list, from the "group" attribute of nodes, or from a plugin that generates nodes (the plugin must be listed under "plugin")
+Fatal error in netlab: Cannot proceed beyond this point due to errors, exiting
+rc=1

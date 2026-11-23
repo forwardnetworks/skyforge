@@ -1,0 +1,12 @@
+# expect: none
+defaults.device: eos
+module: [ ospf ]
+nodes:
+  r1:
+  r2:
+  r3:
+links:
+- r1-r2
+- r2-r3
+- [ r1, r2, r3 ]
+- { r1: , r3: , type: p2p }

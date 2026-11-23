@@ -1,0 +1,12 @@
+# expect: none
+defaults.device: eos
+plugin: [ fabric ]
+bgp.as: 65000
+fabric:
+  spines: 2
+  leafs: 2
+groups:
+  spines:
+    module: [ ospf, bgp ]
+  leafs:
+    module: [ ospf, bgp ]

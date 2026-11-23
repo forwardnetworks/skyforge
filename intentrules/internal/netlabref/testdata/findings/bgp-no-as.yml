@@ -1,0 +1,6 @@
+# expect: mandatory-attribute-missing
+provider: clab
+defaults.device: eos
+module: [ bgp ]
+nodes: [ r1, r2 ]
+links: [ r1-r2 ]

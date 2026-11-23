@@ -1,0 +1,19 @@
+name: fabric-demo
+provider: kne
+defaults:
+  device: eos
+module: [ bgp ]
+plugin: [ fabric ]
+bgp.as: 65000
+fabric:
+  leafs: 36
+  spines: 10
+  spine:
+    bgp.as: 65100
+  leaf:
+    bgp.as: '{65200 + count}'
+addressing:
+  router_id:
+    ipv4: 10.0.0.0/24
+  p2p:
+    ipv4: 10.1.0.0/16

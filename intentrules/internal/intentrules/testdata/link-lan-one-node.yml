@@ -1,0 +1,9 @@
+# expect: none
+# netlab accepts a LAN that names one node (hosts attach later), so it is not a finding.
+defaults.device: eos
+nodes:
+  r1:
+  r2:
+links:
+- r1-r2
+- { r1: , type: lan }

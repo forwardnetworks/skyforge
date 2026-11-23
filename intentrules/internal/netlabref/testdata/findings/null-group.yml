@@ -1,0 +1,12 @@
+# expect: group-null-value
+provider: clab
+defaults.device: eos
+plugin: [ fabric ]
+fabric.spines: 2
+fabric.leafs: 2
+fabric.link.pool: core
+addressing:
+  core: { ipv4: 10.1.0.0/16, prefix: 31 }
+groups:
+  leafs:
+  spines:

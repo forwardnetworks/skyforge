@@ -1,0 +1,791 @@
+(platform-caveats)=
+# Platform Caveats
+
+```eval_rst
+.. contents:: Table of Contents
+   :depth: 1
+   :local:
+   :backlinks: none
+```
+
+## Arista EOS
+
+(caveats-veos)=
+### Arista vEOS VM Caveats
+
+* Use **libvirt.uuid** node property to ensure a vEOS VM does not change its serial number every time you start the lab.
+* Arista vEOS VMs are configured with the *netmiko* library. To use Ansible playbooks, set the **defaults.devices.eos.libvirt.group_vars.netlab_config_mode** [topology default](topo-defaults) or **netlab_config_mode** node variable to an empty value.
+* Using *netmiko* to configure Arista vEOS VMs disables Arista's proprietary linkdown emulation.
+
+(caveats-ceos)=
+### Arista cEOS Container Caveats
+
+Device configuration:
+
+* With no additional settings, Arista cEOS containers are configured with the *netmiko* library. To use an Ansible playbook (using an SSH session with the **arista.eos.eos_config** Ansible modules), set the **netlab_config_mode** node variable to an empty value.
+* To configure cEOS containers with Linux scripts using FastCLI, set the **defaults.devices.eos.clab.group_vars.netlab_config_mode** [topology default](topo-defaults) to **sh**. You can also set the **netlab_config_mode** node variable to **sh** to experiment with this feature.
+* Using Linux scripts or *netmiko* to configure Arista cEOS containers disables Arista's proprietary linkdown emulation.
+
+Other caveats:
+* You can set Arista cEOS serial number and system MAC address with the **eos.serialnumber** and **eos.systemmacaddr** node properties.
+* Anycast gateways and DHCP/DHCPv6 clients do not work on Arista cEOS Ethernet interfaces.
+* cEOS MPLS data plane was introduced in release 4.32.1F.
+* Arista cEOS disables OSPFv2 on broadcast container stub interfaces (implemented as _dummy_ interfaces). _netlab_ automatically changes the OSPF network type for Arista cEOS dummy interfaces to **point-to-point**.
+
+The default name of the management interface is **Management0** on vEOS and **Management1** on cEOS. If you'd like to change the management interface name on cEOS:
+
+* Create `intf_map` file in the topology directory with the following contents:
+
+```
+{
+  "ManagementIntf": {
+    "eth0": "Management0"
+  }
+}
+```
+
+* Map that file into the `/mnt/flash/EosIntfMapping_json` container file in the node **clab.binds** dictionary, for example:
+
+```
+nodes:
+  r:
+    device: eos
+    clab.binds:
+      intf_map: /mnt/flash/EosIntfMapping_json
+```
+
+(caveats-eos)=
+### Other Arista EOS Caveats
+
+* Routed VLANs cannot be used in EVPN MPLS VLAN bundles
+* Inter-VLAN forwarding with EVPN MPLS-based MAC VRFs works only with anycast gateways
+* Arista EOS uses an [invalid value for the suboption 150 of the DHCP option 82](https://blog.ipspace.net/2023/03/netlab-vrf-dhcp-relay.html#vendor-interoperability-is-fun) when doing inter-VRF DHCPv4 relaying.
+* The DHCP client on Arista EOS is finicky. When the DHCP state changes on one of the data-plane Ethernet interfaces, the management interface might lose its IPv4 address.
+* Arista EOS cannot configure OSPF NSSA type-7 address ranges.
+* On Arista EOS, IPv6 is enabled on all interfaces as soon as one has an IPv6 address. Arista EOS implementation of IS-IS refuses to work on interfaces with missing address families.
+* IPv6 BFD for IS-IS cannot be enabled on individual interfaces.  If you set **isis.bfd.ipv6** to *True*, BFD is enabled on all IS-IS interfaces.
+* Arista EOS virtual machines and containers use [proprietary control-plane messages to indicate the loss of Ethernet line protocol](https://blog.ipspace.net/2025/03/arista-spooky-action-distance/). Set the **netlab_phy_control** node variable to *False* to disable this functionality.
+* Device configurations that contain `no lldp transmit` or `no lldp receive` configuration command trigger configuration reload failures due to an Arista EOS bug ([more details](https://github.com/ipspace/netlab/issues/2577)). These commands are thus automatically removed from collected device configurations.
+* Arista EOS uses per-protocol Segment Routing Global Blocks. If you run SR-MPLS with OSPFv2 and IS-IS on the same device, the SRGB specified in the lab topology is applied to IS-IS and not to OSPFv2.
+
+GRE tunnel caveats:
+
+* OSPFv2 routing process does not use routes reachable over tunnel interfaces unless the **tunnel routes** parameter is configured. _netlab_ enables OSPFv2 tunnel routes, as no other routing protocol has a similar limitation, and Arista EOS documentation claims it's enabled by default (which is not the case).
+* IS-IS does not work over GRE tunnels
+* Arista cEOS might forward multiple copies of the packets received over GRE tunnels
+
+(caveats-arcos)=
+## Arrcus ArcOS
+
+ArcOS is a commercial NOS; there is no public container image. See the [ArcOS installation
+notes](build-arcos) for the image, the first-boot bootstrap, the supported configuration modules,
+and validation. Configuration is deployed with a bash script executed within the ArcOS container.
+
+* Initial device configuration sets the ArcOS interface MTU to the lab topology layer-3 MTU
+  (**interface.mtu**) plus 26.
+* _netlab_ configures static routes and they are used for traffic forwarding, but the tested ArcOS
+  image does not report them in the OpenConfig RIB tree.
+* While _netlab_ configures SR-MPLS, MPLS/LDP, and SRv6, the dataplane does not work in the
+  container image.
+* BGP sessions come up roughly 70 seconds after the rest of the configuration; the BGP daemon
+  rejects session state changes until it has finished reading its boot-time configuration. The
+  integration tests declare that wait. OSPF and IS-IS are not affected.
+* An OSPF ABR summarizes loopback host routes with the wrong prefix length, so a loopback placed in
+  a non-backbone area is not reachable from other areas. Loopbacks in area 0 and all inter-area
+  transit prefixes are unaffected.
+* IS-IS IPv6 is single-topology; the tested image has no multi-topology (RFC 5120) knob. Devices
+  running multi-topology IS-IS -- which is how _netlab_ configures every other device -- will not
+  install ArcOS IPv6 routes, so IPv6 IS-IS works only in an all-ArcOS IS-IS domain. IPv4 IS-IS
+  interoperates normally.
+* ArcOS computes the IPv4 VRRPv3 checksum over the IPv4 pseudo-header and has no knob to disable
+  it, while _netlab_ configures every other device the other way, so IPv4 VRRP does not interoperate
+  with other _netlab_ devices. A single ArcOS first-hop router works. IPv6 VRRP is unaffected.
+* With static VXLAN flooding, the container image withdraws the head-end-replication entry shortly
+  after programming it, so an ArcOS VTEP cannot originate BUM traffic (receiving works). Use
+  `vxlan.flooding: evpn`.
+* A discard (blackhole) static route pointing to a directly-connected host is displaced by the
+  connected route once that host's neighbor entry becomes reachable. Discard routes for prefixes
+  that are not directly connected work normally.
+
+(caveats-aruba)=
+## Aruba AOS-CX
+
+* Ansible automation of Aruba AOS-CX requires the installation of the [ArubaNetworks Ansible Collection](https://galaxy.ansible.com/arubanetworks/aoscx) with `ansible-galaxy collection install arubanetworks.aoscx`.
+* The limitations of the Aruba AOS-CX Simulator can be found [here](https://feature-navigator.arubanetworks.com/), selecting *CX Simulator* as platform.
+* It seems that the Aruba AOS-CX Simulator cannot generate ICMP Fragmentation-Needed messages.
+* Inter-VRF static routes are supported only for IPv4.
+* With MC-LAG (VSX), it seems the virtual dataplane has some problems in case of LAG member link failure.
+
+### VRF and L3VPN Caveats
+
+* OSPF processes can be only *1-63*. VRF indexes usually are > 100, so a device tweak will map every *vrfidx* to a different OSPF process ID. That means you cannot have more than 62 VRF using OSPF.
+* On the Aruba AOS-CX Virtual version *10.11.0001*, the MPLS L3VPN forwarding plane seems broken (while the control plane works fine).
+
+### VXLAN and EVPN Caveats
+
+* ECMP is not supported.
+* The VXLAN data plane (at least, on the virtual version) does not support VNI greater than 65535. If you set a higher value, an overflow will occur, and you may have overlapping VNIs. The workaround for this is to set `defaults.vxlan.start_vni: 20000` and `defaults.evpn.start_transit_vni: 10000` (especially on multi-vendor topologies).
+* EVPN Symmetric IRB is supported only from the Aruba AOS-CX Virtual version *10.13*.
+* VXLAN-encapsulated ARP traffic generated by ArubaCX has an invalid IP packet length and is rejected by Linux-based devices.
+* CPU-generated traffic is not encapsulated in Symmetric IRB on the AOS-CX Simulator.
+* Active-Gateway MAC Addresses shall be the same across all VTEPs in AOS-CX Simulator.
+* Manually Setting Virtual-MAC for EVPN RT-5 is not working (but an autogenerated one is fine).
+* AOS-CX doing [centralized VXLAN-to-VXLAN routing](https://github.com/ipspace/netlab/blob/dev/tests/integration/evpn/04-vxlan-central-routing.yml) does not work with Linux-based edge switches bridging from VXLAN to edge VLANs. It works flawlessly with Arista cEOS and Cisco Nexus OS as edge devices.
+
+(caveats-bird)=
+## BIRD Internet Routing Daemon
+
+* You must build the BIRD container image with the **netlab clab build bird** command. Without additional arguments, that command installs the latest BIRD v3 package from CZ.NIC BIRD repository on top of Ubuntu 24.04. See [](build-bird) for build targets and version options.
+* BIRD is implemented as a pure control-plane daemon running as a container with a single external interface. You can set the node **role** to **router** to turn a BIRD instance into a more traditional networking device with a loopback interface.
+* BIRD uses the node BGP router ID as the default router ID for BGP and OSPF protocol instances.
+* The VM or container running BIRD in host mode starts with static routes pointing to one of the adjacent routers (see [](linux-forwarding)). After establishing routing adjacencies, BIRD copies BGP and OSPF into the kernel IP routing table.
+* The **bird** container starts BIRD in foreground mode with logging messages (including debugging messages) sent to *stderr*. Use the **docker logs** command to inspect the BIRD messages.
+
+### Unnumbered Interfaces
+
+* Unnumbered IPv4 interfaces on BIRD require a single unnumbered peer
+
+### OSPF Caveats
+
+* BIRD OSPF implementation has no *reference bandwidth*. The default OSPF cost is 10.
+
+### BGP Caveats
+
+* You must run OSPF on the BIRD daemon for the IBGP sessions to work.
+* BIRD will not advertise (reflect) an IBGP route if it has an equivalent OSPF route.
+
+### IPv6 Caveats
+
+* If the BGP next hop of a reflected IBGP route is reachable as an OSPF route, BIRD advertises a link-local address as one of the next hops of the IBGP IPv6 prefix, potentially resulting in broken IPv6 connectivity.
+
+(caveats-asav)=
+## Cisco ASAv Caveats
+
+* Some ASAv versions use older SSH protocols. For more details, see the [SSH Access to Cisco IOS/IOS-XE](cisco-ios-ssh).
+* ASAv does not have a standard implementation of OSPFv2 or IS-IS point-to-point circuits. netlab reports an error if you try to use IS-IS point-to-point with ASAv nodes. You could add `isis.network_type: false` to point-to-point links connecting ASA to other devices.
+* The ASAv IS-IS configuration templates were not tested, as all IS-IS integration tests include at least one point-to-point circuit
+* ASAv implements OSPFv2 point-to-point links with the `point-to-point non-broadcast` network type. *netlab* configures static OSPF neighbors on these links.
+* ASAv cannot run OSPFv3 on loopback interfaces; *netlab* does not advertise the IPv6 loopback prefix in OSPFv3.
+* ASAv implements OSPFv3 point-to-point links with the `point-to-point non-broadcast` network type. Unlike OSPFv2, static OSPFv3 neighbors are not needed.
+* ASAv static routes require an outgoing interface. *netlab* does not configure static routes with indirect next hops on ASAv.
+* ASAv does not support equal-cost static routes over multiple interfaces. *netlab* configures only the first next hop of a static route.
+* ASAv releases before 9.18(2) do not support loopback interfaces; *netlab* does not configure them by default. Set `loopback: true` on ASAv nodes running release 9.18(2) or later.
+* *netlab* uses loopback interfaces for IBGP sessions. IBGP sessions with ASAv nodes that have no loopback interface do not work; use EBGP sessions instead.
+* OSPF routes are not imported into the IPv6 BGP address family (OSPFv3 is not implemented). Routing policies cannot be used with route import.
+* ASAv containers are configured with the *netmiko* library. You can also configure ASAv VMs with *netmiko*. To use this configuration method, set the **defaults.devices.asav.group_vars.netlab_config_mode** [topology default](topo-defaults) or **netlab_config_mode** node variable to **netmiko**.
+
+(caveats-cat8000v)=
+## Cisco Catalyst 8000v
+
+**Licensing:**
+
+* Catalyst 8000v uses a boot-level license to enable additional features. The *netlab*-built Vagrant box configures the **premier** license, while the older versions of *vrnetlab* built containers without the add-on license. Set the default parameter **defaults.devices.cat8000v.clab.cat8000v.license** to *none* if you're using Catalyst 8000v containers without the **premier** license.
+* The **premier** license is required for new-style VLAN configuration (see below), VXLAN, EVPN, MPLS, SR-MPLS, and SRv6.
+
+**VLAN caveats:**
+
+* You cannot use reserved VLANs (1002..1005) on Catalyst 8000v
+* _netlab_ uses new-style VLAN configuration (service instance configured as a **member** of the **bridge-domain**) on Catalyst 8000v nodes with the **premier** license, and old-style VLAN configuration (**bridge-domain** configured under **service instance**) on other Catalyst 8000v nodes.
+
+**EVPN/VXLAN caveats:**
+
+* Cisco IOS/XE does not accept VXLAN VNI values below 4096
+
+**Container caveats:**
+
+You should use the latest *vrnetlab* code to build (or rebuild) the Catalyst 8000v containers:
+
+* Older _vrnetlab_ code used **virtio** NICs for Catalyst 8000v VMs, causing problems with Ethernet subinterfaces. The latest *vrnetlab* code [uses **vmxnet3** NICs](https://github.com/srl-labs/vrnetlab/pull/419).
+* Older _vrnetlab_ code did not apply the **network-premier** license to the Catalyst 8000v VM. The [latest code](https://github.com/srl-labs/vrnetlab/pull/421) starts the VM while building the container, applies the license, and saves the snapshot of the modified disk image into the container image.
+
+See also [common Cisco IOS](caveats-ios) caveats.
+
+(caveats-csr)=
+## Cisco CSR 1000v
+
+* Cisco CSR 1000v does not support an interface MTU lower than 1500 bytes or an IP MTU higher than 1500 bytes.
+* Cisco CSR 1000v supports VXLAN with ingress replication and EVPN with MPLS encapsulation, but not EVPN with VXLAN encapsulation
+
+See also [SSH access](cisco-ios-ssh) and [common Cisco IOS](caveats-ios) caveats.
+
+(caveats-ios)=
+## Cisco IOS/IOS XE Caveats
+
+These caveats are common to all Cisco IOS/IOS XE platforms:
+
+* BGP configuration is optimized for reasonable convergence times under lab conditions. Do not use the same settings in a production network.
+* It's impossible to configure RIPv2 on individual subnets on Cisco IOS. RIPv2 might be running on more interfaces than intended. _netlab_ configures those interfaces to be *passive*.
+* Cisco IOS does not support passive interfaces in RIPng.
+* Cisco IOS requires a *default metric* when redistributing routes into RIPv2. The RIPv2 configuration template sets the default metric to the value of the **netlab_ripv2_default_metric** node parameter (default: 5)
+* Cisco IOS behaves like an awful IP host from the 1980s with the **no ip routing** configuration; it does not use static routes and relies only on the **ip default-gateway**. IPv4 routing is thus enabled even when a Cisco IOS device has **role** set to *host*.
+* You can use the **ios.debug** global- or node attribute to [enable debugging](node-debug-attribute) during the initial device configuration.
+* The **remove-private-as** option **all** or **replace** is not accepted when the local BGP AS number is private.
+
+These caveats are common to all Cisco IOS XE platforms:
+
+* Cisco IOS/XE does not accept VXLAN VNI values below 4096
+
+(caveats-iosv)=
+## Cisco IOSv/IOSvL2 Caveats
+These caveats apply only to Cisco IOSv and IOSvL2
+
+* Cisco IOS release 15.x does not support unnumbered interfaces. Use Cisco CSR 1000v.
+* Multiple OSPFv2 processes on Cisco IOS cannot have the same OSPF router ID. _netlab_ automatically generates a different OSPF router ID for each VRF.
+* You cannot use VLANs 1002 through 1005 with Cisco IOSvL2 image
+* Cisco IOSv does not support VRRPv3 on BVI interfaces
+* Cisco IOSv cannot use tagged VLAN 1 in a trunk
+* Cisco IOSvL2 cannot configure tagged VLAN 1 in a trunk. Internal VLAN 1002 is used as a fake native VLAN on interfaces that have tagged VLAN 1 in a trunk.
+
+See also [common Cisco IOS](caveats-ios) caveats.
+
+(cisco-ios-ssh)=
+### SSH Access to Cisco IOSv
+
+The Cisco IOSv SSH implementation uses RSA keys and older encryption algorithms that newer Linux distributions may not enable by default.
+
+That wasn't a problem for Ansible users until October 2025, when the new version of the `ansible-pylibssh` package (installed with Ansible) was released. `ansible-pylibssh` release 1.3.0 bundles `libssh` release 0.11.0 with [disabled legacy SSH algorithms](https://github.com/ipspace/netlab/discussions/2759).
+
+_netlab_ automatically tells Ansible to use the **paramiko** library when it detects a newer version of the `ansible-pylibssh` library. You could also downgrade `ansible-pylibssh` to release 1.2.2 with a command similar to `pip3 install --upgrade ansible-pylibssh==1.2.2` (you might have to prefix the command with `sudo` or add the `--break-system-packages` argument to the **pip3** command). Alternatively, you can tell Ansible to use the **paramiko** SSH library with:
+
+```
+$ export ANSIBLE_NETWORK_CLI_SSH_TYPE=paramiko
+$ export ANSIBLE_PARAMIKO_LOOK_FOR_KEYS=False
+```
+
+However, even the **paramiko** release 5.0 [removed support for the ancient algorithms used in Cisco IOSv](https://github.com/ipspace/netlab/discussions/3714). You might be able to get IOSv to work with a downgraded version of paramiko installed, for example, with `pip3 install --upgrade 'paramiko<5.0'`. Alternatively, use **[netlab install netmiko](netlab-install)** to install the latest *netmiko* library and an old-enough *paramiko* library, and enable *netmiko*-based configuration of Cisco IOS devices (totally bypassing the IOS-related Ansible headaches).
+
+Nonetheless, it's much better to use IOL and IOLL2 containers instead of IOSv and IOSvL2.
+
+We added a similar mechanism to _netlab_ commands that use SSH to connect to network devices. These commands append the group variable `netlab_ssh_args` (when defined) to the **ssh** command; the value of that variable for Cisco IOS/IOS-XE devices is set to:
+
+```
+group_vars:
+  netlab_ssh_args: "-o KexAlgorithms=+diffie-hellman-group-exchange-sha1 -o PubkeyAcceptedKeyTypes=ssh-rsa -o HostKeyAlgorithms=+ssh-rsa"
+```
+
+You can change the additional SSH arguments with the node **netlab_ssh_args** parameter or with the **defaults.devices._device_.group_vars.netlab_ssh_args** [system default](topo-defaults).
+
+Additionally, you might have to execute `sudo update-crypto-policies --set LEGACY` on AlmaLinux/RHEL.
+
+(caveats-iol)=
+## Cisco IOS on Linux (IOL) and IOL Layer-2 Image
+
+* The Cisco IOL and IOL L2 images work only as containers created with Roman Dodin's fork of [vrnetlab](https://github.com/srl-labs/vrnetlab).
+* You need Containerlab 0.59.0 or greater to run these images.
+* You cannot use VLANs 1002 through 1005 with the Cisco IOL layer-2 image
+* Cisco IOS/XE does not accept VXLAN VNI values below 4096
+* Cisco IOL layer-2 image cannot configure tagged VLAN 1 in a trunk. Internal VLAN 1002 is used as a fake native VLAN on interfaces that have tagged VLAN 1 in a trunk.
+* Cisco IOL/IOLL2 cannot set the interface MTU (which is fixed at 1500 bytes). IOLL2 cannot set the IP MTU.
+* VXLAN with static ingress replication does not work on IOL/IOLL2, but works with the EVPN control plane.
+* [_netlab_ external tools](tools-intro) (connected to the same management network as lab devices) cannot open an SSH session to IOL devices; IOL is reporting TCP checksum errors.
+
+See also [common Cisco IOS](caveats-ios) caveats.
+
+(caveats-iosxr)=
+## Cisco IOS XR
+
+* Cisco IOS XR cannot configure the minimum TTL when configuring BGP TTL security. The value of the **bgp.gtsm** interface parameter is ignored.
+* Cisco IOS XR routing policies cannot use traditional prefix lists. _netlab_ thus implements **routing.prefix** lists as **prefix-sets** which cannot mix **permit** and **deny** conditions. When encountering such a filter, _netlab_ generates a warning and does its best (**deny** check followed by **permit** check).
+* The same limitation applies to BGP AS-path matching (using **as-set** objects) and BGP community matching (using **community-set** objects)
+* _netlab_ translates **match.community** routing policy entry into IOS XR `community matches-any` test, and the **community-set** object cannot match two (or more) communities in a single entry. You cannot use the current _netlab_ IOS XR implementation of BGP community lists to match two (or more) communities being attached to the route *at the same time*.
+* The **remove-private-as** option **all** or **replace** is not accepted when the local BGP AS number is private.
+
+* IOS XRv/XRd support **routed VLANs only**: a routed access VLAN stays on the physical interface, a routed VLAN on a trunk becomes a dot1q subinterface. XRd Control Plane forwards through an L3-only Linux dataplane with no L2VPN bridge-domains, so bridged and IRB VLANs (VLAN interfaces, native VLANs) are rejected on this device. Use **cisco8000v** for bridged VLANs on IOS XR.
+
+### Cisco IOS XRv
+
+* netlab was tested with IOS XR release 7.4. Earlier releases might use a different management interface name. In that case, you must set the **defaults.devices.iosxr.mgmt_if** parameter to the name of the management interface
+* Copying the Vagrant public insecure SSH key into IOS XR during the box building process is cumbersome. The vagrant configuration file uses a fixed SSH password.
+* Maximum interface bandwidth on IOS XRv is 1 Gbps (1000000).
+* It seems IOS XR starts an SSH server before it parses the device configuration[^WCPGW], and newer versions of Vagrant don't like that and will ask you for the password for user **vagrant**. Ignore that prompt and the subsequent error messages[^POT]; you might get a running lab in a few minutes[^MAS].
+
+[^WCPGW]: Yeah, what could possibly go wrong?
+
+[^POT]: You'll get plenty of those. Even when the IOS XR device is configured, and you can log into the console, it hates accepting SSH sessions.
+
+[^MAS]: Hint: you have plenty of time to make coffee and a snack.
+
+### Cisco XRd
+
+* Older versions of the `cisco.iosxr` Ansible Galaxy collection did not work with XRd because they tried to execute the `show inventory` command. If you experience that error, upgrade the collection with:
+
+```shell
+ansible-galaxy collection install --upgrade cisco.iosxr
+```
+
+* Starting numerous IOS XRd containers could overload your server. If you experience errors during the initial device configuration, reduce the number of parallel configuration processes -- set the ANSIBLE_FORKS environment variable to one with `export ANSIBLE_FORKS=1`.
+
+(caveats-cisco8000v)=
+## Cisco 8000v
+
+Cisco 8000v is a VM-in-container emulator of the Cisco 8000 platform. It's running IOS XR and is a completely different device from the [Catalyst 8000v](caveats-cat8000v).
+
+* Cisco 8000v container uses Open vSwitch ([more details](https://containerlab.dev/manual/kinds/c8000/#host-server-requirements)). _netlab_ tries to load the Open vSwitch kernel module when starting a Cisco 8000v device, but does not install the Open vSwitch package. You have to install that package on your Linux server before using the Cisco 8000v device.
+
+See also [common IOS XR caveats](caveats-iosxr)
+
+(caveats-nxos)=
+## Cisco Nexus OS
+
+* Nexus OS release 9.3 requires 6 GB of RAM (*netlab* system default).
+* Nexus OS release 10.1 requires 8 GB of RAM and will fail with a cryptic message claiming it's running on unsupported hardware when it doesn't have enough memory.
+* Nexus OS release 10.2 requires at least 10 GB of RAM and crashes when you try to run it as an 8 GB VM.
+* To change the default amount of memory used by a **nxos** device, set the **defaults.devices.nxos.memory** parameter (in MB)[^DD]
+* Nexus OS cannot use VLANs above 3966[^NXOM]
+* Nexus OS cannot configure tagged VLAN 1 in a trunk. VLAN 3967 is used as a fake native VLAN on interfaces that have tagged VLAN 1 in a trunk.
+* _netlab_ starts Nexus OS devices with an old version of OVMF UEFI firmware that is no longer available on recent Ubuntu releases. Use [*vrnetlab*-based container](clab-vrnetlab) if the Nexus OS VM fails to start.
+
+[^DD]: See [](topology/hierarchy.md) for an in-depth explanation of why attributes with hierarchical names work in *netlab*
+
+[^NXOM]: The platform limit is 3967. _netlab_ uses another VLAN as a fake native VLAN.
+
+(caveats-cumulus)=
+## Cumulus Linux
+
+```{warning}
+Cumulus Linux 4.x is retired. While there are no plans to remove it from _netlab_, we will not add new features or run integration tests.
+```
+
+* The Cumulus VX 4.x uses Python version 3.7, which recent versions of Ansible refuse to work with. We have to use the **raw** module to communicate with Cumulus VX 4.x virtual machines.
+* Cumulus VX 4.x uses an ancient versions of FRR (7.5; current release is 10.2) with numerous issues or. For example, it silently ignores OSPF passive interfaces inside VRFs
+
+_netlab_ uses the VLAN-aware bridge paradigm to configure VLANs on Cumulus Linux. That decision results in the following restrictions:
+
+* The _netlab_-generated Cumulus Linux VLAN configuration cannot use routed subinterfaces; *ifupdown2* version shipping with Cumulus Linux 4.4.0 refuses to create VLAN subinterfaces in combination with a VLAN-aware bridge.
+* The _netlab_-generated Cumulus Linux VLAN configuration cannot use a routed native VLAN; *ifupdown2* enslaves physical ports to the bridge and cannot configure IP addresses on physical ports.
+* FRRouting version bundled with Cumulus Linux 4.4 cannot run OSPFv3 in VRFs and fails to advertise local IPv6 prefixes in other areas.
+
+See also [other FRRouting caveats](caveats-frr).
+
+(caveats-cumulus-clab)=
+### Running Cumulus Linux in Containerlab
+
+* *netlab* uses Cumulus VX 4.4 containers created by Michael Kashin and downloaded from his Docker Hub account. These containers are not tested as they cause occasional system crashes.
+* *containerlab* could run Cumulus Linux as a [container or as a micro-VM with *firecracker*](https://containerlab.dev/manual/kinds/cvx/). The default used by *netlab* is to run Cumulus Linux as a container. Add the **clab.runtime** parameter to node data to change that.
+* Cumulus Linux running as a container might report errors related to the DHCP client during initial configuration. In this case,  you might have to disable **apparmor** for the DHCP client. The hammer-of-Thor command to fix this problem is `sudo systemctl disable apparmor` followed by a reboot; your sysadmin friends probably have a better suggestion.
+
+(caveats-cumulus-nvue)=
+## Cumulus 5.x with NVUE
+
+You could configure Cumulus Linux 5.x with configuration templates developed for Cumulus Linux 4.4 (use device type **cumulus** and specify desired device image), or with NVUE.
+
+(caveats-cumulus-5x)=
+To run Cumulus Linux 5.x with **cumulus** device type, set the following default values in [lab topology](defaults-topology) or one of the [defaults files](defaults-user-file):
+
+```
+defaults.devices.cumulus.libvirt.image: CumulusCommunity/cumulus-vx:5.10.0
+defaults.devices.cumulus.libvirt.memory: 2048
+```
+
+Other caveats:
+
+* The default MTU value is 1500 to match the implementation defaults from other vendors and enable things like seamless OSPF peering.
+* *netlab* uses Cumulus VX 5.3 containers created by Michael Kashin and downloaded from his Docker Hub account. These containers are severely out-of-date, are not tested in our integration tests, and might not work as expected.
+* Some features - such as VRF route leaking and route advertisement in the default VRF (used in certain EVPN scenarios) - are not supported by NVUE, and require the use of custom config *snippets*. Only one such snippet is supported per configuration file (e.g. /etc/frr/frr.conf), which means a topology using a combination of multiple features that all require *snippets* will not work.
+* Cumulus NVUE does not support OSPFv3
+
+(caveats-os10)=
+## Dell OS10
+
+* Dell OS10 uses a so-called *Virtual Network* interface for VLANs that use VXLAN. There are several limitations when using such SVIs - OSPF is not supported, and gateways are limited to anycast (not VRRP)
+* The *anycast* gateway is not supported on plain *ethernet* interfaces, so you need to use *VRRP* there.
+* Dell OS10 only allows configuring of the EVPN RD in the form `X.X.X.X:N.` By default, *netlab* uses `N:M` for L3VNI, so on this platform the L3VNI RD is derived from the Router-ID and the VRF ID as `router-id:vrf-id` (and the one generated by *netlab* is not used).
+* OSPF NSSA areas are not supported for OSPFv3
+
+### VRRP Caveats
+Netlab enables VRRPv3 by default on Dell OS10, overriding any platform defaults. If you need VRRPv2, check out the [vrrp.version](plugin-vrrp-version) plugin
+
+(caveats-dnsmasq)=
+## dnsmasq DHCP server
+
+You have to build the *dnsmasq* container image with the **netlab clab build dnsmasq** command ([more details](build-dnsmasq))
+
+(caveats-vpp)=
+## VPP (Vector Packet Processor)
+
+* You must [build the VPP container image](build-vpp) with the **netlab clab build vpp** command.
+* VPP can use FRR or BIRD control plane. [More details](vpp-control-plane).
+
+(caveats-exos)=
+## Extreme Networks EXOS
+
+* _netlab_ configures EXOS devices with the *netmiko* library. The only way to configure EXOS devices with Ansible is the now-deprecated **community.network.exos_config** Ansible module. This collection is no longer actively maintained. To install it, you can still run:
+
+```shell
+ansible-galaxy collection install community.network
+```
+
+* EXOS does not support the same VRRP group for IPv4 and IPv6
+* Saved EXOS device configuration includes commands that cannot be configured on the EXOS VM. _netlab_ therefore cannot do a configuration reload for EXOS devices.
+
+(caveats-voss)=
+## Extreme Networks VOSS
+
+* _netlab_ needs the *netmiko* library to check whether the VOSS SSH server is ready and to configure VOSS devices. Install it with the **netlab install netmiko** command.
+* The only way to configure VOSS devices with Ansible is the now-deprecated **community.network.voss_config** Ansible module. This collection is no longer actively maintained. To install it, you can still run:
+
+```shell
+ansible-galaxy collection install community.network
+```
+
+(caveats-fortios)=
+## Fortinet FortiOS
+
+Device-specific parameters:
+
+* A FortiGate firewall does not pass any traffic by default. If you want the firewall to behave like a router after the initial configuration, set the `netlab_default_policy` node- or group variable to `True`. To create a disabled default policy, set the `netlab_default_policy.enable` variable to `False`.
+
+[BGP graceful restart](plugin-bgp-session-gr) (**bgp.session** plugin):
+
+* FortiOS has no helper-only graceful restart mode: it either advertises the full restart capability or stays silent. The only valid **bgp.gr** states are therefore `enable` and `disable`; a node-level `state: helper` leaves the device default (graceful restart disabled) in place.
+* FortiOS accepts the graceful restart timers in the 1-3600 second range. A value of 0 (allowed by the _netlab_ schema) is rejected by the device during configuration deployment.
+* Enabling graceful restart on any BGP neighbor also enables the global FortiOS **graceful-restart** switch, which preserves the forwarding state across a routing restart. Advertising the capability without it would announce forwarding-state preservation the device does not deliver.
+
+Device configuration:
+
+* Use a recent version of Ansible and **fortinet.fortios** Ansible Galaxy collection (version 2.3.6 or later)
+* When the **netlab_generate_api_token** device group variable is `True` (default behavior), _netlab_ generates the API token for the _netlab_ user (created during the Vagrant box creation process) and saves it in the `ansible_httpapi_session_key.access_token` Ansible host variable. You can disable the generation of API token with the `netlab_generate_api_token: False` node/group variable.
+* Without the API token, _netlab_ tries to configure Fortinet devices with configuration scripts uploaded through the FortiOS Monitor API calls using username/password authentication.
+* If the API call fails, _netlab_ tries to push the configuration to a Fortinet device through a regular SSH session. Use **netlab initial -vvv --limit _fw_device_** to troubleshoot the configuration download (Ansible displays full contents of the SSH session at this level of verbosity).
+* _netlab_ uses HTTPS to access FortiOS API. See [](caveats-fortios-70) if your device cannot use HTTPS due to licensing restrictions.
+* To troubleshoot API authentication, log into the FortiOS VM with **netlab connect** and enable HTTP debugging with the following commands:
+
+```
+diag debug enable
+diag debug application httpsd -1
+```
+
+```{warning}
+* **‌fortinet.fortios** collection throws ridiculous errors when the API authentication fails.
+* We're not testing Fortinet implementation as part of the regular integration tests; the configuration scripts might be outdated. If you encounter a problem, please open an issue.
+```
+
+FortiOS restarts the HTTPS server after multi-VDOM configuration. The initial configuration playbook waits for the HTTPS server to become available after changing the VDOM mode to `multi-vdom`. The following device variables (which can also be set as node/group variables) control the wait time:
+
+(caveats-fortios-wait)=
+* `netlab_vdom_timer` -- the initial wait time (default: 0). Ansible won't try to reach the HTTPS server until this timer expires
+* `netlab_check_delay` -- the delay between retries (default: 5 seconds)
+* `netlab_check_retries` -- the number of retries (default: 20)
+
+(caveats-fortios-70)=
+### Fortinet FortiOS 7.0
+
+* FortiOS VM images have a default 15-day evaluation license. The VM has [limited capabilities](https://docs.fortinet.com/document/fortigate-private-cloud/7.2.0/kvm-administration-guide/504166/fortigate-vm-evaluation-license) without a license file. It will work for 15 days from the first boot, at which point you must install a license file or recreate the vagrant box completely from scratch.
+* The 15-day evaluation license only allows one single VDOM. Using the **netlab_vdom** node parameter will fail when using the built-in 15-day license.
+* You cannot use HTTPS without FortiOS license. Set these node/group variables to use HTTP:
+
+```
+ansible_httpapi_use_ssl: false
+ansible_httpapi_port: 80
+```
+
+### Fortinet FortiOS 7.4.x/7.6.x
+
+* Starting from FortiOS 7.2, FortiGate devices do not come with a license out of the box. Users can link *one* device with a permanent evaluation license to an account on the Fortinet support portal.
+* The license needs to be added before creating the Vagrant box.
+* There are restrictions associated with the evaluation license, including a maximum of three interfaces, firewall policies, and routes. For more detailed information, refer to the [evaluation license restrictions](https://docs.fortinet.com/document/fortigate/7.6.3/administration-guide/441460).
+* The license is linked to the serial number of the device and the UUID. To ensure that the serial number remains consistent each time you start the lab, set the `libvirt.uuid` (or `clab.env.FORTIGATE_UUID`) node parameter to the appropriate value.
+* MTU can be defined on the interface level; the default is forced to 1500 bytes due to a different behavior between `7.4.8` and `7.6.3` releases.
+* If you want to use a multi-vdom configuration, you just need to set the `netlab_vdom: <name>` in the node data. `root` vdom will be used as the management with interface `port1`, and everything else will be configured in the specified traffic vdom. Default is `netlab_vdom: root` vdom in a no-vdom configuration.
+
+(caveats-frr)=
+## FRRouting
+
+* Many FRR configuration templates are not idempotent -- you cannot run **netlab initial** multiple times. Non-idempotent templates include VLAN and VRF configurations.
+* You can change the FRR default profile with the **netlab_frr_defaults** node parameter (`traditional` or `datacenter`, default is `datacenter`).
+* **netlab collect** downloads FRR configuration but not Linux interface configuration.
+* FRR has no default logging destinations. The initial device configuration adds file logging to `/var/log/frr/frr.log`.
+* _netlab_ automatically enables FRR daemons required by the _netlab_ modules you use on individual nodes in the `/etc/frr/daemons` FRRouting configuration file. Use the **frr.daemons** node attribute to enable additional FRRouting daemons.
+
+**FRR-Specific Node Attributes:**
+
+* The **frr.debug** global- or node attribute [enables debugging](node-debug-attribute) during the initial device configuration. On FRR containers, it also relays log file output to container *stdout* so you can inspect it with **docker logs** (see below).
+* The **frr.logfile** attribute specifies the path to the FRR logging file (default: `/var/log/frr/frr.log`)
+* You can specify a list of additional FRRouting daemons you want to have enabled in the **frr.daemons** node attribute.
+
+**FRR VM Caveats:**
+
+* The VM version of FRR is a Debian VM. The FRR package is downloaded and installed during **vagrant up** processing in the libvirt environment. To postpone the FRR installation to the initial configuration process, set the node variable **netlab_quick_start** to `true`.
+* You can [build a custom FRR VM](build-frr) with a preinstalled **frr** package to speed up the **vagrant up** processing.
+
+**FRR Container Features and Caveats:**
+
+* FRR logging messages are written to the log file (default: `/var/log/frr/frr.log`; see **frr.logfile**). When **frr.debug** is enabled, they are also copied to the container *stdout* so you can inspect them with **docker logs _containername_** (which you can find with the **netlab status** command). The log relay can trigger SELinux denials on the host and is therefore disabled by default.
+* FRR containers need host kernel modules (drivers) to implement the data-plane functionality of *vrf*, *mpls*, and *vxlan* netlab modules. The kernel modules are automatically loaded (when available) during the **netlab up** processing.
+* VRF and VXLAN kernel modules are usually bundled with a Linux distribution. If your Ubuntu distribution does not include the MPLS drivers, try installing them with `sudo apt install linux-generic`.
+* You cannot load kernel modules in GitHub Codespaces and thus cannot use *vrf*, *mpls*, or *vxlan* modules on FRRouting nodes in that environment.
+* FRR containers have a management VRF. Use `ip vrf exec mgmt <command>` to run a CLI command that needs access to the outside world through the management interface. To disable the management VRF, set the **netlab_mgmt_vrf** node parameter to *False*.
+* FRR initial container configuration might fail if your Ubuntu distribution does not include the VRF kernel module. Install the VRF kernel module with `sudo apt install linux-generic`, then reboot the server.
+
+**FRR Implementation Caveats:**
+
+* FRR configures BFD as part of OSPFv2/OSPFv3 configuration.
+* IPv6 L3VPN over SRv6 does not work in parallel with the IPv6 AF. You have to disable the IPv6 AF on IPv6 IBGP sessions with **bgp.activate.ipv6: []**.
+* An OSPFv3 ABR running FRR release 10.3 does not originate summary external routes from NSSA areas
+* As of FRRouting release 10.6.0, the FRR implementation of EVPN for VXLAN-over-IPv6 is incompatible with the Arista EOS implementation due to different encodings of the PMSI_TUNNEL_ATTRIBUTE.
+
+(caveats-ocnos)=
+## IP Infusion OcNOS
+
+* _netlab_ runs IP Infusion OcNOS as a *vrnetlab* container (*containerlab* kind `ipinfusion_ocnos`). Download the OcNOS VM image for KVM (free, registration required) from the [IP Infusion web site](https://www.ipinfusion.com/free-software-demos/?vm=KVM&src=netlab). Decompress it (`xz -d`), copy the `.qcow2` file into the `ipinfusion/ocnos` directory of the [vrnetlab fork](https://github.com/srl-labs/vrnetlab), and run `make docker-image`.
+* We tested _netlab_ with the `OcNOS-SP-PLUS-x86-7.0.0-262-GA.qcow2` image; `make docker-image` builds it into the `vrnetlab/ipinfusion_ocnos:7.0.0-262` container image.
+* _netlab_ uses the default credentials of the *containerlab* kind (`admin`/`admin@123`).
+* The management interface (`eth0`) is in the `management` VRF, so the *vrnetlab* management subnet (`10.0.0.0/24`) does not conflict with the _netlab_ loopback addresses. The data-plane interfaces start with `eth1`.
+* The loopback interface `lo` always has 127.0.0.1/8 as its primary IPv4 address; _netlab_ configures the loopback IPv4 address as a secondary address. Additional loopback interfaces are named `loopback<n>`.
+* OcNOS assigns OSPFv2 areas with **network** statements in the OSPF routing process.
+* OcNOS BFD timers are limited to 999 msec.
+* OcNOS OSPF area ranges have no cost option; the **ospf.areas** plugin configures area ranges without the **cost** parameter.
+* OcNOS static routes with a next hop that is not on a connected subnet are configured with the **recursive** keyword. With OcNOS 7.0.0-262, an IPv4 recursive static route whose next hop resolves over more than one equal-cost path is in the routing table, but the router reports its destination as unreachable. IPv6 recursive static routes work in the same scenario.
+* OcNOS VLANs use a VLAN-aware bridge (bridge 1) with VLAN interfaces named `vlan1.<vlan-id>`. _netlab_ does not support routed VLAN subinterfaces on OcNOS.
+* OcNOS creates VLAN 1 together with the VLAN-aware bridge and does not allow you to use it as an access VLAN, a native VLAN, or a VLAN in a trunk. _netlab_ reports an error when a VLAN with VLAN ID 1 is used on an OcNOS node.
+* With OcNOS 7.0.0-262, routes imported into a VRF from another VRF on the same router are in the VRF routing table, but the router reports their destinations as unreachable, so it does not forward traffic between the VRFs.
+* OcNOS is a strict ABR. It does not originate inter-area summaries in a VRF OSPF instance when the VRF has no active area-0 adjacency.
+* OcNOS applies routing policies to BGP sessions that are already established only after a session reset. To apply them after `bgp.policy` plugin configures them, use `clear ip bgp * soft in` and `clear ip bgp * soft out`, `clear bgp ipv6 * soft in` and `clear bgp ipv6 * soft out`, and `clear ip bgp * vrf <vrf> soft in` and `clear ip bgp * vrf <vrf> soft out` for IPv4 VRF sessions. IPv6 VRF sessions need a hard reset (`clear bgp ipv6 unicast * vrf <vrf>`).
+
+(caveats-junos)=
+## Common Junos caveats
+
+* Ansible requires `ncclient` Python package and its dependencies to be installed (`python3 -m pip install ncclient`) to configure Junos devices.
+* Junos cannot have more than one loopback interface per routing instance. Using **loopback** links on Junos devices will result in configuration errors.
+* Junos configuration template configures BFD timers within routing protocol configuration, not on individual interfaces
+* Junos does not disable the default BGP address family on a BGP neighbor until another AF is configured.
+* IS-IS NSAP is configured on the loopback interface for the global IS-IS instance and with the protocol **net** parameter in VRF IS-IS instances.
+* OSPFv3 over a GRE tunnel signals interface MTU value of `0` on *DBD* packets. If you need to interoperate with other devices/vendors, you need to ignore the MTU mismatch on the peer device.
+
+Implementation limitations in import/export route filters (reported as errors that can be disabled with topology settings):
+
+* When prepending an AS number different than the local one, JunOS puts the prepended AS at the beginning of the *AS_PATH* while other vendors perform the prepending and then add the device's own AS at the beginning. Most EBGP peers deny a BGP update that does not have the neighbor's AS number at the beginning of the *AS_PATH*. If needed, _netlab_ automatically adds the *local-as* to the prepend list to get it at the beginning of the *AS_PATH*.
+* *as-path* regex syntax for JunOS has different rules than other vendors. For example, a *null as-path* is represented as `()`. netlab tries some as-path conversion, but sometimes it could be wrong.
+
+(caveats-crpd)=
+## Juniper cRPD
+
+* cRPD might require a license file to unlock additional features. You can specify the location of the license file with the **clab.license** node parameter or **defaults.devices.crpd.clab.node.license** [device default](topo-defaults).
+* Inter-VRF route leaking does not work correctly
+* VRRPv3 for IPv4 implementation uses the [checksum calculation that is incompatible with most other VRRP implementations](https://blog.ipspace.net/2025/01/sturgeon-law-vrrp-edition/). The `checksum-without-pseudoheader` configuration command does not seem to be available.
+* Anycast gateway is unsupported
+
+(caveats-vmx)=
+## Juniper vMX
+
+* vMX can run only as a [_vrnetlab_ container](clab-vrnetlab)
+* vMX requires a license file. By default, _netlab_ downloads the evaluation license for Junos 18.2 from the Juniper website.
+
+You can change the location of the license file with two variables:
+
+* **netlab_license_file** -- the name of a local file containing the relevant vMX license.
+* **netlab_license_url** -- the URL of a license file. The license file will be downloaded and installed on the vMX device. This parameter is used only when the local license file is not specified.
+
+You can change the license file parameters within a node definition or with **defaults.devices.vmx.group_vars._parameter_name_** [system default](topo-defaults).
+
+(caveats-vptx)=
+## Juniper vPTX
+
+* *netlab* supports only vJunosEvolved releases that do not require external PFE- and RPIO links. The first vJunosEvolved release implementing internal PFE- and RPIO links is the release 23.2R1-S1.8.
+* vJunosEvolved software is supposed to be run on an Intel CPU. _netlab_ implements the hacks [suggested by Juniper to run vJunos on an AMD CPU](https://www.juniper.net/documentation/us/en/software/nce/nce-510-virtual-switches-mist-cloud-managed/amd-cpu_unofficial_tweaks.html), but please note that this is not supported.
+* _netlab_ can start virtual machines running vJunosEvolved release 24.1+ (which requires UEFI BIOS - previous releases do not work with UEFI BIOS). Use the vrnetlab-generated container as a workaround if you want to run older vJunosEvolved releases.
+* _netlab_ supports the [vrnetlab-generated](https://containerlab.dev/manual/kinds/vr-vjunosevolved/) vJunosEvolved container, not the cJunosEvolved container. The differences between the two make it impossible to run both container versions as the same virtual device, and cJunosEvolved offers no significant advantages at the moment.
+* The vJunosEvolved container runs on Intel and AMD CPU.
+* The virtual MAC address of the anycast gateway is ignored. _netlab_, therefore, cannot implement the usually expected functionality of an anycast gateway on vPTX.
+* VXLAN encapsulation works only with the EVPN control plane
+* _netlab_ does not configure all the necessary nerd knobs to make centralized EVPN/VXLAN routing work with vPTX
+
+The rest of this section lists information you might find helpful if you're a long-time Junos user:
+
+* vJunos Evolved (vJunos EVO, Juniper vPTX) uses Linux instead of BSD as the underlying OS. There are some basic differences from a "default" JunOS instance, including the management interface name, which is `re0:mgmt-0`.
+* After the VM boots up, you need to wait for the *virtual FPC* to become *Online* before being able to forward packets. You can verify this with `show chassis fpc`. **NOTE**: You can see the network interfaces only after the *FPC* is online.
+* It seems that the DHCP Client of the management interface does not install a default route, even if received by the DHCP server.
+* The VM will complain about missing licenses. You can ignore that.
+
+See also [](caveats-junos).
+
+(caveats-vsrx)=
+## Juniper vSRX in Containerlab
+
+You can run Juniper vSRX as a container packaged by *vrnetlab*. See [_containerlab_ documentation](https://containerlab.dev/manual/kinds/vr-vsrx/) for further details.
+
+The Juniper vSRX image in *vrnetlab* uses the network `10.0.0.0/24` for its own internal network, which conflicts with the default network used by **netlab** for the loopback addressing. See [](clab-vrnetlab) for details.
+
+vSRX container built with *vrnetlab* uses **flow based forwarding**. You have two ways to use it:
+
+* Configure security zones, and attach interfaces and rules to them;
+* Change the mode to [**packet based forwarding**](https://supportportal.juniper.net/s/article/SRX-How-to-change-forwarding-mode-for-IPv4-from-flow-based-to-packet-based).
+
+See also [](caveats-junos).
+
+(caveats-vjunos-switch)=
+## vJunos-Switch in Containerlab
+
+* You can run Juniper vJunos-switch as a container packaged by Roman Dodin's fork of [vrnetlab](https://github.com/srl-labs/vrnetlab). See [_containerlab_ documentation](https://containerlab.dev/manual/kinds/vr-vjunosswitch/) for further details.
+* Use a recent *vrnetlab* release that places the management interface into the **mgmt_junos** routing instance to avoid the conflict between [management IP subnet](clab-vrnetlab) `10.0.0.0/24` and **netlab** loopback addressing.
+* vJunos-switch VLAN configuration uses the so-called *Enterprise Style VLAN configuration* (which uses `family ethernet-switching` on unit 0 of interfaces).
+
+See also [](caveats-junos).
+
+### EVPN Caveats on vJunos-Switch
+
+_netlab_ can use *default-switch* or MAC VRF EVPN configuration on a vJunos-switch. It uses MAC VRF EVPN configuration unless you set the **evpn.\_junos\_default\_macvrf** variable to *True*.
+
+MAC VRF EVPN configuration (using VLAN-based or VLAN-aware EVPN service) works well with most other EVPN implementations. However, it uses a separate MAC VRF for every VLAN, and as we're not creating the VLAN subinterfaces, we have to assign physical interfaces to MAC VRFs. It's thus impossible to use an EVPN-enabled VLAN in a VLAN trunk.
+
+The *default macvrf* VLAN-aware EVPN configuration (using the `switch-options` of the default routing instance) has other drawbacks and limitations:
+
+* All EVPN routes are announced with the same RD (configured under `switch-options`). A default route target is configured under `switch-options` but is then overwritten for each VNI under the `protocol evpn` configuration.
+* You cannot use multiple import/export RT. The *first* import RT is used on the configuration templates as the VNI RT.
+* VLAN-aware EVPN service might not work with devices from other vendors using VLAN-based EVPN service.
+* Every JunOS *routing-instance* (i.e., L3 VRF and MAC-VRF) must use a unique *Route Distinguisher*. For this reason, when using EVPN with VLAN Bundles, a new RD is allocated for every MAC-VRF.
+
+(caveats-vjunos-router)=
+## vJunos-Router in Containerlab
+
+* You can run Juniper vJunos-switch as a container packaged by Roman Dodin's fork of [vrnetlab](https://github.com/srl-labs/vrnetlab). See [_containerlab_ documentation](https://containerlab.dev/manual/kinds/vr-vjunosswitch/) for further details.
+* Use a recent *vrnetlab* release that places the management interface into the **mgmt_junos** routing instance to avoid the conflict between [management IP subnet](clab-vrnetlab) `10.0.0.0/24` and **netlab** loopback addressing.
+
+See also [](caveats-junos).
+
+## Linux caveats
+See [](generic-linux-devices)
+
+(caveats-routeros6)=
+## Mikrotik RouterOS 6
+
+* Runs with the *CHR* image.
+* The CHR free license offers full features with a 1Mbps upload limit per interface, upgradeable to an unrestricted 60-day trial by registering a free MikroTik account and using the ```/system license renew``` command.
+* LLDP on Mikrotik CHR RouterOS is enabled on all the interfaces.
+* A BGP VRF instance cannot have the same Router ID as the default one. The current configuration template uses the IP address of the last interface in the VRF as the VRF instance Router ID.
+* _netlab_ cannot configure OSPFv3 on Mikrotik RouterOS 6
+
+(caveats-routeros7)=
+## Mikrotik RouterOS 7
+
+* Runs with the *CHR* image.
+* LLDP on Mikrotik CHR RouterOS is enabled on all the interfaces.
+* The CHR free license offers full features with a 1Mbps upload limit per interface, upgradeable to an unrestricted 60-day trial by registering a free MikroTik account and using the `/system license renew` command.
+* The RouterOS7 BGP configuration templates use the newer BGP configuration model. Use a recent software release (we tested them with release 7.21.4).
+* _netlab_ does not configure the OSPF reference bandwidth
+* BFD with OSPF uses the system default values for interval and multiplier.
+
+Other caveats you might encounter:
+
+* MPLS dataplane seems to have issues when using *virtio* networking, while the LDP and VPNv4 control plane work fine. With *e1000* everything works fine.
+* Route Reflection of inactive routes does not work.
+* OSPFv3 does not work within VRFs
+* BGP VPNv6 address family does not work; RouterOS7 does not recognize the next hops.
+
+(caveats-srlinux)=
+## Nokia SR Linux
+
+* Only supported on top of *Containerlab*
+* Supports SR Linux release 24.7.1 or later (due to YANG model changes)
+* Requires `nokia.srlinux` Ansible Galaxy collection (minimum version 0.5.0). Use **ansible-galaxy collection install nokia.srlinux** command to install it.
+* MPLS, LDP, SR-MPLS, and SRv6 are only supported on 7250 IXR and 7730 SXR routers. Set the `clab.type` node attribute to one of the [valid node types](https://containerlab.dev/manual/kinds/srl/#types) to use these features. You will also need a license to run these containers.
+* Nokia SR Linux needs an EVPN control plane to enable VXLAN functionality. VXLAN ingress replication lists are built from EVPN Route Type 3 updates.
+* Inter-VRF route leaking is supported only in combination with BGP EVPN
+* SR Linux does not support configurable propagation of extended BGP communities.
+* The SR Linux prefix filters cannot contain the **deny** action.
+* The SR Linux configuration templates do not support additional routing policies on routing protocol route imports
+* SR Linux needs a static default route (with low route preference) to implement OSPF **default-originate always** functionality.
+* SR Linux does not set metrics on routes imported into OSPF. While you can specify the metric and metric type of the OSPF default route, those settings have no impact.
+* SR Linux does not support setting a default metric for NSSA areas
+* You cannot use non-SRv6 interface EBGP neighbors in the global routing table together with SRv6 layer-3 services. SR Linux does not strip SRv6 TLVs from outgoing updates sent to interface EBGP neighbors, resulting in incorrect routing tables on the receiving router. 
+
+(caveats-sros)=
+## Nokia SR OS
+
+* Only supported on top of *Containerlab*, using VRNetlab (VM running inside container)
+* With the launch of the Nokia SR SIM, we stopped running integration tests for the SR-OS VM. The last release with which we ran a full suite of integration tests for the SR-OS VM was 25.07.
+
+Other caveats (shared with Nokia SR-SIM):
+
+* We use the `nokia.grpc` Ansible Galaxy collection to configure SR-OS. The latest version of that collection has to be installed from the git repo:
+
+  ```
+  ansible-galaxy collection install git+https://github.com/nokia/ansible-networking-collections.git#/grpc/
+  python3 -m pip install grpcio protobuf==3.20.1
+  ```
+
+  You can also use the **netlab install grpc** command to install the `nokia.grpc` collection and prerequisite Python modules.
+* As of May 2024, the `nokia.grpc` collection crashes Ansible versions between 4.10.0 and 9.5.1. We recommend upgrading to Ansible release 9.5.1 or later (also included as part of the **netlab install grpc** script):
+
+```
+sudo pip3 install --upgrade 'ansible>=9.5.1'
+```
+
+* We implemented inter-VRF route leaking only for MPLS/VPN deployments.
+* The SR OS configuration templates do not support additional routing policies on routing protocol route imports
+* An SR OS interface cannot use an unnumbered IPv4 address in combination with IPv6 GUA
+* SR OS requires the IPv6 prefix configured on the global loopback interface to be a /128 prefix. _netlab_ automatically adjusts the **loopback.ipv6** prefix.
+
+(caveats-srsim)=
+## Nokia SR-SIM Container
+
+The Nokia Containerized Service Router Simulator (SR-SIM) uses environment variables to specify the emulated hardware (cards and MDAs), but also requires the same hardware to be specified in router configuration. A mismatch between the environment variables and router configuration results in *ghost* ports.
+
+The _netlab_ definition of **srsim** device uses SR-1 platform with two 12-port 100GE linecards, for a total of 24 dataplane interfaces.
+
+```{warning}
+_netlab_ supports *‌integrated* (single container), but not *‌distributed* (multiple containers) or *‌grouped* (a group of containers) [SR-SIM deployment](https://containerlab.dev/manual/kinds/sros/).
+```
+
+If you want to use a different hardware setup, you have to specify:
+
+* Desired platform in the **clab.kind** parameter
+* Desired linecards in the **clab.env** environment variables
+* Corresponding hardware configuration in the **netlab_srsim_hw** parameter.
+
+Use **netlab defaults devices.srsim** command to display the built-in hardware setup.
+
+See also [](caveats-sros) caveats for further details.
+
+(caveats-openbsd)=
+## OpenBSD
+
+* The virtual disk size of the `qcow2` image you can download from https://bsd-cloud-image.org/ is too small to survive the kernel reordering OpenBSD performs after every boot.
+* The kernel reordering is disabled in the Vagrant box, leaving you with approximately 170 MB of free disk space. You'll have a bit less than that in the *vrnetlab* container.
+* OSPF reference bandwidth is not implemented
+* OpenBSD OSPFv3 implementation does not support ABR functionality. It also advertises passive interfaces with a very high cost.
+* _netlab_ RIPv2/RIPng template implements route redistribution, but only for static and connected prefixes
+* The device role on nodes with a loopback interface is automatically changed to **router** (contrary to most other network devices, OpenBSD does not allow you to reach non-connected IP addresses unless the IPv4/IPv6 forwarding is enabled).
+
+(caveats-sonic-vm)=
+## SONiC Virtual Machine
+
+* SONiC implementation was tested with Azure `sonic-vs` VM image (release 2023-11) with FRR running in a container. Other SONiC distributions might use different approaches that would require significant modifications to the configuration deployment process.
+* BGP is the only routing protocol running on Azure SONiC. The choice is hardcoded in FRR compilation flags.
+* You cannot use IBGP, as there's no IGP protocol to resolve IBGP next hops, unless you believe in running IBGP over EBGP.
+* The Azure SONiC VM image has to be started with a preconfigured BGP AS number (specified in **config_db.json**); otherwise, it does not start the FRR container. That BGP process is removed during the initial BGP configuration and replaced with the actual BGP AS number specified in the lab topology.
+* _netlab_ configures BGP on SONiC through vtysh, not through **config_db**.
+
+(caveats-sonic-clab)=
+## SONiC Container
+
+The `sonic` device also runs under *containerlab* with the community `docker-sonic-vs` image; see [](build-sonic-container) for how to obtain it and how the two deployments differ.
+
+* Configuration is deployed with **docker exec** commands, not over an SSH session.
+* `docker-sonic-vs` ships `sshd` but does not start it.
+* `srv6` is control-plane and kernel-plane only: the locator and End/End.X SIDs are advertised in the IS-IS LSDB and installed as kernel `seg6local` routes, but the end-to-end SRv6 datapath does not resolve -- the same open item as FRR/IS-IS SRv6 on other platforms.
+
+(caveats-vyos)=
+## VyOS
+
+**netlab ** uses VyOS 1.5-compatible configuration syntax. The configurations should also work on the 1.4 LTS release (since it was tested just before it became the new LTS).
+
+The use of a *rolling release* means that potentially any build is broken or has regressions, even if the VyOS team is smart enough to perform some [automated smoke tests](https://github.com/vyos/vyos-1x/tree/current/smoketest/scripts/cli) and load [arbitrary configurations](https://github.com/vyos/vyos-1x/tree/current/smoketest/configs) to ensure there are no errors during config migration and system bootup.
+
+(vyos-vagrant)=
+[Building a local Vagrant box](build-vyos) from a recent [VyOS rolling/nightly](https://vyos.net/get/nightly-builds/) or VyOS Stream ISO image lets us easily track and react to any configuration syntax change (which, anyway, is very rare). However, we're testing all new functionality only with VyOS containers; if you find a misalignment between the VyOS VM config and the **netlab** templates, feel free to *Open an Issue* or *Submit a PR*.
+
+(vyos-clab)=
+Speaking of containers, there's no official VyOS container; the documentation only describes how to build your own from the sources or downloaded ISO images. *netlab* uses a [third-party container](https://github.com/sysoleg/vyos-container) (`ghcr.io/sysoleg/vyos-container`) to run VyOS with *containerlab*.
+
+Other VyOS caveats:
+
+* VyOS configuration template configures BFD timers only at the global level
+* VyOS containers need host kernel modules (drivers) to implement the data-plane functionality of _vrf_, _mpls_, and _vxlan_ netlab modules. The kernel modules load automatically (when available) during **netlab up** processing.
+* On VyOS, IPv6 is enabled on all interfaces as soon as one has an IPv6 address.
+* VyOS containers cannot deal with min/max MTU sizes on dummy Ethernet interfaces used to implement stub networks. Stub networks in containers are implemented as **dum** interfaces.
+* VRF and VXLAN kernel modules are usually bundled with a Linux distribution. If your Ubuntu distribution does not include the MPLS drivers, try installing them with `sudo apt install linux-generic`.
+* You cannot load kernel modules in GitHub Codespaces and thus cannot use _vrf_, _mpls_, or _vxlan_ modules on VyOS nodes in that environment.
+* While VyOS itself supports IPv6 transport for VXLAN, using static flooding with the **vxlan** module, the version of the FRR BGP daemon it uses does not support EVPN with IPv6 next hops.
+* VyOS does not have a simple way to handle a management VRF on containerlab, so it will always have a default IPv4 route (`0.0.0.0/0`) in the default routing table. This can cause problems if you want a device to originate a default route only when it receives one from other routers.
+* BFD with OSPF uses the system default values for interval and multiplier.

@@ -1,0 +1,353 @@
+(module-ospf)=
+# OSPF Configuration Module
+
+This configuration module configures OSPFv2 and OSPFv3 routing processes on most supported platforms (see [supported features](#supported-features) and [platform support](#platform-support)).
+
+```eval_rst
+.. contents:: Table of Contents
+   :depth: 2
+   :local:
+   :backlinks: none
+```
+
+```{note}
+Use **[netlab report](../netlab/report.md)** or **[netlab create -o report](../netlab/create.md)** commands to create reports on OSPF areas, routers, and interfaces. Use the **[‌netlab show reports ospf](netlab-show-reports)** command to display available OSPF reports.
+```
+
+## Supported Features
+
+Supported OSPF features:
+
+* OSPFv2 and/or OSPFv3 (see platform support table and [address families](routing_af))
+* Multi-area deployment
+* Per-link cost and asymmetric costs
+* OSPF network type
+* Interface timers (hello and dead interval)
+* Per-interface router priority
+* OSPF authentication
+* Reference bandwidth
+* Unnumbered point-to-point interfaces
+* [Passive interfaces](routing_passive)
+* [Static router ID](routing_router_id)
+* [Route import](routing_import) (redistribution)
+* [Default route origination](ospf-default)
+* BFD (optionally with RFC9355 strict mode)
+* Graceful Restart
+* VRF OSPFv2/OSPFv3 instances (on platforms with [VRF support](module-vrf-platform-support))
+* Stub and NSSA areas (implemented in a separate [ospf.areas plugin](plugin-ospf-areas))
+
+Missing features:
+
+* Virtual links
+* Opaque LSA
+* Multi-area adjacencies
+* Demand circuits
+* A gazillion nerd knobs and IETF quirks
+
+Need one of those? Create a plugin and contribute it.
+
+(ospf-platform)=
+## Platform Support
+
+We implemented OSPFv2, OSPFv3, OSPF areas, reference bandwidth, passive interfaces, and point-to-point circuits on almost all devices. The missing bits are documented as caveats in the *Core OSPF features* column in the following table, which includes the per-platform support of other router-level OSPF features:
+
+```{features}
+- title: Core OSPF<br>features
+  enabled: ospf
+  caveats: ospf.caveats.core
+- title: Unnumbered<br>IPv4 interfaces
+  enabled: ospf.unnumbered
+  caveats: ospf.caveats.unnumbered
+- title: Route<br>import
+  enabled: |
+    ospf['import']
+  caveats: |
+    ospf.caveats['import']
+- title: Default<br>route
+  enabled: ospf.default
+  caveats: ospf.caveats.default
+- title: BFD
+  enabled: ospf and bfd
+  caveats: ospf.caveats.bfd
+```
+
+**Notes:**
+* Use the `netlab show modules -m ospf` command to display the route types that can be imported into OSPFv2/OSPFv3.
+
+The following devices support OSPF graceful restart:
+
+```{features}
+- title: OSPFv2
+  enabled: >-
+    'ipv4' in ospf.gr
+- title: OSPFv3
+  enabled: >-
+    'ipv6' in ospf.gr
+```
+
+```{tip}
+See [OSPFv2](https://release.netlab.tools/_html/coverage.ospf.ospfv2) and [OSPFv3](https://release.netlab.tools/_html/coverage.ospf.ospfv3) Integration Tests Results for more details.
+```
+
+(ospf-interface-support)=
+These devices also support optional OSPF interface attributes:
+
+```{features}
+- title: Interface<br>timers
+  enabled: ospf.timers
+- title: Router<br>priority
+  enabled: ospf.priority
+- title: Cleartext<br>password
+  enabled: ospf.password
+```
+
+VRF OSPF instances are implemented on these devices:
+
+```{features}
+- title: OSPFv2 VRF<br>instances
+  enabled: vrf.ospfv2
+- title: OSPFv3 VRF<br>instances
+  enabled: vrf.ospfv3
+```
+
+(ospf-node-parameters)=
+## Node Parameters
+
+* **ospf.process** -- process ID (default: 1)
+* **ospf.af** -- [OSPF address families](routing_af), usually set by the data transformation code. Configures OSPFv2 when **ospf.af.ipv4** is set to `True` and OSPFv3 (on devices that support OSPFv3) when **ospf.af.ipv6** is set to `True`. 
+* **ospf.area** -- default OSPF area (default: 0.0.0.0). Used on links/interfaces (including the loopback interface) without an explicit OSPF area.
+* **ospf.bfd** -- enable BFD for OSPF (default: False)
+* **ospf.bfd.strict** enables RFC9355 BFD Strict-Mode (default: False)
+* **ospf.gr** -- OSPF graceful restart settings. **ospf.gr.restart** can be `true` (enable GR with default settings) or a dictionary with **grace_period** (1–1800 seconds). **ospf.gr.helper** can be `true` (enable GR helper with default settings) or a dictionary with **grace_period** (10–1800 seconds). You can also set **ospf.gr** to a boolean value as a shortcut for **ospf.gr.restart**.
+* **ospf.default** -- External default route origination ([more details](ospf-default))
+* **ospf.digest** -- default OSPFv2 digest authentication parameters. Applies to all interfaces without an explicit **ospf.digest** setting.
+* **ospf.import** -- [import (redistribute) routes](routing_import) into the global OSPF instance. By default, no routes are redistributed into the global OSPF instance.
+* **ospf.password** -- default OSPFv2 cleartext authentication password. Applies to all interfaces without an explicit **ospf.password** setting.
+* **ospf.priority** -- node-wide OSPF router priority. Applies to all interfaces without an explicit **ospf.priority** setting.
+* **ospf.reference_bandwidth** – per-node OSPF auto-cost reference bandwidth (in Mbps).
+* **ospf.distance** -- administrative distance of OSPF routes (1-255). Rendered as `distance N` on Cisco IOS and as intra-area/inter-area/external distance on Arista EOS. Use it to rank OSPF below or above another protocol (for example `201` to prefer IBGP-reflected copies of the same prefixes). Supported on IOS/IOL and EOS; other devices refuse the attribute.
+* **ospf.reject_default_route** -- ignore (`true`) or install (`false`) a default route learned from OSPF neighbours. Rendered as `protocol ospf reject-default-route yes|no` on PAN-OS, whose default is `yes`. Unset leaves the device default. Supported on devices with the **ospf.default_route** feature (PAN-OS); other devices refuse the attribute.
+* **ospf.allow_redist_default_route** -- allow a 0.0.0.0/0 route to be redistributed into OSPF (PAN-OS `allow-redist-default-route`, default `no`). Same feature and default rules as **ospf.reject_default_route**.
+* **ospf.router_id** -- set [static router ID](routing_router_id).
+* **ospf.passive** -- node-level default for passive interfaces (default: False)
+* **ospf.timers** -- default OSPF interface timers. You can override the node values on individual interfaces.
+
+You can specify most node parameters as global values (top-level topology elements) or within individual nodes (see [example](#example) for details).
+
+## VRF Parameters
+
+* You can use most OSPF node parameters (for example, **area**, **digest**, **gr**, **password**, or **timers**) in VRF definitions to change the VRF OSPF instance configuration.
+* By default, _netlab_ redistributes BGP- and connected routes into VRF OSPF instances on all network devices. You can change that on devices supporting configurable route import with the **[ospf.import](routing_import)** VRF parameter.
+* You can change the [router ID](routing_router_id) of a VRF OSPF instance with **ospf.router_id** parameter. Use this parameter when building back-to-back links between VRFs on the same node.
+* Set **ospf.active** to *True* to force a VRF to use OSPF even when no routers are attached to the VRF interfaces.
+* To disable OSPF in a VRF set **ospf** to *False* (see also [](routing_disable_vrf)).
+* To originate a default route in a VRF OSPF instance, set the **ospf.default** VRF parameter ([more details](ospf-default))
+
+## Link Parameters
+
+* **ospf.area** -- OSPF area. Use on ABRs; node-level OSPF area is recommended for intra-area routers.
+* **ospf.bfd** -- turn BFD for OSPF on or off on an individual link or interface (boolean value, overrides node **ospf.bfd** setting)
+* **ospf.cost** -- OSPF cost
+* **ospf.digest** -- A dictionary defining the OSPFv2 message digest (MD5 or SHA) authentication.
+* **ospf.network_type** -- Set OSPF network type. Allowed values are **point-to-point**, **point-to-multipoint**, **broadcast** and **non-broadcast**[^NS]. See also [Default Link Parameters](#default-link-parameters)
+* **ospf.passive** -- explicitly enable or disable [passive interfaces](routing_passive)
+* **ospf.password** -- OSPFv2 cleartext interface authentication password
+* **ospf.timers** -- set OSPF interface timers. A dictionary containing **dead** and **hello** values (from 1 to 8192 seconds). If you specify only one of the timers, the other one is set to be four times higher/lower.
+
+[^NS]: Some OSPF network types (non-broadcast or point-to-multipoint) are not supported by all platforms.
+
+**Notes:**
+
+* The same parameters can be specified for individual link nodes.
+* You can also set **ospf.area** and **ospf.cost** on the **loopback** interface[^LBI].
+
+[^LBI]: The loopback OSPF area is implemented in all OSPF configuration templates, but some might not set the loopback OSPF cost.
+
+OSPF is automatically started on all interfaces within an autonomous system (interfaces with no EBGP neighbors; see also [](routing_external)). To disable OSPF on an intra-AS link, set **ospf** to *False* (see also [](routing_disable)).
+
+```{tip}
+* Management interfaces are never added to the OSPF process. They are not in the set of device links and, thus, not considered in the OSPF configuration template.
+* The OSPF configuration module is automatically removed from a node that does not run OSPF on any non-loopback interface or VRF. In that case, _netlab_ generates a warning that can be turned off by setting **‌defaults.ospf.warnings.inactive** to **‌False**.
+```
+
+(ospf-default-link)=
+## Default Link Parameters
+
+Unless the OSPF network type is specified with the **ospf.network_type**, it's set to **point-to-point** on links with exactly two non-host nodes attached to them and left unspecified otherwise (implying platform default, which is almost always **broadcast**).
+
+When the **ospf.passive** attribute is not specified on a link or an interface, _netlab_ uses the link roles together with the link types to decide whether to include an interface in an OSPF process and whether to make an interface passive:
+
+* External links (links with **role: external**) are not included in the OSPF process. 
+* Links with **role** set to **passive** are configured as *passive* OSPF interfaces.
+* Interfaces connected to links with a single router or routing daemon attached are *passive* OSPF interfaces.
+
+**Notes:** 
+
+* The BGP module could set the link role. Links with devices from different AS numbers attached to them get a role specified in **defaults.bgp.ebgp_role** parameter. The system default value of that parameter is **external**, excluding inter-AS links from the OSPF process.
+* Management interfaces are never added to the OSPF process. They are not in the set of device links and, thus, not considered in the OSPF configuration template.
+
+(ospf-interface)=
+## Interface Parameters
+
+Most OSPF interface parameters can be specified on the link and are copied into interface data and configured on lab devices; these parameters can only be set on individual interfaces:
+
+* **ospf.priority** -- OSPF router priority
+
+(ospf-default)=
+## Specifying External Default Route
+
+The **ospf.default** parameter specifies that the device should originate an external (E1 or E2) default route into an OSPF domain. It can be set to **true** or **false**; you can also be more specific and use the following settings:
+
+* **ospf.default.always**: set to *True* when you want the device to originate an OSPF default route, even when it does not have a default route itself.
+* **ospf.default.cost**: set the cost of the originated default route
+* **ospf.default.type**: the OSPF type of the external default route (`e1` or `e2`).
+
+## Example
+
+We want to create a three-router multi-area OSPF network:
+
+* R1 is a backbone area router
+* R2 is ABR between the backbone area and area 1
+* R3 is in an intra-area router in area 1.
+
+All devices run OSPF:
+```
+module: [ ospf ]
+```
+
+The default OSPF area is 0.0.0.0:
+```
+ospf:
+  area: 0.0.0.0
+```
+
+R1 and R2 are in the default OSPF area (no need to specify per-node area):
+
+```
+nodes:
+  r1:
+    device: iosv
+  r2:
+    device: eos
+```
+
+R3 is in area 1. Non-default OSPF area must be specified within node data:
+
+```
+nodes:
+  r3:
+    device: nxos
+    ospf:
+      area: 0.0.0.1
+```
+
+The link between R1 and R2 is in area 0. No need to specify per-link area:
+
+```
+links:
+- r1:
+  r2:
+```
+
+The link between R2 and R3 is in area 1. Specify the OSPF area within the link definition:
+
+```
+links:
+- r2:
+  r3:
+  ospf:
+    area: 0.0.0.1
+```
+
+Alternatively, you could specify the OSPF area just for R2 (as R3 is already in area 1):
+
+```
+links:
+- r2:
+    ospf:
+      area: 0.0.0.1
+  r3:
+```
+
+**Interesting details**:
+
+* The default value for the interface OSPF area is the node OSPF area
+* The default value for node OSPF area is the global OSPF area (default value: 0.0.0.0).
+* Due to the propagation of default values, the OSPF area for the R2-R3 link would be area 0 on R2 and area 1 on R3 -- you have to specify the OSPF area within the link definition or an individual node connected to the link.
+
+### Resulting Device Configurations
+
+The above topology generates the following device configurations:
+
+#### R1 (Cisco IOS)
+
+```
+router ospf 1
+!
+interface Loopback0
+ ip ospf 1 area 0.0.0.0
+!
+interface GigabitEthernet0/1
+ ip ospf 1 area 0.0.0.0
+ ip ospf network point-to-point
+```
+
+#### R2 (Arista EOS)
+
+```
+router ospf 1
+!
+interface Loopback0
+ ip ospf area 0.0.0.0
+!
+interface Ethernet1
+ ip ospf area 0.0.0.0
+ ip ospf network point-to-point
+!
+interface Ethernet2
+ ip ospf area 0.0.0.1
+ ip ospf network point-to-point
+```
+
+#### R3 (Cisco Nexus-OS)
+
+```
+feature ospf
+!
+router ospf 1
+!
+interface loopback0
+ ip router ospf 1 area 0.0.0.1
+!
+interface Ethernet1/1
+ ip router ospf 1 area 0.0.0.1
+ ip ospf network point-to-point
+```
+
+### Complete network topology:
+
+```
+module: [ ospf ]
+
+ospf:
+  area: 0.0.0.0
+
+nodes:
+  r1:
+    device: iosv
+  r2:
+    device: eos
+  r3:
+    device: nxos
+    ospf:
+      area: 0.0.0.1
+
+links:
+- r1:
+  r2:
+
+- r2:
+  r3:
+  ospf:
+    area: 0.0.0.1
+```

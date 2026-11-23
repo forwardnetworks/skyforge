@@ -1,0 +1,7 @@
+# expect: link-unknown-node
+defaults.device: eos
+nodes:
+  r1:
+  r2:
+links:
+- r1-r3

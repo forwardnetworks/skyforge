@@ -1,0 +1,5 @@
+Warning in mpls: Node lpeny has VRFs and the bgp+mpls modules but no mpls.vpn, so no VPN address family will be configured and VRF routes will not be advertised to other PEs
+... Set mpls.vpn on the PE nodes (not on P routers) to activate the VPN address family
+... This is expected if the VRFs are carried by EVPN or by a custom config template
+... Set defaults.mpls.warnings.vrf_without_vpn_af to False to hide this warning
+Warning in mpls: Node lpelon has VRFs and the bgp+mpls modules but no mpls.vpn, so no VPN address family will be configured and VRF routes will not be advertised to other PEs

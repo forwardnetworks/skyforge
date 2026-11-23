@@ -1,0 +1,6 @@
+Errors encountered while processing topology.yml
+IncorrectValue in links: Duplicate linkid lk7 used on links links[3] and links[4]
+IncorrectValue in links: Linkid lk7 used on multiple interfaces of node r1
+... Ethernet2 (r1 -> r3) and Ethernet3 (r1 -> r2)
+Fatal error in netlab: Cannot proceed beyond this point due to errors, exiting
+rc=1

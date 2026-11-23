@@ -1,0 +1,4 @@
+# expect: missing-device-type
+provider: clab
+nodes: [ r1, r2 ]
+links: [ r1-r2 ]

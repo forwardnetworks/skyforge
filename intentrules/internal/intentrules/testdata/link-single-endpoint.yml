@@ -1,0 +1,9 @@
+# expect: link-endpoints
+# A link typed point-to-point that names one node: the second end is missing. (netlab refuses it at compile time.)
+defaults.device: eos
+nodes:
+  r1:
+  r2:
+links:
+- r1-r2
+- { r2: , type: p2p }

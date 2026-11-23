@@ -1,0 +1,4 @@
+Warning in bgp: Node S1 has IBGP sessions but no IGP
+... Add a supported IGP (ospf, eigrp, isis, ripv2) to the list of modules
+... Set defaults.bgp.warnings.missing_igp to False to hide this warning
+Warning in bgp: Node S2 has IBGP sessions but no IGP

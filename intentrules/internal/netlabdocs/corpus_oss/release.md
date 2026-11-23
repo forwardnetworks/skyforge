@@ -1,0 +1,246 @@
+Release Notes
+=============
+
+**Release 26.11 (2026-11-xx)**
+
+The highlights of release 26.11 include:
+
+* Support for IP Infusion OcNOS by [@victorkhgith](https://github.com/victorkhgith) and Extreme VOSS by [@sdargoeuves](https://github.com/sdargoeuves)
+* The new **[netlab node](netlab-node)** command starts, stops, restarts, or pauses individual *containerlab* nodes (by [@Muddyblack](https://github.com/Muddyblack))
+* **netlab validate** can print [JSON results](netlab-validate-json)
+* *Netmiko* is the default configuration method for Cisco IOS XR and Nexus OS, and is used by **netlab config** and **netlab collect**
+* OSPFv3, IBGP, static routes, and route redistribution on Cisco ASAv
+
+[More details](release-26.11), new [device features](release-26.11-device-features), and [breaking changes](release-26.11-breaking)
+
+**Release 26.10 (2026-10-02)**
+
+The highlights of release 26.10 include:
+
+* SRv6 support on Junos and Nokia SR Linux
+* Global IPv4 BGP routes with SRv6 next hops can be propagated over EBGP on FRRouting and Cisco IOS XR.
+* Static route entries can use lists of prefixes, nodes, or pools.
+* *containerlab* nodes can start in batches or wait for other nodes to start.
+* **netlab install netmiko** installs the Netmiko and Paramiko packages needed for Netmiko-based device configuration.
+
+[More details](release-26.10) and new [device features](release-26.10-device-features)
+
+**Release 26.09 (2026-09-18)**
+
+The highlights of release 26.09 include:
+
+* The [**services** module](module-services) supports [syslog clients and servers](services-syslog-parameters).
+* DNS and Syslog are implemented on most supported platforms.
+* The new **netmiko** [device configuration mode](platform-config-mode) for virtual machines
+* [Generic prefix sets](generic-routing-prefix-set) in ACL rules and prefix lists
+* LAG on Mikrotik RouterOS7
+
+We also decided to [deprecate Cisco IOSv](caveats-iosv) and [sunset the libvirt (Vagrant) provider](libvirt-sunset).
+
+[More details](release-26.09), new [device features](release-26.09-device-features), and [breaking changes](release-26.09-breaking)
+
+**Release 26.08 (2026-08-10)**
+
+The highlights of release 26.08 include:
+
+* Support for ArcOS by [@roc-ops](https://github.com/roc-ops), VPP (FD.io) by [@jbemmel](https://github.com/jbemmel), and SONiC containers (also by [@roc-ops](https://github.com/roc-ops))
+* The [**routing** module](generic-routing) supports [IPv4/IPv6 access control lists](generic-routing-acl) (by [@DanPartelly](https://github.com/danpartelly))
+* The new [**services** module](module-services) configures [DNS clients and servers](services-platform)
+* GRE tunnels on Arista EOS and GRE/WireGuard tunnels on Mikrotik RouterOS7 and OpenBSD (by [@snuffy22](https://github.com/snuffy22))
+* *clab* provider supports the **podman** container runtime ([details](lab-clab))
+
+We couldn't avoid a few changes with a non-zero chance of breaking your existing setup:
+
+* *netlab* always configures an IPv6 *containerlab* management subnet to support *vrnetlab* containers using Transparent Management feature.
+* Linux nodes (and devices based on them, like BIRD) do not accept IPv6 default route from the management network (most other devices use a management VRF)
+* We switched to [sudo-less *containerlab* operation](https://containerlab.dev/install/#sudo-less-operation).
+
+[More details](release-26.08), new [device features](release-26.08-device-features), and [breaking changes](release-26.08-breaking)
+
+**Release 26.07 (2026-07-12)**
+
+The highlights of release 26.07 include:
+
+* The [**multiserver** plugin](plugin-multiserver) distributes containerlab devices across multiple servers.
+* The [**GRE tunnel** plugin](plugin-tunnel-gre) supports GRE tunnels on Cisco IOS, FRR, VyOS, and Junos (vSRX and vJunos-router).
+* The [**WireGuard tunnel** plugin](plugin-tunnel-wireguard) supports WireGuard tunnels on FRR.
+* The [**bgp.session** plugin](plugin-bgp-session) and the [OSPF module](module-ospf) support graceful restart on Arista EOS, BIRD, FortiOS, and FRR
+* The [**bgp.policy** plugin](plugin-bgp-policy) supports the **bgp.role** attribute on FRR and BIRD.
+
+We also had to make a few breaking changes:
+
+* The VirtualBox provider has been removed.
+* BIRD v3 is now the [default BIRD version](build-bird).
+* Mikrotik RouterOS 7 BGP templates use the new(er) BGP configuration syntax.
+
+[More details](release-26.07) and [breaking changes](release-26.07-breaking)
+
+**Release 26.06 (2026-06-07)**
+
+* Nokia SR Linux supports [SR-MPLS](module-sr-mpls) over IPv6 and [MPLS/VPN](mpls-l3vpn-supported-platforms) services.
+* FortiOS supports [OSPFv3](module-ospf).
+* **[netlab install](netlab-install)** scripts work on Ubuntu 26.04
+* You can [build custom Linux Vagrant boxes](linux-build) and set the full box name with the **[netlab libvirt package](netlab-libvirt-package)** command.
+
+[More details](release-26.06) and [breaking changes](release-26.06-breaking)
+
+**Release 26.05 (2026-05-16)**
+
+* Support for global BGP routes with SRv6 next hops on FRR and IOS XR
+* Support for Juniper cSRX container
+* Streamline and speed up the FortiOS initial device configuration
+* Junos OSPF/IS-IS [route redistribution](routing_import), VRF [IS-IS instances](isis-platform), and OSPF interface parameters
+* We changed the minimum supported Python version to 3.10. New _netlab_ versions will thus no longer run on Ubuntu 20.04.
+* You can [define scripts](dev-cli-hooks) (for example, device license management) that are executed at various points in the `netlab up` and `netlab down` processes.
+
+[More details](release-26.05) and [breaking changes](release-26.05-breaking)
+
+**Release 26.04 (2026-04-12)**
+
+* New [**bgp.advertise**](bgp-advertise-prefix) node/VRF attribute — advertise prefixes from IP routing tables into BGP on most platforms.
+* The **bgp.originate** node attribute can be used to [originate IPv4 and IPv6 prefixes](bgp-advertise-prefix) in global and VRF BGP instances.
+* Extreme Networks EXOS initial platform support
+* Static routes on Nexus OS, Nokia SR OS, SR Linux, OpenBSD
+* EVPN/VXLAN-over-IPv6 on FRRouting
+
+[More details](release-26.04)
+
+**Release 26.03 (2026-03-10)**
+
+* [New Cisco IOS XR features](release-26.03-ios-xr): SR-MPLS, MPLS/VPN, MPLS 6PE, EVPN over MPLS, VRRP, full BGP routing policy support
+* [Juniper cRPD](caveats-crpd) support
+* [EVPN/VXLAN](module-evpn) on Juniper vPTX and vJunos-router
+* OpenBSD BGP support
+* [SR-MPLS support for OSPFv2](sr-mpls-platforms) on EOS, FRR, IOS XE, IOS XR
+
+[More details](release-26.03) and [breaking changes](release-26.03-breaking)
+
+**Release 26.02 (2026-02-11)**
+
+* Support for [Kubernetes (KinD) clusters](plugin-kind) based on work by [@wnagele](https://github.com/wnagele)
+* Layer-2 EVPN/VXLAN support on Cat8000v, IOL, IOLL2
+* Containers can be [configured with Linux scripts or *containerlab* startup-config parameter](platform-config-mode) instead of with an Ansible playbook.
+* **[netlab graph](netlab-graph)** command can create graphs from a subset of nodes or links
+
+[More details](release-26.02) and [a tiny breaking change](release-26.02-breaking)
+
+**Release 26.01.01 (2026-01-14)**
+
+Release 26.01.01 is a bug-fix release [fixing](bug-fixes-26.01.01) the **[netlab status](netlab-status)** crash.
+
+**Release 26.01 (2026-01-12)**
+
+Release 26.01 introduces a major rewrite of the device configuration file generation process, making it fully independent of Ansible. Ansible is used solely for configuration deployment.
+
+Other new features include:
+
+* EVPN for VXLAN-over-IPv6
+* The 'skip_config' [node attribute](node-attributes) can be used to deploy partially-provisioned labs
+* Lightweight [netlab API HTTP server](netlab-api)
+
+[More details](release-26.01) and [breaking changes](release-26.01-breaking)
+
+**Release 25.12.03 (2025-12-13)**
+
+Release 25.12.03 changes the **ansible_host** inventory parameter from hostname to IPv4 address for containers with SSH servers to address a change in *ansible-pylibssh* version 1.3.0 that prevented underscores in SSH hostnames.
+
+[Bug fixes in release 25.12.03](bug-fixes-25.12.03)
+
+**Release 25.12.01/02 (2025-12-05)**
+
+Release 25.12.01 fixes [a stupid bug](bug-fixes-25.12.01) that crashed **netlab install**. Release 25.12.02 fixes the target containerlab release version (it wasn't one of my best days).
+
+**Release 25.12 (2025-12-05)**
+
+* Large BGP community lists, implemented on Arista EOS, FRR, and Junos. You can use standard- or large community lists in [routing policies](generic-routing-policies)
+* Support Cisco ASAv in *vrnetlab* containers
+* [Reread validation tests](netlab-validate-dev) from the lab topology file (if it was modified since the lab was started) every time you run the **[netlab validate](netlab-validate)** command
+* The **shutdown** [link/interface attribute](link-attributes) can be used to start labs with interfaces turned off
+* The **bgp.rr_mesh** parameter [controls IBGP sessions between BGP route reflectors](bgp-ibgp-sessions)
+
+[More details](release-25.12) and [breaking changes](release-25.12-breaking)
+
+**Release 25.11.01 (2025-11-18)**
+
+Release 25.11.01 fixes [two bugs](bug-fixes-25.11.01) that could prevent the use of SR-OS/SR-SIM or some external tools.
+
+**Release 25.11 (2025-11-12)**
+
+* SRv6 support on Cisco IOS/XE
+* RIPv2/RIPng support on OpenBSD thanks to Remi Locherer
+* The **[netlab graph](netlab-graph)** command can generate PNG/SVG/JPEG/PDF graphs if you have D2 or Graphviz installed
+* You can generate [reports](netlab-report) and [graphs](netlab-graph), or inspect transformed topology data without starting a lab
+* You can use device-based groups (for example, **eos** or **frr** groups) to set node attributes.
+
+[More details](release-25.11) and [breaking changes](release-25.11-breaking)
+
+**Release 25.10 (2025-10-08)**
+
+* You can use [wildcards or regular expressions](groups-members) to specify group- or **[as_list](bgp-aslist)** ASN/RR members.
+* New device: container version of Cisco 8000v emulator (running IOS XR)
+* [Graphing improvements](release-25.10-graph)
+* Support for vJunosEVO release 24/25
+* OSPFv2/v3 on OpenBSD
+* OSPFv2/v3 interface parameters on IOS XR
+
+[More details...](release-25.10)
+
+**Release 25.09-post1 (2025-09-14)**
+
+[Release 25.09-post1](release-25.09-post1) fixes the _netlab_ templating crash caused by breaking changes in Ansible core release 12.9.
+
+**Release 25.09 (2025-09-07)**
+
+* Link impairment (implemented with Linux *netem* queuing discipline) can be defined in [lab topology](links-netem) or configured/controlled with the **[netlab tc](netlab-tc)** command
+* Configurable [IPv6 Router Advertisement](links-ra) parameters
+* The [**files** plugin](plugin-files) allows you to store the content of short files (including custom configuration templates) directly in the lab topology
+* New device: Nokia SR-SIM
+* [Graphing](release-25.09-graph), [reporting](release-25.09-reports), and [performance/scalability](release-25.09-performance) improvements
+
+[More details...](release-25.09)
+
+**Release 25.07 (2025-07-14)**
+
+* The [ospf.areas plugin](plugin-ospf-areas) supports OSPFv2 and OSPFv3 stub areas, NSSA areas, and area ranges.
+* The [BGP routing policies](plugin-bgp-policy) plugin supports aggregate BGP routes
+* The [BGP configuration module](module-bgp) supports BGP confederations
+* The [evpn.multihoming](plugin-evpn-multihoming) plugin implements EVPN Ethernet Segment Identifiers and EVPN-based MLAG/multihoming
+* Baseline OpenBSD support
+
+[More details...](release-25.07)
+
+**Release 25.06 (2025-06-11)**
+
+* Discard [static routes](generic-routing-static)
+* [Redistribution](routing_import) of [static routes](generic-routing-static) into OSPF, IS-IS, RIPv2, RIPng, and BGP
+* Numerous new Nokia SR-OS [features](release-25.06-sros-features) and [bug fixes](release-25.06-sros-bug-fixes).
+* LAG on Junos
+
+[More details...](release-25.06)
+
+For older releases, check the [release notes archive](release-archive.md).
+
+```eval_rst
+.. toctree::
+   :caption: Individual release notes
+   :maxdepth: 1
+
+   release/26.11.md
+   release/26.10.md
+   release/26.09.md
+   release/26.08.md
+   release/26.07.md
+   release/26.06.md
+   release/26.05.md
+   release/26.04.md
+   release/26.03.md
+   release/26.02.md
+   release/26.01.md
+   release/25.12.md
+   release/25.11.md
+   release/25.10.md
+   release/25.09.md
+   release/25.07.md
+   release/25.06.md
+   release-archive.md
+```   

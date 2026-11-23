@@ -1,0 +1,6 @@
+Errors encountered while processing plugin-block-no-plugin.yml
+IncorrectValue in groups: Cannot use "module" attribute in group leafs that has no direct or indirect members
+... The topology has a 'fabric' block, which belongs to the 'fabric' plugin, but the plugin is not enabled: add 'plugin: [ fabric ]'
+... A group gets members from its own "members" list, from the "group" attribute of nodes, or from a plugin that generates nodes (the plugin must be listed under "plugin")
+IncorrectValue in groups: Cannot use "module" attribute in group spines that has no direct or indirect members
+Fatal error in netlab: Cannot proceed beyond this point due to errors, exiting

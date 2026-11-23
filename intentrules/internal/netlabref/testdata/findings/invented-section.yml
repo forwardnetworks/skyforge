@@ -1,0 +1,7 @@
+# expect: unknown-topology-attribute
+# netlab has no hosts: section (hosts are nodes with a device)
+provider: clab
+defaults.device: eos
+nodes: [ r1 ]
+hosts:
+  h1: { device: linux }

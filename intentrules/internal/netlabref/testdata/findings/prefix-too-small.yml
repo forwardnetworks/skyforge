@@ -1,0 +1,11 @@
+# expect: prefix-too-small
+provider: clab
+defaults.device: eos
+nodes: [ r1, r2, r3, r4 ]
+links:
+- r1:
+  r2:
+  r3:
+  r4:
+  prefix:
+    ipv4: 10.0.0.0/30

@@ -1,0 +1,13 @@
+# expect: none
+# A group named like a device holds every node of that device, so it is not empty (and its module list applies to them).
+defaults.device: eos
+groups:
+  eos:
+    module: [ ospf ]
+nodes:
+  r1:
+    device: eos
+  r2:
+    device: eos
+links:
+- r1-r2

@@ -1,0 +1,13 @@
+# expect: none
+# Single-node networks that say what they are.
+defaults.device: eos
+nodes:
+  r1:
+  r2:
+links:
+- r1-r2
+- r1:
+  type: stub
+  prefix: 192.0.2.0/24
+- r2:
+    ipv4: 198.51.100.1/24

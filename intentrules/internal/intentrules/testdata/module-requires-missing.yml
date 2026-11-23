@@ -1,0 +1,25 @@
+# expect: module-requires
+# evpn needs bgp. The topology enables bgp, but the leaves carry their own module list, which replaces it, and it has no bgp.
+defaults.device: eos
+module: [ bgp ]
+bgp.as: 65000
+vlans:
+  red:
+    ospf: false
+nodes:
+  l1:
+    module: [ ospf, vlan, vxlan, evpn ]
+  l2:
+    module: [ ospf, vlan, vxlan, evpn ]
+  h1:
+    device: linux
+  h2:
+    device: linux
+links:
+- l1-l2
+- h1:
+  l1:
+    vlan.access: red
+- h2:
+  l2:
+    vlan.access: red
