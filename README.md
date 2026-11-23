@@ -35,4 +35,6 @@ constraints). See [intentrules/README.md](intentrules/README.md).
 
 ## Licence
 
-The docs and scripts we wrote here: [Functional Source License 1.1, Apache-2.0 future licence](LICENSE) (FSL-1.1-ALv2). It is source-available, not open source: you can read, run, modify and redistribute it for any purpose except a competing commercial product or service, and each release converts to Apache-2.0 two years after it is published. Commits up to `aa25fed` were published under Apache-2.0 and stay under it. Patches: each upstream's licence. Blueprints: ipSpace's licence ([LICENSE.md](components/blueprints/netlab/LICENSE.md)), which forbids offering them as a hosted or SaaS service. See [NOTICE](NOTICE).
+The docs and scripts we wrote here, and the `intentrules/` module: [Fair Core License 1.0, Apache-2.0 future licence](LICENSE) (FCL-1.0-ALv2). It is source-available, not open source: you can read, run, modify and redistribute it for any purpose except a competing commercial product or service, and each release converts to Apache-2.0 two years after it is published. Commits up to `aa25fed` were published under Apache-2.0, and commits from `4c6e1b6` up to `3775ce0` under the Functional Source License 1.1 (FSL-1.1-ALv2); each keeps the licence it was published with. Patches: each upstream's licence. Blueprints: ipSpace's licence ([LICENSE.md](components/blueprints/netlab/LICENSE.md)), which forbids offering them as a hosted or SaaS service. See [NOTICE](NOTICE).
+
+Licensing and commercial questions: craigjohnson@forwardnetworks.com

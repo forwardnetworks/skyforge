@@ -18,5 +18,5 @@ Plain Go, no other tooling. Direct dependencies: `gopkg.in/yaml.v3`, `github.com
 
 ## Licence
 
-Functional Source License 1.1, Apache-2.0 future licence ([LICENSE](LICENSE)): source-available, not open source. The vendored Infrahub JSON
+Fair Core License 1.0, Apache-2.0 future licence ([LICENSE](LICENSE)): source-available, not open source. The vendored Infrahub JSON
 schema in `internal/intentrules/jsonschema/` keeps its own Apache-2.0 licence and NOTICE.

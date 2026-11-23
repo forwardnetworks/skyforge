@@ -1,7 +1,7 @@
 Skyforge (source-available release)
 Copyright 2026 Forward Networks, Inc.
 
-The documentation and tooling in this repository, and the control plane and portal where included, are licensed under the Functional Source License, Version 1.1, ALv2 Future License (see LICENSE). Each release converts to the Apache License, Version 2.0 two years after it is made available. Commits up to aa25fed were published under the Apache License, Version 2.0 and stay under it.
+The documentation and tooling in this repository, the intentrules module, and the control plane and portal where included, are licensed under the Fair Core License, Version 1.0, ALv2 Future License (see LICENSE). Each release converts to the Apache License, Version 2.0 two years after it is made available. Commits up to aa25fed were published under the Apache License, Version 2.0, and commits from 4c6e1b6 up to 3775ce0 under the Functional Source License, Version 1.1, ALv2 Future License; each keeps the licence it was published with.
 
 Each directory under patches/ is a patch series for a third-party project. A patch is a derivative work of the
 project it modifies and stays under that project's licence; see UPSTREAM.md for the licence of each upstream.
@@ -9,6 +9,8 @@ project it modifies and stays under that project's licence; see UPSTREAM.md for 
 components/blueprints/netlab/ is derived from ipspace/netlab-examples, Copyright (c) 2020-2025 Ivan Pepelnjak
 (ipSpace.net AG) and contributors, and stays under that project's licence (components/blueprints/netlab/LICENSE.md):
 a permissive notice WITH a restriction on offering the software as a hosted or SaaS service. It is not an OSI
-open-source licence and it is not FSL or Apache-2.0.
+open-source licence and it is not FCL, FSL or Apache-2.0.
 
 Nothing in this repository relicenses any upstream code.
+
+Licensing and commercial questions: craigjohnson@forwardnetworks.com
