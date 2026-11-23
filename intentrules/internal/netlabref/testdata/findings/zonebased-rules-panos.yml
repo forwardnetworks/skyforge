@@ -1,0 +1,29 @@
+# expect: none
+# NEGATIVE CONTROL: the same lab on PAN-OS, which renders firewall.zonebased.rules. No finding.
+name: zfw_rules
+provider: kne
+plugin: [ firewall.zonebased ]
+
+nodes:
+  fwA:
+    device: panos
+    firewall.zonebased:
+      default_rules:
+        - from_zone: zoneA
+          to_zone: zoneB
+          action: permit
+      rules:
+        - from_zone: zoneB
+          to_zone: zoneA
+          action: permit
+          service: [ SSH ]
+  swA:
+    device: eos
+
+links:
+  - fwA:
+      firewall.zone: zoneA
+    swA:
+  - fwA:
+      firewall.zone: zoneB
+    swA:

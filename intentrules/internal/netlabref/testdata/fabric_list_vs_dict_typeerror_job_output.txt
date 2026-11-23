@@ -1,0 +1,43 @@
+Traceback (most recent call last):
+  File "/usr/local/bin/netlab", line 15, in <module>
+    netsim.cli.main()
+    ~~~~~~~~~~~~~~~^^
+  File "/opt/netlab/netsim/cli/__init__.py", line 510, in main
+    lab_commands(os.path.realpath(script))                    # Turn that into real path so 'netlab' can be called even after cwd()
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/netlab/netsim/cli/__init__.py", line 550, in lab_commands
+    mod.run(sys.argv[arg_start:])   # type: ignore
+    ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/netlab/netsim/cli/create.py", line 182, in run
+    augment.main.transform(topology)
+    ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "/opt/netlab/netsim/augment/main.py", line 144, in transform
+    transform_setup(topology)
+    ~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "/opt/netlab/netsim/augment/main.py", line 42, in transform_setup
+    augment.plugin.execute('topology_expand',topology)        # Topology-expanding plugins must be called before link checks
+    ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/netlab/netsim/augment/plugin.py", line 372, in execute
+    execute_plugin_hook(action,plugin,topology)               # ... and try to execute the hook
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/netlab/netsim/augment/plugin.py", line 352, in execute_plugin_hook
+    func(topology)                                          # ... and execute the plugin function
+    ~~~~^^^^^^^^^^
+  File "/opt/netlab/netsim/extra/fabric/__init__.py", line 203, in topology_expand
+    (grp,nodes,links) = generate_fabric(topology,l_cnt,s_cnt)
+                        ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/netlab/netsim/extra/fabric/__init__.py", line 148, in generate_fabric
+    adjust_group_parameters(                                # Adjust group/node parameters
+    ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      group_name,
+      ^^^^^^^^^^^
+      groups,
+      ^^^^^^^
+      node_lists[role],
+      ^^^^^^^^^^^^^^^^^
+      fabric.get(role,{}))
+      ^^^^^^^^^^^^^^^^^^^^
+  File "/opt/netlab/netsim/extra/fabric/__init__.py", line 91, in adjust_group_parameters
+    params = params + {}                            # First create a local copy of the parameters
+             ~~~~~~~^~~~
+TypeError: can only concatenate list (not "dict") to list

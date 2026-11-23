@@ -1,0 +1,6 @@
+Errors encountered while processing topology.yml
+IncorrectAttr in topology: topology uses an attribute from module bgp which is not enabled in topology
+IncorrectAttr in topology: Invalid topology attribute 'fabric' found in topology
+... 'fabric' is the configuration block of the 'fabric' plugin, which is not enabled: add 'plugin: [ fabric ]'
+Fatal error in netlab: Cannot proceed beyond this point due to errors, exiting
+rc=1

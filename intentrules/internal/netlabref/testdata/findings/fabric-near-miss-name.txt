@@ -1,0 +1,5 @@
+Warning in fabric: Node leaf1 looks like the fabric node L1, but it is a separate node outside the fabric groups (the fabric plugin generates L1 itself)
+... Use the generated name L1 (nodes: { L1: ... } adds parameters to it), or set fabric.leaf.name / fabric.spine.name to the name template you want
+... Set defaults.fabric.warnings.node_name to False to hide this warning
+Warning in fabric: Node spine1 looks like the fabric node S1, but it is a separate node outside the fabric groups (the fabric plugin generates S1 itself)
+... Use the generated name S1 (nodes: { S1: ... } adds parameters to it), or set fabric.leaf.name / fabric.spine.name to the name template you want

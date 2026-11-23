@@ -1,0 +1,34 @@
+{
+  "_comment": "Per-device web UI overrides on top of the kne service map. supported=false means NO usable web UI on our image even though its service map exposes the port; reason is shown to users verbatim (portal tooltip and the proxy's 501 page). Optional scheme/port say where a supported device's web UI listens when it is not https/443 (the proxy and HasWebUI use them; an explicit ?scheme=/?port= on the proxy URL still wins). Data, not logic: add or remove a device here, nothing else changes. fortios: the FortiGate-VM EVALUATION licence has no HTTPS administrative access (443 never serves), but HTTP on port 80 serves the full web UI with the day-0 allowaccess http (measured 2026-11-03 on FortiOS 7.0.9). Plain HTTP is acceptable only on the Skyforge proxy path: encryption is provided outside Skyforge. The eval licence expires 15 days after first boot, after which features are disabled. PAN-OS is supported on the default https/443 (PA-VM web UI is default-on). pathPrefixRewrite marks a device whose web UI assumes the origin root (fortios: <base href=\"/\">, root-absolute /<hash>/main.js, /api/v2 built from location.origin, /logout redirects, Path=/ cookies): the proxy rewrites its HTML/JS/Set-Cookie and injects a fetch/XHR/WebSocket shim (see deployment_node_browser_rewrite.go). htmlLiterals/scriptLiterals are exact quoted root paths used as navigation targets; never list router paths there.",
+  "devices": {
+    "fortios": {
+      "supported": true,
+      "scheme": "http",
+      "port": 80,
+      "pathPrefixRewrite": {
+        "htmlLiterals": [
+          "/logout",
+          "/prompt",
+          "/login"
+        ],
+        "scriptLiterals": [
+          "/logout",
+          "/saml/logout"
+        ],
+        "stripPrefixQueryParams": [
+          "redir"
+        ],
+        "scriptReplacements": [
+          {
+            "old": "e.appBaseHref:null!=t?t:\"\"}",
+            "new": "e.appBaseHref:null!=t?t:(window.__skyforgeBasePath||\"\")}"
+          },
+          {
+            "old": "if(t=e.startsWith(\"/\")?e:this.stripBaseUrl(this.getServerBase(),e),void 0===t)",
+            "new": "if(t=e.startsWith(\"/\")?(window.__skyforgeBasePath&&e.startsWith(window.__skyforgeBasePath+\"/\")?e.slice(window.__skyforgeBasePath.length):e):this.stripBaseUrl(this.getServerBase(),e),void 0===t)"
+          }
+        ]
+      }
+    }
+  }
+}

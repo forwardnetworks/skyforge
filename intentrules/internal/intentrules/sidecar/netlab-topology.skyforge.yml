@@ -1,0 +1,120 @@
+# Skyforge sidecar for schema/netlab-topology.yml.
+#
+# Infrahub rejects any key it does not know, so everything Skyforge adds to the schema lives here, in a directory that is never
+# given to Infrahub. Entries are keyed Kind.member (an attribute or a relationship of the schema); the loader refuses a key that
+# resolves to nothing, so this file cannot drift away from the schema.
+#
+#   netlab:     where the member lives in a netlab topology.yml (documentation, and what the generated docs show)
+#   findings:   which finding code a violated constraint on the member reports (unique, ref, min_count, max_count,
+#               cardinality, required, regex, enum, range). A member without an entry reports the generic schema-<constraint> code.
+#   message:    the sentence per constraint; {attr} is replaced by the object's attribute, {path} by its location in the document.
+#
+# A code netlab's own classifier already knows (internal/netlabref findingRules) takes its class, why and fix from there:
+# one text per code. A code only this layer emits carries its class, why and fix in findings: below.
+sidecar_version: 1
+
+annotations:
+  NetlabDevice.name:
+    netlab: {key: "nodes.<name>"}
+    findings: {unique: node-name-duplicate}
+    messages:
+      unique: "node {name} is defined more than once; netlab silently keeps the last of two definitions in a node list, and refuses a repeated key in a node mapping"
+  NetlabLink.linkid:
+    netlab: {key: "links[].linkid"}
+    findings: {unique: schema-unique}
+    messages:
+      unique: "link id {linkid} is used by more than one link; netlab refuses a duplicate link id"
+  NetlabInterface.device:
+    netlab: {key: "links[].interfaces[].node"}
+    findings: {ref: link-unknown-node, required: link-unknown-node, min_count: link-unknown-node}
+    messages:
+      ref: "a link refers to the node {node}, which is not defined"
+      required: "a link refers to the node {node}, which is not defined"
+      min_count: "a link refers to the node {node}, which is not defined"
+  NetlabP2pLink.endpoints:
+    netlab: {key: "links[].interfaces"}
+    findings: {min_count: link-endpoints, max_count: link-endpoints, required: link-endpoints}
+    messages:
+      min_count: "{name} is typed or read as point-to-point but names {count} node(s); it needs two"
+      max_count: "{name} is typed point-to-point but names {count} nodes; it needs two"
+      required: "{name} names no node"
+  NetlabLanLink.endpoints:
+    netlab: {key: "links[].interfaces"}
+    findings: {min_count: link-endpoints, required: link-endpoints}
+    messages:
+      min_count: "{name} is typed lan but names no node"
+      required: "{name} names no node"
+  NetlabStubLink.endpoints:
+    netlab: {key: "links[].interfaces"}
+    findings: {cardinality: link-endpoints, required: link-endpoints}
+    messages:
+      cardinality: "{name} is typed stub or loopback but names {count} nodes; it takes one"
+      required: "{name} names no node"
+  NetlabPluginBlock.plugin:
+    netlab: {key: "plugin"}
+    findings: {required: unknown-topology-attribute, min_count: unknown-topology-attribute}
+    messages:
+      required: "{key} is the configuration block of the {owner} plugin, which is not enabled (add it under plugin:)"
+      min_count: "{key} is the configuration block of the {owner} plugin, which is not enabled (add it under plugin:)"
+  NetlabVlan.svi_ospf:
+    netlab: {key: "vlans.<name>.ospf", default: "on"}
+  NetlabVlan.mode:
+    netlab: {key: "vlans.<name>.mode", default: irb}
+  NetlabDevice.modules:
+    netlab: {key: "nodes.<name>.module, groups.<name>.module, module"}
+  NetlabModule.requires:
+    netlab: {key: "netsim/modules/<name>.yml requires"}
+  NetlabGroup.members:
+    netlab: {key: "groups.<name>.members, nodes.<name>.group"}
+
+# Findings only this layer emits: class, whether netlab itself would refuse the topology (is_error), why and fix. Codes that
+# netlab's classifier knows are not repeated here.
+findings:
+  module-requires:
+    class: will-not-work
+    why: "netlab refuses a module without the one it builds on (evpn needs bgp; vxlan and stp need vlan), but only when it compiles. The node cannot be rendered."
+    fix: "Add the required module to the node's module list. A node's own module: list replaces the topology-level list, so name the full set there."
+  node-name-duplicate:
+    class: likely-wrong
+    why: "Two nodes share a name. In a node list netlab accepts the topology and silently keeps the last definition, so the first node, and anything written for it, is replaced without a word (a repeated key in a node mapping is a different matter: netlab refuses it)."
+    fix: "Give each node one definition; rename the one that was meant to be a different node."
+  schema-unique:
+    class: will-not-work
+    why: "Two links share an id that must be unique. netlab refuses a repeated link id, but only when it compiles."
+    fix: "Give each link id to one link."
+  link-endpoints:
+    class: will-not-work
+    why: "A link's type fixes how many nodes it names: a point-to-point link two, a stub or loopback one (a LAN needs at least one). netlab refuses a typed link with the wrong count, but only when it compiles, and a link with no type and one node is not wrong (it is netlab's stub network), so the early signal is the typed case."
+    fix: "Name the missing end, or change the type to the one that matches the nodes (type: stub for a single-node network)."
+  schema-ref:
+    class: will-not-work
+    why: "A reference names an object that does not exist."
+    fix: "Define the object or correct the name."
+  schema-required:
+    class: will-not-work
+    why: "A required value or reference is missing."
+    fix: "Provide it."
+  schema-min-count:
+    class: likely-wrong
+    why: "Fewer related objects than the model requires."
+    fix: "Add the missing ones."
+  schema-max-count:
+    class: likely-wrong
+    why: "More related objects than the model allows."
+    fix: "Remove the extra ones."
+  schema-cardinality:
+    class: likely-wrong
+    why: "More than one object where one is allowed."
+    fix: "Keep one."
+  schema-regex:
+    class: likely-wrong
+    why: "A value does not match the pattern the model requires."
+    fix: "Use a value that matches."
+  schema-enum:
+    class: likely-wrong
+    why: "A value is not one of the allowed choices."
+    fix: "Use one of the allowed values."
+  schema-range:
+    class: likely-wrong
+    why: "A number or length is outside the allowed range."
+    fix: "Use a value inside the range."

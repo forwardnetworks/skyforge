@@ -1,0 +1,9 @@
+# expect: node-name-duplicate
+# The same node name twice in the list form: the second definition silently replaces the first.
+defaults.device: eos
+nodes:
+- name: r1
+- name: r2
+- name: r1
+links:
+- r1-r2

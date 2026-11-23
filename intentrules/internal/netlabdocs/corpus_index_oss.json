@@ -1,0 +1,545 @@
+{
+  "source": "netlab/docs (OSS subset of the generated corpus)",
+  "entries": [
+    {
+      "path": "addressing.md",
+      "bytes": 9669,
+      "sha256": "e4a3bf06db832209e6018af5d96f361834677f697514f06eae02eac8f2da9cf3"
+    },
+    {
+      "path": "caveats.md",
+      "bytes": 63627,
+      "sha256": "6fc50e40ed78e8aaec05b27e79d983dce5b62a7b648620aaf5ed9d69dcea1859"
+    },
+    {
+      "path": "cli-overview.md",
+      "bytes": 2356,
+      "sha256": "5c057647c8f7e116de4aad5180c65be305b57dbc50e217d0f0a510012fb93c4d"
+    },
+    {
+      "path": "components.md",
+      "bytes": 3310,
+      "sha256": "660052125e3fea5b63bb6b14650a8e7d6ec95b13af65754a5744796d48468ada"
+    },
+    {
+      "path": "custom-config-templates.md",
+      "bytes": 8048,
+      "sha256": "a201cf75ed7a65508c1579326a0f735d6732cd9a9c775f6ec03e791a2c229768"
+    },
+    {
+      "path": "customize.md",
+      "bytes": 4159,
+      "sha256": "91689bde5626de598ed25843b5d66299c8a3a5835e1577d933984727211c0fb1"
+    },
+    {
+      "path": "defaults.md",
+      "bytes": 10633,
+      "sha256": "a1ada373cc16af30e9baa78a7f705e2d487b2cdc9390925c17c8007579fbae0d"
+    },
+    {
+      "path": "example/addr-builtin.txt",
+      "bytes": 10625,
+      "sha256": "bc16e6ebfc820bc04e821bd96437bfa9ccb052e85aee266daba2b2cc8f6d22fb"
+    },
+    {
+      "path": "example/addr-complex.txt",
+      "bytes": 3856,
+      "sha256": "d10727a287b6ba69acb6fa98103140f87001fbb5515fe54cc02f77a9562b01ea"
+    },
+    {
+      "path": "example/addr-custom-pools.txt",
+      "bytes": 4534,
+      "sha256": "8e6d7978234eaae1c85ca9a00a576a8fc888bd1e5ac4ed3a06c5f6d4c59fdc9e"
+    },
+    {
+      "path": "example/addr-ipv6.txt",
+      "bytes": 4174,
+      "sha256": "1cde54ec6b258ae05fe365df3e8cab2be585eb5a033cf165e0bf8a18d6d4e817"
+    },
+    {
+      "path": "example/addr-static.txt",
+      "bytes": 3503,
+      "sha256": "7d58a9cb751947027f8a72c732940a6abc2117deb0bdb24f409d801740742e15"
+    },
+    {
+      "path": "example/addressing-tutorial.md",
+      "bytes": 1675,
+      "sha256": "cad30ff8494d72bf4ef1e829b3c4dfe07c21aea389c01973625fc5e72e49a41f"
+    },
+    {
+      "path": "example/bridge.md",
+      "bytes": 4650,
+      "sha256": "c0f5723fdaa6cd82597ca69695f779255d016b22fae32171e4ac1d869daf64a1"
+    },
+    {
+      "path": "example/external.md",
+      "bytes": 11589,
+      "sha256": "e95d9c70455bcc6ce6b8cfee702b2f2c75a67a202db0f1de3bbacac82ee7e929"
+    },
+    {
+      "path": "example/github.md",
+      "bytes": 10675,
+      "sha256": "9a557f4d80cc36914c505d721afa6d8075c90fc654b9ed260022b571f9ff766d"
+    },
+    {
+      "path": "example/link-definition.md",
+      "bytes": 5024,
+      "sha256": "2f238910aa22b12277aa467db33fa3440d0802348c000aab33d1c8a8e49742a6"
+    },
+    {
+      "path": "example/linux.md",
+      "bytes": 5089,
+      "sha256": "c73e177cc58f6bb845e770c87551bd2a5e1e89a6daaedc15bacc9a289349def4"
+    },
+    {
+      "path": "example/release.md",
+      "bytes": 5068,
+      "sha256": "8e3677951a8fa10a5bf32e322a99126be88a2be56d0f089f45c066333265a9c3"
+    },
+    {
+      "path": "example/selecting-vlan-mode.md",
+      "bytes": 3698,
+      "sha256": "7a545b4c9f31ac66b37443a79eaf3823296807d6114af8f01a0ea4f94274b276"
+    },
+    {
+      "path": "example/vlan-addressing.md",
+      "bytes": 12620,
+      "sha256": "ec6bb6e01d0ef8bf008450ea9a0f2230c7a1b08a706a8a0d820f66721e96acb6"
+    },
+    {
+      "path": "example/vrf-tutorial.md",
+      "bytes": 8263,
+      "sha256": "4bfa70b39c0100f20a1d5f4115ae4290b8cedc4d9b69f41951a98389838b97af"
+    },
+    {
+      "path": "extend-attributes.md",
+      "bytes": 3273,
+      "sha256": "d4b2954be3a5d3e7be4f33d8d03a1dbb60b13b5aa40960a2ff806585d6257788"
+    },
+    {
+      "path": "extools.md",
+      "bytes": 3207,
+      "sha256": "fc7c224684ae829b679c0e8fc63203b16d82c8346c17b83e914e729a54d38580"
+    },
+    {
+      "path": "groups.md",
+      "bytes": 17615,
+      "sha256": "a44e98f826a7fa74b6d5632cf185c487b8e47c7f5e73394098f2f734b6203481"
+    },
+    {
+      "path": "index.md",
+      "bytes": 4546,
+      "sha256": "d36488614832cde497a8877aabb755201ff9cbff4a260f042916a529fa9d0209"
+    },
+    {
+      "path": "install.md",
+      "bytes": 5472,
+      "sha256": "ef7904d2431bdf783d3cafade1a70770ec32c49394c05d88561e8ec54fa0a358"
+    },
+    {
+      "path": "links.md",
+      "bytes": 32122,
+      "sha256": "6006b160a7438b32925cde92a2b775ac35f15d97b699fcae750bc4a5fa1690ab"
+    },
+    {
+      "path": "module-reference.md",
+      "bytes": 1149,
+      "sha256": "307fd6c34f22de6aa7315ecca762813f347f8473c688ab61ba8ad75cc3772609"
+    },
+    {
+      "path": "module/bfd.md",
+      "bytes": 2087,
+      "sha256": "bcbc9e447750cc89ec74564a5086fe66910ca38a4b043d214ef476489c7fcae4"
+    },
+    {
+      "path": "module/bgp.md",
+      "bytes": 32272,
+      "sha256": "19fc97c9f815b2282c5419d91e6f5d4d01a91524460dab9d26f295d5b2199f94"
+    },
+    {
+      "path": "module/dhcp.md",
+      "bytes": 7545,
+      "sha256": "2b6ea9298f7639de4899447124f49c0ea48b6c671c1eb4d5bc65d42ccff61d67"
+    },
+    {
+      "path": "module/eigrp.md",
+      "bytes": 5563,
+      "sha256": "bdaac947b7c56aaec3cf74fee82d42b07a6c8424f722232357380d8a5bbf7b88"
+    },
+    {
+      "path": "module/evpn.md",
+      "bytes": 15230,
+      "sha256": "f943c8c3e29fb01fc32576885f8a9618915d42dfef1c51fc51fe2e4b392780b2"
+    },
+    {
+      "path": "module/gateway.md",
+      "bytes": 6641,
+      "sha256": "222eb842bbab08dbbbd7f6620480b456e566cb2db502fa777a77c12908f64a02"
+    },
+    {
+      "path": "module/isis.md",
+      "bytes": 8718,
+      "sha256": "ce385c7bb73d14d49e76da193643fde370cc508e4ae90cd68c61bed2500d6e54"
+    },
+    {
+      "path": "module/lag.md",
+      "bytes": 6918,
+      "sha256": "32342718a8a59e60be13b3ed762ccf0770601f3e4ca33bb610f1e15738555ccf"
+    },
+    {
+      "path": "module/mpls.md",
+      "bytes": 8213,
+      "sha256": "d184b17132df1f92b8747334595f9136ecc97fd5f1841509b75e0c2b8f656763"
+    },
+    {
+      "path": "module/ospf.md",
+      "bytes": 14006,
+      "sha256": "04b12edf9d81d5b57c8e38424601b7830a1f4ae59ee8d40f4eaf59a30e9101ef"
+    },
+    {
+      "path": "module/ripv2.md",
+      "bytes": 3586,
+      "sha256": "f1507c394029f1f6f1730abe723363a8868dc1053b9dd805b93acceed0e31203"
+    },
+    {
+      "path": "module/routing-acl.txt",
+      "bytes": 6417,
+      "sha256": "cd3a833131f41d2c8621782a0feee24b5957891d23a176e4421a1a2e48723f35"
+    },
+    {
+      "path": "module/routing-advanced.txt",
+      "bytes": 3771,
+      "sha256": "4686a7b93e158545dea4af95e8072af039172e0b1f03eee47250cdded3d3145d"
+    },
+    {
+      "path": "module/routing-aspath.txt",
+      "bytes": 2779,
+      "sha256": "9ffba54040e5e426038cf919a00e2924fac374d04993308aa5b2f272a73e0688"
+    },
+    {
+      "path": "module/routing-clist.txt",
+      "bytes": 5755,
+      "sha256": "cca0dc87f3a4040639015d32c8d380581d523b8331246f96e41082f5418fb89f"
+    },
+    {
+      "path": "module/routing-policy.txt",
+      "bytes": 7740,
+      "sha256": "201fcb7fceba94f8467cdd824a51e1a0fa65fcc7d06ae51fc4e1e6317ef41b77"
+    },
+    {
+      "path": "module/routing-prefix.txt",
+      "bytes": 5131,
+      "sha256": "f733a78aac50b8d3832dc17b137b97680d40c40ac0602432bf1c412a4a88a693"
+    },
+    {
+      "path": "module/routing-static.txt",
+      "bytes": 6369,
+      "sha256": "cf81e8501a85e968ffbb736a67c829b88216bd6059879619df516ca03199cbe4"
+    },
+    {
+      "path": "module/routing.md",
+      "bytes": 1584,
+      "sha256": "2a07c31223783f1bcdd25856ba9cecafccf5ac47029c0ebf816224d024c677e9"
+    },
+    {
+      "path": "module/routing_protocols.md",
+      "bytes": 9104,
+      "sha256": "f8fc31f44a8cbabf3aeb0f932b062566a6bec87ca97810e4bdb0d3d1fa1247b2"
+    },
+    {
+      "path": "module/sdwan.md",
+      "bytes": 7219,
+      "sha256": "75b54d655b344f58ecf33f98c53a8719aaf4b4181d264c17d90d0da631004d61"
+    },
+    {
+      "path": "module/services.md",
+      "bytes": 2851,
+      "sha256": "4cf17273a3652216223262d48dc7c93391093f9430ef3c69f2c6349d072cf88d"
+    },
+    {
+      "path": "module/sr-mpls.md",
+      "bytes": 6137,
+      "sha256": "27588f6b5cf8dcc838adb3e0934f9b39917a502fb03abee2a73e51b42a2114e7"
+    },
+    {
+      "path": "module/srv6.md",
+      "bytes": 4085,
+      "sha256": "25832bf535b291b84996cc75e4dccd6f4ba0dd008632ca2458a19eb93a38687f"
+    },
+    {
+      "path": "module/stp.md",
+      "bytes": 4155,
+      "sha256": "467f5ccfbcbcffcd70174f5826dd352aa61953b6d3036419b559605a284168ea"
+    },
+    {
+      "path": "module/vlan.md",
+      "bytes": 19373,
+      "sha256": "1674085c6b9e8766ce260bc3e7edfffd2d1610f9a8e2c05b8bfaed447b96ccef"
+    },
+    {
+      "path": "module/vrf.md",
+      "bytes": 13244,
+      "sha256": "b2f8083ada2ce9f41c2c94a8d83e0325a0f7cb44785bfb0601ff2574b3f3884e"
+    },
+    {
+      "path": "module/vxlan.md",
+      "bytes": 7608,
+      "sha256": "014138368435cb57e7e73035dd1769c47461d64e2499190af0da00916e79d73b"
+    },
+    {
+      "path": "modules.md",
+      "bytes": 7438,
+      "sha256": "64d59b2bbe83c307db920f552ffcd5300db52f6796fd1bb3a71ab5085032fd25"
+    },
+    {
+      "path": "netlab-multicast-plan.md",
+      "bytes": 1429,
+      "sha256": "e52c7651d7eb3dbac13b7296e6bc6f39d5edbd9b3024090cf529f5317adb10f6"
+    },
+    {
+      "path": "netlab-sdwan-plan.md",
+      "bytes": 21483,
+      "sha256": "62df47b2e8284a308cbaa3b9bb8294466e44c57f5eced7274c28fa18e9ce0da2"
+    },
+    {
+      "path": "node/debug.md",
+      "bytes": 3094,
+      "sha256": "da11a23e7c2235928dd4d35a004aefbff0eb882b006c92424e33de0551250cb5"
+    },
+    {
+      "path": "node/roles.md",
+      "bytes": 6919,
+      "sha256": "871a379725b35215d13018f1c36be0bf0cffe6754aac507ae95cafc9498db718"
+    },
+    {
+      "path": "nodes.md",
+      "bytes": 12871,
+      "sha256": "a4a43189bd82cef32f7daed6720f6a51f9786f36119287b578ff3230b3397a4c"
+    },
+    {
+      "path": "outputs/ansible.md",
+      "bytes": 2698,
+      "sha256": "67b688c7e84e17bcac4d7bbe16a859620e70c02b07589b0a489f425a04172ed8"
+    },
+    {
+      "path": "outputs/d2.md",
+      "bytes": 10094,
+      "sha256": "a401715d9ea7c6d85f560c8378d76776995d55138ff2aa4886263fd313eddde0"
+    },
+    {
+      "path": "outputs/devices.md",
+      "bytes": 2419,
+      "sha256": "a52b0b4c062e635c8f83e380567c773266d38c0625c5b16761a002a16cd8d0e7"
+    },
+    {
+      "path": "outputs/graph.md",
+      "bytes": 10513,
+      "sha256": "cb5037c1117b1e0f4972d2c7d05b0df90fbe0379c5067b4ca0e04024bdc35a71"
+    },
+    {
+      "path": "outputs/index.md",
+      "bytes": 1762,
+      "sha256": "86c244f9d9e07ffb03468cae9abad3f76bfd6ba20321c1d76e9e39eb40f69acf"
+    },
+    {
+      "path": "outputs/provider.md",
+      "bytes": 750,
+      "sha256": "778c61d2e421b20d1b5a70f634d0fa11b7b7831ded4710b5467c437d668d83f8"
+    },
+    {
+      "path": "outputs/report.md",
+      "bytes": 2171,
+      "sha256": "47f7fd7dbcdec7abcc4973bf618d4641719c6d8516c4218f974f2ac69e0e1157"
+    },
+    {
+      "path": "outputs/yaml-or-json.md",
+      "bytes": 2851,
+      "sha256": "19940580bc483c686ee870af7a977d2ba1aa22218a9ee5b82aa22a58875d40df"
+    },
+    {
+      "path": "platforms.md",
+      "bytes": 35815,
+      "sha256": "5c0a0181250ff31e6067a3be888e769f9a5eb9e11f206844cbca59e099d17eab"
+    },
+    {
+      "path": "plugins.md",
+      "bytes": 2660,
+      "sha256": "83f5c11124c1bf2a37c4a6869bcc0d216e94394c94e60446c6cdf59a0efe8510"
+    },
+    {
+      "path": "plugins/bgp.domain.md",
+      "bytes": 1345,
+      "sha256": "1c31b20135d1cb7165791d3feec423bcbab11fd18099f77c1a373190cc7b6892"
+    },
+    {
+      "path": "plugins/bgp.originate.md",
+      "bytes": 2191,
+      "sha256": "bafbde14812a41b8ee2bbb4906bf92f1aa2241e3d71f1235e2333495ea480166"
+    },
+    {
+      "path": "plugins/bgp.policy.md",
+      "bytes": 12948,
+      "sha256": "d5a2d91579aa5c589ab1915d46e779b397a38ec3e58b76370cbaa577136bc2cb"
+    },
+    {
+      "path": "plugins/bgp.session.md",
+      "bytes": 13013,
+      "sha256": "90e1f2d351d4386e9543b1b924484e5f82102b17d9cf7491667032be47c70930"
+    },
+    {
+      "path": "plugins/bonding.md",
+      "bytes": 2204,
+      "sha256": "17f957e0b00a45e2b3bb3c4a8b95ee03e93b74bab7508e88302840e6193d572f"
+    },
+    {
+      "path": "plugins/check.config.md",
+      "bytes": 1963,
+      "sha256": "4f9a5f1e641c3233d88caa527596be87c119618719c8ecba64d81e53cc862596"
+    },
+    {
+      "path": "plugins/ebgp.multihop.md",
+      "bytes": 4178,
+      "sha256": "2a4ca0b17134668cf760cbec2740aa95d66002ac2be6d5032eb3bc75f1e11236"
+    },
+    {
+      "path": "plugins/evpn.multihoming.md",
+      "bytes": 4042,
+      "sha256": "5402f03d200a9e4be582083a41f948c53cd9cf9b71aae159240a8ef75375ad24"
+    },
+    {
+      "path": "plugins/fabric.md",
+      "bytes": 4132,
+      "sha256": "88f352702e79366f40972514a9b7d66a79a9ca97c0d6ab8a2bfc47510dd2ca45"
+    },
+    {
+      "path": "plugins/files.md",
+      "bytes": 7051,
+      "sha256": "90cabe14651a7b74a6f6ab233266b466370610c7dc67e725908442de1b5971a0"
+    },
+    {
+      "path": "plugins/firewall.policy.md",
+      "bytes": 6596,
+      "sha256": "673303aa2807d269fe4839c2bb0ed6bb58bcd3dfef547477863d198b07467b80"
+    },
+    {
+      "path": "plugins/firewall.zonebased.md",
+      "bytes": 2453,
+      "sha256": "cdc696d9bea0dab75d7148654f688e0827483dc758026142f1ff784314123ac6"
+    },
+    {
+      "path": "plugins/ipsec.md",
+      "bytes": 2950,
+      "sha256": "c916fbe5aa5d6a6783b545ee87d46e030599d8580f516baeeffbf1f23edd8197"
+    },
+    {
+      "path": "plugins/kind.md",
+      "bytes": 6821,
+      "sha256": "a9ea9a6d9d4bff1f1408dabc25576b1d339e3ffed71c7fbf7abac06a8cb665df"
+    },
+    {
+      "path": "plugins/loadbalancer.md",
+      "bytes": 4546,
+      "sha256": "37d5de7a1cf062795dbcf3940d5e8cae55108a240a8078a75acc3b19a9c79c15"
+    },
+    {
+      "path": "plugins/mlag.vtep.md",
+      "bytes": 2858,
+      "sha256": "5991814540207f58ed7d91fb9233089aaf4f2c2aaf4f1e5752835c88eb1f1c52"
+    },
+    {
+      "path": "plugins/multilab.md",
+      "bytes": 6912,
+      "sha256": "cc43dc3a4787d6b157a3009354960052cb5ae50ca2246b841b1c27bc79a05185"
+    },
+    {
+      "path": "plugins/multiserver.md",
+      "bytes": 15674,
+      "sha256": "2bad37f61656e7a12a9b79a5d3cf9abfdf2bb5b86f85bdf910e1ce8c7525ec63"
+    },
+    {
+      "path": "plugins/nat.md",
+      "bytes": 6580,
+      "sha256": "58b02ca1191f74af866a66c503e543dbef848798a231d72a52586039732bdf78"
+    },
+    {
+      "path": "plugins/node.clone.md",
+      "bytes": 2575,
+      "sha256": "831bf25cc91d836fdf76eb4037e4eb651256cf3704bfcc7d56c890d087418fdc"
+    },
+    {
+      "path": "plugins/ospf.areas.md",
+      "bytes": 3838,
+      "sha256": "3907048bb1a474bba3b90ac482717db2ac3a5728c27e7dfcc310f3fa86094079"
+    },
+    {
+      "path": "plugins/tunnel.dmvpn.md",
+      "bytes": 1518,
+      "sha256": "16febaa04f7a1ea3e1bce6e14ed1d67e98fe0a0c472b319636cdca0a817f8d79"
+    },
+    {
+      "path": "plugins/tunnel.gre.md",
+      "bytes": 3359,
+      "sha256": "6041b8b9c4a2c93709809d71dafe2fcab6af265155d5f04b391baf631a344075"
+    },
+    {
+      "path": "plugins/tunnel.wireguard.md",
+      "bytes": 9678,
+      "sha256": "00973abae0d7e069895651aab4f661592e18cf9b55d42064db8cdd24878cb9ea"
+    },
+    {
+      "path": "plugins/vrrp.version.md",
+      "bytes": 764,
+      "sha256": "23c6f55ac0f1845b80797b7c90cb8c515d43e951d042ad910f9ad6a2ccfbbb5d"
+    },
+    {
+      "path": "prefix.md",
+      "bytes": 3298,
+      "sha256": "f5685efc46d02f543268611e67caf32f0e11e7a65ab47e455fff22ee8b02e34b"
+    },
+    {
+      "path": "providers.md",
+      "bytes": 1172,
+      "sha256": "fa91bf352438c76d9143b560462b6a788f8bd99c40bad43024b11ec2eae8e1c6"
+    },
+    {
+      "path": "release-archive.md",
+      "bytes": 26638,
+      "sha256": "611b6b3733d7e7e55564639909ce2facaecf65aba3ad6be35629b7e2c029517c"
+    },
+    {
+      "path": "release.md",
+      "bytes": 12382,
+      "sha256": "188f10320ab4ce0dd12c52c345e469b9cf06bc3fb98d21051d3178cefb2f1f97"
+    },
+    {
+      "path": "topology-overview.md",
+      "bytes": 3127,
+      "sha256": "9c0bb572b269e0b399f7dceaf1c336291ab14a9849bcec4e5c3253b62aadb177"
+    },
+    {
+      "path": "topology-reference.md",
+      "bytes": 3332,
+      "sha256": "d00a58cd7ce86a1903e6b3b5937c2bed9e0fdfcc0b0a40b2f67fa9937903f891"
+    },
+    {
+      "path": "topology/hierarchy.md",
+      "bytes": 1792,
+      "sha256": "05411f0b838e9d59982cbe5f791909871086b173ab29f9a67530b9964a6bd7a4"
+    },
+    {
+      "path": "topology/otg.md",
+      "bytes": 7351,
+      "sha256": "349c3cc6f38ebd9e2cf4daf676fa3408a205ffe424cef9bbce1d6110025b0474"
+    },
+    {
+      "path": "topology/validate.md",
+      "bytes": 21499,
+      "sha256": "1a121d1d0f86e649cdc82457706eca572dc1facc1a2b14903d4be587d219e161"
+    },
+    {
+      "path": "tutorials.md",
+      "bytes": 5230,
+      "sha256": "5b1f77be2eb9fb235e12090d7f9e227a994966f7ac3e976c456c5a09942dce84"
+    }
+  ]
+}

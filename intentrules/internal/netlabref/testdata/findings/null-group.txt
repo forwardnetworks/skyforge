@@ -1,0 +1,4 @@
+Errors encountered while processing null-group.yml
+IncorrectType in groups: Definition of group 'leafs' must be a dictionary
+... 'leafs:' has no value (YAML null). Give it attributes (module, device, members), a list of members, or write 'leafs: {}' for an empty group
+Fatal error in netlab: Cannot proceed beyond this point due to errors, exiting

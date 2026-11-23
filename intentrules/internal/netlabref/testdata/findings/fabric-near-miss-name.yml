@@ -1,0 +1,16 @@
+# expect: fabric-near-miss-node-name
+# The fabric plugin is on, and the topology also declares a node written as a role word and a number (leaf1, spine1): separate nodes outside the fabric groups.
+name: fab_near_miss
+provider: kne
+defaults.device: eos
+plugin: [ fabric ]
+
+fabric:
+  spines: 1
+  leafs: 2
+
+nodes:
+  leaf1:
+  spine1:
+  h1:
+    device: linux

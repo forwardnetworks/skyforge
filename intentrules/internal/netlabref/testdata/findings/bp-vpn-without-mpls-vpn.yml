@@ -1,0 +1,2 @@
+# expect: vpn-without-mpls-vpn
+# Output of netlab create on the shipped blueprint enterprise-prepost/sr-migrate (no topology copied).

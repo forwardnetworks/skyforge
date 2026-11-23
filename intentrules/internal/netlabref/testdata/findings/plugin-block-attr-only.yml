@@ -1,0 +1,7 @@
+# expect: unknown-topology-attribute
+provider: clab
+defaults.device: eos
+fabric:
+  spines: 2
+  leafs: 2
+nodes: [ h1 ]

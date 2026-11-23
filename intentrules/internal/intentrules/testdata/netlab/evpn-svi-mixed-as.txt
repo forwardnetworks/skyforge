@@ -1,0 +1,16 @@
+Warning in ospf: l1 does not use ospf on any non-loopback interface or VRF
+... It has been removed from the list of modules active on l1
+... Set defaults.ospf.warnings.inactive to False to hide this warning
+Warning in evpn: Extended BGP communities are not enabled on ebgp BGP sessions on l1
+... EVPN needs extended BGP communities attached to EVPN routes
+... Set defaults.evpn.warnings.extcommunity to False to hide this warning
+Warning in ospf: l2 does not use ospf on any non-loopback interface or VRF
+... It has been removed from the list of modules active on l2
+Warning in evpn: Extended BGP communities are not enabled on ebgp BGP sessions on l2
+Warning in evpn: Removing an EBGP session between l1 and l2 running over an EVPN-enabled VLAN red
+... Set defaults.evpn.warnings.ebgp_vlan to False to hide this warning
+... In most scenarios, you don't need EBGP sessions between PE-devices across an EVPN-
+    controlled VLAN. See https://netlab.tools/module/evpn/#evpn-rp for details.
+
+Warning in evpn: Removing an EBGP session between l2 and l1 running over an EVPN-enabled VLAN red
+rc=0

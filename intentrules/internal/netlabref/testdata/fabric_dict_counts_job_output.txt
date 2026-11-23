@@ -1,0 +1,28 @@
+Traceback (most recent call last):
+  File "/w/job_path.py", line 4, in <module>
+    create.run(["-p", "kne", "topology.yml"])
+    ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/netlab/netsim/cli/create.py", line 182, in run
+    augment.main.transform(topology)
+    ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "/opt/netlab/netsim/augment/main.py", line 144, in transform
+    transform_setup(topology)
+    ~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "/opt/netlab/netsim/augment/main.py", line 42, in transform_setup
+    augment.plugin.execute('topology_expand',topology)        # Topology-expanding plugins must be called before link checks
+    ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/netlab/netsim/augment/plugin.py", line 372, in execute
+    execute_plugin_hook(action,plugin,topology)               # ... and try to execute the hook
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/netlab/netsim/augment/plugin.py", line 352, in execute_plugin_hook
+    func(topology)                                          # ... and execute the plugin function
+    ~~~~^^^^^^^^^^
+  File "/opt/netlab/netsim/extra/fabric/__init__.py", line 197, in topology_expand
+    (grp,nodes,links) = generate_fabric(topology,l_cnt,s_cnt)
+                        ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/netlab/netsim/extra/fabric/__init__.py", line 127, in generate_fabric
+    for count in range(1,l_cnt+1):
+                         ~~~~~^~
+  File "box/box.py", line 314, in box.box.Box.__add__
+box.exceptions.BoxTypeError: Box can only merge two boxes or a box and a dictionary.
+ERROR: netlab create failed: Box can only merge two boxes or a box and a dictionary.

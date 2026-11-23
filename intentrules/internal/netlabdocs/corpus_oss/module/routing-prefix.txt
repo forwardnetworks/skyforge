@@ -1,0 +1,104 @@
+(generic-routing-prefixes)=
+## Prefix Filters (prefix-lists)
+
+Prefix filters are lists of conditions (usually known as *lists*) that permit or deny IPv4 or IPv6 prefixes. You can use prefix filters in the **match.prefix** and **match.nexthop** parameters of routing policies to match IPv4/IPv6 routes or next hops. Each prefix filter entry can have these attributes:
+
+* **action**: A prefix filter entry can **permit** or **deny** matched prefixes (default: **permit**)
+* **sequence**: Statement sequence number. When not specified, *netlab* sets a prefix filter entry's **sequence** number to ten times its list position.
+* **prefix**: A (list of) [generic prefixes](generic-routing-prefix-set), which can include IPv4 prefixes, IPv6 prefixes, named prefixes, and other prefix-related attributes like VLANs, links, or address pools.
+* **min**: Minimum prefix length. You can specify it as an integer or a dictionary with **ipv4** and **ipv6** keys.
+* **max**: Maximum prefix length in the same format as the **min** parameters.
+
+For backward compatibility reasons, you can also specify:
+
+* **ipv4**: A (list of) IPv4 prefixes to match
+* **ipv6**: A (list of) IPv6 prefixes to match
+* **pool**: Name(s) of the addressing pool(s) to match
+
+```{warning}
+* The **min** and **max** lengths must be greater than or equal to the longest prefix length an entry is matching, and less than or equal to the maximum imposed by the address family prefix size.
+* Some devices (for example, Cisco IOS) require the **min** and **max** lengths to be strictly greater than the matched prefix length
+* You cannot specify **min** and **max** lengths if the prefix-list entry matches host prefixes (/32 for IPv4 and /128 for IPv6)
+```
+
+Prefix filters are specified in the global- or node-level **routing.prefix** dictionary (see [](routing-object-import) and  [](routing-object-merge) for more details). 
+
+The keys of the **routing.prefix** dictionary are filter names (prefix-list names), and the values are prefix filters (lists of prefix filter entries).
+
+The following example specifies a prefix filter that matches the loopback pool, a named prefix, and an IPv6 prefix:
+
+```
+module: [ routing ]
+
+prefix:
+  lb_c1: 192.168.42.0/24
+
+routing.prefix:
+  loopbacks:
+  - action: permit
+    prefix: [ pool.loopback, prefix.lb_c1, 2001:db8:cafe:2::/64 ]
+```
+
+(routing-prefix-name)=
+### Keeping the Declared Prefix-List Name
+
+_netlab_ appends the address family to every generated prefix list (`p1-ipv4`, see below). When the configured object must carry exactly the declared name -- for example, because a change-review workflow edits it by name -- specify the prefix filter as a dictionary with a **value** list and a **name**:
+
+```
+routing.prefix:
+  PARTNER-IN-V4:
+    name: PARTNER-IN-V4
+    value:
+    - prefix: 198.19.0.0/21
+    - { prefix: 0.0.0.0/0, max: 32, action: deny, sequence: 100 }
+```
+
+The **name** is used verbatim for every address family of that filter. It is accepted only on devices whose features declare `routing.prefix.name` (Cisco IOS/IOS XE: `ip prefix-list` and `ipv6 prefix-list` are separate namespaces); other devices report an error instead of silently generating the `-ipv4`/`-ipv6` names.
+
+(routing-prefix-ds)=
+### Dual-Stack Prefix Lists
+
+Address pools, named prefixes, and prefix filter entries can contain IPv4 and IPv6 prefixes. Meanwhile, most network operating systems use different configuration objects to match IPv4 and IPv6 prefixes.
+
+_netlab_ generates separate per-address-family *prefix lists* for every prefix filter configured on a network device, expanding lists of matching prefixes into one prefix per prefix list entry, resulting in sequence numbers that do not match the ones used in the lab topology. The address family is appended to the prefix list name to deal with devices that cannot use the same names for IPv4 and IPv6 prefix lists.
+
+To avoid route map inconsistencies, a prefix list that contains no usable entries (for example, an IPv6 prefix list generated from a prefix filter that matches only IPv4 prefixes) has a single *deny everything* condition.
+
+Let's assume we're using the following prefix filters:
+
+```
+routing.prefix:
+  p1:
+  - prefix: [ 192.168.24.0/24, 2001:db8:0:1::/64 ]
+  p2:
+  - prefix: 172.16.0.0/16
+  - prefix: 2001:db8:0:2::/64
+  p3:
+  - prefix: 172.16.1.0/24
+```
+
+_netlab_ generates these prefix lists on an IPv4-only device (an IPv6 prefix list is not generated, and the sequence numbers are generated as the device prefix list is created):
+
+```
+ip prefix-list p1-ipv4 seq 100 permit 192.168.24.0/24
+!
+ip prefix-list p2-ipv4 seq 100 permit 172.16.0.0/16
+!
+ip prefix-list p3-ipv4 seq 100 permit 172.16.1.0/24
+```
+
+Meanwhile, the following prefix lists are generated on a dual-stack device (including a meaningless IPv6 prefix list P3)
+
+```
+ip prefix-list p1-ipv4 seq 100 permit 192.168.24.0/24
+!
+ip prefix-list p2-ipv4 seq 100 permit 172.16.0.0/16
+!
+ip prefix-list p3-ipv4 seq 100 permit 172.16.1.0/24
+!
+ipv6 prefix-list p1-ipv6 seq 100 permit 2001:db8:0:1::/64
+!
+ipv6 prefix-list p2-ipv6 seq 110 permit 2001:db8:0:2::/64
+!
+ipv6 prefix-list p3-ipv6 seq 100 deny ::/0
+```

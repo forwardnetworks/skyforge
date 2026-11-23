@@ -1,0 +1,5 @@
+Errors encountered while processing topology.yml
+IncorrectValue in modules: Module evpn on device eos (node l1) requires bgp module
+IncorrectValue in modules: Module evpn on device eos (node l2) requires bgp module
+Fatal error in netlab: Cannot proceed beyond this point due to errors, exiting
+rc=1

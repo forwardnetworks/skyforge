@@ -1,0 +1,8 @@
+Warning in evpn: Node l1 runs OSPF on the IRB SVI of EVPN-controlled VLAN(s) red; OSPF adjacencies will form across the VXLAN tunnel
+... Set defaults.evpn.warnings.svi_ospf to False to hide this warning
+... Turn OSPF off on the VLAN (vlans.<name>.ospf: False), make the SVI passive
+    (vlans.<name>.ospf.passive: True) or make the VLAN layer-2-only (vlan.mode: bridge).
+    See https://netlab.tools/module/evpn/#evpn-rp for details.
+
+Warning in evpn: Node l2 runs OSPF on the IRB SVI of EVPN-controlled VLAN(s) red; OSPF adjacencies will form across the VXLAN tunnel
+rc=0

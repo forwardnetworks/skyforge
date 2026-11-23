@@ -1,0 +1,7 @@
+# expect: link-endpoints
+defaults.device: eos
+nodes:
+  r1:
+  r2:
+links:
+- { r1: , r2: , type: stub }

@@ -1,0 +1,2 @@
+# expect: igp-on-no-interface,ibgp-without-igp
+# Output of netlab create on the shipped blueprint enterprise-prepost/vxlan-evpn (no topology copied).

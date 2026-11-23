@@ -1,0 +1,4 @@
+Warning in firewall.zonebased: Node fwA(fortios) sets firewall.zonebased.rules, which fortios does not render: the 1 rule(s) will be silently ignored
+... Devices that render firewall.zonebased.rules: panos
+... Use firewall.policy.rules for specific rules: it is a module-level attribute with its own per-device renderers (see the firewall.policy plugin documentation)
+... Set defaults.firewall.zonebased.warnings.rules_not_rendered to False to hide this warning

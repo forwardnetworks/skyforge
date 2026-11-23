@@ -1,0 +1,77 @@
+# Declarative checks over the objects the loader builds from a netlab topology. Same idea as an Infrahub check (a name, what to
+# iterate, an assertion), kept as data in a small YAML predicate language: attr + eq/ne/in/regex/exists, all/any/not, related
+# (a relationship, an optional where, count_ge/count_le). No scripting.
+#
+# Constraints that the schema itself states (unique names, defined endpoints, two ends on a link, a plugin block's plugin) are
+# not repeated here; the evaluator enforces them from the schema. This file holds what a schema cannot say.
+#
+# Fields: id; code (the finding code; a code in netlab's classifier takes its class, why and fix from there); class (only for a
+# code that is not); kind (what to iterate); where (which objects the rule applies to); assert / assert_not (what must hold /
+# must not hold, otherwise the rule fires); message (a template; {attr} is the object's attribute, {subjects} the names from
+# subjects); subjects (related objects named in the message); needs (modules the rule is about, shown in the generated docs).
+rules_version: 1
+
+rules:
+  - id: irb-vlan-ospf-on-vxlan-fabric
+    code: evpn-svi-ospf-overlay
+    kind: NetlabVlan
+    description: >-
+      An IRB VLAN, with OSPF left at netlab's default (on) or set on, that two or more nodes running ospf, vxlan and evpn carry. netlab
+      puts OSPF on the SVI, the leaves adjoin across their own VXLAN tunnel and the fabric flaps. A VLAN that one node carries is a
+      stub network: netlab makes its SVI passive, so nothing forms and the rule stays quiet. A hand-written topology leaves
+      vlans.<name>.ospf absent, which is the default, so the rule fires on absent as well as on true.
+    needs: [ospf, evpn, vlan]
+    where:
+      all:
+        - {attr: mode, eq: irb}
+        - {attr: svi_ospf, eq: "on"}
+        - {attr: in_vrf, eq: false}
+        - {attr: mixed_as, eq: false}
+        - {attr: svi_ospf_warning, eq: true}
+    assert_not:
+      related:
+        rel: devices
+        count_ge: 2
+        where:
+          all:
+            - {attr: svi_possible, eq: true}
+            - related: {rel: modules, where: {attr: name, eq: ospf}}
+            - related: {rel: modules, where: {attr: name, eq: evpn}}
+            - related: {rel: modules, where: {attr: name, eq: vxlan}}
+    message: "OSPF runs on the IRB SVI of the VLAN {name} on {subjects}"
+    subjects:
+      rel: devices
+      where:
+        all:
+          - {attr: svi_possible, eq: true}
+          - related: {rel: modules, where: {attr: name, eq: ospf}}
+          - related: {rel: modules, where: {attr: name, eq: evpn}}
+          - related: {rel: modules, where: {attr: name, eq: vxlan}}
+
+  - id: module-requires-module
+    code: module-requires
+    kind: NetlabDevice
+    description: >-
+      A node enables a module whose required module it does not enable (evpn needs bgp, vxlan and stp need vlan). The requirement
+      is read from netlab's own module definitions, never copied here.
+    needs: [bgp, vlan]
+    assert:
+      related: {rel: missing_modules, count_le: 0}
+    message: "node {name} enables a module that needs {subjects}, which the node does not enable"
+    subjects:
+      rel: missing_modules
+
+  - id: group-module-list-without-members
+    code: group-module-no-members
+    kind: NetlabGroup
+    description: >-
+      A group carries a module list but nothing is a member of it: not its members list, not a node naming it, and no plugin that
+      generates nodes is enabled.
+    needs: [groups]
+    where:
+      all:
+        - {attr: populated_by_plugin, eq: false}
+        - {attr: has_module_list, eq: true}
+    assert:
+      related: {rel: members}
+    message: "group {name} has a module list but no members"

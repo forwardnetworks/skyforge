@@ -1,0 +1,5 @@
+Errors encountered while processing topology.yml
+IncorrectValue in links: Point-to-point link links[2] needs exactly two nodes
+... {'_linkname': 'links[2]', 'type': 'p2p', 'interfaces': [{'node': 'r2'}], 'linkindex': 2, 'node_count': 1, 'role': 'stub'}
+Fatal error in netlab: Cannot proceed beyond this point due to errors, exiting
+rc=1

@@ -1,0 +1,2 @@
+# expect: igp-on-no-interface,module-attribute-on-unused-link
+# Output of netlab create on a generic campus blueprint (no topology copied).

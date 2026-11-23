@@ -1,0 +1,28 @@
+# expect: none
+# The leaves are in different autonomous systems, so BGP marks the VLAN's link external and OSPF does not run on the SVIs.
+defaults.device: eos
+evpn.session: [ ibgp, ebgp ]
+evpn.as: 65000
+vlans:
+  red:
+groups:
+  leafs:
+    members: [ l1, l2 ]
+    module: [ ospf, bgp, vlan, vxlan, evpn ]
+nodes:
+  l1:
+    bgp.as: 65001
+  l2:
+    bgp.as: 65002
+  h1:
+    device: linux
+  h2:
+    device: linux
+links:
+- l1-l2
+- h1:
+  l1:
+    vlan.access: red
+- h2:
+  l2:
+    vlan.access: red

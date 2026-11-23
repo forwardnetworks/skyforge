@@ -1,0 +1,9 @@
+# expect: module-not-enabled
+provider: clab
+defaults.device: eos
+module: [ ospf ]
+nodes: [ r1, r2 ]
+links:
+- r1:
+  r2:
+  isis.cost: 10

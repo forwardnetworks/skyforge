@@ -1,0 +1,9 @@
+# expect: unknown-topology-attribute
+# The fabric plugin's configuration block, but the plugin is not enabled.
+defaults.device: eos
+bgp.as: 65000
+fabric:
+  spines: 2
+  leafs: 2
+nodes:
+  r1:

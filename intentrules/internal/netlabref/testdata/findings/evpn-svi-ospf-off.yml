@@ -1,0 +1,50 @@
+# expect: none
+# The fix proven live (E6, 0 of 264 probes lost): vlans.<name>.ospf: false.
+name: synth-evpn-irb
+provider: kne
+bgp.as: 65000
+groups:
+  switches:
+    members: [l1, l2, l3, l4, s1, s2]
+    device: eos
+    module: [vlan, vxlan, ospf, bgp, evpn]
+  hosts:
+    members: [h1, h2, h3, h4]
+    device: linux
+vlans:
+  red:
+    ospf: false
+  blue:
+    ospf: false
+nodes:
+  l1:
+  l2:
+  l3:
+  l4:
+  s1:
+  s2:
+  h1:
+  h2:
+  h3:
+  h4:
+links:
+- h1:
+  l1:
+    vlan.access: red
+- h2:
+  l2:
+    vlan.access: red
+- h3:
+  l3:
+    vlan.access: blue
+- h4:
+  l4:
+    vlan.access: blue
+- l1-s1
+- l1-s2
+- l2-s1
+- l2-s2
+- l3-s1
+- l3-s2
+- l4-s1
+- l4-s2

@@ -1,0 +1,2 @@
+# expect: evpn-extended-communities-off
+# Output of netlab create on the shipped blueprint EVPN/tshoot-multi-pod (no topology copied).

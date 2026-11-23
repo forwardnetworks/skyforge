@@ -1,0 +1,5 @@
+Errors encountered while processing topology.yml
+IncorrectValue in links: More than one node connected to a stub link links[1]
+... {'_linkname': 'links[1]', 'type': 'stub', 'interfaces': [{'node': 'r1'}, {'node': 'r2'}], 'linkindex': 1, 'node_count': 2}
+Fatal error in netlab: Cannot proceed beyond this point due to errors, exiting
+rc=1

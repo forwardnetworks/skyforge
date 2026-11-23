@@ -1,0 +1,18 @@
+# expect: none
+# The fabric plugin creates the leaf nodes, so a link may name a node the document does not define.
+defaults.device: eos
+plugin: [ fabric ]
+bgp.as: 65000
+fabric:
+  spines: 2
+  leafs: 2
+groups:
+  spines:
+    module: [ ospf, bgp ]
+  leafs:
+    module: [ ospf, bgp ]
+nodes:
+  h1:
+    device: linux
+links:
+- h1-L1

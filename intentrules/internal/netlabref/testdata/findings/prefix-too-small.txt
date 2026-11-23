@@ -1,0 +1,6 @@
+Errors encountered while processing prefix-too-small.yml
+IncorrectValue in links: Cannot use ipv4 prefix 10.0.0.0/30 to address 4 nodes on links[1]
+... link data: {'_linkname': 'links[1]', 'prefix': {'ipv4': '10.0.0.0/30'},
+... 'interfaces': [{'node': 'r1'}, {'node': 'r2'}, {'node': 'r3'}, {'node': 'r4'}],
+... 'linkindex': 1, 'node_count': 4, 'type': 'lan', 'bridge': 'fxprefixto_1'}
+Fatal error in netlab: Cannot proceed beyond this point due to errors, exiting

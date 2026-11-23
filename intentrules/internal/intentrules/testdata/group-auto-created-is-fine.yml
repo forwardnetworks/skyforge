@@ -1,0 +1,10 @@
+# expect: none
+# _auto_create makes the listed members into nodes, so the groups are not empty.
+defaults.device: eos
+groups:
+  _auto_create: true
+  core:
+    members: [ c1, c2 ]
+    module: [ ospf ]
+links:
+- c1-c2

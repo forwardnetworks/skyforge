@@ -1,0 +1,320 @@
+(module-vrf)=
+# Virtual Routing and Forwarding (VRF) Tables
+
+This configuration module implements the VRF planning and configuration logic and is used together with [BGP](bgp.md), [OSPF](ospf.md), and [IS-IS](isis.md) configuration modules to implement VRF-aware routing protocols.
+
+```eval_rst
+.. contents:: Table of Contents
+   :depth: 2
+   :local:
+   :backlinks: none
+```
+
+## Platform Support
+
+(module-vrf-platform-support)=
+VRFs are supported on these platforms:
+
+```{features}
+- title: VRF<br />config
+  enabled: vrf
+- title: Route<br />leaking
+  enabled: vrf and vrf.get('leaking',True)
+  caveats: vrf.leaking_caveats
+- title: VRF-aware<br />Loopback
+  enabled: vrf and vrf.get('loopback',True)
+  caveats: vrf.loopback_caveats
+```
+
+(module-vrf-platform-routing-support)=
+These platforms support routing protocols in VRFs:
+
+```{features}
+- title: OSPFv2
+  enabled: vrf.ospfv2
+  caveats: vrf.ospfv2_caveats
+- title: OSPFv3
+  enabled: vrf.ospfv3
+  caveats: vrf.ospfv3_caveats
+- title: EBGP
+  enabled: vrf.bgp
+  caveats: vrf.bgp_caveats
+- title: RIPv2
+  enabled: vrf.ripv2
+  caveats: vrf.ripv2_caveats
+- title: RIPng
+  enabled: vrf.ripng
+  caveats: vrf.ripng_caveats
+- title: IS-IS
+  enabled: vrf.isis
+  caveats: vrf.isis_caveats
+```
+
+```{note}
+* You cannot run EIGRP within a VRF, but the configuration module is VRF-aware -- it will not try to configure EIGRP routing on VRF interfaces
+* IBGP within a VRF instance does not work. PE-routers and CE-routers MUST HAVE different BGP AS numbers ([more details](bgp-vrf))
+* The detailed device support matrix for BGP, OSPFv2, and OSPFv3 is in the [VRF Integration Tests Results](https://release.netlab.tools/_html/coverage.vrf). The RIP-in-VRF tests are in the [RIPv2/RIPng Integration Tests Results](https://release.netlab.tools/_html/coverage.ripv2); the IS-IS tests are in the [IS-IS Integration Tests Results](https://release.netlab.tools/_html/coverage.isis)
+```
+
+## Parameters
+
+The following parameters can be set globally or per node:
+
+* **vrfs**: A dictionary of VRF definitions (see below)
+* **vrf.loopback** (bool): Create loopback interfaces for all VRFs used on this node
+* **vrf.as**: The default AS number used in RD/RT values when **bgp.as** is not set ([more details](default-vrf-values)). The system default for **vrf.as** is 65000.
+
+(module-vrf-definition)=
+## VRF Definition
+
+VRFs are defined in a global or node-specific **vrfs** dictionary, allowing you to create VRFs that are used network-wide or only on a single node.
+
+The keys of the **vrfs** dictionary are VRF names; the values are VRF definitions. A VRF definition could be empty or a dictionary with one or more of these attributes:
+
+* **rd** -- route distinguisher (integer or string)
+* **import** -- a list of import route targets
+* **export** -- a list of export route targets
+* **loopback** (bool or prefix) -- Create a loopback interface for this VRF ([more details](vrf-loopback)).
+* **links** - a [list of links](module-vrf-links) within this VRF.
+* A VRF definition can also contain other link- or interface-level parameters (for example, OSPF cost).
+
+Empty VRF definition will get [default RD and RT values](default-vrf-values) assigned during the topology transformation process.
+
+```{warning}
+* Some VRF names (for example, *‌base*, *‌mgmt*, *‌system*, and *‌global*) cannot be used because they're used internally by network operating systems.
+* Do not reuse VRF names when defining node-specific VRFs. To implement complex VPN topologies, a subtle interaction between global and node-specific VRFs is needed, and _netlab_ assumes that the VRFs with the same name refer to the same routing and forwarding instance.
+* Global VRFs will not be instantiated on a node using the _vrf_ module unless the node is attached to a [VRF link](module-vrf-interface). If you want to create a VRF that uses no external interfaces, add the VRF name to the node **‌vrfs** dictionary.
+* The **‌vrfs** dictionary and the _vrf_ module will be removed from a node with no VRF interfaces or [VRF loopback interfaces](vrf-loopback).
+```
+
+
+### Additional VRF Parameters
+
+You can also set these parameters to influence routing protocols within a VRF.
+
+* **ospf.active** -- start an OSPF instance within a VRF even when there are no viable OSPF neighbors on VRF interfaces
+* **ospf.area** -- the default OSPF area for the VRF OSPF process (default: node **ospf.area**). It is configured on the VRF loopback interfaces.
+* **bgp.router_id** -- per-VRF BGP router ID. You have to set this parameter if you want to configure inter-VRF EBGP sessions between interfaces of the same device.[^ELB]
+* **ospf.router_id** -- per-VRF OSPF router ID. You can use this parameter for the same reasons as **bgp.router_id** or if you want consistent OSPF router IDs on Cisco IOS.
+* **_igp_.af** -- specify the [address families](routing_af) you want to use with **isis**, **ospf**, or **rip** VRF instance.
+* You can also specify OSPF route redistribution (**import**), **default** route origination, and default OSPF **password** and **timers**.
+
+[^ELB]: That's how some people implement inter-VRF route leaking. You don't want to know the details ;)
+
+(vrf-loopback)=
+### Creating VRF Loopback Interfaces
+
+A loopback interface is created for a VRF whenever you set the **vrfs.*name*.loopback** or **vrf.loopback** global or node parameter. The global or node parameter is a boolean value that triggers (or turns off) the creation of loopbacks for all VRFs that do not have more specific loopback definitions.
+
+**loopback** parameter in a global- or node VRF definition could be:
+
+* A boolean value -- the address of the loopback interface will be allocated from the **vrf_loopback** address pool
+* A dictionary with the **pool** attribute to specify an alternate address pool
+
+**loopback** parameter in a node VRF definition can also be:
+
+* A string specifying the IPv4- or IPv6 prefix of the loopback interface (host bits are set to 1 for IPv4 prefixes larger than /32 or IPv6 prefixes larger than /128).
+* A dictionary of address families specifying IPv4 and/or IPv6 prefixes to be used on the loopback interface
+
+Global and node VRF definitions can also include a subset of OSPF (area, cost), IS-IS (type, metric/cost), and BGP (advertise) parameters.
+
+To disable a VRF loopback, set the **loopback** parameter to *False* or *None* (no value).
+
+### RD and RT Values
+
+A route distinguisher could be specified in N:N format (example: 65000:1) or as an integer. AS number specified in **bgp.as** or **vrf.as** will be prepended to an integer RD-value to generate RD value in N:N format.
+
+**import** and **export** route targets could be specified as a single value or a list of values. Each RT value could be an integer (see above), a string in N:N format, or a VRF name. When using a VRF name as an RT value, the VRF RD is used as the route target.
+
+For example, to implement a _common services_ VPN giving *red* and *blue* VRFs access to *common* VRF, use these VRF definitions:
+
+```
+vrfs:
+  red:
+    import: [ red, common ]
+    export: [ red ]
+  blue:
+    import: [ blue, common ]
+    export: [ blue ]
+  common:
+    import: [ common, red, blue ]
+    export: [ common ]
+```
+
+(default-vrf-values)=
+### Default RD/RT Values
+
+_netlab_ uses the following default values when the global VRF definitions don't have the **rd**, **import**, or **export** values (including the corner case of empty VRF definition):
+
+* When the **rd** is missing, it's assigned a unique value in the `asn:nn` format using the global **bgp.as** or **vrf.as** value as the high-end of the RD value. The lower 16 bits of the RD value are the VRF ID (starting with one).
+* The missing **import** and **export** route targets become a list, with the VRF RD as the sole element.
+
+When completing the node-level VRF definitions, _netlab_ copies the missing parameters from the global VRFs with the same name, and replaces empty values using the same rules as for the global VRF definitions, but this time using node **bgp.as** and **vrf.as** values (which can themselves be inherited from the global values).
+
+For example, defining a simple global VRF *red*...
+
+```
+vrfs:
+  red:
+```
+
+... results in the following data structure:
+
+```
+red:
+  export:
+  - '65000:1'
+  id: 1
+  import:
+  - '65000:1'
+  rd: '65000:1'
+```
+
+When using an empty **rd** value in a node VRF, the **rd** will be auto-generated, while the **import** and **export** route targets will be inherited from the global VRF definition.
+
+For example, defining a *red* VRF with node-specific auto-generated RD...
+
+```
+vrfs:
+  red:
+
+nodes:
+  r1:
+    bgp.as: 65001
+    vrfs:
+      green:
+      red.rd:
+```
+
+... results in the following (VRF-related) data structures:
+
+```
+vrfs:
+  red:
+    export:
+    - '65000:1'
+    id: 1
+    import:
+    - '65000:1'
+    rd: '65000:1'
+
+nodes:
+  r1:
+    vrfs:
+      red:
+        export:
+        - '65000:1'
+        id: 1
+        import:
+        - '65000:1'
+        rd: '65001:1'
+```
+
+Notes:
+
+* The global RD/RT values are generated using the system default **vrf.as** value (65000).
+* The global RT values for the *red* VRF are copied into the node data structures. The global RD value is not copied because it is set in the node VRF definition.
+* Node RD value for the *red* VRF is generated using the node **bgp.as** value (65001).
+
+(module-vrf-interface)=
+## Using VRFs on Interfaces and Links
+
+To use a VRF, add the **vrf** attribute (a global or node-specific VRF name) to a link or an interface on a link.
+
+For example, the following topology creates a simple VRF with two hosts attached to it:
+
+```
+module: [ vrf ]
+
+vrfs:
+  red:
+
+nodes:
+  r1:
+    device: eos
+  h1:
+    device: linux
+  h2:
+    device: linux
+
+links:
+- r1:
+    vrf: red
+  h1:
+- r1:
+    vrf: red
+  h2:
+```
+
+While it usually makes sense to specify **vrf** on an interface, you could use the **vrf** attribute on a link to add all interfaces attached to that link to the specified VRF, for example, when building VRF-lite topologies.
+
+(module-vrf-links)=
+### Specify Links within VRF Definition
+
+While you can assign links to VRFs with the **vrf** link or interface attribute, you can also list VRF links in the **links** list of a global VRF definition. The methods are equivalent and produce the same results, but the VRF **links** approach results in a more concise lab topology.
+
+Consider the simplest possible topology with a switch (s1) and two hosts (h1 and h2) connected to two interfaces in the same VRF. This is how you would define the VRF and links within that VRF:
+
+```
+vrfs:
+  example:
+
+links:
+- h1:
+  s1:
+  vrf: example
+- h2:
+  s1:
+  vrf: example
+```
+
+Using the VRF **links** attribute, the same lab topology could be (using [link definition shortcuts](link-example-no-attributes)) shortened to:
+
+```
+vrfs:
+  example:
+    links: [ h1-s1, h2-s1 ]
+```
+
+## Interaction with Routing Protocols
+
+BGP, OSPF, IS-IS, and RIP configuration modules are VRF aware:
+
+* VRF interfaces that should be part of an IGP routing process (OSPF, IS-IS, or RIP) are moved into VRF-specific data structures that are then used to create VRF-specific IGP instances.
+* EBGP neighbors discovered on VRF interfaces are moved into VRF-specific data structures and used to configure BGP neighbors with a BGP VRF address family.
+
+Notes:
+
+* VRF IGP instances are created only in VRFs with neighbors using the same configuration module (for example, neighbors using the **ospf** configuration module).
+* To create an IGP instance in a VRF that has no IGP neighbors, set ***igp*.active** (for example, **ospf.active**) node VRF parameter to *True*.
+* VRF-specific IGP and BGP configurations are included in the VRF configuration templates.
+* Unless you configure route redistribution with **_protocol_.import** VRF parameter, _netlab_ configures redistribution of connected subnets into IGP VRF routing processes and the BGP VRF address family.
+* If a node has **bgp.as** parameter and VRF-specific IGP instance(s), the VRF configuration templates configure two-way redistribution between the IGP instances and the BGP VRF address family unless you [configured VRF route redistribution](routing_import).
+* IBGP sessions within VRF instances do not work ([more details](bgp-vrf))
+
+### Creating VRF OSPF Instances
+
+Assume that we want an OSPF instance in the brown VRF, but the only link in the VRF is a stub link, so the OSPF instance would not be created with default settings. Setting the **ospf.active** parameter in **nodes.r3.vrfs.brown** forces the creation of the VRF OSPF instance.
+
+```
+nodes:
+  r3:
+    module: [ vrf,ospf ]
+    vrfs:
+      brown:
+        ospf.active: True
+
+links:
+- r3:
+    vrf: brown
+```
+
+## Examples
+
+You'll find VRF-related examples in the [Defining and Using VRFs](../example/vrf-tutorial.md) tutorial and in these blog posts:
+
+-   [Creating VRF Lite Labs With netlab](https://blog.ipspace.net/2022/04/netsim-vrf-lite.html)
+-   [Creating MPLS/VPN Labs With netlab](https://blog.ipspace.net/2022/04/netsim-mpls-vpn.html)
+-   [Combining VLANs with VRFs](https://blog.ipspace.net/2022/06/netsim-vlan-vrf.html)
+-   [VRF Lite Topology with VLAN Trunks](https://blog.ipspace.net/2022/09/netlab-vrf-lite.html)
+-   [Using VLAN and VRF Links](https://blog.ipspace.net/2023/04/netlab-vrf-vlan-links.html)

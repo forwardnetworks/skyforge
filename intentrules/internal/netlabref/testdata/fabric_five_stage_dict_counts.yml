@@ -1,0 +1,35 @@
+---
+name: fabric-demo
+provider: kne
+
+# Synthetic 5-stage Clos fabric used as a test fixture
+defaults:
+  device: eos
+
+module: [ bgp ]
+plugin: [ fabric ]
+
+bgp.as: 65000
+
+fabric:
+  superspines:
+    module: [ bgp ]
+    count: 4
+    name: SS{count}
+    bgp.as: 65001
+
+  spines:
+    module: [ bgp ]
+    count: 10
+    name: S{count}
+    bgp.as: 65100
+
+  leafs:
+    module: [ bgp ]
+    count: 36
+    name: L{count}
+    bgp.as: '{65200 + count}'
+
+addressing:
+  router_id: 10.0.0.0/24
+  p2p: 10.1.0.0/16

@@ -1,0 +1,10 @@
+# expect: device-module-unsupported
+provider: clab
+defaults.device: eos
+module: [ ospf ]
+nodes:
+  r1:
+  h1:
+    device: linux
+    module: [ ospf ]
+links: [ r1-h1 ]
